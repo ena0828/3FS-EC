@@ -2,6 +2,7 @@
 
 #include "common/serde/Service.h"
 #include "fbs/storage/Common.h"
+#include "fbs/storage/Ec.h"
 
 namespace hf3fs::storage {
 
@@ -20,6 +21,10 @@ SERDE_SERVICE(StorageSerde, 3) {
   SERDE_SERVICE_METHOD(getAllChunkMetadata, 13, GetAllChunkMetadataReq, GetAllChunkMetadataRsp);
   SERDE_SERVICE_METHOD(offlineTarget, 16, OfflineTargetReq, OfflineTargetRsp);
   SERDE_SERVICE_METHOD(removeTarget, 17, RemoveTargetReq, RemoveTargetRsp);
+  SERDE_SERVICE_METHOD(createEcTarget, 18, EcCreateTargetReq, EcCreateTargetRsp);
+  SERDE_SERVICE_METHOD(createEcFragment, 19, EcCreateReq, EcCreateRsp);
+  SERDE_SERVICE_METHOD(readEcFragment, 20, EcReadReq, EcReadRsp);
+  SERDE_SERVICE_METHOD(reconcileEcFragment, 21, EcReconcileReq, EcReconcileRsp);
 };
 
 }  // namespace hf3fs::storage

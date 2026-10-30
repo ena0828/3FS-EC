@@ -64,6 +64,14 @@ class StorageClientImpl : public StorageClient {
 
   CoTryTask<CreateTargetRsp> createTarget(NodeId nodeId, const CreateTargetReq &req) override;
 
+  CoTryTask<EcCreateTargetRsp> createEcTarget(NodeId nodeId, const EcCreateTargetReq &req) override;
+
+  CoTryTask<EcFragmentReceipt> createEcFragment(const EcCreateReq &req) override;
+
+  CoTryTask<EcReadResult> readEcFragment(const EcReadReq &req) override;
+
+  CoTryTask<EcFragmentReceipt> reconcileEcFragment(const EcReconcileReq &req) override;
+
   CoTryTask<OfflineTargetRsp> offlineTarget(NodeId nodeId, const OfflineTargetReq &req) override;
 
   CoTryTask<RemoveTargetRsp> removeTarget(NodeId nodeId, const RemoveTargetReq &req) override;
@@ -136,7 +144,10 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<Rsp> callMessengerMethod(StorageMessenger &messenger,
                                      ClientRequestContext &requestCtx,
                                      const hf3fs::flat::NodeInfo &nodeInfo,
-                                     const Req &request);
+                                     const Req &request,
+                                     uint32_t sendRetryTimes = 1,
+                                     bool *dispatched = nullptr,
+                                     bool allowTcp = false);
 
   template <typename Op, typename BatchReq, typename BatchRsp, auto Method>
   CoTryTask<BatchRsp> sendBatchRequest(StorageMessenger &messenger,

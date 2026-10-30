@@ -17,6 +17,9 @@ AllocateWorker::AllocateWorker(const Config &config, Components &components)
       executors_(std::make_pair(1u, 1u), std::make_shared<folly::NamedThreadFactory>("Allocate")) {}
 
 Result<Void> AllocateWorker::start() {
+  if (components_.storageTargets.ecOnly()) {
+    XLOG(INFO, "EC-only storage disables legacy compaction until identity-preserving durable relocation is supported");
+  }
   executors_.add([this] { loop(); });
   started_ = true;
   return Void{};
@@ -48,7 +51,9 @@ void AllocateWorker::loop() {
     for (auto &engine : components_.storageTargets.engines()) {
       engine->allocate_groups(minRemainGroups, maxRemainGroups, 128);
       engine->allocate_ultra_groups(minRemainUltraGroups, maxRemainUltraGroups, 32);
-      engine->compact_groups(maxReserved);
+      // The legacy move path resets the operation etag and does not establish
+      // the EC relocation durability contract. Preallocation remains enabled.
+      if (!components_.storageTargets.ecOnly()) engine->compact_groups(maxReserved);
     }
   }
 

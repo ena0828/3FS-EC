@@ -110,6 +110,9 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
       co_return makeError(std::move(targetResult.error()));
     }
     auto target = std::move(*targetResult);
+    if (target->ecOnly) {
+      co_return makeError(StorageCode::kTargetStateInvalid, "legacy batch reads cannot access an EC target");
+    }
     if (UNLIKELY(!target->upToDate())) {
       auto msg = fmt::format("read target is not upToDate, req {}, target {}", it->readIO(), *target);
       XLOG(ERR, msg);
@@ -335,6 +338,9 @@ CoTask<IOResult> StorageOperator::handleUpdate(ServiceRequestContext &requestCtx
                                                net::IBSocket *ibSocket,
                                                TargetPtr &target) {
   // 1. get target.
+  if (target->ecOnly) {
+    co_return makeError(StorageCode::kTargetStateInvalid, "legacy updates cannot access an EC target");
+  }
   if (UNLIKELY(req.options.fromClient && !target->isHead)) {
     XLOGF(ERR, "non-head node receive a client update request");
     co_return makeError(StorageClientCode::kRoutingError, "non-head node receive a client update request");
@@ -641,6 +647,9 @@ Result<std::vector<std::pair<ChunkId, ChunkMetadata>>> StorageOperator::doQuery(
   auto recordGuard = storageDoQueryRecorder.record();
   // get target for chunk query from client.
   CHECK_RESULT(target, components_.targetMap.getByChainId(vChainId));
+  if (target->ecOnly) {
+    return makeError(StorageCode::kTargetStateInvalid, "legacy range queries cannot access an EC target");
+  }
 
   auto queryResult = FAULT_INJECTION_POINT(requestCtx.debugFlags.injectServerError(),
                                            makeError(StorageCode::kMetaStoreInvalidIterator),
@@ -1018,6 +1027,10 @@ CoTryTask<TargetSyncInfo> StorageOperator::syncStart(const SyncStartReq &req) {
   auto target = std::move(*targetResult);
   auto targetId = target->targetId;
 
+  if (target->ecOnly) {
+    co_return makeError(StorageCode::kTargetStateInvalid, "CRAQ synchronization cannot access an EC target");
+  }
+
   if (UNLIKELY(target->publicState != flat::PublicTargetState::SYNCING)) {
     auto msg = fmt::format("target {} check state failed: {}", targetId, magic_enum::enum_name(target->publicState));
     XLOG(ERR, msg);
@@ -1051,6 +1064,11 @@ CoTryTask<TargetSyncInfo> StorageOperator::syncStart(const SyncStartReq &req) {
 
 CoTryTask<SyncDoneRsp> StorageOperator::syncDone(const SyncDoneReq &req) {
   auto recordGuard = syncDoneRecorder.record();
+  auto target = components_.targetMap.getByChainId(req.vChainId);
+  if (!target) co_return makeError(target.error());
+  if ((*target)->ecOnly) {
+    co_return makeError(StorageCode::kTargetStateInvalid, "CRAQ synchronization cannot access an EC target");
+  }
   auto result = components_.targetMap.syncReceiveDone(req.vChainId);
   if (UNLIKELY(!result)) {
     XLOGF(ERR, "sync done {} failed: {}", req, result.error());
@@ -1110,6 +1128,12 @@ CoTryTask<RemoveTargetRsp> StorageOperator::removeTarget(const RemoveTargetReq &
   }
   auto &target = **targetResult;
 
+  // Offline EC targets still contain unpublished or live allocations. Their
+  // removal needs the EC directory/GC protocol, including when force is set.
+  if (target.ecOnly) {
+    co_return makeError(StorageCode::kTargetStateInvalid, "legacy target removal cannot delete EC allocations");
+  }
+
   // 2. check status.
   if (!target.unrecoverableOffline()) {
     auto msg = fmt::format("remove failed: target is not offline! {}", target);
@@ -1164,6 +1188,9 @@ CoTryTask<QueryChunkRsp> StorageOperator::queryChunk(const QueryChunkReq &req) {
 
   QueryChunkRsp rsp;
   rsp.target = **targetResult;
+  if (rsp.target.ecOnly) {
+    co_return makeError(StorageCode::kTargetStateInvalid, "legacy metadata queries cannot access an EC target");
+  }
   if (rsp.target.storageTarget && !req.chunkId.data().empty()) {
     rsp.meta = rsp.target.storageTarget->queryChunk(req.chunkId);
   }
@@ -1182,6 +1209,10 @@ CoTryTask<GetAllChunkMetadataRsp> StorageOperator::getAllChunkMetadata(const Get
 
   auto target = std::move(*targetResult);
   auto targetId = target->targetId;
+
+  if (target->ecOnly) {
+    co_return makeError(StorageCode::kTargetStateInvalid, "CRAQ metadata enumeration cannot access an EC target");
+  }
 
   if (UNLIKELY(target->publicState != flat::PublicTargetState::SERVING)) {
     auto msg = fmt::format("target {} check state failed: {}", targetId, magic_enum::enum_name(target->publicState));

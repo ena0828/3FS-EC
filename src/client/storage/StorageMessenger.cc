@@ -167,6 +167,62 @@ CoTryTask<CreateTargetRsp> StorageMessenger::createTarget(const hf3fs::net::Addr
                                                                                                             timestamp);
 }
 
+CoTryTask<EcCreateTargetRsp> StorageMessenger::createEcTarget(const hf3fs::net::Address &address,
+                                                              const EcCreateTargetReq &request,
+                                                              const net::UserRequestOptions *options,
+                                                              serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcCreateTargetReq,
+                                        EcCreateTargetRsp,
+                                        hf3fs::storage::StorageSerde<>::createEcTarget<serde::ClientContext>>(
+      client_,
+      address,
+      request,
+      options,
+      timestamp);
+}
+
+CoTryTask<EcCreateRsp> StorageMessenger::createEcFragment(const hf3fs::net::Address &address,
+                                                          const EcCreateReq &request,
+                                                          const net::UserRequestOptions *options,
+                                                          serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcCreateReq,
+                                        EcCreateRsp,
+                                        hf3fs::storage::StorageSerde<>::createEcFragment<serde::ClientContext>>(
+      client_,
+      address,
+      request,
+      options,
+      timestamp);
+}
+
+CoTryTask<EcReadRsp> StorageMessenger::readEcFragment(const hf3fs::net::Address &address,
+                                                      const EcReadReq &request,
+                                                      const net::UserRequestOptions *options,
+                                                      serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcReadReq,
+                                        EcReadRsp,
+                                        hf3fs::storage::StorageSerde<>::readEcFragment<serde::ClientContext>>(
+      client_,
+      address,
+      request,
+      options,
+      timestamp);
+}
+
+CoTryTask<EcReconcileRsp> StorageMessenger::reconcileEcFragment(const hf3fs::net::Address &address,
+                                                                const EcReconcileReq &request,
+                                                                const net::UserRequestOptions *options,
+                                                                serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcReconcileReq,
+                                        EcReconcileRsp,
+                                        hf3fs::storage::StorageSerde<>::reconcileEcFragment<serde::ClientContext>>(
+      client_,
+      address,
+      request,
+      options,
+      timestamp);
+}
+
 CoTryTask<OfflineTargetRsp> StorageMessenger::offlineTarget(const hf3fs::net::Address &address,
                                                             const OfflineTargetReq &request,
                                                             const net::UserRequestOptions *options,

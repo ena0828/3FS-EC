@@ -9,6 +9,8 @@ namespace hf3fs::storage {
 
 // Physical configuration of the storage target. Store in `target.toml`.
 static inline constexpr auto kPhysicalConfigFileName = "target.toml";
+static inline constexpr auto kEcPhysicalConfigFileName = "ec-target-v1.toml";
+static inline constexpr auto kEcTargetMarker = "3FS_EC_TARGET_V1\n";
 
 class PhysicalConfig {
   SERDE_STRUCT_FIELD(path, Path{});
@@ -25,6 +27,7 @@ class PhysicalConfig {
   SERDE_STRUCT_FIELD(kv_store_name, std::string{"meta"});
   SERDE_STRUCT_FIELD(kv_path, std::optional<Path>{});
   SERDE_STRUCT_FIELD(only_chunk_engine, false);
+  SERDE_STRUCT_FIELD(ec_only, false);
 
  public:
   Path kvPath() const {

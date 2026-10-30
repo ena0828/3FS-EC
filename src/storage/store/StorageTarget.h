@@ -35,6 +35,9 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   // load storage target.
   Result<Void> load(const Path &path);
 
+  // Read and validate the physical mode without opening a data store.
+  static Result<PhysicalConfig> readPhysicalConfig(const Path &path);
+
   // add new chunk size.
   Result<Void> addChunkSize(const std::vector<Size> &sizeList);
 
@@ -73,6 +76,10 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
 
   // update chunk (write/remove/truncate).
   void updateChunk(UpdateJob &job, folly::CPUThreadPoolExecutor &executor);
+
+  Result<EcFragmentReceipt> createEcFragment(const EcCreateReq &request);
+  Result<EcReadResult> readEcFragment(const EcReadReq &request);
+  Result<EcFragmentReceipt> reconcileEcFragment(const EcReconcileReq &request);
 
   // query chunks: the chunk ids in result are in reverse lexicographical order
   Result<std::vector<std::pair<ChunkId, ChunkMetadata>>> queryChunks(const ChunkIdRange &chunkIdRange);
@@ -115,6 +122,9 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
 
   // get all uncommitted chunk ids.
   Result<std::vector<ChunkId>> uncommitted() {
+    if (ecOnly()) {
+      return makeError(StatusCode::kInvalidArg, "legacy uncommitted query is forbidden on an EC target");
+    }
     if (useChunkEngine()) {
       return ChunkEngine::queryUncommittedChunks(*engine_, chainId());
     } else {
@@ -124,6 +134,9 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
 
   // reset uncommitted chunk to committed state.
   Result<Void> resetUncommitted(ChainVer chainVer) {
+    if (ecOnly()) {
+      return makeError(StatusCode::kInvalidArg, "CRAQ recovery is forbidden on an EC target");
+    }
     if (useChunkEngine()) {
       return ChunkEngine::resetUncommittedChunks(*engine_, chainId(), chainVer);
     } else {
@@ -160,6 +173,7 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
 
   // check if chunk engine is used.
   inline bool useChunkEngine() const { return targetConfig_.only_chunk_engine; }
+  bool ecOnly() const { return targetConfig_.ec_only; }
 
  private:
   const Config &config_;
@@ -183,6 +197,7 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   CoLockManager<> channelLocks_;
   folly::Synchronized<std::set<Size>, std::mutex> chunkSizeList_;
   bool released_ = false;
+  bool initialized_ = false;
 };
 
 }  // namespace hf3fs::storage

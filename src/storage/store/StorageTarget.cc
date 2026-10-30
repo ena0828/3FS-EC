@@ -1,9 +1,12 @@
 #include "storage/store/StorageTarget.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <fcntl.h>
+#include <folly/ScopeGuard.h>
 #include <folly/experimental/symbolizer/Symbolizer.h>
 #include <fstream>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "common/monitor/Recorder.h"
 #include "common/serde/Serde.h"
@@ -35,6 +38,62 @@ monitor::ValueRecorder targetReservedSize{"storage.target.reserved_size", std::n
 monitor::ValueRecorder targetUnrecycledSize{"storage.target.unrecycled_size", std::nullopt, false};
 monitor::OperationRecorder pointQueryRecorder{"storage.point_query"};
 std::atomic<uint32_t> gGenerationId{};
+
+Result<Void> writeNewEcConfigFile(const Path &path, std::string_view bytes) {
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return makeError(StorageCode::kStorageInitFailed, fmt::format("create EC config {} failed: {}", path, errno));
+  }
+  SCOPE_EXIT { ::close(fd); };
+  while (!bytes.empty()) {
+    const auto written = ::write(fd, bytes.data(), bytes.size());
+    if (written < 0 && errno == EINTR) continue;
+    if (written <= 0) {
+      return makeError(StorageCode::kStorageInitFailed, fmt::format("write EC config {} failed: {}", path, errno));
+    }
+    bytes.remove_prefix(static_cast<size_t>(written));
+  }
+  while (::fsync(fd) != 0) {
+    if (errno == EINTR) continue;
+    return makeError(StorageCode::kStorageInitFailed, fmt::format("sync EC config {} failed: {}", path, errno));
+  }
+  return Void{};
+}
+
+Result<Void> syncEcConfigDirectory(const Path &path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    return makeError(StorageCode::kStorageInitFailed,
+                     fmt::format("open EC config directory {} failed: {}", path, errno));
+  }
+  SCOPE_EXIT { ::close(fd); };
+  while (::fsync(fd) != 0) {
+    if (errno == EINTR) continue;
+    return makeError(StorageCode::kStorageInitFailed,
+                     fmt::format("sync EC config directory {} failed: {}", path, errno));
+  }
+  return Void{};
+}
+
+Result<Path> physicalConfigPath(const Path &path) {
+  const auto marker = path / kPhysicalConfigFileName;
+  const auto ecConfig = path / kEcPhysicalConfigFileName;
+  if (!boost::filesystem::exists(ecConfig) && !boost::filesystem::is_symlink(ecConfig)) return marker;
+  if (!boost::filesystem::is_regular_file(ecConfig) || boost::filesystem::is_symlink(ecConfig) ||
+      !boost::filesystem::is_regular_file(marker) || boost::filesystem::is_symlink(marker)) {
+    return makeError(StorageCode::kStorageInitFailed, "EC target requires two regular configuration files");
+  }
+  const std::string_view expected{kEcTargetMarker};
+  if (boost::filesystem::file_size(marker) != expected.size()) {
+    return makeError(StorageCode::kStorageInitFailed, "EC target marker length mismatch");
+  }
+  std::ifstream input(marker, std::ios::binary);
+  std::string actual(expected.size(), '\0');
+  if (!input.read(actual.data(), actual.size()) || actual != expected) {
+    return makeError(StorageCode::kStorageInitFailed, "EC target marker mismatch");
+  }
+  return ecConfig;
+}
 
 Result<std::string> getDeviceUUID(const Path &path) {
   struct stat st;
@@ -77,7 +136,7 @@ StorageTarget::StorageTarget(const Config &config,
       chunkStore_(config_, globalFileStore) {}
 
 StorageTarget::~StorageTarget() {
-  if (released_) {
+  if (released_ || !initialized_) {
     return;
   }
   auto result = sync();
@@ -87,14 +146,23 @@ StorageTarget::~StorageTarget() {
 }
 
 Result<Void> StorageTarget::create(const PhysicalConfig &config) {
+  if (config.ec_only && (!config.only_chunk_engine || config.chain_id == 0)) {
+    return makeError(StorageCode::kStorageInitFailed, "EC target requires ChunkEngine and a nonzero fixed chain id");
+  }
   Path targetConfigFilePath = config.path / kPhysicalConfigFileName;
-  if (boost::filesystem::exists(targetConfigFilePath)) {
+  if (boost::filesystem::exists(targetConfigFilePath) || boost::filesystem::is_symlink(targetConfigFilePath) ||
+      boost::filesystem::exists(config.path / kEcPhysicalConfigFileName) ||
+      boost::filesystem::is_symlink(config.path / kEcPhysicalConfigFileName)) {
     auto msg = fmt::format("Target config file {} already exists", targetConfigFilePath.string());
     XLOG(INFO, msg);
     if (!config.allow_existing_targets) {
       return makeError(StorageCode::kStorageInitFailed, std::move(msg));
     }
     RETURN_AND_LOG_ON_ERROR(load(config.path));
+    if (targetConfig_.ec_only != config.ec_only || (config.ec_only && targetConfig_.chain_id != config.chain_id)) {
+      return makeError(StorageCode::kStorageInitFailed,
+                       "existing target mode or EC chain differs; conversion is forbidden");
+    }
     if (targetConfig_.target_id != config.target_id) {
       auto msg = fmt::format("target id is different: {} != {}", targetConfig_.target_id, config.target_id);
       XLOG(ERR, msg);
@@ -107,7 +175,7 @@ Result<Void> StorageTarget::create(const PhysicalConfig &config) {
       XLOG(ERR, msg);
       return makeError(StorageCode::kStorageInitFailed, std::move(msg));
     }
-    RETURN_AND_LOG_ON_ERROR(addChunkSize(config.chunk_size_list));
+    if (!ecOnly()) RETURN_AND_LOG_ON_ERROR(addChunkSize(config.chunk_size_list));
     XLOGF(INFO, "Target config file {} check passed", targetConfigFilePath.string());
     return Void{};
   }
@@ -122,11 +190,15 @@ Result<Void> StorageTarget::create(const PhysicalConfig &config) {
   }
   if (useChunkEngine()) {
     boost::system::error_code ec{};
-    boost::filesystem::create_directories(targetConfig_.path, ec);
+    const bool created = boost::filesystem::create_directories(targetConfig_.path, ec);
     if (UNLIKELY(ec.failed())) {
       auto msg = fmt::format("target create directory {} failed: {}", targetConfig_.path.string(), ec.message());
       XLOG(ERR, msg);
       return makeError(StorageCode::kChunkOpenFailed, std::move(msg));
+    }
+    if (ecOnly() && !created) {
+      return makeError(StorageCode::kStorageInitFailed,
+                       "EC creation requires a fresh target directory or complete EC config");
     }
   } else {
     RETURN_AND_LOG_ON_ERROR(chunkStore_.create(targetConfig_));
@@ -141,32 +213,55 @@ Result<Void> StorageTarget::create(const PhysicalConfig &config) {
     RETURN_AND_LOG_ON_ERROR(getDeviceUUIDResult);
   }
 
-  std::ofstream targetConfigFile(targetConfigFilePath, std::ios::out);
-  if (!targetConfigFile) {
-    auto msg = fmt::format("Open target config file {} failed", targetConfigFilePath.string());
-    XLOG(ERR, msg);
-    return makeError(StorageCode::kStorageInitFailed, std::move(msg));
-  }
-  if (!(targetConfigFile << serde::toTomlString(targetConfig_))) {
-    auto msg = fmt::format("Write target config file {} failed", targetConfigFilePath.string());
-    XLOG(ERR, msg);
-    return makeError(StorageCode::kStorageInitFailed, std::move(msg));
+  if (ecOnly()) {
+    // Write the incompatible marker first. Any interrupted initialization stays
+    // unreadable by both old loaders and the strict two-file EC loader.
+    RETURN_AND_LOG_ON_ERROR(writeNewEcConfigFile(targetConfigFilePath, kEcTargetMarker));
+    RETURN_AND_LOG_ON_ERROR(
+        writeNewEcConfigFile(config.path / kEcPhysicalConfigFileName, serde::toTomlString(targetConfig_)));
+    RETURN_AND_LOG_ON_ERROR(syncEcConfigDirectory(config.path));
+    RETURN_AND_LOG_ON_ERROR(syncEcConfigDirectory(config.path.parent_path()));
+  } else {
+    std::ofstream targetConfigFile(targetConfigFilePath, std::ios::out);
+    if (!targetConfigFile) {
+      auto msg = fmt::format("Open target config file {} failed", targetConfigFilePath.string());
+      XLOG(ERR, msg);
+      return makeError(StorageCode::kStorageInitFailed, std::move(msg));
+    }
+    if (!(targetConfigFile << serde::toTomlString(targetConfig_))) {
+      auto msg = fmt::format("Write target config file {} failed", targetConfigFilePath.string());
+      XLOG(ERR, msg);
+      return makeError(StorageCode::kStorageInitFailed, std::move(msg));
+    }
   }
   *chunkSizeList_.lock() = {targetConfig_.chunk_size_list.begin(), targetConfig_.chunk_size_list.end()};
   targetTag_ = monitor::instanceTagSet(std::to_string(targetConfig_.target_id));
   targetUsedSize_ = targetUsedSize.getRecorderWithTag(targetTag_);
   targetReservedSize_ = targetReservedSize.getRecorderWithTag(targetTag_);
   targetUnrecycledSize_ = targetUnrecycledSize.getRecorderWithTag(targetTag_);
+  initialized_ = true;
   return Void{};
 }
 
-Result<Void> StorageTarget::load(const Path &path) {
-  RETURN_AND_LOG_ON_ERROR(serde::fromTomlFile(targetConfig_, path / kPhysicalConfigFileName));
-  if (path != targetConfig_.path) {
-    auto msg = fmt::format("Path config mismatch {} != real {}", targetConfig_.path, path);
+Result<PhysicalConfig> StorageTarget::readPhysicalConfig(const Path &path) {
+  CHECK_RESULT(configPath, physicalConfigPath(path));
+  PhysicalConfig config;
+  RETURN_AND_LOG_ON_ERROR(serde::fromTomlFile(config, configPath));
+  const bool hasEcConfig = configPath.filename() == kEcPhysicalConfigFileName;
+  if (config.ec_only != hasEcConfig || (hasEcConfig && (!config.only_chunk_engine || config.chain_id == 0))) {
+    return makeError(StorageCode::kStorageInitFailed, "EC target files and physical mode disagree");
+  }
+  if (path != config.path) {
+    auto msg = fmt::format("Path config mismatch {} != real {}", config.path, path);
     XLOG(ERR, msg);
     return makeError(StorageCode::kStorageInitFailed, std::move(msg));
   }
+  return config;
+}
+
+Result<Void> StorageTarget::load(const Path &path) {
+  CHECK_RESULT(config, readPhysicalConfig(path));
+  targetConfig_ = std::move(config);
 
   auto getDeviceUUIDResult = getDeviceUUID(path);
   if (!getDeviceUUIDResult) {
@@ -206,10 +301,12 @@ Result<Void> StorageTarget::load(const Path &path) {
   targetUsedSize_ = targetUsedSize.getRecorderWithTag(targetTag_);
   targetReservedSize_ = targetReservedSize.getRecorderWithTag(targetTag_);
   targetUnrecycledSize_ = targetUnrecycledSize.getRecorderWithTag(targetTag_);
+  initialized_ = true;
   return Void{};
 }
 
 Result<Void> StorageTarget::addChunkSize(const std::vector<Size> &sizeList) {
+  if (ecOnly()) return makeError(StatusCode::kInvalidArg, "legacy resizing is forbidden on an EC target");
   if (useChunkEngine()) {
     return Void{};
   }
@@ -256,8 +353,35 @@ Result<Void> StorageTarget::addChunkSize(const std::vector<Size> &sizeList) {
   return Void{};
 }
 
+Result<EcFragmentReceipt> StorageTarget::createEcFragment(const EcCreateReq &request) {
+  if (!ecOnly() || !useChunkEngine() || engine_ == nullptr || request.targetId != targetId() ||
+      request.vChainId.chainId != chainId()) {
+    return makeError(StatusCode::kInvalidArg, "EC creation requires the matching dedicated ChunkEngine target");
+  }
+  return ChunkEngine::createEcFragment(*engine_, request);
+}
+
+Result<EcReadResult> StorageTarget::readEcFragment(const EcReadReq &request) {
+  if (!ecOnly() || !useChunkEngine() || engine_ == nullptr || request.targetId != targetId() ||
+      request.vChainId.chainId != chainId()) {
+    return makeError(StatusCode::kInvalidArg, "EC read requires the matching dedicated ChunkEngine target");
+  }
+  return ChunkEngine::readEcFragment(*engine_, request);
+}
+
+Result<EcFragmentReceipt> StorageTarget::reconcileEcFragment(const EcReconcileReq &request) {
+  if (!ecOnly() || !useChunkEngine() || engine_ == nullptr || request.targetId != targetId() ||
+      request.vChainId.chainId != chainId()) {
+    return makeError(StatusCode::kInvalidArg, "EC reconciliation requires the matching dedicated ChunkEngine target");
+  }
+  return ChunkEngine::reconcileEcFragment(*engine_, request);
+}
+
 Result<Void> StorageTarget::setChainId(ChainId chainId) {
   auto chunkSizeListGuard = chunkSizeList_.lock();
+  if (ecOnly() && chainId != ChainId{targetConfig_.chain_id}) {
+    return makeError(StorageCode::kStorageInitFailed, "EC target chain id is immutable");
+  }
   if (targetConfig_.chain_id != 0) {
     return Void{};
   }
@@ -287,6 +411,7 @@ Result<Void> StorageTarget::setChainId(ChainId chainId) {
 
 // prepare aio read.
 Result<Void> StorageTarget::aioPrepareRead(AioReadJob &job) {
+  if (ecOnly()) return makeError(StatusCode::kInvalidArg, "legacy reads are forbidden on an EC target");
   readCountPerDisk_->addSample(1);
   readBytesPerDisk_->addSample(job.alignedLength());
   if (useChunkEngine()) {
@@ -297,6 +422,7 @@ Result<Void> StorageTarget::aioPrepareRead(AioReadJob &job) {
 }
 
 Result<Void> StorageTarget::aioFinishRead(AioReadJob &job) {
+  if (ecOnly()) return makeError(StatusCode::kInvalidArg, "legacy reads are forbidden on an EC target");
   if (job.state().chunkEngineJob.has_chunk()) {
     return Void{};
   }
@@ -305,6 +431,10 @@ Result<Void> StorageTarget::aioFinishRead(AioReadJob &job) {
 
 // update chunk (write/remove/truncate).
 void StorageTarget::updateChunk(UpdateJob &job, folly::CPUThreadPoolExecutor &executor) {
+  if (ecOnly()) {
+    job.setResult(makeError(StatusCode::kInvalidArg, "legacy mutations are forbidden on an EC target"));
+    return;
+  }
   if (job.type() == UpdateType::COMMIT) {
     if (useChunkEngine()) {
       job.setResult(ChunkEngine::commit(*engine_, job, config_.kv_store().sync_when_write()));
@@ -357,6 +487,7 @@ void StorageTarget::updateChunk(UpdateJob &job, folly::CPUThreadPoolExecutor &ex
 }
 
 Result<std::vector<std::pair<ChunkId, ChunkMetadata>>> StorageTarget::queryChunks(const ChunkIdRange &chunkIdRange) {
+  if (ecOnly()) return makeError(StatusCode::kInvalidArg, "legacy range queries are forbidden on an EC target");
   auto pointQueryStrategy = config_.point_query_strategy();
   if ((pointQueryStrategy == PointQueryStrategy::CLASSIC && chunkIdRange.begin.nextChunkId() == chunkIdRange.end) ||
       (pointQueryStrategy == PointQueryStrategy::MODERN &&
@@ -380,6 +511,7 @@ Result<std::vector<std::pair<ChunkId, ChunkMetadata>>> StorageTarget::queryChunk
 }
 
 Result<ChunkMetadata> StorageTarget::queryChunk(const ChunkId &chunkId) {
+  if (ecOnly()) return makeError(StatusCode::kInvalidArg, "legacy chunk queries are forbidden on an EC target");
   if (useChunkEngine()) {
     return ChunkEngine::queryChunk(*engine_, chunkId, chainId());
   }
@@ -411,6 +543,7 @@ Result<Void> StorageTarget::reportUnrecycledSize() {
 }
 
 Result<Void> StorageTarget::getAllMetadata(ChunkMetaVector &metadataVec) {
+  if (ecOnly()) return makeError(StatusCode::kInvalidArg, "legacy metadata enumeration is forbidden on an EC target");
   if (useChunkEngine()) {
     return ChunkEngine::getAllMetadata(*engine_, chainId(), metadataVec);
   } else {
@@ -419,6 +552,7 @@ Result<Void> StorageTarget::getAllMetadata(ChunkMetaVector &metadataVec) {
 }
 
 Result<Void> StorageTarget::getAllMetadataMap(std::unordered_map<ChunkId, ChunkMetadata> &metas) {
+  if (ecOnly()) return makeError(StatusCode::kInvalidArg, "legacy metadata enumeration is forbidden on an EC target");
   if (useChunkEngine()) {
     return ChunkEngine::getAllMetadataMap(*engine_, metas, chainId());
   } else {

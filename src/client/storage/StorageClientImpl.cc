@@ -415,6 +415,71 @@ static Result<hf3fs::flat::TargetInfo> getTargetInfo(
   return *targetInfo;
 }
 
+// The routing table identifies the single member and its current owner. The
+// storage service additionally checks that this is a dedicated EC target.
+static Result<flat::NodeInfo> getEcNodeInfo(const std::shared_ptr<hf3fs::client::RoutingInfo const> &routingInfo,
+                                            const VersionedChainId &vChainId,
+                                            TargetId targetId) {
+  if (!routingInfo || !routingInfo->raw()) {
+    return makeError(StorageClientCode::kRoutingError, "EC routing info is unavailable");
+  }
+  if (targetId == TargetId{}) {
+    return makeError(StorageClientCode::kInvalidArg, "EC target id must be nonzero");
+  }
+  auto chainInfo = getChainInfo(routingInfo, vChainId.chainId);
+  RETURN_ON_ERROR(chainInfo);
+  if (chainInfo->chainVersion != vChainId.chainVer) {
+    return makeError(StorageClientCode::kRoutingVersionMismatch, "EC chain version differs from current routing");
+  }
+  if (chainInfo->targets.size() != 1 || chainInfo->targets.front().targetId != targetId) {
+    return makeError(StorageClientCode::kRoutingError, "EC target must be the sole member of its chain");
+  }
+  if (chainInfo->targets.front().publicState != flat::PublicTargetState::SERVING) {
+    return makeError(StorageClientCode::kNotAvailable, "EC chain target is not serving");
+  }
+  auto targetInfo = getTargetInfo(routingInfo, targetId);
+  RETURN_ON_ERROR(targetInfo);
+  if (targetInfo->chainId != vChainId.chainId || !targetInfo->nodeId) {
+    return makeError(StorageClientCode::kRoutingError, "EC target ownership is missing or inconsistent");
+  }
+  auto nodeInfo = getNodeInfo(routingInfo, *targetInfo->nodeId);
+  RETURN_ON_ERROR(nodeInfo);
+  if (nodeInfo->status != flat::NodeStatus::HEARTBEAT_CONNECTED) {
+    return makeError(StorageClientCode::kNotAvailable, "EC target owner is not heartbeat-connected");
+  }
+  return *nodeInfo;
+}
+
+static bool matchesEcMessageTag(const MessageTag &actual, const MessageTag &expected) {
+  return actual.clientId == expected.clientId && actual.requestId == expected.requestId &&
+         actual.channel.id == expected.channel.id && actual.channel.seqnum == expected.channel.seqnum;
+}
+
+static Result<Void> validateEcReceipt(const EcFragmentReceipt &receipt,
+                                      const EcFragmentIdentity &identity,
+                                      const VersionedChainId &vChainId,
+                                      TargetId targetId,
+                                      const Uuid &operationId,
+                                      uint32_t length,
+                                      const ChecksumInfo &checksum) {
+  const auto &actual = receipt.identity;
+  if (receipt.version != kEcFragmentProtocolVersion || actual.version != identity.version ||
+      actual.object != identity.object || actual.stripe != identity.stripe ||
+      actual.generation != identity.generation || actual.shard != identity.shard ||
+      actual.allocation != identity.allocation || receipt.vChainId != vChainId || receipt.targetId != targetId ||
+      receipt.operationId != operationId || receipt.length != length || receipt.checksum != checksum) {
+    return makeError(StorageClientCode::kProtocolMismatch, "EC receipt does not match the requested fragment");
+  }
+  return Void{};
+}
+
+static Status ecSealOutcomeUnknown(const Status &cause) {
+  return Status(
+      StorageCode::kEcSealOutcomeUnknown,
+      fmt::format("EC durability outcome is unknown; retain allocation and reconcile durable state. Cause: {}", cause),
+      cause);
+}
+
 template <UnaryPredicate<flat::NodeInfo> NodeSelector>
 static Result<std::vector<SlimTargetInfo>> selectServingTargets(
     const std::shared_ptr<hf3fs::client::RoutingInfo const> &routingInfo,
@@ -824,7 +889,11 @@ template <typename Req, typename Rsp, auto Method>
 CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenger,
                                                       ClientRequestContext &requestCtx,
                                                       const hf3fs::flat::NodeInfo &nodeInfo,
-                                                      const Req &request) {
+                                                      const Req &request,
+                                                      uint32_t sendRetryTimes,
+                                                      bool *dispatched,
+                                                      bool allowTcp) {
+  if (dispatched) *dispatched = false;
   monitor::ScopedLatencyWriter latencyWriter(request_latency, requestCtx.requestTagSet);
   monitor::ScopedCounterWriter inflightRequests(inflight_requests,
                                                 atomic_inflight_requests.at(requestCtx.methodType),
@@ -833,57 +902,69 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
 
   net::UserRequestOptions options;
   options.timeout = requestCtx.requestTimeout;
-  options.sendRetryTimes = 1;
+  options.sendRetryTimes = sendRetryTimes;
 
   if (auto reqInfo = RequestInfo::get(); reqInfo && reqInfo->canceled()) {
     XLOGF(WARN, "Request {} {} canceled", reqInfo->describe(), fmt::ptr(&request));
     co_return makeError(StorageClientCode::kRequestCanceled);
   }
 
-  for (const auto &serviceGroup : nodeInfo.app.serviceGroups) {
-    for (const auto &address : serviceGroup.endpoints) {
-      if (address.type == net::Address::Type::RDMA) {
-        serde::Timestamp timestamp;
-        auto response =
-            FAULT_INJECTION_POINT(requestCtx.debugFlags.injectClientError(),
-                                  makeError(StorageClientCode::kCommError),
-                                  (co_await std::invoke(Method, messenger, address, request, &options, &timestamp)));
-
-        XLOGF_IF(WARN,
-                 latencyWriter.getElapsedTime() > requestCtx.requestTimeout * 2,
-                 "Latency higher than expected, request: {}, timeout: {}, latency: {}, host: {}, address: {}",
-                 fmt::ptr(&request),
-                 requestCtx.requestTimeout,
-                 Duration(latencyWriter.getElapsedTime()).asMs(),
-                 nodeInfo.app.hostname,
-                 address);
-
-        if (response) {
-          inflight_time.addSample(timestamp.inflightLatency(), requestCtx.requestTagSet);
-          server_latency.addSample(timestamp.serverLatency(), requestCtx.requestTagSet);
-          network_latency.addSample(timestamp.networkLatency(), requestCtx.requestTagSet);
-        } else {
-          XLOGF(ERR,
-                "Call messenger error: {}, {} request: {}, usercall: #{}, timeout: {}, latency: {}, host: {}, address: "
-                "{}",
-                response.error(),
-                magic_enum::enum_name(requestCtx.methodType),
-                fmt::ptr(&request),
-                requestCtx.userCallId,
-                requestCtx.requestTimeout,
-                Duration(latencyWriter.getElapsedTime()).asMs(),
-                nodeInfo.app.hostname,
-                address);
-        }
-
-        co_return response;
+  // EC messages own their inline payload and may use TCP without an RDMA
+  // buffer. Prefer RDMA across all groups, then select exactly one TCP address.
+  // Existing chunk APIs keep allowTcp=false because their buffers may use RDMA.
+  const auto *selectedAddress = [&]() -> const net::Address * {
+    const net::Address *tcpAddress = nullptr;
+    for (const auto &serviceGroup : nodeInfo.app.serviceGroups) {
+      if (allowTcp && !serviceGroup.services.contains("StorageSerde")) continue;
+      for (const auto &address : serviceGroup.endpoints) {
+        if (address.type == net::Address::Type::RDMA) return &address;
+        if (allowTcp && !tcpAddress && address.type == net::Address::Type::TCP) tcpAddress = &address;
       }
     }
+    return tcpAddress;
+  }();
+  if (!selectedAddress) {
+    XLOGF(DBG1, "No supported storage endpoint found on node (allowTcp={}): {:?}", allowTcp, nodeInfo);
+    co_return makeError(allowTcp ? StorageClientCode::kRoutingError : StorageClientCode::kNoRDMAInterface);
   }
 
-  // No RDMA interface is found for the target node
-  XLOGF(DBG1, "No RDMA interface found on node: {:?}", nodeInfo);
-  co_return makeError(StorageClientCode::kNoRDMAInterface);
+  const auto &address = *selectedAddress;
+  serde::Timestamp timestamp;
+  // Once invoked, a communication failure cannot prove that the server did
+  // not commit. Return this attempt directly; do not try another address.
+  if (dispatched) *dispatched = true;
+  auto response =
+      FAULT_INJECTION_POINT(requestCtx.debugFlags.injectClientError(),
+                            makeError(StorageClientCode::kCommError),
+                            (co_await std::invoke(Method, messenger, address, request, &options, &timestamp)));
+
+  XLOGF_IF(WARN,
+           latencyWriter.getElapsedTime() > requestCtx.requestTimeout * 2,
+           "Latency higher than expected, request: {}, timeout: {}, latency: {}, host: {}, address: {}",
+           fmt::ptr(&request),
+           requestCtx.requestTimeout,
+           Duration(latencyWriter.getElapsedTime()).asMs(),
+           nodeInfo.app.hostname,
+           address);
+
+  if (response) {
+    inflight_time.addSample(timestamp.inflightLatency(), requestCtx.requestTagSet);
+    server_latency.addSample(timestamp.serverLatency(), requestCtx.requestTagSet);
+    network_latency.addSample(timestamp.networkLatency(), requestCtx.requestTagSet);
+  } else {
+    XLOGF(ERR,
+          "Call messenger error: {}, {} request: {}, usercall: #{}, timeout: {}, latency: {}, host: {}, address: {}",
+          response.error(),
+          magic_enum::enum_name(requestCtx.methodType),
+          fmt::ptr(&request),
+          requestCtx.userCallId,
+          requestCtx.requestTimeout,
+          Duration(latencyWriter.getElapsedTime()).asMs(),
+          nodeInfo.app.hostname,
+          address);
+  }
+
+  co_return response;
 }
 
 template <typename IO>
@@ -2413,6 +2494,258 @@ CoTryTask<CreateTargetRsp> StorageClientImpl::createTarget(NodeId nodeId, const 
                                                                                                             requestCtx,
                                                                                                             *nodeInfo,
                                                                                                             req);
+}
+
+CoTryTask<EcCreateTargetRsp> StorageClientImpl::createEcTarget(NodeId nodeId, const EcCreateTargetReq &req) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  if (req.version != kEcFragmentProtocolVersion || req.settings.targetId == TargetId{}) {
+    co_return makeError(StorageClientCode::kInvalidArg, "invalid EC target creation request");
+  }
+  const DebugOptions debugOptions;
+  ClientRequestContext requestCtx(MethodType::createEcTarget,
+                                  flat::UserInfo(),
+                                  debugOptions,
+                                  config_,
+                                  1,
+                                  0,
+                                  config_.retry().max_wait_time());
+  auto routingInfo = getCurrentRoutingInfo();
+  if (!routingInfo || !routingInfo->raw()) co_return makeError(StorageClientCode::kRoutingError);
+  auto nodeInfo = getNodeInfo(routingInfo, flat::NodeId(nodeId));
+  CO_RETURN_ON_ERROR(nodeInfo);
+  if (nodeInfo->status != flat::NodeStatus::HEARTBEAT_CONNECTED) {
+    co_return makeError(StorageClientCode::kNotAvailable, "EC storage node is not heartbeat-connected");
+  }
+
+  auto perServerSemaphore = writeConcurrencyLimit_.getPerServerSemaphore(nodeId);
+  SemaphoreGuard perServerReq(*perServerSemaphore);
+  co_await perServerReq.coWait();
+  SemaphoreGuard concurrentReq(writeConcurrencyLimit_.getConcurrencySemaphore());
+  co_await concurrentReq.coWait();
+  if (requestCtx.isTimeout()) co_return makeError(StorageClientCode::kTimeout, "EC request expired while waiting");
+
+  routingInfo = getCurrentRoutingInfo();
+  if (!routingInfo || !routingInfo->raw()) co_return makeError(StorageClientCode::kRoutingError);
+  nodeInfo = getNodeInfo(routingInfo, flat::NodeId(nodeId));
+  CO_RETURN_ON_ERROR(nodeInfo);
+  if (nodeInfo->status != flat::NodeStatus::HEARTBEAT_CONNECTED) {
+    co_return makeError(StorageClientCode::kNotAvailable, "EC storage node is not heartbeat-connected");
+  }
+  requestCtx.logWaitingTime();
+
+  bool dispatched = false;
+  auto response = co_await callMessengerMethod<EcCreateTargetReq, EcCreateTargetRsp, &StorageMessenger::createEcTarget>(
+      getStorageMessengerForUpdates(),
+      requestCtx,
+      *nodeInfo,
+      req,
+      0,
+      &dispatched,
+      true);
+  if (!response) {
+    if (!dispatched || response.error().code() == StorageCode::kChunkAlreadyExists) {
+      co_return makeError(response.error());
+    }
+    co_return makeError(ecSealOutcomeUnknown(response.error()));
+  }
+  if (response->version != kEcFragmentProtocolVersion || response->targetId != req.settings.targetId) {
+    co_return makeError(ecSealOutcomeUnknown(
+        Status(StorageClientCode::kProtocolMismatch, "EC target creation returned an inconsistent receipt")));
+  }
+  co_return std::move(*response);
+}
+
+CoTryTask<EcFragmentReceipt> StorageClientImpl::createEcFragment(const EcCreateReq &req) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  CO_RETURN_ON_ERROR(req.validate());
+  const auto checksum = ChecksumInfo::create(ChecksumType::CRC32C,
+                                             reinterpret_cast<const uint8_t *>(req.payload.data.data()),
+                                             req.payload.data.size());
+  if (checksum != req.checksum) {
+    co_return makeError(StorageClientCode::kChecksumMismatch, "EC creation payload differs from its checksum");
+  }
+  const DebugOptions debugOptions;
+  ClientRequestContext requestCtx(MethodType::createEcFragment,
+                                  req.userInfo,
+                                  debugOptions,
+                                  config_,
+                                  1,
+                                  0,
+                                  config_.retry().max_wait_time());
+  auto nodeInfo = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
+  CO_RETURN_ON_ERROR(nodeInfo);
+  const auto nodeId = nodeInfo->app.nodeId;
+  auto perServerSemaphore = writeConcurrencyLimit_.getPerServerSemaphore(nodeId);
+  SemaphoreGuard perServerReq(*perServerSemaphore);
+  co_await perServerReq.coWait();
+  SemaphoreGuard concurrentReq(writeConcurrencyLimit_.getConcurrencySemaphore());
+  co_await concurrentReq.coWait();
+  if (requestCtx.isTimeout()) co_return makeError(StorageClientCode::kTimeout, "EC request expired while waiting");
+
+  nodeInfo = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
+  CO_RETURN_ON_ERROR(nodeInfo);
+  if (nodeInfo->app.nodeId != nodeId) {
+    co_return makeError(StorageClientCode::kRoutingVersionMismatch, "EC target owner changed while waiting");
+  }
+  // Copy the bounded payload only after admission. operationId remains the
+  // caller's persisted value; the transport correlation tag belongs to this call.
+  EcCreateReq request = req;
+  request.tag = MessageTag(clientId_, RequestId(nextRequestId_.fetch_add(1)));
+  requestCtx.logWaitingTime();
+  bool dispatched = false;
+  auto response = co_await callMessengerMethod<EcCreateReq, EcCreateRsp, &StorageMessenger::createEcFragment>(
+      getStorageMessengerForUpdates(),
+      requestCtx,
+      *nodeInfo,
+      request,
+      0,
+      &dispatched,
+      true);
+  if (!response) {
+    if (!dispatched || response.error().code() == StorageCode::kChunkAlreadyExists) {
+      co_return makeError(response.error());
+    }
+    co_return makeError(ecSealOutcomeUnknown(response.error()));
+  }
+  if (!matchesEcMessageTag(response->tag, request.tag)) {
+    co_return makeError(ecSealOutcomeUnknown(
+        Status(StorageClientCode::kProtocolMismatch, "EC creation response tag differs from the request")));
+  }
+  // A correlated application error is authoritative. In particular, existence
+  // is not proof that this operation sealed the requested bytes.
+  CO_RETURN_ON_ERROR(response->result);
+  auto validReceipt = validateEcReceipt(*response->result,
+                                        request.identity,
+                                        request.vChainId,
+                                        request.targetId,
+                                        request.operationId,
+                                        static_cast<uint32_t>(request.payload.data.size()),
+                                        request.checksum);
+  if (!validReceipt) co_return makeError(ecSealOutcomeUnknown(validReceipt.error()));
+  co_return std::move(*response->result);
+}
+
+CoTryTask<EcReadResult> StorageClientImpl::readEcFragment(const EcReadReq &req) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  CO_RETURN_ON_ERROR(req.validate());
+  const DebugOptions debugOptions;
+  ClientRequestContext requestCtx(MethodType::readEcFragment,
+                                  req.userInfo,
+                                  debugOptions,
+                                  config_,
+                                  1,
+                                  0,
+                                  config_.retry().max_wait_time());
+  auto nodeInfo = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
+  CO_RETURN_ON_ERROR(nodeInfo);
+  const auto nodeId = nodeInfo->app.nodeId;
+  auto perServerSemaphore = readConcurrencyLimit_.getPerServerSemaphore(nodeId);
+  SemaphoreGuard perServerReq(*perServerSemaphore);
+  co_await perServerReq.coWait();
+  SemaphoreGuard concurrentReq(readConcurrencyLimit_.getConcurrencySemaphore());
+  co_await concurrentReq.coWait();
+  if (requestCtx.isTimeout()) co_return makeError(StorageClientCode::kTimeout, "EC request expired while waiting");
+
+  nodeInfo = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
+  CO_RETURN_ON_ERROR(nodeInfo);
+  if (nodeInfo->app.nodeId != nodeId) {
+    co_return makeError(StorageClientCode::kRoutingVersionMismatch, "EC target owner changed while waiting");
+  }
+  EcReadReq request = req;
+  request.tag = MessageTag(clientId_, RequestId(nextRequestId_.fetch_add(1)));
+  requestCtx.logWaitingTime();
+  auto response = co_await callMessengerMethod<EcReadReq, EcReadRsp, &StorageMessenger::readEcFragment>(messenger_,
+                                                                                                        requestCtx,
+                                                                                                        *nodeInfo,
+                                                                                                        request,
+                                                                                                        1,
+                                                                                                        nullptr,
+                                                                                                        true);
+  CO_RETURN_ON_ERROR(response);
+  if (!matchesEcMessageTag(response->tag, request.tag)) {
+    co_return makeError(StorageClientCode::kProtocolMismatch, "EC read response tag differs from the request");
+  }
+  CO_RETURN_ON_ERROR(response->result);
+  auto &result = *response->result;
+  CO_RETURN_ON_ERROR(validateEcReceipt(result.receipt,
+                                       request.identity,
+                                       request.vChainId,
+                                       request.targetId,
+                                       request.operationId,
+                                       request.expectedLength,
+                                       request.checksum));
+  if (result.payload.data.size() != request.expectedLength) {
+    co_return makeError(StorageClientCode::kProtocolMismatch, "EC read payload length differs from the request");
+  }
+  const auto checksum = ChecksumInfo::create(ChecksumType::CRC32C,
+                                             reinterpret_cast<const uint8_t *>(result.payload.data.data()),
+                                             result.payload.data.size());
+  if (checksum != request.checksum) {
+    co_return makeError(StorageClientCode::kChecksumMismatch, "EC read payload checksum verification failed");
+  }
+  co_return std::move(result);
+}
+
+CoTryTask<EcFragmentReceipt> StorageClientImpl::reconcileEcFragment(const EcReconcileReq &req) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  CO_RETURN_ON_ERROR(req.validate());
+  const DebugOptions debugOptions;
+  ClientRequestContext requestCtx(MethodType::reconcileEcFragment,
+                                  req.userInfo,
+                                  debugOptions,
+                                  config_,
+                                  1,
+                                  0,
+                                  config_.retry().max_wait_time());
+  auto nodeInfo = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
+  CO_RETURN_ON_ERROR(nodeInfo);
+  const auto nodeId = nodeInfo->app.nodeId;
+  // Reconciliation performs disk durability barriers and shares the write
+  // admission limits, even when the target's contents are read-only.
+  auto perServerSemaphore = writeConcurrencyLimit_.getPerServerSemaphore(nodeId);
+  SemaphoreGuard perServerReq(*perServerSemaphore);
+  co_await perServerReq.coWait();
+  SemaphoreGuard concurrentReq(writeConcurrencyLimit_.getConcurrencySemaphore());
+  co_await concurrentReq.coWait();
+  if (requestCtx.isTimeout()) co_return makeError(StorageClientCode::kTimeout, "EC request expired while waiting");
+
+  nodeInfo = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
+  CO_RETURN_ON_ERROR(nodeInfo);
+  if (nodeInfo->app.nodeId != nodeId) {
+    co_return makeError(StorageClientCode::kRoutingVersionMismatch, "EC target owner changed while waiting");
+  }
+  EcReconcileReq request = req;
+  request.tag = MessageTag(clientId_, RequestId(nextRequestId_.fetch_add(1)));
+  requestCtx.logWaitingTime();
+  bool dispatched = false;
+  auto response = co_await callMessengerMethod<EcReconcileReq, EcReconcileRsp, &StorageMessenger::reconcileEcFragment>(
+      getStorageMessengerForUpdates(),
+      requestCtx,
+      *nodeInfo,
+      request,
+      0,
+      &dispatched,
+      true);
+  if (!response) {
+    if (!dispatched || response.error().code() == StorageCode::kChunkAlreadyExists) {
+      co_return makeError(response.error());
+    }
+    co_return makeError(ecSealOutcomeUnknown(response.error()));
+  }
+  if (!matchesEcMessageTag(response->tag, request.tag)) {
+    co_return makeError(ecSealOutcomeUnknown(
+        Status(StorageClientCode::kProtocolMismatch, "EC reconciliation response tag differs from the request")));
+  }
+  CO_RETURN_ON_ERROR(response->result);
+  auto validReceipt = validateEcReceipt(*response->result,
+                                        request.identity,
+                                        request.vChainId,
+                                        request.targetId,
+                                        request.operationId,
+                                        request.expectedLength,
+                                        request.checksum);
+  if (!validReceipt) co_return makeError(ecSealOutcomeUnknown(validReceipt.error()));
+  co_return std::move(*response->result);
 }
 
 CoTryTask<OfflineTargetRsp> StorageClientImpl::offlineTarget(NodeId nodeId, const OfflineTargetReq &req) {

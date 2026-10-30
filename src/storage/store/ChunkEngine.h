@@ -5,6 +5,7 @@
 #include "chunk_engine/src/cxx.rs.h"
 #include "common/utils/UtcTime.h"
 #include "fbs/storage/Common.h"
+#include "fbs/storage/Ec.h"
 #include "storage/aio/BatchReadJob.h"
 #include "storage/update/UpdateJob.h"
 
@@ -73,6 +74,10 @@ struct ChunkEngine {
   }
 
   static Result<uint32_t> update(chunk_engine::Engine &engine, UpdateJob &job);
+
+  static Result<EcFragmentReceipt> createEcFragment(chunk_engine::Engine &engine, const EcCreateReq &request);
+  static Result<EcReadResult> readEcFragment(chunk_engine::Engine &engine, const EcReadReq &request);
+  static Result<EcFragmentReceipt> reconcileEcFragment(chunk_engine::Engine &engine, const EcReconcileReq &request);
 
   static Result<uint32_t> commit(chunk_engine::Engine &engine, UpdateJob &job, bool sync);
 

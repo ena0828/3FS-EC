@@ -55,6 +55,9 @@ Result<const Target *> TargetMap::getTarget(TargetId targetId) const {
 Result<const Target *> TargetMap::getByChainId(VersionedChainId vChainId, bool allowOutdatedChainVer) const {
   CHECK_RESULT(targetId, getTargetId(vChainId.chainId));
   CHECK_RESULT(target, getTarget(targetId));
+  if (target->ecOnly && (target->chainMemberCount != 1 || target->chainId != vChainId.chainId)) {
+    return makeError(StorageClientCode::kRoutingError, "EC target requires its fixed chain and exactly one member");
+  }
   if (target->vChainId != vChainId && !allowOutdatedChainVer) {
     auto msg = fmt::format("chain {} version mismatch request {} != local {}",
                            vChainId.chainId,
@@ -78,6 +81,15 @@ Result<const Target *> TargetMap::getByChainId(VersionedChainId vChainId, bool a
 
 Result<Void> TargetMap::addStorageTarget(const std::shared_ptr<StorageTarget> &storageTarget) {
   auto targetId = storageTarget->targetId();
+  for (const auto &[id, existing] : targets_) {
+    if (existing.ecOnly != storageTarget->ecOnly()) {
+      return makeError(StorageCode::kTargetStateInvalid, "EC and legacy targets cannot share a target map");
+    }
+    const auto chainId = existing.storageTarget ? existing.storageTarget->chainId() : existing.chainId;
+    if (id != targetId && (existing.ecOnly || storageTarget->ecOnly()) && chainId == storageTarget->chainId()) {
+      return makeError(StorageCode::kTargetStateInvalid, "EC chain prefix is already owned by another physical target");
+    }
+  }
   Target target;
   target.storageTarget = storageTarget;
   target.targetId = targetId;
@@ -86,8 +98,13 @@ Result<Void> TargetMap::addStorageTarget(const std::shared_ptr<StorageTarget> &s
   target.localState = flat::LocalTargetState::ONLINE;
   target.diskIndex = storageTarget->diskIndex();
   target.useChunkEngine = storageTarget->useChunkEngine();
+  target.ecOnly = storageTarget->ecOnly();
   auto [it, succ] = targets_.emplace(targetId, target);
   if (UNLIKELY(!succ)) {
+    if (it->second.ecOnly != target.ecOnly ||
+        (target.ecOnly && (it->second.chainId != target.chainId || it->second.path != target.path))) {
+      return makeError(StorageCode::kTargetStateInvalid, "physical target mode or EC identity cannot change");
+    }
     if (it->second.localState == flat::LocalTargetState::OFFLINE) {
       it->second = std::move(target);
       return Void{};
@@ -110,6 +127,9 @@ Result<Target *> TargetMap::getMutableTarget(TargetId targetId) {
 
 Result<Void> TargetMap::syncReceiveDone(VersionedChainId chainId) {
   CHECK_RESULT(constTarget, getByChainId(chainId, false));
+  if (constTarget->ecOnly) {
+    return makeError(StatusCode::kInvalidArg, "CRAQ sync completion is forbidden on an EC target");
+  }
   auto targetId = constTarget->targetId;
   CHECK_RESULT(target, getMutableTarget(targetId));
   XLOGF(WARNING,
@@ -158,6 +178,7 @@ Result<Void> TargetMap::updateRouting(std::shared_ptr<hf3fs::client::RoutingInfo
     target.vChainId = VersionedChainId{};
     target.publicState = flat::PublicTargetState::INVALID;
     target.successor = std::nullopt;
+    target.chainMemberCount = 0;
   }
   bool invalidRoutingInfo = false;
   auto invalidRoutingInfoLogGuard = folly::makeGuard([&] {
@@ -187,6 +208,7 @@ Result<Void> TargetMap::updateRouting(std::shared_ptr<hf3fs::client::RoutingInfo
 
     // 5. update local target.
     CHECK_RESULT(target, getMutableTarget(targetId));
+    target->chainMemberCount = chain.targets.size();
     bool targetIsServing = targetInfo->publicState == flat::PublicTargetState::SERVING ||
                            targetInfo->publicState == flat::PublicTargetState::SYNCING;
     auto previousLocalState = target->localState;
@@ -199,8 +221,13 @@ Result<Void> TargetMap::updateRouting(std::shared_ptr<hf3fs::client::RoutingInfo
       if (target->storageTarget->chainId() != chain.chainId) {
         auto msg = fmt::format("target.chain != routing.chain, target {}, chain {}", *target, chain);
         XLOG(ERR, msg);
-        return makeError(StorageClientCode::kRoutingError, std::move(msg));
+        if (!target->ecOnly) {
+          return makeError(StorageClientCode::kRoutingError, std::move(msg));
+        }
+        // Retain the immutable physical chain id but publish this routing
+        // snapshot. Neither the old nor the incompatible new chain may write.
       }
+      target->chainId = target->storageTarget->chainId();
     }
     target->localState = updateLocalState(targetId, previousLocalState, targetInfo->publicState);
     target->publicState = targetInfo->publicState;
@@ -219,6 +246,13 @@ Result<Void> TargetMap::updateRouting(std::shared_ptr<hf3fs::client::RoutingInfo
     }
 
     // 6. update successor.
+    if (target->ecOnly) {
+      // Publish even incompatible routing so an old writable snapshot cannot
+      // remain authoritative. EC lookup then rejects multiple chain members.
+      target->isHead = targetIsServing && target->chainMemberCount == 1;
+      target->isTail = target->isHead;
+      continue;
+    }
     while (targetIsServing && ++it != chain.targets.end()) {
       auto targetInfo = routingInfo->getTarget(it->targetId);
       if (UNLIKELY(!targetInfo)) {
@@ -270,7 +304,7 @@ Result<Void> TargetMap::updateRouting(std::shared_ptr<hf3fs::client::RoutingInfo
   }
 
   for (auto &[targetId, target] : targets_) {
-    if (lastSrvTargets.contains(targetId) && target.storageTarget &&
+    if (!target.ecOnly && lastSrvTargets.contains(targetId) && target.storageTarget &&
         (target.publicState == flat::PublicTargetState::SERVING ||
          target.publicState == flat::PublicTargetState::SYNCING ||
          target.publicState == flat::PublicTargetState::WAITING)) {
@@ -283,6 +317,10 @@ Result<Void> TargetMap::updateRouting(std::shared_ptr<hf3fs::client::RoutingInfo
 }
 
 Result<Void> TargetMap::removeTarget(TargetId targetId) {
+  CHECK_RESULT(target, getTarget(targetId));
+  if (target->ecOnly) {
+    return makeError(StatusCode::kInvalidArg, "EC target removal requires a dedicated fenced reclamation protocol");
+  }
   auto succ = targets_.erase(targetId);
   if (succ != 1) {
     auto msg = fmt::format("target {} not found", targetId);

@@ -13,6 +13,7 @@
 #include "common/utils/Semaphore.h"
 #include "fbs/mgmtd/RoutingInfo.h"
 #include "fbs/storage/Common.h"
+#include "fbs/storage/Ec.h"
 
 namespace hf3fs::storage::client {
 
@@ -356,6 +357,10 @@ class StorageClient : public folly::MoveOnly {
     removeTarget,
     queryChunk,
     getAllChunkMetadata,
+    createEcTarget,
+    createEcFragment,
+    readEcFragment,
+    reconcileEcFragment,
   };
 
   class RetryConfig : public hf3fs::ConfigBase<RetryConfig> {
@@ -554,6 +559,29 @@ class StorageClient : public folly::MoveOnly {
   virtual CoTryTask<SpaceInfoRsp> querySpaceInfo(NodeId nodeId) = 0;
 
   virtual CoTryTask<CreateTargetRsp> createTarget(NodeId nodeId, const CreateTargetReq &req) = 0;
+
+  // Immutable EC fragments require the persistent RPC backend. InMem must not
+  // silently substitute its ordinary chunk operations for this contract.
+  virtual CoTryTask<EcCreateTargetRsp> createEcTarget(NodeId, const EcCreateTargetReq &) {
+    co_return makeError(StatusCode::kNotImplemented, "EC targets require the RPC storage client");
+  }
+
+  // Persist operationId before calling. A seal-outcome-unknown error requires
+  // durable-state reconciliation. Readable bytes, a retry, or AlreadyExists
+  // alone do not acknowledge a successful seal.
+  virtual CoTryTask<EcFragmentReceipt> createEcFragment(const EcCreateReq &) {
+    co_return makeError(StatusCode::kNotImplemented, "immutable EC fragments require the RPC storage client");
+  }
+
+  virtual CoTryTask<EcReadResult> readEcFragment(const EcReadReq &) {
+    co_return makeError(StatusCode::kNotImplemented, "immutable EC fragments require the RPC storage client");
+  }
+
+  // Unlike readEcFragment, a successful reconciliation establishes the
+  // target's synchronous durability barrier for this exact operation.
+  virtual CoTryTask<EcFragmentReceipt> reconcileEcFragment(const EcReconcileReq &) {
+    co_return makeError(StatusCode::kNotImplemented, "EC durability reconciliation requires the RPC storage client");
+  }
 
   virtual CoTryTask<OfflineTargetRsp> offlineTarget(NodeId nodeId, const OfflineTargetReq &req) = 0;
 

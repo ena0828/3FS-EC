@@ -18,11 +18,15 @@ struct StorageTargetsHelper;
 
 namespace hf3fs::storage {
 
+inline constexpr auto kEcEngineDirectoryName = "engine-ec-v1";
+inline constexpr auto kEcEngineRootMarker = "3FS_EC_ENGINE_ROOT_V1\n";
+
 class StorageTargets {
  public:
   class Config : public ConfigBase<Config> {
     CONFIG_ITEM(target_paths, std::vector<Path>{}, [](auto &vec) { return !vec.empty(); });
     CONFIG_ITEM(target_num_per_path, 0u);
+    CONFIG_ITEM(ec_only, false);
     CONFIG_HOT_UPDATED_ITEM(collect_all_fds, true);
     CONFIG_HOT_UPDATED_ITEM(space_info_cache_timeout, 5_s);
     CONFIG_HOT_UPDATED_ITEM(allow_disk_without_uuid, false);
@@ -50,7 +54,7 @@ class StorageTargets {
   Result<Void> create(const CreateConfig &createConfig);
 
   // create new storage target.
-  Result<Void> create(const CreateTargetReq &req);
+  Result<Void> create(const CreateTargetReq &req, bool ecOnly = false);
 
   // open a batch of storage targets.
   Result<Void> load(CPUExecutorGroup &executor);
@@ -75,9 +79,22 @@ class StorageTargets {
 
   // chunk engines.
   auto &engines() const { return engines_; }
+  bool ecOnly() const { return config_.ec_only(); }
 
   // remove target.
   Result<Void> removeChunkEngineTarget(ChainId chainId, uint32_t diskIndex) {
+    if (config_.ec_only()) {
+      return makeError(StatusCode::kInvalidArg, "legacy engine removal is forbidden in an EC-only process");
+    }
+    const auto snapshot = targetMap_.snapshot();
+    for (const auto &[id, target] : snapshot->getTargets()) {
+      if (target.chainId == chainId && target.ecOnly) {
+        return makeError(StatusCode::kInvalidArg, "legacy engine removal is forbidden on an EC target");
+      }
+    }
+    if (diskIndex >= engines_.size()) {
+      return makeError(StatusCode::kInvalidArg, "invalid disk index");
+    }
     auto &engine = *engines_[diskIndex];
     return ChunkEngine::removeAllChunks(engine, chainId);
   }

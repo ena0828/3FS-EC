@@ -79,6 +79,26 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.createTarget(req);
   }
 
+  CoTryTask<EcCreateTargetRsp> createEcTarget(serde::CallContext &ctx, const EcCreateTargetReq &req) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.createEcTarget(req);
+  }
+
+  CoTryTask<EcCreateRsp> createEcFragment(serde::CallContext &ctx, const EcCreateReq &req) {
+    reportUpdateQueueLatency(ctx);
+    return storageOperator_.createEcFragment(req);
+  }
+
+  CoTryTask<EcReadRsp> readEcFragment(serde::CallContext &ctx, const EcReadReq &req) {
+    reportReadQueueLatency(ctx);
+    return storageOperator_.readEcFragment(req);
+  }
+
+  CoTryTask<EcReconcileRsp> reconcileEcFragment(serde::CallContext &ctx, const EcReconcileReq &req) {
+    reportUpdateQueueLatency(ctx);
+    return storageOperator_.reconcileEcFragment(req);
+  }
+
   CoTryTask<OfflineTargetRsp> offlineTarget(serde::CallContext &ctx, const OfflineTargetReq &req) {
     reportDefaultQueueLatency(ctx);
     return storageOperator_.offlineTarget(req);

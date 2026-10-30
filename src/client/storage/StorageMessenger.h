@@ -9,6 +9,7 @@
 #include "common/utils/Coroutine.h"
 #include "common/utils/Result.h"
 #include "fbs/storage/Common.h"
+#include "fbs/storage/Ec.h"
 
 namespace hf3fs::storage::client {
 
@@ -69,6 +70,26 @@ class StorageMessenger {
                                           const CreateTargetReq &request,
                                           const net::UserRequestOptions *options = nullptr,
                                           serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcCreateTargetRsp> createEcTarget(const hf3fs::net::Address &address,
+                                              const EcCreateTargetReq &request,
+                                              const net::UserRequestOptions *options = nullptr,
+                                              serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcCreateRsp> createEcFragment(const hf3fs::net::Address &address,
+                                          const EcCreateReq &request,
+                                          const net::UserRequestOptions *options = nullptr,
+                                          serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcReadRsp> readEcFragment(const hf3fs::net::Address &address,
+                                      const EcReadReq &request,
+                                      const net::UserRequestOptions *options = nullptr,
+                                      serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcReconcileRsp> reconcileEcFragment(const hf3fs::net::Address &address,
+                                                const EcReconcileReq &request,
+                                                const net::UserRequestOptions *options = nullptr,
+                                                serde::Timestamp *timestamp = nullptr);
 
   CoTryTask<OfflineTargetRsp> offlineTarget(const hf3fs::net::Address &address,
                                             const OfflineTargetReq &request,

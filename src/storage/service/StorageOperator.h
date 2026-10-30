@@ -16,6 +16,7 @@
 #include "common/utils/Coroutine.h"
 #include "common/utils/LockManager.h"
 #include "common/utils/Semaphore.h"
+#include "fbs/storage/Ec.h"
 #include "storage/aio/AioReadWorker.h"
 #include "storage/service/BufferPool.h"
 #include "storage/service/ReliableForwarding.h"
@@ -41,6 +42,8 @@ class StorageOperator {
     CONFIG_HOT_UPDATED_ITEM(read_only, false);
     CONFIG_HOT_UPDATED_ITEM(rdma_transmission_req_timeout, 0_ms);
     CONFIG_HOT_UPDATED_ITEM(apply_transmission_before_getting_semaphore, true);
+    CONFIG_ITEM(enable_ec_fragments, false);
+    CONFIG_ITEM(max_concurrent_ec_requests, 8u, [](auto value) { return value > 0 && value <= 64; });
   };
 
   StorageOperator(const Config &config, Components &components)
@@ -88,6 +91,11 @@ class StorageOperator {
   CoTryTask<SpaceInfoRsp> spaceInfo(const SpaceInfoReq &req);
 
   CoTryTask<CreateTargetRsp> createTarget(const CreateTargetReq &req);
+
+  CoTryTask<EcCreateTargetRsp> createEcTarget(const EcCreateTargetReq &req);
+  CoTryTask<EcCreateRsp> createEcFragment(const EcCreateReq &req);
+  CoTryTask<EcReadRsp> readEcFragment(const EcReadReq &req);
+  CoTryTask<EcReconcileRsp> reconcileEcFragment(const EcReconcileReq &req);
 
   CoTryTask<OfflineTargetRsp> offlineTarget(const OfflineTargetReq &req);
 
@@ -146,6 +154,9 @@ class StorageOperator {
  private:
   friend class ReliableUpdate;
 
+  Result<TargetPtr> ecTarget(VersionedChainId chain, TargetId targetId, bool writing) const;
+  Result<Void> validateEcTarget(const TargetPtr &expected, bool writing) const;
+
   ConstructLog<"storage::StorageOperator"> constructLog_;
   const Config &config_;
   Components &components_;
@@ -156,6 +167,7 @@ class StorageOperator {
   std::map<uint8_t, hf3fs::Semaphore> concurrentRdmaReadSemaphore_;
   std::atomic<uint64_t> totalReadBytes_{};
   std::atomic<uint64_t> totalReadIOs_{};
+  Semaphore ecFragmentSemaphore_{config_.max_concurrent_ec_requests(), 64};
 };
 
 }  // namespace hf3fs::storage

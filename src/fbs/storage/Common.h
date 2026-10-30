@@ -685,6 +685,9 @@ class StorageTarget;
 struct Target {
   std::shared_ptr<StorageTarget> storageTarget;
   std::weak_ptr<bool> weakStorageTarget;
+  // Local-only safety state. Do not infer membership from serving replicas.
+  uint32_t chainMemberCount{};
+  bool ecOnly{};
   SERDE_STRUCT_FIELD(targetId, TargetId{});
   SERDE_STRUCT_FIELD(path, Path{});
   SERDE_STRUCT_FIELD(diskError, false);

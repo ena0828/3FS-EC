@@ -1,9 +1,11 @@
 #pragma once
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <variant>
 
 #include "common/utils/BoundedQueue.h"
 #include "storage/store/StorageTargets.h"
+#include "storage/update/EcJob.h"
 #include "storage/update/UpdateJob.h"
 
 namespace hf3fs::storage {
@@ -29,11 +31,27 @@ class UpdateWorker {
 
   CoTask<void> enqueue(UpdateJob *job) {
     assert(job->target()->diskIndex() < queueVec_.size());
-    co_await queueVec_[job->target()->diskIndex()]->co_enqueue(job);
+    co_await queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job});
+  }
+
+  CoTask<void> enqueue(EcCreateJob *job) {
+    assert(job->target()->diskIndex() < queueVec_.size());
+    co_await queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job});
+  }
+
+  CoTask<void> enqueue(EcReadJob *job) {
+    assert(job->target()->diskIndex() < queueVec_.size());
+    co_await queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job});
+  }
+
+  CoTask<void> enqueue(EcReconcileJob *job) {
+    assert(job->target()->diskIndex() < queueVec_.size());
+    co_await queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job});
   }
 
  protected:
-  using Queue = BoundedQueue<UpdateJob *>;
+  using QueueItem = std::variant<std::monostate, UpdateJob *, EcCreateJob *, EcReadJob *, EcReconcileJob *>;
+  using Queue = BoundedQueue<QueueItem>;
   void run(Queue &queue);
 
  private:
