@@ -266,6 +266,84 @@ impl Engine {
         )
     }
 
+    /// Create a complete chunk only if no committed chunk has this key.
+    ///
+    /// The key lock spans the existence check, preparation and publication, so
+    /// concurrent calls cannot replace each other's result. Existing bytes,
+    /// even identical bytes, return `ChunkAlreadyExists`; idempotence belongs
+    /// to the caller. Other mutation APIs remain able to change this key, so
+    /// callers must reserve their immutable namespace for this API.
+    ///
+    /// With `sync`, data is explicitly synchronized before the synchronous
+    /// metadata commit. Errors retain the engine's existing writing-list
+    /// recovery semantics and do not establish that nothing reached storage.
+    pub fn create_immutable(
+        &self,
+        chunk_id: &[u8],
+        data: &[u8],
+        checksum: u32,
+        sync: bool,
+    ) -> Result<ChunkArc> {
+        if chunk_id.is_empty() || chunk_id.len() < self.prefix_len {
+            return Err(Error::InvalidArg(format!(
+                "immutable chunk id must be nonempty and cover prefix {}",
+                self.prefix_len
+            )));
+        }
+        let length = u32::try_from(data.len())
+            .map_err(|_| Error::InvalidArg("immutable chunk length exceeds u32".into()))?;
+        if Size::from(length) > CHUNK_SIZE_ULTRA {
+            return Err(Error::InvalidArg(format!(
+                "immutable chunk length {} exceeds {}",
+                length, CHUNK_SIZE_ULTRA
+            )));
+        }
+        let actual_checksum = crc32c::crc32c(data);
+        if actual_checksum != checksum {
+            return Err(Error::ChecksumMismatch(format!(
+                "invalid checksum local {:08x} != remote {:08x}",
+                actual_checksum, checksum
+            )));
+        }
+
+        // Do not call get/update_chunk/commit_chunk while this lock is held:
+        // those public entry points acquire the same non-reentrant key lock.
+        let mut entry = self.meta_cache.entry_by_ref(chunk_id);
+        if self.get_with_entry(chunk_id, &mut entry)?.is_some() {
+            return Err(Error::ChunkAlreadyExists);
+        }
+        let mut req = UpdateReq {
+            checksum,
+            length,
+            create_new: true,
+            ..Default::default()
+        };
+        // Pass the borrowed slice directly; no raw pointer is reconstructed.
+        let mut chunk = self.prepare_update_chunk(chunk_id, &mut req, data, None)?;
+        let result = (|| {
+            if sync {
+                let fd = chunk.chunk.fd_and_offset().fd;
+                loop {
+                    // SAFETY: chunk and this Engine keep the owning Cluster
+                    // alive; this call borrows its fd and does not close it.
+                    if unsafe { libc::fdatasync(fd) } == 0 {
+                        break;
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(Error::IoError(format!(
+                            "sync immutable chunk data failed: {err}"
+                        )));
+                    }
+                }
+            }
+            self.commit_chunk_with_entry(&mut chunk, sync, &mut entry)
+        })();
+        // WritingChunk::drop takes writing_list; release the key guard first.
+        drop(entry);
+        result
+    }
+
     pub fn remove(&self, chunk_id: &[u8]) -> Result<ChunkArc> {
         self.update(
             chunk_id,
@@ -324,6 +402,19 @@ impl Engine {
 
         // 2. get old chunk.
         let old_chunk = self.get(chunk_id)?;
+        self.prepare_update_chunk(chunk_id, req, data, old_chunk)
+    }
+
+    // The caller validates data and supplies the previously loaded chunk.
+    // This helper never acquires meta_cache, allowing create_immutable to
+    // retain the key lock across preparation and metadata publication.
+    fn prepare_update_chunk(
+        &self,
+        chunk_id: &[u8],
+        req: &mut UpdateReq,
+        data: &[u8],
+        old_chunk: Option<ChunkArc>,
+    ) -> Result<WritingChunk> {
         let etag = match &old_chunk {
             Some(chunk) => {
                 if req.create_new {
@@ -465,27 +556,41 @@ impl Engine {
         }
         drop(writing_list);
 
-        self.meta_store
-            .persist_writing_chunk(chunk_id, new_chunk.meta())?;
-
-        Ok(WritingChunk {
+        // Establish the owner before persistence can fail. Its Drop marks the
+        // holder aborted without discarding a possibly persisted writing log.
+        let writing = WritingChunk {
             chunk_id: chunk_id.into(),
             chunk: new_chunk,
             list: self.writing_list.clone(),
             prefix_len: self.prefix_len as _,
             is_remove: req.is_remove,
             commit_succ: false,
-        })
+        };
+        self.meta_store
+            .persist_writing_chunk(chunk_id, writing.meta())?;
+        Ok(writing)
     }
 
     pub fn commit_chunk(&self, mut chunk: WritingChunk, sync: bool) -> Result<ChunkArc> {
+        let chunk_id = chunk.chunk_id.clone();
+        let mut entry = self.meta_cache.entry_by_ref(&chunk_id);
+        let result = self.commit_chunk_with_entry(&mut chunk, sync, &mut entry);
+        drop(entry);
+        result
+    }
+
+    fn commit_chunk_with_entry(
+        &self,
+        chunk: &mut WritingChunk,
+        sync: bool,
+        entry: &mut EntryByRef<Bytes, [u8], ChunkArc>,
+    ) -> Result<ChunkArc> {
         chunk.set_committed();
         let chunk_id = &chunk.chunk_id;
-        let new_chunk: ChunkArc = (&chunk).into();
+        let new_chunk: ChunkArc = (&*chunk).into();
 
         if chunk.is_remove {
-            let mut entry = self.meta_cache.entry_by_ref(chunk_id);
-            match self.get_with_entry(chunk_id, &mut entry)? {
+            match self.get_with_entry(chunk_id, entry)? {
                 Some(old_chunk) => {
                     self.meta_store
                         .remove(&chunk.chunk_id, old_chunk.meta(), sync)?
@@ -493,14 +598,12 @@ impl Engine {
                 None => self.meta_store.remove_writing_chunk(chunk_id, sync)?,
             }
             entry.remove();
-            drop(entry);
             chunk.commit_succ();
             return Ok(new_chunk);
         }
 
         // update rocksdb under lock protection.
-        let mut entry = self.meta_cache.entry_by_ref(chunk_id);
-        match self.get_with_entry(chunk_id, &mut entry)? {
+        match self.get_with_entry(chunk_id, entry)? {
             Some(old_chunk) => {
                 self.meta_store
                     .move_chunk(chunk_id, old_chunk.meta(), new_chunk.meta(), sync)?;
@@ -511,7 +614,6 @@ impl Engine {
             }
         }
         entry.insert(new_chunk.clone());
-        drop(entry);
 
         chunk.commit_succ();
         Ok(new_chunk)
@@ -765,6 +867,263 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn test_engine_create_immutable_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        };
+        let key = b"ec-fragment";
+        let data: Vec<u8> = (0..4097).map(|i| (i * 37 + 11) as u8).collect();
+        let checksum = crc32c::crc32c(&data);
+        {
+            let engine = Engine::open(&config).unwrap();
+            let chunk = engine.create_immutable(key, &data, checksum, true).unwrap();
+            assert_eq!(chunk.meta().len, data.len() as u32);
+            assert_eq!(chunk.meta().checksum, checksum);
+            assert_eq!(chunk.meta().chunk_ver, 1);
+            assert!(!chunk.meta().uncommitted);
+            let position = chunk.meta().pos;
+            for replacement in [&data[..], &b"different bytes"[..]] {
+                assert_eq!(
+                    engine
+                        .create_immutable(key, replacement, crc32c::crc32c(replacement), true)
+                        .unwrap_err(),
+                    Error::ChunkAlreadyExists
+                );
+            }
+            let existing = engine.get(key).unwrap().unwrap();
+            assert_eq!(existing.meta().pos, position);
+            let mut actual = vec![0; data.len()];
+            existing.pread(&mut actual, 0).unwrap();
+            assert_eq!(actual, data);
+            assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+        }
+
+        // Clean reopen checks durable metadata/data visibility, not power loss.
+        config.create = false;
+        let engine = Engine::open(&config).unwrap();
+        let existing = engine.get(key).unwrap().unwrap();
+        let mut actual = vec![0; data.len()];
+        existing.pread(&mut actual, 0).unwrap();
+        assert_eq!(actual, data);
+        assert_eq!(existing.meta().checksum, checksum);
+        assert_eq!(
+            engine
+                .create_immutable(key, &data, checksum, true)
+                .unwrap_err(),
+            Error::ChunkAlreadyExists
+        );
+        assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_engine_create_immutable_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        for key in [&b""[..], &b"e"[..]] {
+            assert!(matches!(
+                engine.create_immutable(key, b"", 0, true),
+                Err(Error::InvalidArg(_))
+            ));
+        }
+        for data in [&b""[..], &b"bad checksum"[..]] {
+            assert!(matches!(
+                engine.create_immutable(b"ec-invalid", data, crc32c::crc32c(data) ^ 1, true),
+                Err(Error::ChecksumMismatch(_))
+            ));
+        }
+        // Only allocate this input in RAM; rejection precedes disk allocation
+        // and checksum traversal, avoiding a 64 MiB allocator group on disk.
+        let oversized = vec![0; CHUNK_SIZE_ULTRA.0 as usize + 1];
+        assert!(matches!(
+            engine.create_immutable(b"ec-oversized", &oversized, 0, true),
+            Err(Error::InvalidArg(_))
+        ));
+        drop(oversized);
+        assert_eq!(engine.used_size(), UsedSize::default());
+        assert!(engine.get(b"ec-invalid").unwrap().is_none());
+        assert!(engine.get(b"ec-oversized").unwrap().is_none());
+        assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+
+        engine.set_allow_to_allocate(false);
+        assert_eq!(
+            engine
+                .create_immutable(b"ec-empty", b"", 0, true)
+                .unwrap_err(),
+            Error::NoSpace
+        );
+        assert!(engine.get(b"ec-empty").unwrap().is_none());
+        engine.set_allow_to_allocate(true);
+        let empty = engine.create_immutable(b"ec-empty", b"", 0, false).unwrap();
+        assert_eq!(empty.meta().len, 0);
+        assert_eq!(empty.meta().checksum, 0);
+        assert!(!empty.meta().uncommitted);
+        assert_eq!(
+            engine
+                .create_immutable(b"ec-empty", b"", 0, false)
+                .unwrap_err(),
+            Error::ChunkAlreadyExists
+        );
+    }
+
+    #[test]
+    fn test_engine_create_immutable_concurrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        let gate = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for writer in 0..8u8 {
+                let engine = &engine;
+                let gate = &gate;
+                handles.push(scope.spawn(move || {
+                    let data = vec![writer; 4097];
+                    let checksum = crc32c::crc32c(&data);
+                    gate.wait();
+                    (
+                        writer,
+                        engine.create_immutable(b"ec-race", &data, checksum, true),
+                    )
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let mut winner = None;
+        for (writer, result) in results {
+            match result {
+                Ok(chunk) => {
+                    assert!(
+                        winner.replace(writer).is_none(),
+                        "multiple creates succeeded"
+                    );
+                    assert_eq!(chunk.meta().chunk_ver, 1);
+                }
+                Err(error) => assert_eq!(error, Error::ChunkAlreadyExists),
+            }
+        }
+        let data = vec![winner.expect("no create succeeded"); 4097];
+        let chunk = engine.get(b"ec-race").unwrap().unwrap();
+        let mut actual = vec![0; data.len()];
+        chunk.pread(&mut actual, 0).unwrap();
+        assert_eq!(actual, data);
+        assert_eq!(chunk.meta().checksum, crc32c::crc32c(&data));
+        assert_eq!(engine.query_all_chunks(b"ec").unwrap().len(), 1);
+        assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_engine_create_immutable_preserves_pending_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        let data = b"existing pending update";
+        let mut req = UpdateReq {
+            length: data.len() as u32,
+            checksum: crc32c::crc32c(data),
+            data: data.as_ptr() as u64,
+            ..Default::default()
+        };
+        let pending = engine.update_chunk(b"ec-pending", &mut req).unwrap();
+        assert!(matches!(
+            engine.create_immutable(b"ec-pending", b"", 0, true),
+            Err(Error::InvalidArg(_))
+        ));
+        assert!(engine.get(b"ec-pending").unwrap().is_none());
+        assert_eq!(engine.query_uncommitted_chunks(b"ec").unwrap().len(), 1);
+        let chunk = engine.commit_chunk(pending, true).unwrap();
+        let mut actual = vec![0; data.len()];
+        chunk.pread(&mut actual, 0).unwrap();
+        assert_eq!(actual, data);
+        assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_engine_create_immutable_persist_failure_then_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = EngineConfig {
+            path: dir.path().join("engine"),
+            create: true,
+            prefix_len: 2,
+        };
+        let key = b"ec-persist-failure";
+        let rejected = vec![0x29; 4097];
+        let replacement: Vec<u8> = (0..4097).map(|i| (i * 17 + 3) as u8).collect();
+        std::fs::create_dir(&config.path).unwrap();
+
+        {
+            let mut engine = Engine::open(&config).unwrap();
+            // A separately initialized read-only RocksDB rejects the actual
+            // writing-log put after allocation, data I/O and holder insertion.
+            // The allocator retains the original writable store; no production
+            // fault hook or shared process-wide state is needed.
+            let mut readonly_config = MetaStoreConfig {
+                rocksdb: RocksDBConfig {
+                    path: dir.path().join("readonly-meta"),
+                    create: true,
+                    ..Default::default()
+                },
+                prefix_len: config.prefix_len,
+            };
+            drop(MetaStore::open(&readonly_config).unwrap());
+            readonly_config.rocksdb.create = false;
+            readonly_config.rocksdb.read_only = true;
+            let readonly_store = Arc::new(MetaStore::open(&readonly_config).unwrap());
+            let writable_store = std::mem::replace(&mut engine.meta_store, readonly_store);
+
+            for _ in 0..3 {
+                assert!(matches!(
+                    engine.create_immutable(key, &rejected, crc32c::crc32c(&rejected), true),
+                    Err(Error::RocksDBError(_))
+                ));
+                assert!(engine.get(key).unwrap().is_none());
+                let pending = engine.writing_list.get(b"ec".as_slice()).unwrap();
+                assert_eq!(pending.len(), 1);
+                assert!(pending.get(key.as_slice()).unwrap().abort);
+            }
+
+            engine.meta_store = writable_store;
+            assert!(engine.get(key).unwrap().is_none());
+            let chunk = engine
+                .create_immutable(key, &replacement, crc32c::crc32c(&replacement), true)
+                .unwrap();
+            let mut actual = vec![0; replacement.len()];
+            chunk.pread(&mut actual, 0).unwrap();
+            assert_eq!(actual, replacement);
+            assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+        }
+
+        // This is a deterministic refused write and clean reopen, not an
+        // ambiguous acknowledgement or power-loss test.
+        config.create = false;
+        let engine = Engine::open(&config).unwrap();
+        let chunk = engine.get(key).unwrap().unwrap();
+        let mut actual = vec![0; replacement.len()];
+        chunk.pread(&mut actual, 0).unwrap();
+        assert_eq!(actual, replacement);
+        assert_eq!(chunk.meta().checksum, crc32c::crc32c(&replacement));
+        assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+    }
+
+    #[test]
     fn test_engine_normal() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -802,7 +1161,9 @@ mod tests {
             // In normal usage, speed_up_quit() should ONLY be called immediately before process exit.
             // This test intentionally violates that contract to verify the function's behavior,
             // but this will cause memory leaks that persist for the remainder of the test process.
-            unsafe { engine.speed_up_quit(); }
+            unsafe {
+                engine.speed_up_quit();
+            }
         }
 
         {
