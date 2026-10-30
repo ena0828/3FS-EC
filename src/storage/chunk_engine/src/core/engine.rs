@@ -15,6 +15,26 @@ pub struct EngineConfig {
     pub prefix_len: usize,
 }
 
+/// Bound for explicitly supplied tags on the immutable-create API only.
+pub const MAX_IMMUTABLE_ETAG_LEN: usize = 64;
+
+const MAX_RETAINED_WRITING_PER_KEY: usize = 8;
+const MAX_RETAINED_WRITING_CHUNKS: usize = 64;
+
+/// Metadata persisted together with a newly created immutable chunk.
+///
+/// The caller validates the routing version and request identity. Zero values
+/// remain valid for local callers. A nonempty tag is an opaque identifier, not
+/// a verified content digest; an empty tag retains the engine's random tag.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ImmutableCreateContext<'a> {
+    pub chain_ver: u32,
+    pub last_request_id: u64,
+    pub last_client_low: u64,
+    pub last_client_high: u64,
+    pub desired_etag: &'a [u8],
+}
+
 #[derive(Clone)]
 pub struct Engine {
     pub meta_store: Arc<MetaStore>,
@@ -25,10 +45,43 @@ pub struct Engine {
     pub metrics: Arc<Metrics>,
     pub prefix_len: usize,
     pub writing_list: Arc<WritingList>,
+    // Failed log replacements may leave any earlier candidate on disk. Keep
+    // their positions referenced until a later synchronous replacement wins.
+    retained_writing: Arc<Mutex<HashMap<Bytes, Vec<Chunk>>>>,
+    immutable_namespace: Arc<ImmutableNamespace>,
+}
+
+struct ImmutableNamespace {
+    // All paths are established by Engine::open; allocation only fallocates
+    // existing cluster files. External namespace mutation is unsupported.
+    engine_path: PathBuf,
+    parents_to_sync: Vec<PathBuf>,
+    synced: Mutex<bool>,
 }
 
 impl Engine {
     pub fn open(config: &EngineConfig) -> Result<Self> {
+        // Capture the pre-existing ancestor before RocksDB's create_dir_all
+        // creates missing engine/metadata parents. Do not recursively walk
+        // arbitrary directories: only this explicitly configured path chain.
+        let engine_path = std::path::absolute(&config.path)
+            .map_err(|error| Error::IoError(format!("resolve engine path: {error}")))?;
+        let mut parents_to_sync = Vec::new();
+        let mut parent = engine_path.parent();
+        while let Some(path) = parent {
+            parents_to_sync.push(path.to_path_buf());
+            match std::fs::metadata(path) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    parent = path.parent();
+                }
+                Err(error) => {
+                    return Err(Error::IoError(format!(
+                        "inspect engine ancestor {path:?}: {error}"
+                    )));
+                }
+            }
+        }
         let meta_config = MetaStoreConfig {
             rocksdb: RocksDBConfig {
                 path: config.path.join("meta"),
@@ -53,6 +106,12 @@ impl Engine {
             metrics: Default::default(),
             prefix_len: config.prefix_len,
             writing_list: Default::default(),
+            retained_writing: Default::default(),
+            immutable_namespace: Arc::new(ImmutableNamespace {
+                engine_path,
+                parents_to_sync,
+                synced: Mutex::new(false),
+            }),
         };
 
         if !uncommitted_chunks.is_empty() {
@@ -284,10 +343,39 @@ impl Engine {
         checksum: u32,
         sync: bool,
     ) -> Result<ChunkArc> {
+        self.create_immutable_with_context(
+            chunk_id,
+            data,
+            checksum,
+            sync,
+            &ImmutableCreateContext::default(),
+        )
+    }
+
+    /// Create with routing/request metadata and an optional bounded opaque tag.
+    ///
+    /// The context is applied before the writing log and final metadata commit;
+    /// no committed metadata is subsequently modified. The first chunk version
+    /// is still one and is independent of an upper-layer EC generation.
+    pub fn create_immutable_with_context(
+        &self,
+        chunk_id: &[u8],
+        data: &[u8],
+        checksum: u32,
+        sync: bool,
+        context: &ImmutableCreateContext<'_>,
+    ) -> Result<ChunkArc> {
         if chunk_id.is_empty() || chunk_id.len() < self.prefix_len {
             return Err(Error::InvalidArg(format!(
                 "immutable chunk id must be nonempty and cover prefix {}",
                 self.prefix_len
+            )));
+        }
+        if context.desired_etag.len() > MAX_IMMUTABLE_ETAG_LEN {
+            return Err(Error::InvalidArg(format!(
+                "immutable etag length {} exceeds {}",
+                context.desired_etag.len(),
+                MAX_IMMUTABLE_ETAG_LEN
             )));
         }
         let length = u32::try_from(data.len())
@@ -316,32 +404,225 @@ impl Engine {
             checksum,
             length,
             create_new: true,
+            chain_ver: context.chain_ver,
+            last_request_id: context.last_request_id,
+            last_client_low: context.last_client_low,
+            last_client_high: context.last_client_high,
             ..Default::default()
         };
         // Pass the borrowed slice directly; no raw pointer is reconstructed.
-        let mut chunk = self.prepare_update_chunk(chunk_id, &mut req, data, None)?;
+        let mut chunk =
+            self.prepare_update_chunk(chunk_id, &mut req, data, None, Some(context.desired_etag))?;
         let result = (|| {
             if sync {
-                let fd = chunk.chunk.fd_and_offset().fd;
-                loop {
-                    // SAFETY: chunk and this Engine keep the owning Cluster
-                    // alive; this call borrows its fd and does not close it.
-                    if unsafe { libc::fdatasync(fd) } == 0 {
-                        break;
-                    }
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() != std::io::ErrorKind::Interrupted {
-                        return Err(Error::IoError(format!(
-                            "sync immutable chunk data failed: {err}"
-                        )));
-                    }
-                }
+                Self::sync_immutable_data(&chunk.chunk)?;
+                self.sync_immutable_namespace()?;
             }
             self.commit_chunk_with_entry(&mut chunk, sync, &mut entry)
         })();
         // WritingChunk::drop takes writing_list; release the key guard first.
         drop(entry);
         result
+    }
+
+    fn sync_immutable_data(chunk: &Chunk) -> Result<()> {
+        let fd = chunk.fd_and_offset().fd;
+        loop {
+            // SAFETY: chunk keeps the owning Cluster alive; this call borrows
+            // its fd and does not close it.
+            if unsafe { libc::fdatasync(fd) } == 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(Error::IoError(format!(
+                    "sync immutable chunk data failed: {err}"
+                )));
+            }
+        }
+    }
+
+    fn sync_immutable_directory(path: &std::path::Path) -> Result<()> {
+        let directory = std::fs::File::open(path).map_err(|error| {
+            Error::IoError(format!("open immutable directory {path:?}: {error}"))
+        })?;
+        let metadata = directory.metadata().map_err(|error| {
+            Error::IoError(format!("stat immutable directory {path:?}: {error}"))
+        })?;
+        if !metadata.is_dir() {
+            return Err(Error::IoError(format!(
+                "immutable path is not a directory: {path:?}"
+            )));
+        }
+        directory
+            .sync_all()
+            .map_err(|error| Error::IoError(format!("sync immutable directory {path:?}: {error}")))
+    }
+
+    fn sync_immutable_namespace(&self) -> Result<()> {
+        self.sync_immutable_namespace_with(Self::sync_immutable_directory)
+    }
+
+    // The private callback allows path-order and error-retry assertions while
+    // keeping real filesystem operations in the test's synchronization path.
+    fn sync_immutable_namespace_with(
+        &self,
+        mut sync_directory: impl FnMut(&std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        let namespace = &self.immutable_namespace;
+        let mut synced = namespace.synced.lock().unwrap();
+        if *synced {
+            return Ok(());
+        }
+        // Each class has 256 files created at open. Later allocations, moves
+        // and hole punching do not add or rename filesystem entries.
+        for allocator in &self.allocators.vec {
+            sync_directory(
+                &namespace
+                    .engine_path
+                    .join(allocator.clusters.chunk_size.to_string()),
+            )?;
+        }
+        // RocksDB synchronizes its own log/manifest entries, but does not
+        // establish the reachability of the newly created meta directory.
+        sync_directory(&namespace.engine_path.join("meta"))?;
+        sync_directory(&namespace.engine_path)?;
+        for parent in &namespace.parents_to_sync {
+            sync_directory(parent)?;
+        }
+        *synced = true;
+        Ok(())
+    }
+
+    /// Reconfirm an existing immutable committed object after an unknown result.
+    ///
+    /// Requires an isolated immutable namespace: legacy in-place updates must
+    /// not run on these keys. The key and opaque tag bind the caller's object
+    /// and allocation/operation identity; neither is a cryptographic digest.
+    /// This is separate from ordinary reads: success requires full-byte CRC,
+    /// data fdatasync, namespace synchronization, then a successful metadata WAL
+    /// synchronization. Directory success is cached for this Engine instance.
+    /// These explicit barriers are not a substitute for power-loss testing. An error,
+    /// including missing metadata, never authorizes reclamation. A preparation
+    /// log alone is insufficient and is never promoted or removed here.
+    pub fn reconcile_immutable(
+        &self,
+        chunk_id: &[u8],
+        expected_length: u32,
+        expected_checksum: u32,
+        expected_etag: &[u8],
+    ) -> Result<ChunkArc> {
+        self.reconcile_immutable_with_barriers(
+            chunk_id,
+            expected_length,
+            expected_checksum,
+            expected_etag,
+            Self::sync_immutable_data,
+            || self.meta_store.sync_wal(),
+        )
+    }
+
+    // Private barrier parameters permit deterministic failure/order tests
+    // without a global failpoint or changes to ordinary reads and writes.
+    fn reconcile_immutable_with_barriers(
+        &self,
+        chunk_id: &[u8],
+        expected_length: u32,
+        expected_checksum: u32,
+        expected_etag: &[u8],
+        sync_data: impl FnOnce(&Chunk) -> Result<()>,
+        sync_wal: impl FnOnce() -> Result<()>,
+    ) -> Result<ChunkArc> {
+        if chunk_id.is_empty() || chunk_id.len() < self.prefix_len {
+            return Err(Error::InvalidArg(
+                "invalid immutable reconciliation key".into(),
+            ));
+        }
+        if Size::from(expected_length) > CHUNK_SIZE_ULTRA {
+            return Err(Error::InvalidArg(
+                "immutable reconciliation length exceeds limit".into(),
+            ));
+        }
+        if expected_etag.is_empty() || expected_etag.len() > MAX_IMMUTABLE_ETAG_LEN {
+            return Err(Error::InvalidArg(
+                "immutable reconciliation etag must contain 1..=64 bytes".into(),
+            ));
+        }
+
+        let mut entry = self.meta_cache.entry_by_ref(chunk_id);
+        // Read the actual committed record, even when a cache entry exists.
+        // Cache visibility after an unsuccessful sync is not a durable ACK.
+        let meta = self.meta_store.get_chunk_meta(chunk_id)?.ok_or_else(|| {
+            Error::MetaError(
+                "immutable committed metadata not found; outcome remains unknown".into(),
+            )
+        })?;
+        if meta.uncommitted {
+            return Err(Error::MetaError(
+                "immutable metadata is not committed".into(),
+            ));
+        }
+        if meta.len != expected_length {
+            return Err(Error::MetaError(
+                "immutable reconciliation length mismatch".into(),
+            ));
+        }
+        if meta.etag.as_slice() != expected_etag {
+            return Err(Error::ChunkETagMismatch(
+                "immutable reconciliation identity mismatch".into(),
+            ));
+        }
+        if meta.checksum != expected_checksum {
+            return Err(Error::ChecksumMismatch(
+                "immutable reconciliation metadata checksum mismatch".into(),
+            ));
+        }
+        let chunk = match entry.get() {
+            Some(chunk) if chunk.meta() == &meta => chunk.clone(),
+            Some(_) => {
+                return Err(Error::MetaError(
+                    "immutable cache and committed metadata differ; outcome remains unknown".into(),
+                ))
+            }
+            None => {
+                let allocator = self.allocators.select_by_pos(meta.pos)?;
+                // A failed commit may already retain this position in the
+                // writing list. This is not necessarily its first reference.
+                let chunk = Arc::new(allocator.reference(meta, false));
+                // Keep a persistent reference even when validation/sync fails;
+                // dropping the last temporary reference would free the position.
+                entry.insert(chunk.clone());
+                chunk
+            }
+        };
+
+        const VERIFY_SLICE: usize = 64 * 1024;
+        let buffer_length = (expected_length as usize).min(VERIFY_SLICE);
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(buffer_length).map_err(|error| {
+            Error::MetaError(format!("allocate immutable reconciliation buffer: {error}"))
+        })?;
+        buffer.resize(buffer_length, 0);
+        let mut checksum = 0;
+        let mut offset = 0;
+        while offset < expected_length {
+            let length = ((expected_length - offset) as usize).min(buffer.len());
+            chunk.pread(&mut buffer[..length], offset)?;
+            checksum = crc32c::crc32c_append(checksum, &buffer[..length]);
+            offset += length as u32;
+        }
+        if checksum != expected_checksum {
+            return Err(Error::ChecksumMismatch(
+                "immutable reconciliation data checksum mismatch".into(),
+            ));
+        }
+        sync_data(&chunk)?;
+        self.sync_immutable_namespace()?;
+        sync_wal()?;
+        // Do not repeat add_chunk/move_chunk or change preparation state: those
+        // mutations carry non-idempotent accounting and recovery semantics.
+        drop(entry);
+        Ok(chunk)
     }
 
     pub fn remove(&self, chunk_id: &[u8]) -> Result<ChunkArc> {
@@ -402,7 +683,7 @@ impl Engine {
 
         // 2. get old chunk.
         let old_chunk = self.get(chunk_id)?;
-        self.prepare_update_chunk(chunk_id, req, data, old_chunk)
+        self.prepare_update_chunk(chunk_id, req, data, old_chunk, None)
     }
 
     // The caller validates data and supplies the previously loaded chunk.
@@ -414,7 +695,11 @@ impl Engine {
         req: &mut UpdateReq,
         data: &[u8],
         old_chunk: Option<ChunkArc>,
+        desired_etag: Option<&[u8]>,
     ) -> Result<WritingChunk> {
+        // Refuse additional candidates before data allocation when previous
+        // log outcomes have exhausted the conservative retention budget.
+        Self::check_retained_writing_capacity(&self.retained_writing.lock().unwrap(), chunk_id)?;
         let etag = match &old_chunk {
             Some(chunk) => {
                 if req.create_new {
@@ -528,6 +813,9 @@ impl Engine {
         req.out_chain_ver = req.chain_ver;
         req.out_checksum = new_chunk.meta().checksum;
         new_chunk.update_meta(req.deref());
+        if let Some(etag) = desired_etag.filter(|etag| !etag.is_empty()) {
+            new_chunk.set_etag(etag);
+        }
 
         let prefix: Bytes = chunk_id[..self.prefix_len].into();
         let mut writing_list = self.writing_list.entry(prefix).or_default();
@@ -535,10 +823,18 @@ impl Engine {
             std::collections::hash_map::Entry::Occupied(mut occupied_entry)
                 if occupied_entry.get().abort =>
             {
-                occupied_entry.insert(WritingHolder {
-                    chunk: new_chunk.clone(),
-                    abort: false,
-                });
+                // Lock order is writing_list -> retained_writing. No code
+                // holding retained_writing acquires writing_list. Recheck
+                // under both locks so concurrent retries cannot exceed caps.
+                let mut retained = self.retained_writing.lock().unwrap();
+                Self::check_retained_writing_capacity(&retained, chunk_id)?;
+                let replaced = occupied_entry
+                    .insert(WritingHolder {
+                        chunk: new_chunk.clone(),
+                        abort: false,
+                    })
+                    .chunk;
+                retained.entry(chunk_id.into()).or_default().push(replaced);
             }
             std::collections::hash_map::Entry::Occupied(occupied_entry) => {
                 return Err(Error::InvalidArg(format!(
@@ -568,7 +864,30 @@ impl Engine {
         };
         self.meta_store
             .persist_writing_chunk(chunk_id, writing.meta())?;
+        // Only a successful synchronous put proves that the log no longer
+        // references any old candidate. Release positions outside the lock.
+        self.release_retained_writing(chunk_id);
         Ok(writing)
+    }
+
+    fn release_retained_writing(&self, chunk_id: &[u8]) {
+        let replaced = self.retained_writing.lock().unwrap().remove(chunk_id);
+        drop(replaced);
+    }
+
+    fn check_retained_writing_capacity(
+        retained: &HashMap<Bytes, Vec<Chunk>>,
+        chunk_id: &[u8],
+    ) -> Result<()> {
+        if retained.get(chunk_id).map_or(0, Vec::len) >= MAX_RETAINED_WRITING_PER_KEY
+            || retained.values().map(Vec::len).sum::<usize>() >= MAX_RETAINED_WRITING_CHUNKS
+        {
+            return Err(Error::InvalidArg(
+                "unresolved writing-log replacements reached retention limit; recovery required"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn commit_chunk(&self, mut chunk: WritingChunk, sync: bool) -> Result<ChunkArc> {
@@ -598,6 +917,9 @@ impl Engine {
                 None => self.meta_store.remove_writing_chunk(chunk_id, sync)?,
             }
             entry.remove();
+            if sync {
+                self.release_retained_writing(chunk_id);
+            }
             chunk.commit_succ();
             return Ok(new_chunk);
         }
@@ -615,6 +937,9 @@ impl Engine {
         }
         entry.insert(new_chunk.clone());
 
+        if sync {
+            self.release_retained_writing(chunk_id);
+        }
         chunk.commit_succ();
         Ok(new_chunk)
     }
@@ -669,6 +994,9 @@ impl Engine {
         self.meta_store.write(write_batch, sync)?;
 
         for chunk in &mut chunks {
+            if sync {
+                self.release_retained_writing(&chunk.chunk_id);
+            }
             chunk.commit_succ();
             if chunk.is_remove {
                 entries.get_mut(&chunk.chunk_id).unwrap().remove();
@@ -867,6 +1195,407 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn test_engine_immutable_namespace_order_and_shared_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("new-parent");
+        let inner = outer.join("new-inner");
+        let engine_path = inner.join("engine");
+        let engine = Engine::open(&EngineConfig {
+            path: engine_path.clone(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        let mut expected: Vec<_> = engine
+            .allocators
+            .vec
+            .iter()
+            .map(|allocator| allocator.clusters.path.clone())
+            .collect();
+        expected.extend([
+            engine_path.join("meta"),
+            engine_path.clone(),
+            inner,
+            outer,
+            dir.path().to_path_buf(),
+        ]);
+        let mut actual = Vec::new();
+        engine
+            .sync_immutable_namespace_with(|path| {
+                actual.push(path.to_path_buf());
+                Engine::sync_immutable_directory(path)
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert!(*engine.immutable_namespace.synced.lock().unwrap());
+        engine
+            .clone()
+            .sync_immutable_namespace_with(|_| {
+                panic!("successful namespace synchronization must be shared by Engine clones")
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_engine_immutable_namespace_failure_blocks_seal_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        let class_path = engine.allocators.vec[3].clusters.path.clone();
+        let displaced = dir.path().join("temporarily-displaced-class");
+        // All file descriptors remain open, so data I/O can succeed while the
+        // required directory binding is absent. This is a real filesystem
+        // failure, scoped to the temporary Engine, not a global failpoint.
+        std::fs::rename(&class_path, &displaced).unwrap();
+        let mut attempted = Vec::new();
+        assert!(matches!(
+            engine.sync_immutable_namespace_with(|path| {
+                attempted.push(path.to_path_buf());
+                Engine::sync_immutable_directory(path)
+            }),
+            Err(Error::IoError(_))
+        ));
+        assert_eq!(
+            attempted,
+            engine.allocators.vec[..4]
+                .iter()
+                .map(|allocator| allocator.clusters.path.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(!*engine.immutable_namespace.synced.lock().unwrap());
+
+        let key = b"ec-namespace-failure";
+        let data = b"successful data I/O is not enough when directory sync fails";
+        let checksum = crc32c::crc32c(data);
+        let tag = b"namespace-operation";
+        let context = ImmutableCreateContext {
+            desired_etag: tag,
+            ..Default::default()
+        };
+        assert!(matches!(
+            engine.create_immutable_with_context(key, data, checksum, true, &context,),
+            Err(Error::IoError(_))
+        ));
+        assert!(engine.meta_store.get_chunk_meta(key).unwrap().is_none());
+        assert_eq!(engine.query_uncommitted_chunks(b"ec").unwrap().len(), 1);
+        assert!(!*engine.immutable_namespace.synced.lock().unwrap());
+        // A preparation record cannot use the new barrier to promote itself.
+        assert!(engine
+            .reconcile_immutable(key, data.len() as u32, checksum, tag)
+            .is_err());
+        assert!(!*engine.immutable_namespace.synced.lock().unwrap());
+
+        // A committed-but-unsynchronized object must also refuse a new seal
+        // confirmation while this directory prerequisite remains unresolved.
+        let async_key = b"ec-namespace-async";
+        let asynchronous = engine
+            .create_immutable_with_context(async_key, data, checksum, false, &context)
+            .unwrap();
+        assert!(matches!(
+            engine.reconcile_immutable(async_key, data.len() as u32, checksum, tag),
+            Err(Error::IoError(_))
+        ));
+        assert_eq!(
+            engine.meta_store.get_chunk_meta(async_key).unwrap(),
+            Some(asynchronous.meta().clone())
+        );
+        assert!(!*engine.immutable_namespace.synced.lock().unwrap());
+        std::fs::rename(&displaced, &class_path).unwrap();
+        assert_eq!(
+            engine
+                .reconcile_immutable(async_key, data.len() as u32, checksum, tag)
+                .unwrap()
+                .meta(),
+            asynchronous.meta()
+        );
+        assert!(*engine.immutable_namespace.synced.lock().unwrap());
+        let created = engine
+            .create_immutable_with_context(key, data, checksum, true, &context)
+            .unwrap();
+        assert!(*engine.immutable_namespace.synced.lock().unwrap());
+        let mut actual = vec![0; data.len()];
+        created.pread(&mut actual, 0).unwrap();
+        assert_eq!(actual, data);
+        assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+        let accounted = engine.meta_store.query_used_size(b"ec").unwrap();
+        let confirmed = engine
+            .reconcile_immutable(key, data.len() as u32, checksum, tag)
+            .unwrap();
+        assert_eq!(confirmed.meta(), created.meta());
+        assert_eq!(engine.meta_store.query_used_size(b"ec").unwrap(), accounted);
+    }
+
+    #[test]
+    fn test_engine_reconcile_immutable_no_accounting_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        };
+        let objects: Vec<_> = [0usize, 4097, 65553]
+            .into_iter()
+            .map(|length| {
+                let data: Vec<_> = (0..length).map(|i| (i * 19 + 7) as u8).collect();
+                (format!("ec-reconfirm-{length}").into_bytes(), data)
+            })
+            .collect();
+        let tag = b"same-operation-after-lost-ack";
+        {
+            let engine = Engine::open(&config).unwrap();
+            for (key, data) in &objects {
+                // Discard the original return as a lost-ACK model. The initial
+                // final metadata commit is deliberately asynchronous; this is
+                // not an injected RocksDB sync error or a power-loss test.
+                drop(
+                    engine
+                        .create_immutable_with_context(
+                            key,
+                            data,
+                            crc32c::crc32c(data),
+                            false,
+                            &ImmutableCreateContext {
+                                desired_etag: tag,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap(),
+                );
+            }
+            let accounted = engine.meta_store.query_used_size(b"ec").unwrap();
+            let allocated = engine.used_size();
+            for _ in 0..3 {
+                for (key, data) in &objects {
+                    let before = engine.meta_store.get_chunk_meta(key).unwrap().unwrap();
+                    let reconciled = engine
+                        .reconcile_immutable(key, data.len() as u32, crc32c::crc32c(data), tag)
+                        .unwrap();
+                    assert_eq!(reconciled.meta(), &before);
+                    let mut actual = vec![0; data.len()];
+                    reconciled.pread(&mut actual, 0).unwrap();
+                    assert_eq!(&actual, data);
+                }
+                assert_eq!(engine.meta_store.query_used_size(b"ec").unwrap(), accounted);
+                assert_eq!(engine.used_size(), allocated);
+            }
+        }
+        config.create = false;
+        let engine = Engine::open(&config).unwrap();
+        for (key, data) in &objects {
+            let chunk = engine
+                .reconcile_immutable(key, data.len() as u32, crc32c::crc32c(data), tag)
+                .unwrap();
+            let mut actual = vec![0; data.len()];
+            chunk.pread(&mut actual, 0).unwrap();
+            assert_eq!(&actual, data);
+        }
+    }
+
+    #[test]
+    fn test_engine_reconcile_immutable_barrier_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        let key = b"ec-barrier-errors";
+        let data = b"data must precede the metadata WAL barrier";
+        let checksum = crc32c::crc32c(data);
+        let tag = b"barrier-operation";
+        let original = engine
+            .create_immutable_with_context(
+                key,
+                data,
+                checksum,
+                false,
+                &ImmutableCreateContext {
+                    desired_etag: tag,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let before = original.meta().clone();
+        let accounted = engine.meta_store.query_used_size(b"ec").unwrap();
+        let allocated = engine.used_size();
+        let wal_called = AtomicBool::new(false);
+        let result = engine.reconcile_immutable_with_barriers(
+            key,
+            data.len() as u32,
+            checksum,
+            tag,
+            |_| Err(Error::IoError("injected data barrier refusal".into())),
+            || {
+                wal_called.store(true, Ordering::SeqCst);
+                engine.meta_store.sync_wal()
+            },
+        );
+        assert!(matches!(result, Err(Error::IoError(_))));
+        assert!(!wal_called.load(Ordering::SeqCst));
+
+        // Remove only the cache entry while original keeps the allocation
+        // referenced. The failing path must install a new persistent reference.
+        engine.meta_cache.entry_by_ref(key.as_slice()).remove();
+        let data_synced = AtomicBool::new(false);
+        for _ in 0..2 {
+            let result = engine.reconcile_immutable_with_barriers(
+                key,
+                data.len() as u32,
+                checksum,
+                tag,
+                |chunk| {
+                    Engine::sync_immutable_data(chunk)?;
+                    data_synced.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                || {
+                    assert!(data_synced.load(Ordering::SeqCst));
+                    Err(Error::RocksDBError("injected WAL barrier refusal".into()))
+                },
+            );
+            assert!(matches!(result, Err(Error::RocksDBError(_))));
+            assert_eq!(engine.get(key).unwrap().unwrap().meta(), &before);
+            assert_eq!(
+                engine.meta_store.get_chunk_meta(key).unwrap(),
+                Some(before.clone())
+            );
+            assert_eq!(engine.meta_store.query_used_size(b"ec").unwrap(), accounted);
+        }
+        drop(original);
+        assert_eq!(engine.used_size(), allocated);
+        let chunk = engine
+            .reconcile_immutable(key, data.len() as u32, checksum, tag)
+            .unwrap();
+        assert_eq!(chunk.meta(), &before);
+        assert_eq!(engine.used_size(), allocated);
+        assert_eq!(engine.meta_store.query_used_size(b"ec").unwrap(), accounted);
+    }
+
+    #[test]
+    fn test_engine_reconcile_immutable_rejects_prepare_and_cache_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        let key = b"ec-prepared-only";
+        let data = b"a prepared record must not become a seal receipt";
+        let tag = b"prepared-operation";
+        let checksum = crc32c::crc32c(data);
+        let mut request = UpdateReq {
+            data: data.as_ptr() as u64,
+            length: data.len() as u32,
+            checksum,
+            desired_tag: tag,
+            ..Default::default()
+        };
+        let pending = engine.update_chunk(key, &mut request).unwrap();
+        let staged = engine.query_uncommitted_chunks(b"ec").unwrap();
+        assert_eq!(staged.len(), 1);
+        let barrier_called = AtomicBool::new(false);
+        let assert_not_confirmed = || {
+            let result = engine.reconcile_immutable_with_barriers(
+                key,
+                data.len() as u32,
+                checksum,
+                tag,
+                |_| {
+                    barrier_called.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                || {
+                    barrier_called.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(Error::MetaError(_))));
+            assert!(!barrier_called.load(Ordering::SeqCst));
+            assert_eq!(engine.query_uncommitted_chunks(b"ec").unwrap(), staged);
+            assert!(engine.meta_store.get_chunk_meta(key).unwrap().is_none());
+        };
+        assert_not_confirmed();
+        let mut cache_only = pending.chunk.clone();
+        cache_only.set_committed();
+        engine
+            .meta_cache
+            .entry_by_ref(key.as_slice())
+            .insert(Arc::new(cache_only));
+        assert_not_confirmed();
+        engine.meta_cache.entry_by_ref(key.as_slice()).remove();
+        drop(pending);
+    }
+
+    #[test]
+    fn test_engine_reconcile_immutable_checks_actual_metadata() {
+        use derse::Serialize;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        let key = b"ec-metadata-identity";
+        let data = b"check the real committed record and the fixed allocation";
+        let checksum = crc32c::crc32c(data);
+        let tag = b"metadata-operation";
+        let original = engine
+            .create_immutable_with_context(
+                key,
+                data,
+                checksum,
+                true,
+                &ImmutableCreateContext {
+                    desired_etag: tag,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut different = original.as_ref().clone();
+        different.set_chain_ver(original.meta().chain_ver + 1);
+        engine
+            .meta_cache
+            .entry_by_ref(key.as_slice())
+            .insert(Arc::new(different));
+        assert!(matches!(
+            engine.reconcile_immutable(key, data.len() as u32, checksum, tag),
+            Err(Error::MetaError(_))
+        ));
+        engine
+            .meta_cache
+            .entry_by_ref(key.as_slice())
+            .insert(original.clone());
+        let write_meta = |meta: &ChunkMeta| {
+            let mut batch = RocksDB::new_write_batch();
+            let bytes: derse::DownwardBytes = meta.serialize().unwrap();
+            batch.put(MetaKey::chunk_meta_key(key), bytes.as_slice());
+            engine.meta_store.write(batch, true).unwrap();
+        };
+        let mut uncommitted = original.meta().clone();
+        uncommitted.uncommitted = true;
+        write_meta(&uncommitted);
+        assert!(matches!(
+            engine.reconcile_immutable(key, data.len() as u32, checksum, tag),
+            Err(Error::MetaError(_))
+        ));
+        write_meta(original.meta());
+        assert_eq!(
+            engine
+                .reconcile_immutable(key, data.len() as u32, checksum, tag,)
+                .unwrap()
+                .meta(),
+            original.meta()
+        );
+    }
+
+    #[test]
     fn test_engine_create_immutable_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = EngineConfig {
@@ -916,6 +1645,110 @@ mod tests {
             Error::ChunkAlreadyExists
         );
         assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_engine_create_immutable_context_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        };
+        let key = b"ec-context";
+        let data: Vec<u8> = (0..4097).map(|i| (i * 29 + 7) as u8).collect();
+        let checksum = crc32c::crc32c(&data);
+        let expected;
+        {
+            let engine = Engine::open(&config).unwrap();
+            // Include NUL and non-UTF-8 bytes: tags are opaque, bounded bytes.
+            let tag: Vec<u8> = (0..MAX_IMMUTABLE_ETAG_LEN)
+                .map(|i| (i * 13) as u8)
+                .collect();
+            let context = ImmutableCreateContext {
+                chain_ver: 17,
+                last_request_id: u64::MAX - 3,
+                last_client_low: 0x0123_4567_89ab_cdef,
+                last_client_high: 0xfedc_ba98_7654_3210,
+                desired_etag: &tag,
+            };
+            let chunk = engine
+                .create_immutable_with_context(key, &data, checksum, true, &context)
+                .unwrap();
+            expected = chunk.meta().clone();
+            assert_eq!(expected.chain_ver, context.chain_ver);
+            assert_eq!(expected.chunk_ver, 1);
+            assert_eq!(expected.last_request_id, context.last_request_id);
+            assert_eq!(expected.last_client_low, context.last_client_low);
+            assert_eq!(expected.last_client_high, context.last_client_high);
+            assert_eq!(expected.etag.as_slice(), tag);
+            assert!(!expected.uncommitted);
+            // Reusing a key cannot overwrite its already committed context.
+            assert_eq!(
+                engine
+                    .create_immutable_with_context(
+                        key,
+                        &data,
+                        checksum,
+                        true,
+                        &ImmutableCreateContext::default(),
+                    )
+                    .unwrap_err(),
+                Error::ChunkAlreadyExists
+            );
+            assert_eq!(engine.get(key).unwrap().unwrap().meta(), &expected);
+        }
+
+        // The tag input and original Engine are gone; all context fields must
+        // survive a clean reopen through the same metadata commit as the data.
+        config.create = false;
+        let engine = Engine::open(&config).unwrap();
+        let chunk = engine.get(key).unwrap().unwrap();
+        assert_eq!(chunk.meta(), &expected);
+        let mut actual = vec![0; data.len()];
+        chunk.pread(&mut actual, 0).unwrap();
+        assert_eq!(actual, data);
+        assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_engine_create_immutable_context_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        let tag = vec![0x5a; MAX_IMMUTABLE_ETAG_LEN + 1];
+        let invalid = ImmutableCreateContext {
+            desired_etag: &tag,
+            ..Default::default()
+        };
+        assert!(matches!(
+            engine.create_immutable_with_context(b"ec-invalid-tag", b"", 0, true, &invalid),
+            Err(Error::InvalidArg(_))
+        ));
+        assert_eq!(engine.metrics.allocate_times.load(Ordering::Acquire), 0);
+        assert_eq!(engine.used_size(), UsedSize::default());
+        assert!(engine.writing_list.is_empty());
+        assert!(engine.get(b"ec-invalid-tag").unwrap().is_none());
+
+        let chunk = engine
+            .create_immutable_with_context(
+                b"ec-zero-context",
+                b"",
+                0,
+                true,
+                &ImmutableCreateContext::default(),
+            )
+            .unwrap();
+        assert_eq!(chunk.meta().chain_ver, 0);
+        assert_eq!(chunk.meta().last_request_id, 0);
+        assert_eq!(chunk.meta().last_client_low, 0);
+        assert_eq!(chunk.meta().last_client_high, 0);
+        assert!(!chunk.meta().etag.is_empty());
+        assert!(chunk.meta().etag.len() <= 16);
     }
 
     #[test]
@@ -1109,6 +1942,7 @@ mod tests {
             chunk.pread(&mut actual, 0).unwrap();
             assert_eq!(actual, replacement);
             assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+            assert!(engine.retained_writing.lock().unwrap().is_empty());
         }
 
         // This is a deterministic refused write and clean reopen, not an
@@ -1120,6 +1954,138 @@ mod tests {
         chunk.pread(&mut actual, 0).unwrap();
         assert_eq!(actual, replacement);
         assert_eq!(chunk.meta().checksum, crc32c::crc32c(&replacement));
+        assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_engine_immutable_failed_log_replacement_retains_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = EngineConfig {
+            path: dir.path().join("engine"),
+            create: true,
+            prefix_len: 2,
+        };
+        std::fs::create_dir(&config.path).unwrap();
+        let stage_key = b"ec-retained-stage";
+        let live_key = b"ok-committed";
+        let initial_data = vec![0x19; 4097];
+        let stage_data = vec![0x35; 4097];
+        let live_data = vec![0xc7; 4097];
+        let old_position;
+        let live_position;
+        {
+            let mut engine = Engine::open(&config).unwrap();
+            // This real preparation leaves a synchronous writing log pointing
+            // to old_position. Dropping its owner aborts only the memory state.
+            let mut initial_request = UpdateReq {
+                length: initial_data.len() as u32,
+                checksum: crc32c::crc32c(&initial_data),
+                data: initial_data.as_ptr() as u64,
+                ..Default::default()
+            };
+            let pending = engine
+                .update_chunk(stage_key, &mut initial_request)
+                .unwrap();
+            old_position = pending.meta().pos;
+            assert_eq!(old_position.chunk_size(), CHUNK_SIZE_SMALL);
+            drop(pending);
+
+            let mut readonly_config = MetaStoreConfig {
+                rocksdb: RocksDBConfig {
+                    path: dir.path().join("readonly-meta"),
+                    create: true,
+                    ..Default::default()
+                },
+                prefix_len: config.prefix_len,
+            };
+            drop(MetaStore::open(&readonly_config).unwrap());
+            readonly_config.rocksdb.create = false;
+            readonly_config.rocksdb.read_only = true;
+            let writable = std::mem::replace(
+                &mut engine.meta_store,
+                Arc::new(MetaStore::open(&readonly_config).unwrap()),
+            );
+
+            // Each replacement gets a new allocation, but its actual log put
+            // fails. The original on-disk log must retain exclusive use of its
+            // position regardless of how many replacements were attempted.
+            for attempt in 1..=MAX_RETAINED_WRITING_PER_KEY {
+                assert!(matches!(
+                    engine.create_immutable(
+                        stage_key,
+                        &stage_data,
+                        crc32c::crc32c(&stage_data),
+                        true,
+                    ),
+                    Err(Error::RocksDBError(_))
+                ));
+                let retained = engine.retained_writing.lock().unwrap();
+                let candidates = retained.get(stage_key.as_slice()).unwrap();
+                assert_eq!(candidates.len(), attempt);
+                assert_eq!(candidates[0].meta().pos, old_position);
+                assert!(candidates.iter().all(
+                    |candidate| candidate.meta().pos.chunk_size() == old_position.chunk_size()
+                ));
+            }
+            let allocations = engine.metrics.allocate_times.load(Ordering::Acquire);
+            assert!(matches!(
+                engine.create_immutable(
+                    stage_key,
+                    &stage_data,
+                    crc32c::crc32c(&stage_data),
+                    true,
+                ),
+                Err(Error::InvalidArg(message)) if message.contains("retention limit")
+            ));
+            assert_eq!(
+                engine.metrics.allocate_times.load(Ordering::Acquire),
+                allocations
+            );
+
+            engine.meta_store = writable;
+            let live = engine
+                .create_immutable(live_key, &live_data, crc32c::crc32c(&live_data), true)
+                .unwrap();
+            live_position = live.meta().pos;
+            assert_eq!(live_position.chunk_size(), old_position.chunk_size());
+            let retained = engine.retained_writing.lock().unwrap();
+            for candidate in retained.get(stage_key.as_slice()).unwrap() {
+                assert_ne!(live_position, candidate.meta().pos);
+            }
+        }
+
+        // Clean reopen deterministically exercises the old durable log and
+        // allocator recovery. This is not a physical power-loss experiment.
+        config.create = false;
+        {
+            let engine = Engine::open(&config).unwrap();
+            assert!(engine.retained_writing.lock().unwrap().is_empty());
+            let staged = engine.query_uncommitted_chunks(b"ec").unwrap();
+            assert_eq!(staged.len(), 1);
+            assert_eq!(staged[0].1.pos, old_position);
+            assert!(engine.get(stage_key).unwrap().is_none());
+            let live = engine.get(live_key).unwrap().unwrap();
+            assert_eq!(live.meta().pos, live_position);
+            let mut actual = vec![0; live_data.len()];
+            live.pread(&mut actual, 0).unwrap();
+            assert_eq!(actual, live_data);
+
+            engine
+                .create_immutable(stage_key, &stage_data, crc32c::crc32c(&stage_data), true)
+                .unwrap();
+            assert!(engine.retained_writing.lock().unwrap().is_empty());
+            assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+        }
+        let engine = Engine::open(&config).unwrap();
+        for (key, expected) in [
+            (stage_key.as_slice(), &stage_data),
+            (live_key.as_slice(), &live_data),
+        ] {
+            let chunk = engine.get(key).unwrap().unwrap();
+            let mut actual = vec![0; expected.len()];
+            chunk.pread(&mut actual, 0).unwrap();
+            assert_eq!(&actual, expected);
+        }
         assert!(engine.query_uncommitted_chunks(b"ec").unwrap().is_empty());
     }
 

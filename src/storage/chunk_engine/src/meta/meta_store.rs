@@ -140,6 +140,12 @@ impl MetaStore {
         self.rocksdb.write(write_batch, sync)
     }
 
+    /// Synchronize existing metadata records; do not repeat allocation or size
+    /// accounting updates while reconfirming an immutable committed object.
+    pub fn sync_wal(&self) -> Result<()> {
+        self.rocksdb.sync_wal()
+    }
+
     pub fn add_chunk(&self, chunk_id: &[u8], chunk_meta: &ChunkMeta, sync: bool) -> Result<()> {
         let mut write_batch = RocksDB::new_write_batch();
         self.add_chunk_mut(chunk_id, chunk_meta, &mut write_batch)?;

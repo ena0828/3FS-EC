@@ -58,6 +58,10 @@ impl Chunk {
         self.meta.chain_ver = chain_ver;
     }
 
+    pub(crate) fn set_etag(&mut self, etag: &[u8]) {
+        self.meta.etag = etag.into();
+    }
+
     pub fn set_committed(&mut self) {
         self.meta.uncommitted = false;
     }

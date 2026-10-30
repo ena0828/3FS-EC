@@ -88,6 +88,13 @@ impl RocksDB {
         }
     }
 
+    /// Explicitly flush and synchronize the WAL without replaying mutations.
+    pub fn sync_wal(&self) -> Result<()> {
+        self.db
+            .flush_wal(true)
+            .map_err(|error| Error::RocksDBError(format!("sync RocksDB WAL failed: {error}")))
+    }
+
     pub fn new_iterator(&self) -> RocksDBIterator {
         let mut read_options = rocksdb::ReadOptions::default();
         read_options.set_readahead_size(Size::mebibyte(4).into());
