@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["src/storage/ec"]
 members = [
   "src/client/trash_cleaner",
   "src/storage/chunk_engine",
