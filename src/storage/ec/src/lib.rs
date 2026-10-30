@@ -1,12 +1,16 @@
 //! Erasure coding, helper contributions, bounded concurrent shard selection,
-//! and a local read/compute/write pipeline.
+//! a local read/compute/write pipeline, and fixed TCP helper chains.
 //!
-//! This crate does not implement distributed repair, CRAQ, or stripe metadata.
+//! The TCP executor requires trusted, preinstalled plans and a storage adapter.
+//! It does not implement native 3FS RPC, CRAQ, or stripe metadata publication.
+pub mod chain;
 mod codec;
 #[cfg(feature = "isal-backend")]
 mod isal;
 mod pipeline;
 pub mod read;
+pub mod transport;
+pub mod wire;
 
 pub use codec::{Backend, Codec, ContributionPlan, RepairPlan};
 pub use pipeline::{repair_pipeline, repair_sequential, PipelineConfig, RepairStats, ShardStore};
