@@ -21,12 +21,14 @@ class EcAdmissionJob {
                  std::shared_ptr<EcScope> scope,
                  std::shared_ptr<EcWorkerSession> session,
                  std::shared_ptr<StorageTarget> target,
-                 std::function<Result<Void>()> validate)
+                 std::function<Result<Void>()> validate,
+                 std::function<Result<uint32_t>()> waitBudget = {})
       : binding_(binding),
         scope_(std::move(scope)),
         session_(std::move(session)),
         target_(std::move(target)),
-        validate_(std::move(validate)) {}
+        validate_(std::move(validate)),
+        waitBudget_(std::move(waitBudget)) {}
   EcAdmissionJob(const EcAdmissionJob &) = delete;
   EcAdmissionJob &operator=(const EcAdmissionJob &) = delete;
   ~EcAdmissionJob() {
@@ -53,6 +55,7 @@ class EcAdmissionJob {
   std::shared_ptr<EcWorkerSession> session_;
   std::shared_ptr<StorageTarget> target_;
   std::function<Result<Void>()> validate_;
+  std::function<Result<uint32_t>()> waitBudget_;
   Result<EcScopeTicket> result_{makeError(StorageClientCode::kNotInitialized)};
   std::atomic<bool> submitted_{false};
   mutable std::atomic<bool> observedCompletion_{false};

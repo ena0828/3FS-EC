@@ -321,7 +321,9 @@ CoTryTask<Void> MetaClient::waitRoutingInfo(const Rsp &rsp, const RetryConfig &r
   // EC responses use explicit native placements, not replicated chain tables.
   // StorageClient checks their current routing at each data operation.
   if constexpr (std::is_same_v<Rsp, CreateEcFileRsp> || std::is_same_v<Rsp, EcOperationRsp> ||
-                std::is_same_v<Rsp, AcquireEcReadRsp> || std::is_same_v<Rsp, ReleaseEcReadRsp>) {
+                std::is_same_v<Rsp, AcquireEcReadRsp> || std::is_same_v<Rsp, ReleaseEcReadRsp> ||
+                std::is_same_v<Rsp, EcV2MutationRsp> || std::is_same_v<Rsp, AcquireEcReadV2Rsp> ||
+                std::is_same_v<Rsp, ReleaseEcReadV2Rsp> || std::is_same_v<Rsp, PrepareEcRepairV2Rsp>) {
     co_return Void{};
   }
   auto begin = SteadyClock::now();
@@ -505,6 +507,43 @@ CoTryTask<void> MetaClient::updateLayout(Layout &layout) {
 CoTryTask<UserInfo> MetaClient::authenticate(const UserInfo &userInfo) {
   auto req = AuthReq(userInfo);
   co_return (co_await retry(&IMetaServiceStub::authenticate, req)).then(EXTRACT(user));
+}
+
+CoTryTask<CreateEcFileRsp> MetaClient::createEcFileV2(CreateEcFileV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  co_return co_await retry(&IMetaServiceStub::createEcFileV2, req);
+}
+CoTryTask<EcV2MutationRsp> MetaClient::beginEcMutationV2(BeginEcMutationV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  co_return co_await retry(&IMetaServiceStub::beginEcMutationV2, req);
+}
+CoTryTask<EcV2MutationRsp> MetaClient::bindEcMutationV2(BindEcMutationV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  co_return co_await retry(&IMetaServiceStub::bindEcMutationV2, req);
+}
+CoTryTask<EcV2MutationRsp> MetaClient::publishEcMutationV2(PublishEcMutationV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  co_return co_await retry(&IMetaServiceStub::publishEcMutationV2, req);
+}
+CoTryTask<EcV2MutationRsp> MetaClient::getEcOperationV2(GetEcOperationV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  co_return co_await retry(&IMetaServiceStub::getEcOperationV2, req);
+}
+CoTryTask<EcV2MutationRsp> MetaClient::cancelEcMutationV2(CancelEcMutationV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  co_return co_await retry(&IMetaServiceStub::cancelEcMutationV2, req);
+}
+CoTryTask<AcquireEcReadV2Rsp> MetaClient::acquireEcReadV2(AcquireEcReadV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  co_return co_await retry(&IMetaServiceStub::acquireEcReadV2, req);
+}
+CoTryTask<PrepareEcRepairV2Rsp> MetaClient::prepareEcRepairV2(PrepareEcRepairV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  co_return co_await retry(&IMetaServiceStub::prepareEcRepairV2, req);
+}
+CoTryTask<ReleaseEcReadV2Rsp> MetaClient::releaseEcReadV2(ReleaseEcReadV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  co_return co_await retry(&IMetaServiceStub::releaseEcReadV2, req);
 }
 
 CoTryTask<CreateEcFileRsp> MetaClient::createEcFile(CreateEcFileReq req) {

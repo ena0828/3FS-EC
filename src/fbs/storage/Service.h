@@ -4,6 +4,7 @@
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
 
@@ -39,6 +40,7 @@ SERDE_SERVICE(StorageSerde, 3) {
   SERDE_SERVICE_METHOD(queryEcStageV2, 43, EcQueryStageV2Req, EcStageV2Rsp);
   SERDE_SERVICE_METHOD(reconcileEcStageV2, 44, EcReconcileStageV2Req, EcStageV2Rsp);
   SERDE_SERVICE_METHOD(sealEcStageV2, 45, EcSealStageV2Req, EcSealStageV2Rsp);
+  SERDE_SERVICE_METHOD(executeEcHelper, 46, EcHelperHopReq, EcHelperHopRsp);
 };
 
 }  // namespace hf3fs::storage

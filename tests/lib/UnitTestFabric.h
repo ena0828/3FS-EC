@@ -1,5 +1,6 @@
 #pragma once
 
+#include <folly/Synchronized.h>
 #include <map>
 #include <vector>
 
@@ -23,9 +24,13 @@ class FakeMgmtdClient : public hf3fs::client::IMgmtdClientForClient, public hf3f
   std::shared_ptr<hf3fs::client::RoutingInfo> getRoutingInfo() override { return routingInfo_.load(); }
 
   void setRoutingInfo(std::shared_ptr<hf3fs::flat::RoutingInfo> routingInfo) {
-    routingInfo_.store(std::make_shared<hf3fs::client::RoutingInfo>(routingInfo, SteadyClock::now()));
-    for (auto &listener : listeners_) {
-      listener(routingInfo_.load());
+    auto next = std::make_shared<hf3fs::client::RoutingInfo>(routingInfo, SteadyClock::now());
+    routingInfo_.store(next);
+    // Match MgmtdClient: removal waits for callbacks already running under
+    // this read lock. Listeners must not add/remove listeners recursively.
+    auto listeners = listeners_.rlock();
+    for (const auto &[_, listener] : *listeners) {
+      listener(next);
     }
   }
 
@@ -49,12 +54,18 @@ class FakeMgmtdClient : public hf3fs::client::IMgmtdClientForClient, public hf3f
 
   void setAppInfoForHeartbeat(flat::AppInfo) override {}
 
-  bool addRoutingInfoListener(String, RoutingInfoListener listener) override {
-    listeners_.push_back(listener);
-    return true;
+  bool addRoutingInfoListener(String name, RoutingInfoListener listener) override {
+    auto listeners = listeners_.wlock();
+    return listeners->try_emplace(std::move(name), std::move(listener)).second;
   }
 
-  bool removeRoutingInfoListener(std::string_view) override { return true; }
+  bool removeRoutingInfoListener(std::string_view name) override {
+    auto listeners = listeners_.wlock();
+    auto it = listeners->find(name);
+    if (it == listeners->end()) return false;
+    listeners->erase(it);
+    return true;
+  }
 
   void setConfigListener(ConfigListener) override {}
 
@@ -80,7 +91,7 @@ class FakeMgmtdClient : public hf3fs::client::IMgmtdClientForClient, public hf3f
 
  private:
   folly::atomic_shared_ptr<hf3fs::client::RoutingInfo> routingInfo_;
-  std::vector<RoutingInfoListener> listeners_;
+  folly::Synchronized<std::map<String, RoutingInfoListener, std::less<>>> listeners_;
 };
 
 struct SystemSetupConfig : public ConfigBase<SystemSetupConfig> {

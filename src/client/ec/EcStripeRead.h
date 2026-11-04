@@ -64,6 +64,7 @@ struct EcStripeSelection {
 
  private:
   friend class EcStripeRead;
+  friend struct detail::EcReadState;
   // Shared with outstanding attempts until cleanup, and retained with output.
   std::shared_ptr<const detail::EcReadReservation> payloadReservation;
 };

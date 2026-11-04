@@ -149,6 +149,11 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.reconcileEcStageV2(request);
   }
 
+  CoTryTask<EcHelperHopRsp> executeEcHelper(serde::CallContext &ctx, const EcHelperHopReq &request) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.executeEcHelper(request);
+  }
+
   CoTryTask<EcSealStageV2Rsp> sealEcStageV2(serde::CallContext &ctx, const EcSealStageV2Req &request) {
     reportUpdateQueueLatency(ctx);
     return storageOperator_.sealEcStageV2(request);

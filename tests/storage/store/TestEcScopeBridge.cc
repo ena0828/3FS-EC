@@ -13,6 +13,7 @@
 #include <type_traits>
 
 #include "storage/ec_scope/EcScope.h"
+#include "storage/ec_scope/EcScopeLoadBudget.h"
 #include "storage/store/StorageTargets.h"
 #include "storage/update/EcAdmissionJob.h"
 #include "storage/update/UpdateWorker.h"
@@ -541,5 +542,77 @@ TEST_F(TestEcScopeBridge, DuplicateSubmissionToDifferentWorkerFailsBeforePosting
     folly::coro::blockingWait(other.enqueue(&job));
   }, "");
 }
+TEST(TestEcScopeLoadBudget, RejectsInvalidLimitAndExpiredGrant) {
+  const auto start = EcScopeLoadBudget::Clock::time_point{};
+  EcScopeLoadBudget budget{1001, start, std::nullopt};
+  ASSERT_ERROR(budget.remaining(start, 1030, 1000), StatusCode::kInvalidConfig);
+  budget.milliseconds = 250;
+  ASSERT_ERROR(budget.remaining(start, 1000, 1000), StatusCode::kAuthenticationFail);
+}
+
+TEST(TestEcScopeLoadBudget, QueuedTimeConsumesOnlyExtraWaitBudget) {
+  const auto start = EcScopeLoadBudget::Clock::time_point{};
+  EcScopeLoadBudget budget{250, start, std::nullopt};
+  ASSERT_RESULT_EQ(250u, budget.remaining(start, 1030, 1000));
+  ASSERT_RESULT_EQ(150u, budget.remaining(start + 100ms, 1030, 1000));
+  ASSERT_RESULT_EQ(0u, budget.remaining(start + 250ms, 1030, 1000));
+  ASSERT_RESULT_EQ(0u, budget.remaining(start + 1s, 1030, 1000));
+}
+
+TEST(TestEcScopeLoadBudget, ZeroIsNonwaitingButDoesNotIgnoreActualDeadlineOrExpiry) {
+  const auto start = EcScopeLoadBudget::Clock::time_point{};
+  EcScopeLoadBudget budget{0, start, std::nullopt};
+  ASSERT_RESULT_EQ(0u, budget.remaining(start + 1s, 1030, 1000));
+  budget.requestDeadline = start + 2s;
+  ASSERT_ERROR(budget.remaining(start + 2s, 1030, 1000), StorageClientCode::kTimeout);
+  ASSERT_ERROR(budget.remaining(start, 1000, 1000), StatusCode::kAuthenticationFail);
+}
+
+TEST(TestEcScopeLoadBudget, KnownHelperDeadlineRemainsDistinctFromExtraWaitBudget) {
+  const auto start = EcScopeLoadBudget::Clock::time_point{};
+  EcScopeLoadBudget budget{250, start, start + 100ms};
+  ASSERT_RESULT_EQ(60u, budget.remaining(start + 40ms, 1030, 1000));
+  ASSERT_ERROR(budget.remaining(start + 100ms, 1030, 1000), StorageClientCode::kTimeout);
+  budget.requestDeadline.reset();
+  ASSERT_RESULT_EQ(0u, budget.remaining(start + 251ms, 1030, 1000));
+}
+
+TEST_F(TestEcScopeBridge, QueuedWaitBudgetDoesNotBecomeAnAdmissionDeadline) {
+  auto session = worker->acquireEcSession();
+  ASSERT_OK(session);
+  const auto start = EcScopeLoadBudget::Clock::time_point{};
+  EcScopeLoadBudget budget{250, start, std::nullopt};
+  // A deterministic queue barrier consumes the local waiting allowance. Test
+  // both an already loaded scope and the unchanged synchronous first loader.
+  for (const bool warm : {true, false}) {
+    const auto value = binding(warm ? 10 : 11);
+    if (warm) {
+      ASSERT_OK(scope->prepare(value));
+    }
+    WorkerBarrier barrier;
+    std::atomic<int64_t> elapsedMillis{0};
+    std::atomic<uint32_t> observedWait{1001};
+    EcAdmissionJob blocker(binding(warm ? 8 : 9), scope, *session, store, [&] { return barrier.wait(); });
+    EcAdmissionJob queued(value, scope, *session, store, valid, [&]() -> Result<uint32_t> {
+      CHECK_RESULT(wait, budget.remaining(start + std::chrono::milliseconds(elapsedMillis.load()), 1030, 1000));
+      observedWait.store(wait);
+      return wait;
+    });
+    folly::coro::blockingWait(worker->enqueue(&blocker));
+    barrier.entered.get_future().wait();
+    folly::coro::blockingWait(worker->enqueue(&queued));
+    elapsedMillis.store(251);
+    barrier.release();
+    folly::coro::blockingWait(blocker.complete());
+    folly::coro::blockingWait(queued.complete());
+    auto blockerTicket = blocker.takeTicket();
+    auto queuedTicket = queued.takeTicket();
+    ASSERT_OK(blockerTicket);
+    ASSERT_EQ(observedWait.load(), 0u);
+    ASSERT_OK(queuedTicket);
+    ASSERT_OK(queuedTicket->checkExecution());
+  }
+}
+
 }  // namespace
 }  // namespace hf3fs::storage

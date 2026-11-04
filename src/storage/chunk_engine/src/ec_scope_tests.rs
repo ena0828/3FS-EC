@@ -1,8 +1,8 @@
 use super::*;
 use crate::{EngineConfig, MetaStoreConfig, RocksDBConfig};
+use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::io::Write;
 use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
@@ -48,15 +48,24 @@ fn revoke(binding: EcScopeBinding) -> EcScopeRevocation {
 
 fn fixture(max_gates: usize) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let registry = Arc::new(EcScopeRegistry::open(store(dir.path(), true), true, max_gates).unwrap());
+    let registry =
+        Arc::new(EcScopeRegistry::open(store(dir.path(), true), true, max_gates).unwrap());
     let target = registry.register_target(11, 21).unwrap();
-    Fixture { registry, binding: binding(target), _dir: dir }
+    Fixture {
+        registry,
+        binding: binding(target),
+        _dir: dir,
+    }
 }
 
 #[test]
 fn engine_and_target_identity_survive_reopen_and_engine_clones_share_gate() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = EngineConfig { path: dir.path().into(), create: true, prefix_len: 4 };
+    let mut config = EngineConfig {
+        path: dir.path().into(),
+        create: true,
+        prefix_len: 4,
+    };
     let identity;
     let target;
     {
@@ -71,8 +80,15 @@ fn engine_and_target_identity_survive_reopen_and_engine_clones_share_gate() {
         registry.prepare_scope(scope).unwrap();
         let ticket = registry.try_admit(scope).unwrap();
         assert_eq!(
-            cloned.ec_scope_registry().unwrap().revoke(revoke(scope)).unwrap(),
-            EcDrainStatus::Pending { inflight: 1, durable: true }
+            cloned
+                .ec_scope_registry()
+                .unwrap()
+                .revoke(revoke(scope))
+                .unwrap(),
+            EcDrainStatus::Pending {
+                inflight: 1,
+                durable: true
+            }
         );
         ticket.complete();
     }
@@ -81,48 +97,78 @@ fn engine_and_target_identity_survive_reopen_and_engine_clones_share_gate() {
     let registry = engine.ec_scope_registry().unwrap();
     assert_eq!(registry.engine_identity(), identity);
     assert_eq!(registry.load_target(11, 21).unwrap(), target);
-    assert_eq!(registry.prepare_scope(binding(target)), Err(EcScopeError::Revoked));
-    assert_eq!(registry.drain_status(revoke(binding(target))).unwrap(), EcDrainStatus::Drained);
+    assert_eq!(
+        registry.prepare_scope(binding(target)),
+        Err(EcScopeError::Revoked)
+    );
+    assert_eq!(
+        registry.drain_status(revoke(binding(target))).unwrap(),
+        EcDrainStatus::Drained
+    );
 }
 
 #[test]
 fn missing_or_corrupt_identity_is_not_reinitialized() {
     let dir = tempfile::tempdir().unwrap();
     let meta = store(dir.path(), true);
-    assert!(matches!(EcScopeRegistry::open(meta.clone(), false, 4), Err(EcScopeError::MissingIdentity)));
+    assert!(matches!(
+        EcScopeRegistry::open(meta.clone(), false, 4),
+        Err(EcScopeError::MissingIdentity)
+    ));
     let registry = EcScopeRegistry::open(meta.clone(), true, 4).unwrap();
     let identity = registry.engine_identity();
     assert_ne!(identity, [0; 16]);
     let mut bytes = encode_engine(identity);
     bytes[6] ^= 1;
     put_sync(&meta, &[ENGINE_PREFIX], &bytes).unwrap();
-    assert!(matches!(EcScopeRegistry::open(meta, true, 4), Err(EcScopeError::Corrupt(_))));
+    assert!(matches!(
+        EcScopeRegistry::open(meta, true, 4),
+        Err(EcScopeError::Corrupt(_))
+    ));
 }
 
 #[test]
 fn existing_engine_without_scope_schema_fails_closed_even_when_create_was_requested() {
     let dir = tempfile::tempdir().unwrap();
-    let config = EngineConfig { path: dir.path().into(), create: true, prefix_len: 4 };
+    let config = EngineConfig {
+        path: dir.path().into(),
+        create: true,
+        prefix_len: 4,
+    };
     drop(Engine::open(&config).unwrap());
     // Existing metadata must not be treated as new just because a caller uses
     // create=true. No identity was initialized before the first process ended.
     let engine = Engine::open(&config).unwrap();
-    assert!(matches!(engine.ec_scope_registry(), Err(EcScopeError::MissingIdentity)));
+    assert!(matches!(
+        engine.ec_scope_registry(),
+        Err(EcScopeError::MissingIdentity)
+    ));
 }
 
 #[test]
 fn namespace_sync_failure_does_not_publish_a_registry_or_change_identity_on_retry() {
     let dir = tempfile::tempdir().unwrap();
-    let config = EngineConfig { path: dir.path().into(), create: true, prefix_len: 4 };
+    let config = EngineConfig {
+        path: dir.path().into(),
+        create: true,
+        prefix_len: 4,
+    };
     let engine = Engine::open(&config).unwrap();
     let result = engine.ec_scope_registry_with(|| {
-        Err(EcScopeError::Storage(Error::IoError("injected namespace sync failure".into())))
+        Err(EcScopeError::Storage(Error::IoError(
+            "injected namespace sync failure".into(),
+        )))
     });
     assert!(result.is_err());
     assert!(engine.ec_scope_bootstrap.registry.lock().unwrap().is_none());
-    let bytes = exact_get(&engine.meta_store, &[ENGINE_PREFIX]).unwrap().unwrap();
+    let bytes = exact_get(&engine.meta_store, &[ENGINE_PREFIX])
+        .unwrap()
+        .unwrap();
     let persisted = decode_engine(&bytes).unwrap();
-    assert_eq!(engine.ec_scope_registry().unwrap().engine_identity(), persisted);
+    assert_eq!(
+        engine.ec_scope_registry().unwrap().engine_identity(),
+        persisted
+    );
 }
 
 #[test]
@@ -131,8 +177,14 @@ fn record_extents_versions_crc_and_target_incarnation_are_checked() {
     let request = revoke(fixture.binding);
     let bytes = encode_fence(request);
     assert_eq!(bytes.len(), FENCE_RECORD_BYTES);
-    assert_eq!(encode_target(fixture.binding.target).len(), TARGET_RECORD_BYTES);
-    assert_eq!(encode_engine(fixture.binding.target.engine).len(), ENGINE_RECORD_BYTES);
+    assert_eq!(
+        encode_target(fixture.binding.target).len(),
+        TARGET_RECORD_BYTES
+    );
+    assert_eq!(
+        encode_engine(fixture.binding.target.engine).len(),
+        ENGINE_RECORD_BYTES
+    );
     assert_eq!(decode_fence(&bytes).unwrap(), request);
     for length in 0..bytes.len() {
         assert!(decode_fence(&bytes[..length]).is_err());
@@ -147,10 +199,19 @@ fn record_extents_versions_crc_and_target_incarnation_are_checked() {
     assert!(decode_fence(&oversized).is_err());
     let mut wrong = fixture.binding;
     wrong.target.incarnation[0] ^= 1;
-    assert_eq!(fixture.registry.prepare_scope(wrong), Err(EcScopeError::IdentityMismatch));
+    assert_eq!(
+        fixture.registry.prepare_scope(wrong),
+        Err(EcScopeError::IdentityMismatch)
+    );
     let another = self::fixture(8);
-    assert_ne!(another.registry.engine_identity(), fixture.registry.engine_identity());
-    assert_eq!(another.registry.prepare_scope(fixture.binding), Err(EcScopeError::IdentityMismatch));
+    assert_ne!(
+        another.registry.engine_identity(),
+        fixture.registry.engine_identity()
+    );
+    assert_eq!(
+        another.registry.prepare_scope(fixture.binding),
+        Err(EcScopeError::IdentityMismatch)
+    );
 }
 
 #[test]
@@ -166,12 +227,22 @@ fn target_identity_read_requires_successful_wal_confirmation() {
     // A genuinely visible asynchronous record has not yielded a synchronous
     // registration acknowledgment. Fail its read-side confirmation explicitly.
     let mut batch = RocksDB::new_write_batch();
-    batch.put(target_key(target.chain, target.target), encode_target(target));
+    batch.put(
+        target_key(target.chain, target.target),
+        encode_target(target),
+    );
     registry.store.write(batch, false).unwrap();
-    assert!(registry.load_target_with(target.chain, target.target, |_| {
-        Err(EcScopeError::Storage(Error::IoError("injected target WAL confirmation failure".into())))
-    }).is_err());
-    assert_eq!(registry.load_target(target.chain, target.target).unwrap(), target);
+    assert!(registry
+        .load_target_with(target.chain, target.target, |_| {
+            Err(EcScopeError::Storage(Error::IoError(
+                "injected target WAL confirmation failure".into(),
+            )))
+        })
+        .is_err());
+    assert_eq!(
+        registry.load_target(target.chain, target.target).unwrap(),
+        target
+    );
     let scope = binding(target);
     registry.prepare_scope(scope).unwrap();
     registry.try_admit(scope).unwrap().complete();
@@ -190,13 +261,31 @@ fn queued_and_executing_jobs_hold_drain_until_both_complete() {
     let request = revoke(scope);
     // Called on the same thread while both tickets are held: this must return,
     // rather than wait for jobs that may be behind it on a single worker.
-    assert_eq!(registry.revoke(request).unwrap(), EcDrainStatus::Pending { inflight: 2, durable: true });
-    assert!(matches!(registry.try_admit(scope), Err(EcScopeError::Revoked)));
+    assert_eq!(
+        registry.revoke(request).unwrap(),
+        EcDrainStatus::Pending {
+            inflight: 2,
+            durable: true
+        }
+    );
+    assert!(matches!(
+        registry.try_admit(scope),
+        Err(EcScopeError::Revoked)
+    ));
     assert_eq!(queued.check_execution(), Err(EcScopeError::Revoked));
     queued.complete();
-    assert_eq!(registry.drain_status(request).unwrap(), EcDrainStatus::Pending { inflight: 1, durable: true });
+    assert_eq!(
+        registry.drain_status(request).unwrap(),
+        EcDrainStatus::Pending {
+            inflight: 1,
+            durable: true
+        }
+    );
     executing.complete();
-    assert_eq!(registry.drain_status(request).unwrap(), EcDrainStatus::Drained);
+    assert_eq!(
+        registry.drain_status(request).unwrap(),
+        EcDrainStatus::Drained
+    );
     assert_eq!(registry.revoke(request).unwrap(), EcDrainStatus::Drained);
 }
 
@@ -230,11 +319,17 @@ fn admission_and_closing_race_accounts_for_every_success_once() {
     let expected = if admitted.is_empty() {
         EcDrainStatus::Drained
     } else {
-        EcDrainStatus::Pending { inflight: admitted.len() as u64, durable: true }
+        EcDrainStatus::Pending {
+            inflight: admitted.len() as u64,
+            durable: true,
+        }
     };
     assert_eq!(registry.drain_status(request).unwrap(), expected);
     drop(admitted);
-    assert_eq!(registry.drain_status(request).unwrap(), EcDrainStatus::Drained);
+    assert_eq!(
+        registry.drain_status(request).unwrap(),
+        EcDrainStatus::Drained
+    );
 }
 
 #[test]
@@ -251,17 +346,34 @@ fn closing_blocks_new_admission_before_the_durable_write() {
         let registry = registry.clone();
         let entered = entered.clone();
         let proceed = proceed.clone();
-        std::thread::spawn(move || registry.revoke_with(request, |registry, request| {
-            entered.wait();
-            proceed.wait();
-            registry.persist_fence(request)
-        }))
+        std::thread::spawn(move || {
+            registry.revoke_with(request, |registry, request| {
+                entered.wait();
+                proceed.wait();
+                registry.persist_fence(request)
+            })
+        })
     };
     entered.wait();
-    assert!(matches!(registry.try_admit(scope), Err(EcScopeError::Revoked)));
-    assert_eq!(registry.drain_status(request).unwrap(), EcDrainStatus::Pending { inflight: 1, durable: false });
+    assert!(matches!(
+        registry.try_admit(scope),
+        Err(EcScopeError::Revoked)
+    ));
+    assert_eq!(
+        registry.drain_status(request).unwrap(),
+        EcDrainStatus::Pending {
+            inflight: 1,
+            durable: false
+        }
+    );
     ticket.complete();
-    assert_eq!(registry.drain_status(request).unwrap(), EcDrainStatus::Pending { inflight: 0, durable: false });
+    assert_eq!(
+        registry.drain_status(request).unwrap(),
+        EcDrainStatus::Pending {
+            inflight: 0,
+            durable: false
+        }
+    );
     proceed.wait();
     assert_eq!(worker.join().unwrap().unwrap(), EcDrainStatus::Drained);
 }
@@ -277,19 +389,27 @@ fn stale_negative_lookup_cannot_reopen_a_revoked_scope() {
         let registry = registry.clone();
         let loaded = loaded.clone();
         let proceed = proceed.clone();
-        std::thread::spawn(move || registry.prepare_with(scope, |registry, binding| {
-            let result = registry.load_fence(binding)?;
-            assert!(result.is_none());
-            loaded.wait();
-            proceed.wait();
-            Ok(result)
-        }))
+        std::thread::spawn(move || {
+            registry.prepare_with(scope, |registry, binding| {
+                let result = registry.load_fence(binding)?;
+                assert!(result.is_none());
+                loaded.wait();
+                proceed.wait();
+                Ok(result)
+            })
+        })
     };
     loaded.wait();
-    assert_eq!(registry.revoke(revoke(scope)).unwrap(), EcDrainStatus::Drained);
+    assert_eq!(
+        registry.revoke(revoke(scope)).unwrap(),
+        EcDrainStatus::Drained
+    );
     proceed.wait();
     assert_eq!(worker.join().unwrap(), Err(EcScopeError::Revoked));
-    assert!(matches!(registry.try_admit(scope), Err(EcScopeError::Revoked)));
+    assert!(matches!(
+        registry.try_admit(scope),
+        Err(EcScopeError::Revoked)
+    ));
 }
 
 #[test]
@@ -303,11 +423,22 @@ fn failure_before_or_after_persist_never_manufactures_a_durable_ack() {
             if persist_first {
                 registry.persist_fence(request)?;
             }
-            Err(EcScopeError::Storage(Error::IoError("injected completion failure".into())))
+            Err(EcScopeError::Storage(Error::IoError(
+                "injected completion failure".into(),
+            )))
         });
         assert!(result.is_err());
-        assert_eq!(registry.drain_status(request).unwrap(), EcDrainStatus::Pending { inflight: 0, durable: false });
-        assert!(matches!(registry.try_admit(fixture.binding), Err(EcScopeError::Revoked)));
+        assert_eq!(
+            registry.drain_status(request).unwrap(),
+            EcDrainStatus::Pending {
+                inflight: 0,
+                durable: false
+            }
+        );
+        assert!(matches!(
+            registry.try_admit(fixture.binding),
+            Err(EcScopeError::Revoked)
+        ));
         assert_eq!(registry.revoke(request).unwrap(), EcDrainStatus::Drained);
     }
 }
@@ -320,14 +451,26 @@ fn changed_owner_or_revocation_never_bypasses_the_original_scope() {
     assert_eq!(registry.revoke(request).unwrap(), EcDrainStatus::Drained);
     let mut wrong = request;
     wrong.id[0] ^= 1;
-    assert_eq!(registry.revoke(wrong), Err(EcScopeError::RevocationMismatch));
-    assert_eq!(registry.drain_status(wrong), Err(EcScopeError::RevocationMismatch));
+    assert_eq!(
+        registry.revoke(wrong),
+        Err(EcScopeError::RevocationMismatch)
+    );
+    assert_eq!(
+        registry.drain_status(wrong),
+        Err(EcScopeError::RevocationMismatch)
+    );
     wrong = request;
     wrong.binding.owner_uid += 1;
-    assert_eq!(registry.prepare_scope(wrong.binding), Err(EcScopeError::IdentityMismatch));
+    assert_eq!(
+        registry.prepare_scope(wrong.binding),
+        Err(EcScopeError::IdentityMismatch)
+    );
     wrong = request;
     wrong.endpoint_set_digest[0] ^= 1;
-    assert_eq!(registry.revoke(wrong), Err(EcScopeError::RevocationMismatch));
+    assert_eq!(
+        registry.revoke(wrong),
+        Err(EcScopeError::RevocationMismatch)
+    );
 }
 
 #[test]
@@ -342,16 +485,34 @@ fn cold_cache_preserves_original_revoke_and_corrupt_records_never_open() {
     let registry = EcScopeRegistry::open(store(dir.path(), false), false, 8).unwrap();
     let mut wrong = request;
     wrong.id[0] ^= 1;
-    assert_eq!(registry.revoke(wrong), Err(EcScopeError::RevocationMismatch));
-    assert_eq!(registry.drain_status(request).unwrap(), EcDrainStatus::Drained);
+    assert_eq!(
+        registry.revoke(wrong),
+        Err(EcScopeError::RevocationMismatch)
+    );
+    assert_eq!(
+        registry.drain_status(request).unwrap(),
+        EcDrainStatus::Drained
+    );
     let mut corrupt_scope = request.binding;
     corrupt_scope.scope = [9; 16];
     put_sync(&registry.store, &corrupt_scope.key(), b"bad fence record").unwrap();
-    assert!(matches!(registry.prepare_scope(corrupt_scope), Err(EcScopeError::Corrupt(_))));
-    assert!(matches!(registry.try_admit(corrupt_scope), Err(EcScopeError::Busy)));
+    assert!(matches!(
+        registry.prepare_scope(corrupt_scope),
+        Err(EcScopeError::Corrupt(_))
+    ));
+    assert!(matches!(
+        registry.try_admit(corrupt_scope),
+        Err(EcScopeError::Busy)
+    ));
     let corrupt_revoke = revoke(corrupt_scope);
     assert!(registry.revoke(corrupt_revoke).is_err());
-    assert_eq!(registry.drain_status(corrupt_revoke).unwrap(), EcDrainStatus::Pending { inflight: 0, durable: false });
+    assert_eq!(
+        registry.drain_status(corrupt_revoke).unwrap(),
+        EcDrainStatus::Pending {
+            inflight: 0,
+            durable: false
+        }
+    );
 }
 
 #[test]
@@ -367,11 +528,20 @@ fn bounded_cache_never_evicts_tickets_and_reloads_persistent_denial() {
     assert_eq!(registry.prepare_scope(second), Err(EcScopeError::Busy));
     ticket.complete();
     registry.prepare_scope(second).unwrap();
-    assert_eq!(lock(&old_gate.state).unwrap().ensure_live(), Err(EcScopeError::Busy));
-    assert_eq!(registry.revoke(revoke(scope)).unwrap(), EcDrainStatus::Drained);
+    assert_eq!(
+        lock(&old_gate.state).unwrap().ensure_live(),
+        Err(EcScopeError::Busy)
+    );
+    assert_eq!(
+        registry.revoke(revoke(scope)).unwrap(),
+        EcDrainStatus::Drained
+    );
     registry.prepare_scope(second).unwrap();
     assert_eq!(registry.prepare_scope(scope), Err(EcScopeError::Revoked));
-    assert_eq!(registry.drain_status(revoke(scope)).unwrap(), EcDrainStatus::Drained);
+    assert_eq!(
+        registry.drain_status(revoke(scope)).unwrap(),
+        EcDrainStatus::Drained
+    );
 }
 
 #[test]
@@ -380,17 +550,29 @@ fn ticket_unwind_completes_but_poisoned_gate_never_acks() {
     let registry = &fixture.registry;
     registry.prepare_scope(fixture.binding).unwrap();
     let ticket = registry.try_admit(fixture.binding).unwrap();
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let _ticket = ticket;
-        panic!("injected worker exception before returning owned bytes");
-    })).is_err());
-    assert_eq!(registry.revoke(revoke(fixture.binding)).unwrap(), EcDrainStatus::Drained);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ticket = ticket;
+            panic!("injected worker exception before returning owned bytes");
+        }))
+        .is_err()
+    );
+    assert_eq!(
+        registry.revoke(revoke(fixture.binding)).unwrap(),
+        EcDrainStatus::Drained
+    );
     let gate = registry.get_gate(fixture.binding).unwrap();
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let _state = gate.state.lock().unwrap();
-        panic!("injected invariant panic under gate mutex");
-    })).is_err());
-    assert_eq!(registry.drain_status(revoke(fixture.binding)), Err(EcScopeError::Poisoned));
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _state = gate.state.lock().unwrap();
+            panic!("injected invariant panic under gate mutex");
+        }))
+        .is_err()
+    );
+    assert_eq!(
+        registry.drain_status(revoke(fixture.binding)),
+        Err(EcScopeError::Poisoned)
+    );
 }
 
 const CHILD_ROOT: &str = "HF3FS_EC_SCOPE_TEST_CHILD_ROOT";
@@ -398,13 +580,21 @@ const CHILD_ROOT: &str = "HF3FS_EC_SCOPE_TEST_CHILD_ROOT";
 // Invoked only by the parent test below. An ordinary test run does no work.
 #[test]
 fn scope_crash_child() {
-    let Some(root) = std::env::var_os(CHILD_ROOT) else { return };
+    let Some(root) = std::env::var_os(CHILD_ROOT) else {
+        return;
+    };
     let root = Path::new(&root);
     let registry = EcScopeRegistry::open(store(root, false), false, 8).unwrap();
     let scope = binding(registry.load_target(11, 21).unwrap());
     registry.prepare_scope(scope).unwrap();
     let _ticket = registry.try_admit(scope).unwrap();
-    assert_eq!(registry.revoke(revoke(scope)).unwrap(), EcDrainStatus::Pending { inflight: 1, durable: true });
+    assert_eq!(
+        registry.revoke(revoke(scope)).unwrap(),
+        EcDrainStatus::Pending {
+            inflight: 1,
+            durable: true
+        }
+    );
     let ready = std::fs::File::create(root.join("ready")).unwrap();
     ready.sync_all().unwrap();
     loop {
@@ -429,15 +619,28 @@ fn durable_denial_survives_killed_process_with_an_outstanding_ticket() {
         let registry = EcScopeRegistry::open(store(dir.path(), true), true, 8).unwrap();
         target = registry.register_target(11, 21).unwrap();
     }
-    let mut child = KillChild(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "ec_scope::tests::scope_crash_child", "--nocapture"])
-        .env(CHILD_ROOT, dir.path())
-        .stdin(Stdio::null())
-        .spawn().unwrap());
+    let mut child = KillChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ec_scope::tests::scope_crash_child",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, dir.path())
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     while !dir.path().join("ready").exists() {
-        assert!(child.0.try_wait().unwrap().is_none(), "scope child exited before durable fence");
-        assert!(Instant::now() < deadline, "scope child did not reach durable fence");
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "scope child exited before durable fence"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "scope child did not reach durable fence"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     child.0.kill().unwrap();
@@ -446,8 +649,14 @@ fn durable_denial_survives_killed_process_with_an_outstanding_ticket() {
     let scope = binding(target);
     assert_eq!(registry.load_target(11, 21).unwrap(), target);
     assert_eq!(registry.prepare_scope(scope), Err(EcScopeError::Revoked));
-    assert!(matches!(registry.try_admit(scope), Err(EcScopeError::Revoked)));
-    assert_eq!(registry.drain_status(revoke(scope)).unwrap(), EcDrainStatus::Drained);
+    assert!(matches!(
+        registry.try_admit(scope),
+        Err(EcScopeError::Revoked)
+    ));
+    assert_eq!(
+        registry.drain_status(revoke(scope)).unwrap(),
+        EcDrainStatus::Drained
+    );
 }
 
 fn raw_store(path: &Path, create: bool) -> RocksDB {
@@ -455,7 +664,8 @@ fn raw_store(path: &Path, create: bool) -> RocksDB {
         path: path.join("meta"),
         create,
         read_only: false,
-    }).unwrap()
+    })
+    .unwrap()
 }
 
 fn staging_store(
@@ -464,7 +674,11 @@ fn staging_store(
     prefix_len: usize,
 ) -> EcScopeResult<(Arc<MetaStore>, EcStagingProvision)> {
     let config = MetaStoreConfig {
-        rocksdb: RocksDBConfig { path: path.join("meta"), create, read_only: false },
+        rocksdb: RocksDBConfig {
+            path: path.join("meta"),
+            create,
+            read_only: false,
+        },
         prefix_len,
     };
     // The hook retains one writable RocksDB handle/lock across validation and
@@ -482,13 +696,20 @@ fn staging_empty_preflight_accepts_only_exact_startup_baselines() {
             let dir = tempfile::tempdir().unwrap();
             let raw = raw_store(dir.path(), true);
             if mask & 1 != 0 {
-                raw.put([MetaKey::USED_SIZE_PREFIX_LEN_KEY], (prefix_len as u32).to_le_bytes(), true).unwrap();
+                raw.put(
+                    [MetaKey::USED_SIZE_PREFIX_LEN_KEY],
+                    (prefix_len as u32).to_le_bytes(),
+                    true,
+                )
+                .unwrap();
             }
             if mask & 2 != 0 {
-                raw.put([MetaKey::VERSION_KEY], [MetaStore::LATEST_VERSION], true).unwrap();
+                raw.put([MetaKey::VERSION_KEY], [MetaStore::LATEST_VERSION], true)
+                    .unwrap();
             }
             if mask & 4 != 0 {
-                raw.put([MetaKey::USED_SIZE_KEY_PREFIX], 0u64.to_le_bytes(), true).unwrap();
+                raw.put([MetaKey::USED_SIZE_KEY_PREFIX], 0u64.to_le_bytes(), true)
+                    .unwrap();
             }
             let result = preflight_staging(&raw, prefix_len);
             if prefix_len != 0 && mask & 4 != 0 {
@@ -508,14 +729,29 @@ fn staging_empty_preflight_rejects_live_or_noncanonical_keys_without_cleanup() {
         (vec![MetaKey::CHUNK_META_KEY_PREFIX, 1], vec![0]),
         (vec![MetaKey::GROUP_BITS_KEY_PREFIX], vec![0]),
         (vec![MetaKey::POS_TO_CHUNK_KEY_PREFIX, 0], vec![0]),
-        (vec![MetaKey::USED_SIZE_KEY_PREFIX], 1u64.to_le_bytes().to_vec()),
-        (vec![MetaKey::USED_SIZE_KEY_PREFIX, 0], 0u64.to_le_bytes().to_vec()),
-        (vec![MetaKey::USED_SIZE_PREFIX_LEN_KEY], 7u32.to_le_bytes().to_vec()),
-        (vec![MetaKey::USED_SIZE_PREFIX_LEN_KEY, 0], 0u32.to_le_bytes().to_vec()),
+        (
+            vec![MetaKey::USED_SIZE_KEY_PREFIX],
+            1u64.to_le_bytes().to_vec(),
+        ),
+        (
+            vec![MetaKey::USED_SIZE_KEY_PREFIX, 0],
+            0u64.to_le_bytes().to_vec(),
+        ),
+        (
+            vec![MetaKey::USED_SIZE_PREFIX_LEN_KEY],
+            7u32.to_le_bytes().to_vec(),
+        ),
+        (
+            vec![MetaKey::USED_SIZE_PREFIX_LEN_KEY, 0],
+            0u32.to_le_bytes().to_vec(),
+        ),
         (vec![MetaKey::TIMESTAMP_KEY_PREFIX, 0], vec![0]),
         (vec![7], vec![]),
         (vec![MetaKey::VERSION_KEY], vec![0]),
-        (vec![MetaKey::VERSION_KEY], vec![MetaStore::LATEST_VERSION, 0]),
+        (
+            vec![MetaKey::VERSION_KEY],
+            vec![MetaStore::LATEST_VERSION, 0],
+        ),
         (vec![MetaKey::WRITING_CHUNK_KEY_PREFIX, 0], vec![0]),
         (vec![DENY_PREFIX, 0], vec![0]),
         (vec![TARGET_PREFIX, 0], vec![0]),
@@ -550,7 +786,9 @@ fn staging_joint_commit_retries_keep_candidate_before_and_after_unknown_outcome(
             if after_commit {
                 store.write(batch, true)?;
             }
-            Err(EcScopeError::Storage(Error::IoError("injected joint initialization confirmation failure".into())))
+            Err(EcScopeError::Storage(Error::IoError(
+                "injected joint initialization confirmation failure".into(),
+            )))
         });
         assert!(result.is_err());
         let identity = exact_get(&meta, &[ENGINE_PREFIX]).unwrap();
@@ -558,15 +796,27 @@ fn staging_joint_commit_retries_keep_candidate_before_and_after_unknown_outcome(
         assert_eq!(identity.is_some(), after_commit);
         assert_eq!(format.is_some(), after_commit);
         if after_commit {
-            assert_eq!(decode_engine(identity.as_ref().unwrap()).unwrap(), candidate);
+            assert_eq!(
+                decode_engine(identity.as_ref().unwrap()).unwrap(),
+                candidate
+            );
             decode_staging_format(format.as_ref().unwrap(), candidate, 4).unwrap();
         }
-        assert_eq!(joint_provision_staging(&meta, &provision).unwrap(), candidate);
-        assert_eq!(joint_provision_staging(&meta, &provision).unwrap(), candidate);
+        assert_eq!(
+            joint_provision_staging(&meta, &provision).unwrap(),
+            candidate
+        );
+        assert_eq!(
+            joint_provision_staging(&meta, &provision).unwrap(),
+            candidate
+        );
         drop(meta);
         let (meta, reopened) = staging_store(dir.path(), false, 4).unwrap();
         assert!(!reopened.is_empty());
-        assert_eq!(joint_provision_staging(&meta, &reopened).unwrap(), candidate);
+        assert_eq!(
+            joint_provision_staging(&meta, &reopened).unwrap(),
+            candidate
+        );
         let registry = EcScopeRegistry::from_identity(meta, candidate, 8);
         registry.confirm_staging_identity(4).unwrap();
         assert!(registry.confirm_staging_identity(0).is_err());
@@ -582,27 +832,47 @@ fn staging_pair_missing_side_wrong_identity_or_bad_baseline_is_never_repaired() 
         let mut expected_format = Some(encode_staging_format(identity, 4));
         {
             let raw = raw_store(dir.path(), true);
-            raw.put([MetaKey::USED_SIZE_PREFIX_LEN_KEY], 4u32.to_le_bytes(), true).unwrap();
-            raw.put([MetaKey::VERSION_KEY], [MetaStore::LATEST_VERSION], true).unwrap();
+            raw.put(
+                [MetaKey::USED_SIZE_PREFIX_LEN_KEY],
+                4u32.to_le_bytes(),
+                true,
+            )
+            .unwrap();
+            raw.put([MetaKey::VERSION_KEY], [MetaStore::LATEST_VERSION], true)
+                .unwrap();
             match case {
                 0 => expected_identity = None,
                 1 => expected_format = None,
                 2 => expected_format = Some(encode_staging_format([42; 16], 4)),
                 3 => expected_format = Some(encode_staging_format(identity, 0)),
                 4 => expected_format.as_mut().unwrap()[28] ^= 1,
-                5 => raw.delete([MetaKey::USED_SIZE_PREFIX_LEN_KEY], true).unwrap(),
+                5 => raw
+                    .delete([MetaKey::USED_SIZE_PREFIX_LEN_KEY], true)
+                    .unwrap(),
                 6 => raw.put([MetaKey::VERSION_KEY], [0], true).unwrap(),
                 7 => raw.put([ENGINE_PREFIX, 0], b"alias", true).unwrap(),
-                8 => raw.put([MetaKey::WRITING_CHUNK_KEY_PREFIX, 0], b"legacy", true).unwrap(),
+                8 => raw
+                    .put([MetaKey::WRITING_CHUNK_KEY_PREFIX, 0], b"legacy", true)
+                    .unwrap(),
                 _ => unreachable!(),
             }
-            if let Some(bytes) = &expected_identity { raw.put([ENGINE_PREFIX], bytes, true).unwrap(); }
-            if let Some(bytes) = &expected_format { raw.put([STAGING_FORMAT_PREFIX], bytes, true).unwrap(); }
+            if let Some(bytes) = &expected_identity {
+                raw.put([ENGINE_PREFIX], bytes, true).unwrap();
+            }
+            if let Some(bytes) = &expected_format {
+                raw.put([STAGING_FORMAT_PREFIX], bytes, true).unwrap();
+            }
         }
         assert!(staging_store(dir.path(), false, 4).is_err());
         let raw = raw_store(dir.path(), false);
-        assert_eq!(exact_raw_get(&raw, &[ENGINE_PREFIX]).unwrap(), expected_identity);
-        assert_eq!(exact_raw_get(&raw, &[STAGING_FORMAT_PREFIX]).unwrap(), expected_format);
+        assert_eq!(
+            exact_raw_get(&raw, &[ENGINE_PREFIX]).unwrap(),
+            expected_identity
+        );
+        assert_eq!(
+            exact_raw_get(&raw, &[STAGING_FORMAT_PREFIX]).unwrap(),
+            expected_format
+        );
     }
 }
 
@@ -612,14 +882,26 @@ fn staging_existing_prefix_zero_can_omit_prefix_key_but_not_version() {
     let identity = [51; 16];
     {
         let raw = raw_store(dir.path(), true);
-        raw.put([ENGINE_PREFIX], encode_engine(identity), true).unwrap();
-        raw.put([STAGING_FORMAT_PREFIX], encode_staging_format(identity, 0), true).unwrap();
-        raw.put([MetaKey::VERSION_KEY], [MetaStore::LATEST_VERSION], true).unwrap();
+        raw.put([ENGINE_PREFIX], encode_engine(identity), true)
+            .unwrap();
+        raw.put(
+            [STAGING_FORMAT_PREFIX],
+            encode_staging_format(identity, 0),
+            true,
+        )
+        .unwrap();
+        raw.put([MetaKey::VERSION_KEY], [MetaStore::LATEST_VERSION], true)
+            .unwrap();
     }
     let (meta, provision) = staging_store(dir.path(), false, 0).unwrap();
     assert!(!provision.is_empty());
-    assert_eq!(joint_provision_staging(&meta, &provision).unwrap(), identity);
-    assert!(exact_get(&meta, &[MetaKey::USED_SIZE_PREFIX_LEN_KEY]).unwrap().is_none());
+    assert_eq!(
+        joint_provision_staging(&meta, &provision).unwrap(),
+        identity
+    );
+    assert!(exact_get(&meta, &[MetaKey::USED_SIZE_PREFIX_LEN_KEY])
+        .unwrap()
+        .is_none());
     drop(meta);
     {
         let raw = raw_store(dir.path(), false);
@@ -633,11 +915,15 @@ fn staging_joint_commit_rechecks_empty_state_and_never_overwrites_another_pair()
     let dir = tempfile::tempdir().unwrap();
     let (meta, provision) = staging_store(dir.path(), true, 4).unwrap();
     let mut live = RocksDB::new_write_batch();
-    live.put([MetaKey::GROUP_BITS_KEY_PREFIX, 0], b"even an empty allocation group is forbidden");
+    live.put(
+        [MetaKey::GROUP_BITS_KEY_PREFIX, 0],
+        b"even an empty allocation group is forbidden",
+    );
     meta.write(live, true).unwrap();
     assert!(joint_provision_staging_with(&meta, &provision, |_, _| {
         panic!("a nonempty pre-initialization store must never reach commit")
-    }).is_err());
+    })
+    .is_err());
     assert!(exact_get(&meta, &[ENGINE_PREFIX]).unwrap().is_none());
     let other = [61; 16];
     let mut changed = RocksDB::new_write_batch();
@@ -645,8 +931,14 @@ fn staging_joint_commit_rechecks_empty_state_and_never_overwrites_another_pair()
     changed.put([STAGING_FORMAT_PREFIX], encode_staging_format(other, 4));
     changed.put([MetaKey::VERSION_KEY], [MetaStore::LATEST_VERSION]);
     meta.write(changed, true).unwrap();
-    assert_eq!(joint_provision_staging(&meta, &provision), Err(EcScopeError::IdentityMismatch));
-    assert_eq!(decode_engine(&exact_get(&meta, &[ENGINE_PREFIX]).unwrap().unwrap()).unwrap(), other);
+    assert_eq!(
+        joint_provision_staging(&meta, &provision),
+        Err(EcScopeError::IdentityMismatch)
+    );
+    assert_eq!(
+        decode_engine(&exact_get(&meta, &[ENGINE_PREFIX]).unwrap().unwrap()).unwrap(),
+        other
+    );
 }
 
 const PROVISION_CHILD_ROOT: &str = "HF3FS_EC_SCOPE_PROVISION_CHILD_ROOT";
@@ -658,12 +950,16 @@ fn provision_child_ready(root: &Path, identity: EcIdentity) {
     ready.write_all(&identity).unwrap();
     ready.sync_all().unwrap();
     std::fs::rename(temporary, root.join("provision-ready")).unwrap();
-    loop { std::thread::park(); }
+    loop {
+        std::thread::park();
+    }
 }
 
 #[test]
 fn staging_provision_crash_child() {
-    let Some(root) = std::env::var_os(PROVISION_CHILD_ROOT) else { return };
+    let Some(root) = std::env::var_os(PROVISION_CHILD_ROOT) else {
+        return;
+    };
     let root = Path::new(&root);
     let phase = std::env::var(PROVISION_CHILD_PHASE).unwrap();
     if phase == "raw-open" {
@@ -673,7 +969,10 @@ fn staging_provision_crash_child() {
     let (meta, provision) = staging_store(root, true, 4).unwrap();
     assert!(provision.is_empty());
     if phase == "after-joint" {
-        assert_eq!(joint_provision_staging(&meta, &provision).unwrap(), provision.identity);
+        assert_eq!(
+            joint_provision_staging(&meta, &provision).unwrap(),
+            provision.identity
+        );
     } else {
         assert_eq!(phase, "before-joint");
     }
@@ -684,17 +983,30 @@ fn staging_provision_crash_child() {
 fn staging_initialization_recovers_after_killed_process_at_each_transaction_boundary() {
     for phase in ["raw-open", "before-joint", "after-joint"] {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = KillChild(Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "ec_scope::tests::staging_provision_crash_child", "--nocapture"])
-            .env(PROVISION_CHILD_ROOT, dir.path())
-            .env(PROVISION_CHILD_PHASE, phase)
-            .stdin(Stdio::null())
-            .spawn().unwrap());
+        let mut child = KillChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ec_scope::tests::staging_provision_crash_child",
+                    "--nocapture",
+                ])
+                .env(PROVISION_CHILD_ROOT, dir.path())
+                .env(PROVISION_CHILD_PHASE, phase)
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
         let ready = dir.path().join("provision-ready");
         let deadline = Instant::now() + Duration::from_secs(30);
         while !ready.exists() {
-            assert!(child.0.try_wait().unwrap().is_none(), "provision child exited before boundary");
-            assert!(Instant::now() < deadline, "provision child did not reach boundary");
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "provision child exited before boundary"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "provision child did not reach boundary"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         let prior: EcIdentity = std::fs::read(ready).unwrap().try_into().unwrap();
@@ -703,9 +1015,14 @@ fn staging_initialization_recovers_after_killed_process_at_each_transaction_boun
         let (meta, provision) = staging_store(dir.path(), false, 4).unwrap();
         assert_eq!(provision.is_empty(), phase != "after-joint");
         let identity = joint_provision_staging(&meta, &provision).unwrap();
-        if phase == "after-joint" { assert_eq!(identity, prior); }
+        if phase == "after-joint" {
+            assert_eq!(identity, prior);
+        }
         assert_ne!(identity, [0; 16]);
-        assert_eq!(decode_engine(&exact_get(&meta, &[ENGINE_PREFIX]).unwrap().unwrap()).unwrap(), identity);
+        assert_eq!(
+            decode_engine(&exact_get(&meta, &[ENGINE_PREFIX]).unwrap().unwrap()).unwrap(),
+            identity
+        );
         let format = exact_get(&meta, &[STAGING_FORMAT_PREFIX]).unwrap().unwrap();
         assert_eq!(format.len(), STAGING_FORMAT_RECORD_BYTES);
         decode_staging_format(&format, identity, 4).unwrap();
@@ -715,19 +1032,30 @@ fn staging_initialization_recovers_after_killed_process_at_each_transaction_boun
 #[test]
 fn ticket_retains_exclusive_store_instance_until_completion() {
     let dir = tempfile::tempdir().unwrap();
-    let config = EngineConfig { path: dir.path().into(), create: true, prefix_len: 4 };
+    let config = EngineConfig {
+        path: dir.path().into(),
+        create: true,
+        prefix_len: 4,
+    };
     let (ticket, scope, identity) = {
         let engine = Engine::open(&config).unwrap();
         let registry = engine.ec_scope_registry().unwrap();
         let target = registry.register_target(11, 21).unwrap();
         let scope = binding(target);
         registry.prepare_scope(scope).unwrap();
-        (registry.try_admit(scope).unwrap(), scope, registry.engine_identity())
+        (
+            registry.try_admit(scope).unwrap(),
+            scope,
+            registry.engine_identity(),
+        )
     };
     // Both Engine and registry are gone, but admitted work may still hold the
     // ticket. A new instance must not open and report a fresh zero counter.
     assert!(ticket.check_execution().is_ok());
-    let reopen = EngineConfig { create: false, ..config };
+    let reopen = EngineConfig {
+        create: false,
+        ..config
+    };
     assert!(Engine::open(&reopen).is_err());
     assert!(ticket.check_execution().is_ok());
     ticket.complete();
@@ -735,6 +1063,235 @@ fn ticket_retains_exclusive_store_instance_until_completion() {
     let registry = engine.ec_scope_registry().unwrap();
     assert_eq!(registry.engine_identity(), identity);
     assert_eq!(registry.load_target(11, 21).unwrap(), scope.target);
-    assert_eq!(registry.revoke(revoke(scope)).unwrap(), EcDrainStatus::Drained);
+    assert_eq!(
+        registry.revoke(revoke(scope)).unwrap(),
+        EcDrainStatus::Drained
+    );
     assert_eq!(registry.prepare_scope(scope), Err(EcScopeError::Revoked));
+}
+
+#[test]
+fn concurrent_cold_scope_singleflight_reuses_one_real_load() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let f = fixture(8);
+    let registry = f.registry.clone();
+    let binding = f.binding;
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let loads = Arc::new(AtomicUsize::new(0));
+    let leader = {
+        let registry = registry.clone();
+        let entered = entered.clone();
+        let release = release.clone();
+        let loads = loads.clone();
+        std::thread::spawn(move || {
+            registry.prepare_with(binding, |registry, binding| {
+                loads.fetch_add(1, Ordering::SeqCst);
+                let actual = registry.load_fence(binding)?;
+                entered.wait();
+                release.wait();
+                Ok(actual)
+            })
+        })
+    };
+    entered.wait();
+    // Deterministic reproduction of the old data admission path. It is still
+    // deliberately the behavior of nonwaiting control prepare and wait=0.
+    assert_eq!(registry.prepare_scope(binding), Err(EcScopeError::Busy));
+    assert_eq!(
+        registry.prepare_scope_wait(binding, 0),
+        Err(EcScopeError::Busy)
+    );
+    let (waiting, observed) = std::sync::mpsc::channel();
+    let follower = {
+        let registry = registry.clone();
+        std::thread::spawn(move || {
+            registry.prepare_with_wait(
+                binding,
+                Duration::from_secs(1),
+                |_, _| panic!("follower must not issue a second disk lookup"),
+                || waiting.send(()).unwrap(),
+            )
+        })
+    };
+    observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    release.wait();
+    assert_eq!(leader.join().unwrap(), Ok(()));
+    assert_eq!(follower.join().unwrap(), Ok(()));
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+    let first = registry.try_admit(binding).unwrap();
+    let second = registry.try_admit(binding).unwrap();
+    assert_eq!(
+        registry.revoke(revoke(binding)).unwrap(),
+        EcDrainStatus::Pending {
+            inflight: 2,
+            durable: true
+        }
+    );
+    first.complete();
+    second.complete();
+    assert_eq!(
+        registry.drain_status(revoke(binding)).unwrap(),
+        EcDrainStatus::Drained
+    );
+}
+
+#[test]
+fn cold_scope_loader_failure_never_promotes_waiting_follower() {
+    let f = fixture(8);
+    let registry = f.registry.clone();
+    let binding = f.binding;
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let leader = {
+        let registry = registry.clone();
+        let entered = entered.clone();
+        let release = release.clone();
+        std::thread::spawn(move || {
+            registry.prepare_with(binding, |_, _| {
+                entered.wait();
+                release.wait();
+                Err(EcScopeError::Storage(Error::IoError(
+                    "test load failure".into(),
+                )))
+            })
+        })
+    };
+    entered.wait();
+    let (waiting, observed) = std::sync::mpsc::channel();
+    let follower = {
+        let registry = registry.clone();
+        std::thread::spawn(move || {
+            registry.prepare_with_wait(
+                binding,
+                Duration::from_secs(1),
+                |_, _| panic!("follower cannot replace an unconfirmed loader"),
+                || waiting.send(()).unwrap(),
+            )
+        })
+    };
+    observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    release.wait();
+    assert!(leader.join().unwrap().is_err());
+    assert_eq!(follower.join().unwrap(), Err(EcScopeError::Busy));
+    assert!(matches!(
+        registry.try_admit(binding),
+        Err(EcScopeError::Busy)
+    ));
+    registry.prepare_scope_wait(binding, 10).unwrap();
+    registry.try_admit(binding).unwrap().complete();
+}
+
+#[test]
+fn revoke_wakes_loading_followers_before_old_loader_completes() {
+    let f = fixture(8);
+    let registry = f.registry.clone();
+    let binding = f.binding;
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let leader = {
+        let registry = registry.clone();
+        let entered = entered.clone();
+        let release = release.clone();
+        std::thread::spawn(move || {
+            registry.prepare_with(binding, |registry, binding| {
+                let stale = registry.load_fence(binding)?;
+                entered.wait();
+                release.wait();
+                Ok(stale)
+            })
+        })
+    };
+    entered.wait();
+    let (waiting, observed) = std::sync::mpsc::channel();
+    let (done, finished) = std::sync::mpsc::channel();
+    let follower = {
+        let registry = registry.clone();
+        std::thread::spawn(move || {
+            let result = registry.prepare_with_wait(
+                binding,
+                Duration::from_secs(1),
+                |_, _| panic!("follower must share leader"),
+                || waiting.send(()).unwrap(),
+            );
+            done.send(result).unwrap();
+        })
+    };
+    observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        registry.revoke(revoke(binding)).unwrap(),
+        EcDrainStatus::Drained
+    );
+    // The original loader remains blocked. This result requires Closing's
+    // own notification, rather than a notification at loader completion.
+    let result = finished.recv_timeout(Duration::from_millis(500));
+    release.wait();
+    follower.join().unwrap();
+    assert_eq!(result.unwrap(), Err(EcScopeError::Revoked));
+    assert_eq!(leader.join().unwrap(), Err(EcScopeError::Revoked));
+    assert!(matches!(
+        registry.try_admit(binding),
+        Err(EcScopeError::Revoked)
+    ));
+}
+
+#[test]
+fn cold_scope_wait_timeout_is_bounded_under_spurious_notifications() {
+    let f = fixture(8);
+    let registry = f.registry.clone();
+    let binding = f.binding;
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let leader = {
+        let registry = registry.clone();
+        let entered = entered.clone();
+        let release = release.clone();
+        std::thread::spawn(move || {
+            registry.prepare_with(binding, |registry, binding| {
+                let actual = registry.load_fence(binding)?;
+                entered.wait();
+                release.wait();
+                Ok(actual)
+            })
+        })
+    };
+    entered.wait();
+    let gate = registry.get_gate(binding).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let notifier = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                gate.loaded.notify_all();
+                std::thread::yield_now();
+            }
+        })
+    };
+    let start = Instant::now();
+    let result = registry.prepare_scope_wait(binding, 10);
+    let elapsed = start.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    notifier.join().unwrap();
+    release.wait();
+    leader.join().unwrap().unwrap();
+    assert_eq!(result, Err(EcScopeError::Busy));
+    assert!(elapsed < Duration::from_secs(1));
+    registry.try_admit(binding).unwrap().complete();
+}
+
+#[test]
+fn cold_scope_wait_rejects_invalid_cap_and_zero_keeps_nonwaiting_load() {
+    let f = fixture(8);
+    assert!(matches!(
+        f.registry.prepare_scope_wait(f.binding, 1001),
+        Err(EcScopeError::Invalid(_))
+    ));
+    assert!(matches!(
+        f.registry.try_admit(f.binding),
+        Err(EcScopeError::Busy)
+    ));
+    // A single worker can itself synchronously load a cold scope with zero
+    // follower-wait budget. No additional queued task is required.
+    f.registry.prepare_scope_wait(f.binding, 0).unwrap();
+    f.registry.try_admit(f.binding).unwrap().complete();
 }

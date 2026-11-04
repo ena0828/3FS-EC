@@ -22,6 +22,7 @@
 #include "fbs/storage/EcAuthorized.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "storage/aio/AioReadWorker.h"
+#include "storage/ec_helper/EcHelperRuntime.h"
 #include "storage/ec_scope/EcScopeControlExecutor.h"
 #include "storage/service/BufferPool.h"
 #include "storage/service/ReliableForwarding.h"
@@ -50,10 +51,13 @@ class StorageOperator {
     CONFIG_ITEM(enable_ec_fragments, false);
     CONFIG_ITEM(allow_unsafe_ec_fragment_rpc_for_testing, false);
     CONFIG_ITEM(ec_capability_key_file, Path{});
+    CONFIG_ITEM(enable_ec_helpers, false);
+    CONFIG_ITEM(ec_helper_key_file, Path{});
     CONFIG_ITEM(enable_ec_scope_control, false);
     CONFIG_ITEM(ec_scope_control_key_file, Path{});
     CONFIG_ITEM(ec_scope_control_authority, std::string{});
     CONFIG_ITEM(max_concurrent_ec_requests, 8u, [](auto value) { return value > 0 && value <= 64; });
+    CONFIG_ITEM(ec_scope_load_wait_ms, 250u, [](auto value) { return value <= 1000; });
   };
 
   StorageOperator(const Config &config, Components &components)
@@ -110,6 +114,7 @@ class StorageOperator {
   CoTryTask<EcReadRsp> authorizedReadEcFragment(const EcAuthorizedReadReq &req);
   CoTryTask<EcReconcileRsp> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req);
 
+  CoTryTask<EcHelperHopRsp> executeEcHelper(const EcHelperHopReq &request);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const EcScopeControlRequest &req);
   CoTryTask<EcScopeControlRsp> queryEcScopeDrain(const EcScopeControlRequest &req);
 
@@ -178,6 +183,10 @@ class StorageOperator {
   friend class ReliableUpdate;
   friend class StorageEcAuthorizationTestAccess;
   friend class StorageEcStageAuthorizationTestAccess;
+
+  Result<Void> initEcHelpers();
+  CoTryTask<EcHelperHopResult> executeEcHelperOwned(EcHelperHopReq, std::chrono::steady_clock::time_point receivedAt);
+  std::unique_ptr<EcHelperRuntime> ecHelpers_;
 
   Result<Void> initEcScopeControl();
   CoTryTask<EcScopeControlRsp> controlEcScope(const EcScopeControlRequest &, EcScopeControlAction);

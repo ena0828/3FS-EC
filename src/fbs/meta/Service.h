@@ -20,6 +20,8 @@
 #include "fbs/core/user/User.h"
 #include "fbs/meta/Common.h"
 #include "fbs/meta/Ec.h"
+#include "fbs/meta/EcV2Grants.h"
+#include "fbs/meta/EcV2Repair.h"
 #include "fbs/meta/Schema.h"
 #include "fbs/mgmtd/MgmtdTypes.h"
 
@@ -783,6 +785,64 @@ struct AcquireEcReadRsp : RspBase {
 };
 struct ReleaseEcReadRsp : RspBase {};
 
+// V2 methods have independent request types and method numbers. Begin fixes
+// physical instances; only Bind/Acquire produce data capabilities.
+struct CreateEcFileV2Req : CreateEcFileReq {};
+struct BeginEcMutationV2Req : BeginEcMutationReq {};
+struct BindEcMutationV2Req : EcOperationReq {
+  SERDE_STRUCT_FIELD(descriptors, (std::array<storage::EcIntegrityDescriptor, 12>{}));
+};
+struct PublishEcMutationV2Req : EcOperationReq {};
+struct GetEcOperationV2Req : EcOperationReq {};
+struct CancelEcMutationV2Req : EcOperationReq {};
+struct EcV2MutationRsp : RspBase {
+  SERDE_STRUCT_FIELD(reservation, (std::optional<EcV2Reservation>{}));
+  SERDE_STRUCT_FIELD(record, EcOperationRecord{});
+  SERDE_STRUCT_FIELD(object, EcObjectRecord{});
+  SERDE_STRUCT_FIELD(allocations, (std::optional<EcV2AllocationBindings>{}));
+  SERDE_STRUCT_FIELD(grants, EcV2Grants{});
+  SERDE_STRUCT_FIELD(drain, (std::optional<EcV2DrainProgress>{}));
+};
+struct AcquireEcReadV2Req : AcquireEcReadReq {};
+struct ReleaseEcReadV2Req : AcquireEcReadReq {};
+struct AcquireEcReadV2Rsp : RspBase {
+  SERDE_STRUCT_FIELD(contentSha256, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(manifest, EcManifest{});
+  SERDE_STRUCT_FIELD(snapshot, EcV2PinSnapshot{});
+  SERDE_STRUCT_FIELD(readGrants, EcV2Grants{});
+};
+struct ReleaseEcReadV2Rsp : RspBase {
+  SERDE_STRUCT_FIELD(pin, Uuid::zero());
+  SERDE_STRUCT_FIELD(drain, EcV2DrainProgress{});
+};
+
+// The caller selects only a fixed healthy source order and bounded window.
+// Physical instances, descriptors and logical SHA come from durable Meta state.
+struct PrepareEcRepairV2Req : EcOperationReq {
+  SERDE_STRUCT_FIELD(planId, Uuid::zero());
+  SERDE_STRUCT_FIELD(sourceOrder, (std::array<uint8_t, 10>{}));
+  SERDE_STRUCT_FIELD(maxBlocksInFlight, uint8_t{1});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcOperationReq::valid());
+    if (planId.is_nil() || !maxBlocksInFlight || maxBlocksInFlight > 4)
+      return INVALID("invalid V2 repair plan identifier or window");
+    uint16_t selected = 0;
+    for (const auto shard : sourceOrder) {
+      if (shard >= 12 || (selected & (uint16_t{1} << shard)))
+        return INVALID("V2 repair requires ten distinct source indices");
+      selected |= uint16_t{1} << shard;
+    }
+    return VALID;
+  }
+};
+struct PrepareEcRepairV2Rsp : RspBase {
+  SERDE_STRUCT_FIELD(mutation, EcV2MutationRsp{});
+  SERDE_STRUCT_FIELD(plan, storage::EcRepairPlanInput{});
+  SERDE_STRUCT_FIELD(helpers, (std::optional<std::array<storage::EcHelperCapability, 10>>{}));
+};
+
 // testRpc
 struct TestRpcReq : ReqBase {
   SERDE_STRUCT_FIELD(path, PathAt());
@@ -834,6 +894,15 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(cancelEcMutation, 26, CancelEcMutationReq, EcOperationRsp);
   META_SERVICE_METHOD(acquireEcRead, 27, AcquireEcReadReq, AcquireEcReadRsp);
   META_SERVICE_METHOD(releaseEcRead, 28, ReleaseEcReadReq, ReleaseEcReadRsp);
+  META_SERVICE_METHOD(createEcFileV2, 29, CreateEcFileV2Req, CreateEcFileRsp);
+  META_SERVICE_METHOD(beginEcMutationV2, 30, BeginEcMutationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(bindEcMutationV2, 31, BindEcMutationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(publishEcMutationV2, 32, PublishEcMutationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(getEcOperationV2, 33, GetEcOperationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(cancelEcMutationV2, 34, CancelEcMutationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(acquireEcReadV2, 35, AcquireEcReadV2Req, AcquireEcReadV2Rsp);
+  META_SERVICE_METHOD(releaseEcReadV2, 36, ReleaseEcReadV2Req, ReleaseEcReadV2Rsp);
+  META_SERVICE_METHOD(prepareEcRepairV2, 37, PrepareEcRepairV2Req, PrepareEcRepairV2Rsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
 

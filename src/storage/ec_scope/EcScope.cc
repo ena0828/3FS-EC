@@ -55,6 +55,9 @@ Result<EcScopeTargetIdentity> EcScope::loadTarget(uint32_t chain, uint64_t targe
 Result<Void> EcScope::prepare(const EcScopeBinding &binding) const {
   return check(chunk_engine::ec_scope_prepare(*handle_, binding));
 }
+Result<Void> EcScope::prepareWait(const EcScopeBinding &binding, uint32_t waitMillis) const {
+  return check(chunk_engine::ec_scope_prepare_wait(*handle_, binding, waitMillis));
+}
 Result<EcScopeTicket> EcScope::tryAdmit(const EcScopeBinding &binding) const {
   auto result = chunk_engine::ec_scope_try_admit(*handle_, binding);
   RETURN_ON_ERROR(check(result.status));

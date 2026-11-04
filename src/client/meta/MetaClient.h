@@ -100,6 +100,8 @@ class MetaClient {
              std::shared_ptr<storage::client::StorageClient> storage,
              bool dynStripe);
 
+  const ClientId &clientId() const { return clientId_; }
+
   void start(CPUExecutorGroup &exec);
   void stop();
 
@@ -111,6 +113,15 @@ class MetaClient {
   CoTryTask<EcOperationRsp> cancelEcMutation(CancelEcMutationReq req);
   CoTryTask<AcquireEcReadRsp> acquireEcRead(AcquireEcReadReq req);
   CoTryTask<ReleaseEcReadRsp> releaseEcRead(ReleaseEcReadReq req);
+  CoTryTask<CreateEcFileRsp> createEcFileV2(CreateEcFileV2Req req);
+  CoTryTask<EcV2MutationRsp> beginEcMutationV2(BeginEcMutationV2Req req);
+  CoTryTask<EcV2MutationRsp> bindEcMutationV2(BindEcMutationV2Req req);
+  CoTryTask<EcV2MutationRsp> publishEcMutationV2(PublishEcMutationV2Req req);
+  CoTryTask<EcV2MutationRsp> getEcOperationV2(GetEcOperationV2Req req);
+  CoTryTask<EcV2MutationRsp> cancelEcMutationV2(CancelEcMutationV2Req req);
+  CoTryTask<AcquireEcReadV2Rsp> acquireEcReadV2(AcquireEcReadV2Req req);
+  CoTryTask<ReleaseEcReadV2Rsp> releaseEcReadV2(ReleaseEcReadV2Req req);
+  CoTryTask<PrepareEcRepairV2Rsp> prepareEcRepairV2(PrepareEcRepairV2Req req);
 
   CoTryTask<Inode> stat(const UserInfo &userInfo,
                         InodeId inodeId,

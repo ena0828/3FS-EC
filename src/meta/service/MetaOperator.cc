@@ -168,7 +168,8 @@ MetaOperator::MetaOperator(const Config &cfg,
                                              fileHelper_,
                                              sessionManager_,
                                              gcManager_)),
-      ecCoordinator_(std::make_unique<EcCoordinator>(cfg, mgmtdClient, storageClient)) {
+      ecCoordinator_(std::make_unique<EcCoordinator>(cfg, mgmtdClient, storageClient)),
+      ecV2Coordinator_(std::make_unique<EcV2Coordinator>(cfg, mgmtdClient, storageClient)) {
   sessionManager_->setCloseFunc(
       [&](const auto &req) -> CoTryTask<void> { co_return (co_await close(req)).then([](auto &) { return Void{}; }); });
 }
@@ -176,6 +177,7 @@ MetaOperator::MetaOperator(const Config &cfg,
 CoTryTask<void> MetaOperator::init(std::optional<Layout> layout) {
   XLOGF(INFO, "MetaOperator::init");
   if (config_.enable_ec_catalog()) CO_RETURN_ON_ERROR(ecCoordinator_->checkEnabled());
+  if (config_.enable_ec_v2()) CO_RETURN_ON_ERROR(ecV2Coordinator_->checkEnabled());
   if (layout.has_value()) {
     CO_RETURN_ON_ERROR(co_await runOp(&MetaStore::initFs, *layout));
   }

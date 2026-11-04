@@ -165,6 +165,17 @@ pub(crate) fn ec_scope_prepare(
     }
 }
 
+pub(crate) fn ec_scope_prepare_wait(
+    handle: &EcScopeHandle,
+    value: &ffi::RawEcScopeBinding,
+    wait_millis: u32,
+) -> ffi::RawEcScopeStatus {
+    match boundary(|| registry(handle)?.prepare_scope_wait(binding(value)?, wait_millis)) {
+        Ok(()) => status(0, ""),
+        Err(status) => status,
+    }
+}
+
 pub(crate) fn ec_scope_try_admit(
     handle: &EcScopeHandle,
     value: &ffi::RawEcScopeBinding,

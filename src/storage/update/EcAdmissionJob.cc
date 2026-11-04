@@ -11,7 +11,14 @@ void EcAdmissionJob::execute() {
       }
       RETURN_ON_ERROR(validate_());
       RETURN_ON_ERROR(target_->checkEcScopeTarget(binding_.target));
-      RETURN_ON_ERROR(scope_->prepare(binding_));
+      if (waitBudget_) {
+        CHECK_RESULT(millis, waitBudget_());
+        RETURN_ON_ERROR(scope_->prepareWait(binding_, millis));
+      } else {
+        RETURN_ON_ERROR(scope_->prepare(binding_));
+      }
+      RETURN_ON_ERROR(validate_());
+      RETURN_ON_ERROR(target_->checkEcScopeTarget(binding_.target));
       return scope_->tryAdmit(binding_);
     }();
   } catch (const std::exception &) {

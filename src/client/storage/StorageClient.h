@@ -16,6 +16,7 @@
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
 
@@ -374,6 +375,7 @@ class StorageClient : public folly::MoveOnly {
     queryEcStageV2,
     reconcileEcStageV2,
     sealEcStageV2,
+    executeEcHelper,
     revokeEcScope,
     queryEcScopeDrain,
   };
@@ -626,6 +628,24 @@ class StorageClient : public folly::MoveOnly {
   }
   virtual CoTryTask<EcFragmentReceiptV2> sealEcStageV2(const EcSealStageV2Req &) {
     co_return makeError(StatusCode::kNotImplemented, "V2 data RPC is unavailable in this client implementation");
+  }
+  virtual CoTryTask<EcStageStateV2> beginEcStageV2Controlled(EcBeginStageV2Req, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled V2 staging requires RPC storage client");
+  }
+  virtual CoTryTask<EcStageStateV2> appendEcStageV2Controlled(EcAppendStageV2Req, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled V2 staging requires RPC storage client");
+  }
+  virtual CoTryTask<EcStageStateV2> queryEcStageV2Controlled(EcQueryStageV2Req, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled V2 staging requires RPC storage client");
+  }
+  virtual CoTryTask<EcStageStateV2> reconcileEcStageV2Controlled(EcReconcileStageV2Req, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled V2 staging requires RPC storage client");
+  }
+  virtual CoTryTask<EcFragmentReceiptV2> sealEcStageV2Controlled(EcSealStageV2Req, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled V2 staging requires RPC storage client");
+  }
+  virtual CoTryTask<EcHelperHopResult> executeEcHelper(EcHelperHopReq, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "native helper RPC is unavailable");
   }
   virtual CoTryTask<EcReadBlockResultV2> readEcBlockV2Controlled(EcReadBlockV2Req, EcRequestControl) {
     co_return makeError(StatusCode::kNotImplemented, "controlled V2 read is unavailable in this client implementation");

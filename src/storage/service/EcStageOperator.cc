@@ -3,6 +3,7 @@
 #include <folly/experimental/coro/WithCancellation.h>
 
 #include "fbs/storage/EcStageResultV2.h"
+#include "storage/ec_scope/EcScopeLoadBudget.h"
 #include "storage/service/Components.h"
 #include "storage/service/StorageOperator.h"
 #include "storage/update/EcAdmissionJob.h"
@@ -49,6 +50,7 @@ EcFragmentReceiptV2 receipt(const EcFragmentAccessV2 &request, const EcScopeTarg
 template <typename Request>
 CoTryTask<StorageOperator::EcStageExecution> StorageOperator::executeEcStageV2(const Request &wire,
                                                                                EcStageOperation operation) {
+  const EcScopeLoadBudget loadBudget{config_.ec_scope_load_wait_ms(), EcScopeLoadBudget::Clock::now(), std::nullopt};
   const auto &request = wire.request;
   const bool changesContent = operation == EcStageOperation::Begin || operation == EcStageOperation::Append ||
                               operation == EcStageOperation::Seal;
@@ -97,7 +99,12 @@ CoTryTask<StorageOperator::EcStageExecution> StorageOperator::executeEcStageV2(c
                            scope->first,
                            *session,
                            target->storageTarget,
-                           validateAccess);
+                           validateAccess,
+                           [&]() {
+                             return loadBudget.remaining(EcScopeLoadBudget::Clock::now(),
+                                                         verified->claims().expiresAtSeconds,
+                                                         ecAuthorizationNow_());
+                           });
   // Both admission and data work are drained under an explicit empty token.
   // Network timeout never ends ownership of a submitted borrowed job.
   co_await folly::coro::co_withCancellation(folly::CancellationToken{}, updateWorker_.enqueue(&admission));

@@ -9,7 +9,7 @@
 use crate::{Engine, Error, MetaKey, MetaStore, RocksDB, RocksDBIterator};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 const DENY_PREFIX: u8 = 10;
 const ENGINE_PREFIX: u8 = 11;
@@ -189,7 +189,11 @@ fn joint_provision_staging_with(
     provision: &EcStagingProvision,
     commit: impl FnOnce(&MetaStore, rocksdb::WriteBatch) -> EcScopeResult<()>,
 ) -> EcScopeResult<EcIdentity> {
-    let actual = inspect_staging(|key| exact_get(store, key), store.iterator(), provision.prefix_len)?;
+    let actual = inspect_staging(
+        |key| exact_get(store, key),
+        store.iterator(),
+        provision.prefix_len,
+    )?;
     match actual {
         Some(identity) if identity == provision.identity => {}
         Some(_) => return Err(EcScopeError::IdentityMismatch),
@@ -201,7 +205,10 @@ fn joint_provision_staging_with(
                 [STAGING_FORMAT_PREFIX],
                 encode_staging_format(provision.identity, provision.prefix_len),
             );
-            batch.put(MetaKey::used_size_prefix_len_key(), provision.prefix_len.to_le_bytes());
+            batch.put(
+                MetaKey::used_size_prefix_len_key(),
+                provision.prefix_len.to_le_bytes(),
+            );
             batch.put(MetaKey::version_key(), [MetaStore::LATEST_VERSION]);
             commit(store, batch)?;
         }
@@ -224,16 +231,24 @@ fn inspect_staging(
             // startup can have committed before the joint transaction.
             iterator.seek([])?;
             while iterator.valid() {
-                let key = iterator.key().ok_or(EcScopeError::Corrupt("missing metadata key"))?;
-                let value = iterator.value().ok_or(EcScopeError::Corrupt("missing metadata value"))?;
+                let key = iterator
+                    .key()
+                    .ok_or(EcScopeError::Corrupt("missing metadata key"))?;
+                let value = iterator
+                    .value()
+                    .ok_or(EcScopeError::Corrupt("missing metadata value"))?;
                 let allowed = match key {
                     [MetaKey::USED_SIZE_PREFIX_LEN_KEY] => value == prefix_len.to_le_bytes(),
                     [MetaKey::VERSION_KEY] => value == [MetaStore::LATEST_VERSION],
-                    [MetaKey::USED_SIZE_KEY_PREFIX] if prefix_len == 0 => value == 0u64.to_le_bytes(),
+                    [MetaKey::USED_SIZE_KEY_PREFIX] if prefix_len == 0 => {
+                        value == 0u64.to_le_bytes()
+                    }
                     _ => false,
                 };
                 if !allowed {
-                    return Err(EcScopeError::Corrupt("unprovisioned staging database is not pristine"));
+                    return Err(EcScopeError::Corrupt(
+                        "unprovisioned staging database is not pristine",
+                    ));
                 }
                 iterator.next();
             }
@@ -247,16 +262,29 @@ fn inspect_staging(
             if !matches!(prefix.as_deref(), Some(bytes) if bytes == prefix_len.to_le_bytes())
                 && !(prefix_len == 0 && prefix.is_none())
             {
-                return Err(EcScopeError::Corrupt("provisioned staging prefix configuration mismatch"));
+                return Err(EcScopeError::Corrupt(
+                    "provisioned staging prefix configuration mismatch",
+                ));
             }
             if get(&[MetaKey::VERSION_KEY])?.as_deref() != Some(&[MetaStore::LATEST_VERSION]) {
-                return Err(EcScopeError::Corrupt("provisioned staging baseline version mismatch"));
+                return Err(EcScopeError::Corrupt(
+                    "provisioned staging baseline version mismatch",
+                ));
             }
             // A singleton key with an appended suffix is not another valid
             // protocol root. Reject it before legacy normalization can run.
-            for prefix in [MetaKey::USED_SIZE_PREFIX_LEN_KEY, MetaKey::VERSION_KEY, ENGINE_PREFIX, STAGING_FORMAT_PREFIX] {
+            for prefix in [
+                MetaKey::USED_SIZE_PREFIX_LEN_KEY,
+                MetaKey::VERSION_KEY,
+                ENGINE_PREFIX,
+                STAGING_FORMAT_PREFIX,
+            ] {
                 iterator.seek([prefix])?;
-                while iterator.valid() && iterator.key().is_some_and(|key| key.first() == Some(&prefix)) {
+                while iterator.valid()
+                    && iterator
+                        .key()
+                        .is_some_and(|key| key.first() == Some(&prefix))
+                {
                     if iterator.key() != Some(&[prefix]) {
                         return Err(EcScopeError::Corrupt("noncanonical staging singleton key"));
                     }
@@ -265,13 +293,20 @@ fn inspect_staging(
                 iterator.status()?;
             }
             iterator.seek([MetaKey::WRITING_CHUNK_KEY_PREFIX])?;
-            if iterator.key().is_some_and(|key| key.first() == Some(&MetaKey::WRITING_CHUNK_KEY_PREFIX)) {
-                return Err(EcScopeError::Corrupt("legacy writing log in staging database"));
+            if iterator
+                .key()
+                .is_some_and(|key| key.first() == Some(&MetaKey::WRITING_CHUNK_KEY_PREFIX))
+            {
+                return Err(EcScopeError::Corrupt(
+                    "legacy writing log in staging database",
+                ));
             }
             iterator.status()?;
             Ok(Some(identity))
         }
-        _ => Err(EcScopeError::Corrupt("one-sided staging identity/format initialization")),
+        _ => Err(EcScopeError::Corrupt(
+            "one-sided staging identity/format initialization",
+        )),
     }
 }
 
@@ -290,7 +325,9 @@ enum BootstrapMode {
 impl EcScopeBootstrap {
     pub(crate) fn new(allow_create_identity: bool) -> Self {
         Self {
-            mode: BootstrapMode::Ordinary { allow_create_identity },
+            mode: BootstrapMode::Ordinary {
+                allow_create_identity,
+            },
             registry: Mutex::new(None),
         }
     }
@@ -320,8 +357,14 @@ impl Engine {
             return Ok(registry.clone());
         }
         let registry = match &bootstrap.mode {
-            BootstrapMode::Ordinary { allow_create_identity } => {
-                let registry = EcScopeRegistry::open(self.meta_store.clone(), *allow_create_identity, MAX_GATES)?;
+            BootstrapMode::Ordinary {
+                allow_create_identity,
+            } => {
+                let registry = EcScopeRegistry::open(
+                    self.meta_store.clone(),
+                    *allow_create_identity,
+                    MAX_GATES,
+                )?;
                 sync_namespace()?;
                 registry
             }
@@ -384,7 +427,11 @@ impl EcScopeRegistry {
     pub(crate) fn confirm_staging_identity(&self, prefix_len: usize) -> EcScopeResult<()> {
         let prefix_len = u32::try_from(prefix_len)
             .map_err(|_| EcScopeError::Invalid("staging prefix length exceeds u32"))?;
-        let actual = inspect_staging(|key| exact_get(&self.store, key), self.store.iterator(), prefix_len)?;
+        let actual = inspect_staging(
+            |key| exact_get(&self.store, key),
+            self.store.iterator(),
+            prefix_len,
+        )?;
         if actual != Some(self.identity) {
             return Err(EcScopeError::IdentityMismatch);
         }
@@ -417,7 +464,9 @@ impl EcScopeRegistry {
     }
 
     pub fn load_target(&self, chain: u32, target: u64) -> EcScopeResult<EcTargetIdentity> {
-        self.load_target_with(chain, target, |store| store.sync_wal().map_err(EcScopeError::from))
+        self.load_target_with(chain, target, |store| {
+            store.sync_wal().map_err(EcScopeError::from)
+        })
     }
 
     fn load_target_with(
@@ -438,8 +487,14 @@ impl EcScopeRegistry {
         Ok(identity)
     }
 
-    fn check_target(&self, identity: EcTargetIdentity, chain: u32, target: u64) -> EcScopeResult<()> {
-        if identity.engine != self.identity || identity.chain != chain || identity.target != target {
+    fn check_target(
+        &self,
+        identity: EcTargetIdentity,
+        chain: u32,
+        target: u64,
+    ) -> EcScopeResult<()> {
+        if identity.engine != self.identity || identity.chain != chain || identity.target != target
+        {
             return Err(EcScopeError::IdentityMismatch);
         }
         Ok(())
@@ -456,6 +511,38 @@ impl EcScopeRegistry {
         binding: EcScopeBinding,
         load: impl FnOnce(&Self, EcScopeBinding) -> EcScopeResult<Option<EcScopeRevocation>>,
     ) -> EcScopeResult<()> {
+        self.prepare_with_wait(binding, std::time::Duration::ZERO, load, || {})
+    }
+
+    /// Data-admission-only bounded singleflight wait. Zero preserves the
+    /// existing nonwaiting semantics. This budget cannot interrupt the leader's
+    /// already synchronous disk I/O and is not a client RPC deadline.
+    pub fn prepare_scope_wait(
+        &self,
+        binding: EcScopeBinding,
+        wait_millis: u32,
+    ) -> EcScopeResult<()> {
+        if wait_millis > 1000 {
+            return Err(EcScopeError::Invalid(
+                "scope cold-load wait exceeds 1000 ms",
+            ));
+        }
+        self.prepare_with_wait(
+            binding,
+            std::time::Duration::from_millis(wait_millis.into()),
+            |registry, binding| registry.load_fence(binding),
+            || {},
+        )
+    }
+
+    fn prepare_with_wait(
+        &self,
+        binding: EcScopeBinding,
+        wait: std::time::Duration,
+        load: impl FnOnce(&Self, EcScopeBinding) -> EcScopeResult<Option<EcScopeRevocation>>,
+        on_wait: impl FnOnce(),
+    ) -> EcScopeResult<()> {
+        let deadline = std::time::Instant::now() + wait;
         let gate = self.get_gate(binding)?;
         {
             let mut state = lock(&gate.state)?;
@@ -463,7 +550,36 @@ impl EcScopeRegistry {
             match state.phase {
                 Phase::Open => return Ok(()),
                 Phase::Closing | Phase::Denied => return Err(EcScopeError::Revoked),
-                Phase::Loading => return Err(EcScopeError::Busy),
+                Phase::Loading => {
+                    if wait.is_zero() {
+                        return Err(EcScopeError::Busy);
+                    }
+                    // The loader is already executing synchronous I/O on a
+                    // different thread. No queued task behind this waiter is
+                    // needed to finish it. The callback is private test sync.
+                    on_wait();
+                    while state.phase == Phase::Loading {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(EcScopeError::Busy);
+                        }
+                        let (next, _) = gate
+                            .loaded
+                            .wait_timeout(state, remaining)
+                            .map_err(|_| EcScopeError::Poisoned)?;
+                        state = next;
+                        state.ensure_live()?;
+                    }
+                    return match state.phase {
+                        Phase::Open if std::time::Instant::now() < deadline => Ok(()),
+                        Phase::Open => Err(EcScopeError::Busy),
+                        Phase::Closing | Phase::Denied => Err(EcScopeError::Revoked),
+                        // A failed leader leaves the scope unconfirmed. The
+                        // follower never starts another load or promotes it.
+                        Phase::Unloaded | Phase::Loading => Err(EcScopeError::Busy),
+                    };
+                }
                 Phase::Unloaded => state.phase = Phase::Loading,
             }
         }
@@ -474,7 +590,7 @@ impl EcScopeRegistry {
         if state.phase != Phase::Loading {
             return Err(EcScopeError::Revoked);
         }
-        match loaded {
+        let result = match loaded {
             Ok(Some(revocation)) => {
                 state.phase = Phase::Denied;
                 state.revocation = Some(revocation);
@@ -489,7 +605,9 @@ impl EcScopeRegistry {
                 state.phase = Phase::Unloaded;
                 Err(error)
             }
-        }
+        };
+        gate.loaded.notify_all();
+        result
     }
 
     /// No disk I/O. Successful admission is linearized under the same mutex
@@ -506,7 +624,10 @@ impl EcScopeRegistry {
             }
             state.inflight = state.inflight.checked_add(1).ok_or(EcScopeError::Busy)?;
         }
-        Ok(EcAdmissionTicket { gate, _store_lease: self.store.clone() })
+        Ok(EcAdmissionTicket {
+            gate,
+            _store_lease: self.store.clone(),
+        })
     }
 
     /// Disk-executor operation. Closes before persisting; never waits for
@@ -539,6 +660,9 @@ impl EcScopeRegistry {
             state.phase = Phase::Closing;
             state.revocation = Some(request);
             state.persisting = true;
+            // Closing has priority before the durable write; data waiters do
+            // not wait for either that write or the original loader to finish.
+            gate.loaded.notify_all();
         }
         let stored = persist(self, request);
         let mut state = lock(&gate.state)?;
@@ -628,6 +752,7 @@ impl EcScopeRegistry {
                     && matches!(state.phase, Phase::Unloaded | Phase::Open | Phase::Denied)
                 {
                     state.retired = true;
+                    gate.loaded.notify_all();
                     victim = Some(key.clone());
                     break;
                 }
@@ -641,6 +766,7 @@ impl EcScopeRegistry {
         let gate = Arc::new(Gate {
             binding,
             state: Mutex::new(GateState::default()),
+            loaded: Condvar::new(),
         });
         gates.insert(key, gate.clone());
         Ok(gate)
@@ -659,6 +785,7 @@ enum Phase {
 struct Gate {
     binding: EcScopeBinding,
     state: Mutex<GateState>,
+    loaded: Condvar,
 }
 
 struct GateState {
@@ -796,7 +923,9 @@ fn exact_get(store: &MetaStore, key: &[u8]) -> EcScopeResult<Option<Vec<u8>>> {
     // All three records are smaller than this bound; malformed values never
     // allocate an attacker-controlled extent before their length is checked.
     if bytes.len() > FENCE_RECORD_BYTES {
-        return Err(EcScopeError::Corrupt("EC metadata exceeds fixed record size"));
+        return Err(EcScopeError::Corrupt(
+            "EC metadata exceeds fixed record size",
+        ));
     }
     let value = bytes.to_vec();
     iterator.status()?;
@@ -804,9 +933,13 @@ fn exact_get(store: &MetaStore, key: &[u8]) -> EcScopeResult<Option<Vec<u8>>> {
 }
 
 fn exact_raw_get(store: &RocksDB, key: &[u8]) -> EcScopeResult<Option<Vec<u8>>> {
-    let Some(value) = store.get(key)? else { return Ok(None) };
+    let Some(value) = store.get(key)? else {
+        return Ok(None);
+    };
     if value.len() > FENCE_RECORD_BYTES {
-        return Err(EcScopeError::Corrupt("EC raw metadata exceeds fixed record size"));
+        return Err(EcScopeError::Corrupt(
+            "EC raw metadata exceeds fixed record size",
+        ));
     }
     Ok(Some(value.to_vec()))
 }
@@ -843,7 +976,9 @@ fn checked_record<'a>(bytes: &'a [u8], magic: &[u8; 4], length: usize) -> EcScop
         || bytes[4..6] != VERSION.to_be_bytes()
         || bytes[length - 4..] != crc32c::crc32c(&bytes[..length - 4]).to_be_bytes()
     {
-        return Err(EcScopeError::Corrupt("EC metadata version, length, magic or checksum"));
+        return Err(EcScopeError::Corrupt(
+            "EC metadata version, length, magic or checksum",
+        ));
     }
     Ok(&bytes[6..length - 4])
 }
@@ -856,7 +991,9 @@ fn encode_engine(identity: EcIdentity) -> Vec<u8> {
 
 fn decode_engine(bytes: &[u8]) -> EcScopeResult<EcIdentity> {
     let body = checked_record(bytes, b"ECID", ENGINE_RECORD_BYTES)?;
-    let identity = body.try_into().map_err(|_| EcScopeError::Corrupt("EC engine identity"))?;
+    let identity = body
+        .try_into()
+        .map_err(|_| EcScopeError::Corrupt("EC engine identity"))?;
     if identity == [0; 16] {
         return Err(EcScopeError::Corrupt("zero persistent EC engine identity"));
     }
@@ -876,8 +1013,13 @@ fn decode_staging_format(bytes: &[u8], identity: EcIdentity, prefix_len: u32) ->
     let recorded_identity: EcIdentity = reader.take()?;
     let recorded_prefix = u32::from_be_bytes(reader.take()?);
     let recorded_version = u16::from_be_bytes(reader.take()?);
-    if recorded_identity != identity || recorded_prefix != prefix_len || recorded_version != STAGING_FORMAT_VERSION {
-        return Err(EcScopeError::Corrupt("staging format and engine identity disagree"));
+    if recorded_identity != identity
+        || recorded_prefix != prefix_len
+        || recorded_version != STAGING_FORMAT_VERSION
+    {
+        return Err(EcScopeError::Corrupt(
+            "staging format and engine identity disagree",
+        ));
     }
     Ok(())
 }
@@ -926,7 +1068,14 @@ fn decode_fence(bytes: &[u8]) -> EcScopeResult<EcScopeRevocation> {
     let owner_uid = u32::from_be_bytes(reader.take()?);
     let client_namespace = reader.take()?;
     let request = EcScopeRevocation {
-        binding: EcScopeBinding { target, object, kind, scope, owner_uid, client_namespace },
+        binding: EcScopeBinding {
+            target,
+            object,
+            kind,
+            scope,
+            owner_uid,
+            client_namespace,
+        },
         id: reader.take()?,
         endpoint_set_digest: reader.take()?,
     };
@@ -946,7 +1095,8 @@ impl Reader<'_> {
         }
         let (head, rest) = self.0.split_at(N);
         self.0 = rest;
-        head.try_into().map_err(|_| EcScopeError::Corrupt("EC field extent"))
+        head.try_into()
+            .map_err(|_| EcScopeError::Corrupt("EC field extent"))
     }
 
     fn target(&mut self) -> EcScopeResult<EcTargetIdentity> {

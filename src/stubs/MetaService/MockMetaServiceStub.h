@@ -57,6 +57,15 @@ class DummyMetaServiceStub : public IMetaServiceStub {
   NOT_IMPLEMENTED_FUNC(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
   NOT_IMPLEMENTED_FUNC(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
   NOT_IMPLEMENTED_FUNC(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
+  NOT_IMPLEMENTED_FUNC(createEcFileV2, CreateEcFileV2Req, CreateEcFileRsp);
+  NOT_IMPLEMENTED_FUNC(beginEcMutationV2, BeginEcMutationV2Req, EcV2MutationRsp);
+  NOT_IMPLEMENTED_FUNC(bindEcMutationV2, BindEcMutationV2Req, EcV2MutationRsp);
+  NOT_IMPLEMENTED_FUNC(publishEcMutationV2, PublishEcMutationV2Req, EcV2MutationRsp);
+  NOT_IMPLEMENTED_FUNC(getEcOperationV2, GetEcOperationV2Req, EcV2MutationRsp);
+  NOT_IMPLEMENTED_FUNC(cancelEcMutationV2, CancelEcMutationV2Req, EcV2MutationRsp);
+  NOT_IMPLEMENTED_FUNC(acquireEcReadV2, AcquireEcReadV2Req, AcquireEcReadV2Rsp);
+  NOT_IMPLEMENTED_FUNC(releaseEcReadV2, ReleaseEcReadV2Req, ReleaseEcReadV2Rsp);
+  NOT_IMPLEMENTED_FUNC(prepareEcRepairV2, PrepareEcRepairV2Req, PrepareEcRepairV2Rsp);
 
   virtual CoTryTask<AuthRsp> authenticate(const AuthReq &req) { co_return AuthRsp{req.user}; }
   CoTryTask<AuthRsp> authenticate(const AuthReq &req, const net::UserRequestOptions &, serde::Timestamp *) override {
@@ -152,6 +161,15 @@ class MetaServiceStub<hf3fs::stubs::StubMockContext<IMetaServiceStub>> : public 
   FORWARD_RPC_FUNC(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
   FORWARD_RPC_FUNC(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
   FORWARD_RPC_FUNC(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
+  FORWARD_RPC_FUNC(createEcFileV2, CreateEcFileV2Req, CreateEcFileRsp);
+  FORWARD_RPC_FUNC(beginEcMutationV2, BeginEcMutationV2Req, EcV2MutationRsp);
+  FORWARD_RPC_FUNC(bindEcMutationV2, BindEcMutationV2Req, EcV2MutationRsp);
+  FORWARD_RPC_FUNC(publishEcMutationV2, PublishEcMutationV2Req, EcV2MutationRsp);
+  FORWARD_RPC_FUNC(getEcOperationV2, GetEcOperationV2Req, EcV2MutationRsp);
+  FORWARD_RPC_FUNC(cancelEcMutationV2, CancelEcMutationV2Req, EcV2MutationRsp);
+  FORWARD_RPC_FUNC(acquireEcReadV2, AcquireEcReadV2Req, AcquireEcReadV2Rsp);
+  FORWARD_RPC_FUNC(releaseEcReadV2, ReleaseEcReadV2Req, ReleaseEcReadV2Rsp);
+  FORWARD_RPC_FUNC(prepareEcRepairV2, PrepareEcRepairV2Req, PrepareEcRepairV2Rsp);
 
 #undef FORWARD_RPC_FUNC
 

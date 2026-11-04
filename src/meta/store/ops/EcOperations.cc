@@ -7,6 +7,7 @@
 #include "meta/components/EcCoordinator.h"
 #include "meta/store/EcCreateCatalog.h"
 #include "meta/store/EcNamespaceGuard.h"
+#include "meta/store/EcV2BindingCatalog.h"
 #include "meta/store/Operation.h"
 
 namespace hf3fs::meta::server {
@@ -40,6 +41,9 @@ CoTryTask<LoadedEcFile> loadEcFile(IReadWriteTransaction &txn,
                                    const UserInfo &user,
                                    const EcObjectRef &object,
                                    std::optional<AccessType> access) {
+  auto v2 = co_await EcV2BindingCatalog::getObjectMode(txn, object);
+  CO_RETURN_ON_ERROR(v2);
+  if (*v2) co_return makeError(StatusCode::kNotImplemented, "V2 object requires V2 lifecycle methods");
   auto loaded = co_await Inode::load(txn, object.inode);
   CO_RETURN_ON_ERROR(loaded);
   if (!*loaded || !(**loaded).nlink) co_return makeError(MetaCode::kNotFound, "EC inode is absent or unlinked");
@@ -275,6 +279,9 @@ class EcReadPinOp : public Operation<Rsp> {
     if constexpr (std::is_same_v<Req, ReleaseEcReadReq>) {
       // The owner may release after ACL revocation, but never force release of
       // live storage reads. No wire field can manufacture drain evidence.
+      auto v2 = co_await EcV2BindingCatalog::getObjectMode(txn, req_.object);
+      CO_RETURN_ON_ERROR(v2);
+      if (*v2) co_return makeError(StatusCode::kNotImplemented, "V2 pin requires the V2 drain lifecycle");
       auto pin = co_await EcCatalog::getPin(txn, req_.object, req_.pin);
       CO_RETURN_ON_ERROR(pin);
       CO_RETURN_ON_ERROR(checkOwner(req_, pin->owner));

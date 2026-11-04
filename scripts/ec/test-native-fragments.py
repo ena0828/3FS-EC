@@ -21,9 +21,10 @@ import xml.etree.ElementTree as ET
 
 STORAGE_FILTER = (
     "TestEcProtocol.*:TestEcTarget.*:TestEcIntegrity.*:TestEcCodec.*:TestEcAuthorization.*:"
-    "TestEcScopeBridge.*:TestEcStagingBridge.*:TestEcAuthorizationV2.*:TestEcScopeControl.*:TestEcScopeControlExecutor.*"
+    "TestEcScopeBridge.*:TestEcScopeLoadBudget.*:TestEcStagingBridge.*:TestEcAuthorizationV2.*:TestEcScopeControl.*:TestEcScopeControlExecutor.*:TestEcRepairPlan.*:TestEcHelperAuthorization.*"
 )
-SERVICE_FILTER = "TestEcService.*:TestEcServiceWithoutEngine.*:TestEcAuthorizedService.*:TestEcAuthorizedNoKeyService.*:TestEcCapabilityComponents.*:TestEcScopeControlService.*:TestEcStageService.*"
+SERVICE_FILTER = "TestEcService.*:TestEcServiceWithoutEngine.*:TestEcAuthorizedService.*:TestEcAuthorizedNoKeyService.*:TestEcCapabilityComponents.*:TestEcScopeControlService.*:TestEcStageService.*:TestEcNativeRepairService.*"
+CLIENT_FILTER = "TestEcStripeRead.*:TestEcBlockRead.*:TestEcRepairPipeline.*:TestFakeMgmtdRoutingListeners.*"
 LEGACY_FILTER = "TestChunkEngine.ReadWrite:TestStorageTarget.ReadWrite:TestStorageTarget.Uncommitted"
 # TestChunkEngine.ReadWrite retains default 4 MiB/64 MiB buffers and 32 AIO
 # workers: (4 * 4 + 64) * 32 = 2560 MiB of repeated ring registration accounting.
@@ -53,13 +54,13 @@ def parser():
         description=__doc__,
         epilog=("No build, installation, cluster startup, periodic resource sampling or performance tuning is performed. "
                 "The output directory and TMPDIR are retained, including after failure. "
-                "With --suite service, --include-legacy additionally schedules the storage regression cases. "
+                "With --suite service or client, --include-legacy additionally schedules the storage regression cases. "
                 "Its memlock requirement follows the current test buffer/thread defaults, not a universal platform requirement."),
     )
     result.add_argument("--bin-dir", required=True, type=Path, help="directory containing already-built test binaries")
     result.add_argument("--tmp-root", required=True, type=Path, help="existing writable directory on ext4")
     result.add_argument("--output", required=True, type=Path, help="new results directory; its parent must exist")
-    result.add_argument("--suite", choices=("all", "storage", "service"), default="all")
+    result.add_argument("--suite", choices=("all", "storage", "service", "client"), default="all")
     result.add_argument("--include-legacy", action="store_true", help="also run the three named legacy storage regressions (requires 3 GiB memlock limit)")
     result.add_argument("--timeout", type=positive_seconds, default=300.0, help="seconds per listing/test command (default: 300)")
     return result
@@ -272,6 +273,8 @@ def plans(args):
         selected.append(("storage_legacy", "test_storage_store", LEGACY_FILTER))
     if args.suite in ("all", "service"):
         selected.append(("service", "test_storage_service", SERVICE_FILTER))
+    if args.suite in ("all", "client"):
+        selected.append(("client", "test_client", CLIENT_FILTER))
     return selected
 
 

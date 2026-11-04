@@ -45,6 +45,15 @@ IMPL_META_STUB_METHOD(getEcOperation, GetEcOperationReq, EcOperationRsp);
 IMPL_META_STUB_METHOD(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
 IMPL_META_STUB_METHOD(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
 IMPL_META_STUB_METHOD(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
+IMPL_META_STUB_METHOD(createEcFileV2, CreateEcFileV2Req, CreateEcFileRsp);
+IMPL_META_STUB_METHOD(beginEcMutationV2, BeginEcMutationV2Req, EcV2MutationRsp);
+IMPL_META_STUB_METHOD(bindEcMutationV2, BindEcMutationV2Req, EcV2MutationRsp);
+IMPL_META_STUB_METHOD(publishEcMutationV2, PublishEcMutationV2Req, EcV2MutationRsp);
+IMPL_META_STUB_METHOD(getEcOperationV2, GetEcOperationV2Req, EcV2MutationRsp);
+IMPL_META_STUB_METHOD(cancelEcMutationV2, CancelEcMutationV2Req, EcV2MutationRsp);
+IMPL_META_STUB_METHOD(acquireEcReadV2, AcquireEcReadV2Req, AcquireEcReadV2Rsp);
+IMPL_META_STUB_METHOD(releaseEcReadV2, ReleaseEcReadV2Req, ReleaseEcReadV2Rsp);
+IMPL_META_STUB_METHOD(prepareEcRepairV2, PrepareEcRepairV2Req, PrepareEcRepairV2Rsp);
 
 template class MetaServiceStub<serde::ClientContext>;
 template class MetaServiceStub<serde::ClientMockContext>;

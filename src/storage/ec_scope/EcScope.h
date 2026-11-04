@@ -51,6 +51,8 @@ class EcScope {
   Result<EcScopeTargetIdentity> registerTarget(uint32_t chain, uint64_t target) const;
   Result<EcScopeTargetIdentity> loadTarget(uint32_t chain, uint64_t target) const;
   Result<Void> prepare(const EcScopeBinding &binding) const;
+  // Data-only bounded wait; control Query retains nonwaiting prepare().
+  Result<Void> prepareWait(const EcScopeBinding &binding, uint32_t waitMillis) const;
   Result<EcScopeTicket> tryAdmit(const EcScopeBinding &binding) const;
   Result<EcScopeDrainStatus> revoke(const EcScopeRevocation &request) const;
   Result<EcScopeDrainStatus> drainStatus(const EcScopeRevocation &request) const;

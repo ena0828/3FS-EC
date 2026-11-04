@@ -11,6 +11,7 @@
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
 
@@ -116,6 +117,10 @@ class StorageMessenger {
                                                  const net::UserRequestOptions *options = nullptr,
                                                  serde::Timestamp *timestamp = nullptr);
 
+  CoTryTask<EcHelperHopRsp> executeEcHelper(const net::Address &address,
+                                            const EcHelperHopReq &request,
+                                            const net::UserRequestOptions *options = nullptr,
+                                            serde::Timestamp *timestamp = nullptr);
   CoTryTask<EcReadBlockV2Rsp> readEcBlockV2(const net::Address &address,
                                             const EcReadBlockV2Req &request,
                                             const net::UserRequestOptions *options = nullptr,

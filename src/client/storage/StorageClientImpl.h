@@ -81,6 +81,12 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<EcStageStateV2> queryEcStageV2(const EcQueryStageV2Req &) override;
   CoTryTask<EcStageStateV2> reconcileEcStageV2(const EcReconcileStageV2Req &) override;
   CoTryTask<EcFragmentReceiptV2> sealEcStageV2(const EcSealStageV2Req &) override;
+  CoTryTask<EcStageStateV2> beginEcStageV2Controlled(EcBeginStageV2Req, EcRequestControl) override;
+  CoTryTask<EcStageStateV2> appendEcStageV2Controlled(EcAppendStageV2Req, EcRequestControl) override;
+  CoTryTask<EcStageStateV2> queryEcStageV2Controlled(EcQueryStageV2Req, EcRequestControl) override;
+  CoTryTask<EcStageStateV2> reconcileEcStageV2Controlled(EcReconcileStageV2Req, EcRequestControl) override;
+  CoTryTask<EcFragmentReceiptV2> sealEcStageV2Controlled(EcSealStageV2Req, EcRequestControl) override;
+  CoTryTask<EcHelperHopResult> executeEcHelper(EcHelperHopReq, EcRequestControl) override;
   CoTryTask<EcReadBlockResultV2> readEcBlockV2Controlled(EcReadBlockV2Req, EcRequestControl) override;
   CoTryTask<EcFragmentReceipt> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) override;
 
@@ -102,7 +108,10 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<Response> stageRequestV2(const WireReq &,
                                      MethodType,
                                      bool durable,
-                                     const EcRequestControl *control = nullptr);
+                                     const EcRequestControl *control = nullptr,
+                                     bool *wasDispatched = nullptr);
+  template <typename WireReq, typename Response, auto Method>
+  CoTryTask<Response> controlledStageRequestV2(WireReq, MethodType, bool durable, EcRequestControl);
   template <typename WireReq>
   CoTryTask<EcReadResult> readEcFragmentImpl(const WireReq &request, const EcRequestControl *control = nullptr);
   template <typename WireReq>
@@ -161,6 +170,7 @@ class StorageClientImpl : public StorageClient {
  private:
   CoTryTask<EcScopeControlAck> controlEcScope(const EcScopeControlRequest &, EcScopeControlAction);
   hf3fs::Semaphore ecControlConcurrency_{16, 16};
+  hf3fs::Semaphore ecHelperConcurrency_{64, 64};
 
  private:
   void setCurrentRoutingInfo(std::shared_ptr<hf3fs::client::RoutingInfo const> latestRoutingInfo);

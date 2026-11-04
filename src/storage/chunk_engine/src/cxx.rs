@@ -597,6 +597,11 @@ pub mod ffi {
             handle: &EcScopeHandle,
             binding: &RawEcScopeBinding,
         ) -> RawEcScopeStatus;
+        fn ec_scope_prepare_wait(
+            handle: &EcScopeHandle,
+            binding: &RawEcScopeBinding,
+            wait_millis: u32,
+        ) -> RawEcScopeStatus;
         fn ec_scope_try_admit(
             handle: &EcScopeHandle,
             binding: &RawEcScopeBinding,

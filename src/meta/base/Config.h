@@ -59,6 +59,8 @@ struct EcTargetConfig : ConfigBase<EcTargetConfig> {
   CONFIG_ITEM(chain, uint32_t{});
   CONFIG_ITEM(target, uint64_t{});
   CONFIG_ITEM(node, uint32_t{});
+  CONFIG_ITEM(engine_uuid, std::string{});
+  CONFIG_ITEM(target_incarnation, std::string{});
 
  public:
   EcPlacement placement() const {
@@ -73,6 +75,13 @@ struct EcTargetConfig : ConfigBase<EcTargetConfig> {
 struct Config : ConfigBase<Config> {
   // Native EC remains opt-in while storage capability enforcement is integrated.
   CONFIG_ITEM(enable_ec_catalog, false);
+  CONFIG_ITEM(enable_ec_v2, false);
+  CONFIG_ITEM(ec_v2_helper_key_file, Path{});
+  CONFIG_ITEM(ec_v2_helper_grant_ttl_seconds, uint64_t{300});
+  CONFIG_ITEM(ec_v2_control_key_file, Path{});
+  CONFIG_ITEM(ec_v2_control_authority, std::string{});
+  CONFIG_ITEM(ec_v2_drain_timeout, 60_s);
+  CONFIG_ITEM(ec_v2_drain_poll_interval, 20_ms);
   CONFIG_ITEM(ec_allow_colocated_test_targets, false);
   CONFIG_ITEM(ec_allow_unauthorized_storage_for_tests, false);
   CONFIG_ITEM(ec_capability_key_file, Path{});

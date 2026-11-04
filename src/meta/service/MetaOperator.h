@@ -33,6 +33,7 @@
 #include "meta/components/ChainAllocator.h"
 #include "meta/components/Distributor.h"
 #include "meta/components/EcCoordinator.h"
+#include "meta/components/EcV2Coordinator.h"
 #include "meta/components/FileHelper.h"
 #include "meta/components/Forward.h"
 #include "meta/components/GcManager.h"
@@ -80,6 +81,15 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<EcOperationRsp> cancelEcMutation(CancelEcMutationReq req);
   CoTryTask<AcquireEcReadRsp> acquireEcRead(AcquireEcReadReq req);
   CoTryTask<ReleaseEcReadRsp> releaseEcRead(ReleaseEcReadReq req);
+  CoTryTask<CreateEcFileRsp> createEcFileV2(CreateEcFileV2Req req);
+  CoTryTask<EcV2MutationRsp> beginEcMutationV2(BeginEcMutationV2Req req);
+  CoTryTask<EcV2MutationRsp> bindEcMutationV2(BindEcMutationV2Req req);
+  CoTryTask<EcV2MutationRsp> publishEcMutationV2(PublishEcMutationV2Req req);
+  CoTryTask<EcV2MutationRsp> getEcOperationV2(GetEcOperationV2Req req);
+  CoTryTask<EcV2MutationRsp> cancelEcMutationV2(CancelEcMutationV2Req req);
+  CoTryTask<AcquireEcReadV2Rsp> acquireEcReadV2(AcquireEcReadV2Req req);
+  CoTryTask<ReleaseEcReadV2Rsp> releaseEcReadV2(ReleaseEcReadV2Req req);
+  CoTryTask<PrepareEcRepairV2Rsp> prepareEcRepairV2(PrepareEcRepairV2Req req);
 
   CoTryTask<MkdirsRsp> mkdirs(MkdirsReq req);
 
@@ -196,6 +206,8 @@ class MetaOperator : public folly::NonCopyableNonMovable {
 
   CoTryTask<void> authenticate(UserInfo &userInfo);
   CoTryTask<void> authenticateEc(ReqBase &req);
+  CoTryTask<void> authenticateEcV2(ReqBase &req);
+  CoTryTask<EcV2DrainRecord> advanceEcV2Drain(const EcOperationReq &, EcV2DrainRecord);
 
   const Config &config_;
   flat::NodeId nodeId_;
@@ -213,6 +225,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
 
   std::unique_ptr<MetaStore> metaStore_;
   std::unique_ptr<EcCoordinator> ecCoordinator_;
+  std::unique_ptr<EcV2Coordinator> ecV2Coordinator_;
 
   Shards<std::map<InodeId, Batch>, 63> batches_;
 

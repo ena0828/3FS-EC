@@ -2,7 +2,9 @@
 #include <atomic>
 #include <fcntl.h>
 #include <folly/ScopeGuard.h>
+#include <folly/experimental/coro/Baton.h>
 #include <folly/experimental/coro/BlockingWait.h>
+#include <folly/experimental/coro/Sleep.h>
 #include <future>
 #include <linux/magic.h>
 #include <mutex>
@@ -11,12 +13,17 @@
 #include <sys/stat.h>
 #include <sys/vfs.h>
 
+#include "client/ec/NativeEcBlockTransport.h"
+#include "client/ec/NativeEcRepairTransport.h"
 #include "client/storage/StorageClient.h"
 #include "client/storage/StorageMessenger.h"
 #include "common/net/Server.h"
 #include "fbs/storage/EcStageResultV2.h"
+#include "storage/ec_codec/EcCodec.h"
+#include "storage/ec_repair/EcHelperAuthorization.h"
 #include "storage/service/Components.h"
 #include "storage/service/StorageService.h"
+#include "tests/EcRepairTestData.h"
 #include "tests/GtestHelpers.h"
 #include "tests/lib/UnitTestFabric.h"
 
@@ -45,11 +52,12 @@ void smallClient(net::Client::Config &config) {
 struct StageReplyDropState {
   struct ReadDelay {
     std::promise<void> entered;
-    std::promise<void> release;
-    std::shared_future<void> resume = release.get_future().share();
+    // Suspend only this handler; never block its shared network processor.
+    folly::coro::Baton resume;
     std::atomic<bool> resumed{false};
+    std::atomic<bool> started{false};
     void unblock() {
-      if (!resumed.exchange(true)) release.set_value();
+      if (!resumed.exchange(true)) resume.post();
     }
     ~ReadDelay() { unblock(); }
   };
@@ -73,6 +81,14 @@ struct StageReplyDropState {
   bool armed = false;
   Snapshot state;
   std::shared_ptr<ReadDelay> delayedRead;
+  std::array<size_t, 10> helperHopCalls{};
+  std::optional<uint8_t> helperDelayPosition;
+  std::shared_ptr<ReadDelay> delayedHelper;
+  std::vector<std::shared_ptr<ReadDelay>> delayedBegins;
+  size_t beginCalls = 0;
+  size_t queryCalls = 0;
+  size_t reconcileCalls = 0;
+  std::optional<uint16_t> delayedReadShard;
 };
 
 // Every handler still executes the real StorageService. Rebind the serde
@@ -88,14 +104,70 @@ class StageReplyDropStorageService : public StorageService {
     std::shared_ptr<StageReplyDropState::ReadDelay> delay;
     {
       std::lock_guard lock(fault_.mutex);
-      delay = std::move(fault_.delayedRead);
+      if (!fault_.delayedReadShard || *fault_.delayedReadShard == req.request.identity.shard) {
+        delay = std::move(fault_.delayedRead);
+        fault_.delayedReadShard.reset();
+      }
     }
     if (delay) {
+      delay->started = true;
       delay->entered.set_value();
-      delay->resume.wait();
+      co_await delay->resume;
     }
     // Delay the real server handler; never supply synthetic successful data.
     co_return co_await StorageService::readEcBlockV2(ctx, req);
+  }
+
+  CoTryTask<EcHelperHopRsp> executeEcHelper(serde::CallContext &ctx, const EcHelperHopReq &request) {
+    std::shared_ptr<StageReplyDropState::ReadDelay> delay;
+    {
+      std::lock_guard lock(fault_.mutex);
+      if (request.packet.nextHelper < 10) ++fault_.helperHopCalls[request.packet.nextHelper];
+      if (fault_.helperDelayPosition && *fault_.helperDelayPosition == request.packet.nextHelper) {
+        delay = std::move(fault_.delayedHelper);
+        fault_.helperDelayPosition.reset();
+      }
+    }
+    if (delay) {
+      delay->entered.set_value();
+      co_await delay->resume;
+    }
+    co_return co_await StorageService::executeEcHelper(ctx, request);
+  }
+  CoTryTask<EcStageV2Rsp> beginEcStageV2(serde::CallContext &ctx, const EcBeginStageV2Req &request) {
+    {
+      std::lock_guard lock(fault_.mutex);
+      ++fault_.beginCalls;
+    }
+    auto result = co_await StorageService::beginEcStageV2(ctx, request);
+    std::shared_ptr<StageReplyDropState::ReadDelay> delay;
+    if (result && result->result) {
+      std::lock_guard lock(fault_.mutex);
+      if (!fault_.delayedBegins.empty()) {
+        delay = fault_.delayedBegins.front();
+        fault_.delayedBegins.erase(fault_.delayedBegins.begin());
+      }
+    }
+    if (delay) {
+      delay->entered.set_value();
+      co_await delay->resume;
+    }
+    co_return result;
+  }
+
+  CoTryTask<EcStageV2Rsp> queryEcStageV2(serde::CallContext &ctx, const EcQueryStageV2Req &request) {
+    {
+      std::lock_guard lock(fault_.mutex);
+      ++fault_.queryCalls;
+    }
+    co_return co_await StorageService::queryEcStageV2(ctx, request);
+  }
+  CoTryTask<EcStageV2Rsp> reconcileEcStageV2(serde::CallContext &ctx, const EcReconcileStageV2Req &request) {
+    {
+      std::lock_guard lock(fault_.mutex);
+      ++fault_.reconcileCalls;
+    }
+    co_return co_await StorageService::reconcileEcStageV2(ctx, request);
   }
 
   CoTryTask<EcSealStageV2Rsp> sealEcStageV2(serde::CallContext &ctx, const EcSealStageV2Req &req) {
@@ -130,7 +202,7 @@ class StageReplyDropStorageService : public StorageService {
 
 class TestEcStageService : public ::testing::Test {
  protected:
-  void configureEcAuthorization() {
+  virtual void configureEcAuthorization() {
     config_.storage().set_allow_unsafe_ec_fragment_rpc_for_testing(false);
     for (size_t i = 0; i != keyBytes_.size(); ++i) keyBytes_[i] = static_cast<uint8_t>(i + 41);
     const auto path = traces_.path() / "v2-data.key";
@@ -199,8 +271,8 @@ class TestEcStageService : public ::testing::Test {
       group.listener().set_listen_port(0);
       group.listener().set_filter_list({"lo"});
       group.listener().set_custom_tcp_nic_prefix("lo");
-      group.processor().set_max_processing_requests_num(16);
-      group.processor().set_max_coroutines_num(16);
+      group.processor().set_max_processing_requests_num(config_.storage().enable_ec_helpers() ? 128 : 16);
+      group.processor().set_max_coroutines_num(config_.storage().enable_ec_helpers() ? 128 : 16);
       group.processor().set_response_compression_level(0);
     }
     server_ = std::make_unique<net::Server>(serverConfig_);
@@ -542,22 +614,83 @@ TEST_F(TestEcStageService, ExpiryAtWorkerAndAfterSealUseDistinctOutcomes) {
   std::string original;
   auto request = access(4097, 60, original);
   auto token = grant(request);
+  auto physical = components_->targetMap.getByTargetId(targetId_);
+  ASSERT_OK(physical);
+  auto target = (*physical)->storageTarget;
+  EcStageRequest query;
+  query.operation = EcStageOperation::Query;
+  query.identity = request.identity;
+  query.vChainId = request.vChainId;
+  query.targetId = request.targetId;
+  query.operationId = request.operationId;
+  query.integrity = request.integrity;
+  const auto usedBefore = target->usedSize();
+  ASSERT_ERROR(target->executeEcStage(query), StorageCode::kChunkMetadataNotFound);
+  auto restoreClock = folly::makeGuard([&] {
+    StorageEcStageAuthorizationTestAccess::clock(components_->storageOperator, [] { return uint64_t{1000}; });
+  });
+  // Retain this existing pre-mutation injection. Its ordinal is tied to the
+  // current admission checks; the assertions below prove no stage was created.
   auto calls = std::make_shared<std::atomic<unsigned>>(0);
   StorageEcStageAuthorizationTestAccess::clock(components_->storageOperator,
                                                [calls] { return ++*calls >= 4 ? uint64_t{1100} : uint64_t{1000}; });
   ASSERT_ERROR(blockingWait(client_->beginEcStageV2({request, token})), StatusCode::kAuthenticationFail);
   StorageEcStageAuthorizationTestAccess::clock(components_->storageOperator, [] { return uint64_t{1000}; });
+  ASSERT_ERROR(blockingWait(client_->queryEcStageV2({request, token})), StorageCode::kChunkMetadataNotFound);
+  EXPECT_EQ(target->usedSize(), usedBefore);
   ASSERT_OK(blockingWait(client_->beginEcStageV2({request, token})));
   ASSERT_NO_FATAL_FAILURE(appendAll(request, token, original));
-  calls->store(0);
+  auto active = target->executeEcStage(query);
+  ASSERT_OK(active);
+  ASSERT_TRUE(active->state);
+  ASSERT_EQ(active->state->state, 1);
+  ASSERT_EQ(active->state->prefix_bytes, original.size());
+  ASSERT_FALSE(active->state->pending_block);
+  const auto activeRevision = active->state->revision;
+  EXPECT_EQ(target->usedSize(), usedBefore);
+
+  auto observedActive = std::make_shared<std::atomic<bool>>(false);
+  auto observedSealed = std::make_shared<std::atomic<bool>>(false);
+  auto invalidObservation = std::make_shared<std::atomic<bool>>(false);
+  // Auth callbacks run before stage execution or after it has returned. This
+  // direct, read-only query neither re-enters auth nor holds a seal slot lock.
+  // Query observes the event; it is not a fresh durability acknowledgment.
   StorageEcStageAuthorizationTestAccess::clock(components_->storageOperator,
-                                               [calls] { return ++*calls >= 5 ? uint64_t{1100} : uint64_t{1000}; });
-  ASSERT_ERROR(blockingWait(client_->sealEcStageV2({request, token})), StorageCode::kEcSealOutcomeUnknown);
+                                               [target, query, observedActive, observedSealed, invalidObservation] {
+                                                 auto observed = target->executeEcStage(query);
+                                                 if (!observed || !observed->state) {
+                                                   invalidObservation->store(true);
+                                                   return uint64_t{1100};
+                                                 }
+                                                 if (observed->state->state == 1) {
+                                                   observedActive->store(true);
+                                                   return uint64_t{1000};
+                                                 }
+                                                 if (observed->state->state == 2) {
+                                                   observedSealed->store(true);
+                                                   return uint64_t{1100};
+                                                 }
+                                                 invalidObservation->store(true);
+                                                 return uint64_t{1100};
+                                               });
+  auto expiredSeal = blockingWait(client_->sealEcStageV2({request, token}));
   StorageEcStageAuthorizationTestAccess::clock(components_->storageOperator, [] { return uint64_t{1000}; });
+  ASSERT_ERROR(expiredSeal, StorageCode::kEcSealOutcomeUnknown);
+  EXPECT_TRUE(observedActive->load());
+  EXPECT_TRUE(observedSealed->load());
+  EXPECT_FALSE(invalidObservation->load());
   auto state = blockingWait(client_->queryEcStageV2({request, token}));
   ASSERT_OK(state);
   EXPECT_EQ(state->state, 2);
+  EXPECT_GT(state->revision, activeRevision);
+  EXPECT_EQ(state->prefixBytes, original.size());
+  EXPECT_FALSE(state->pendingBlock);
+  const auto committedAfterSeal = target->usedSize();
+  // Engine accounting uses the allocator size class, not logical byte length.
+  EXPECT_GE(committedAfterSeal, usedBefore + original.size());
+  ASSERT_OK(blockingWait(client_->reconcileEcStageV2({request, token})));
   ASSERT_OK(blockingWait(client_->sealEcStageV2({request, token})));
+  EXPECT_EQ(target->usedSize(), committedAfterSeal);
 }
 
 TEST_F(TestEcStageService, ControlledBlockReadUsesRealTcpAndFiniteDeadline) {
@@ -635,6 +768,695 @@ TEST_F(TestEcStageService, LegacyBearerAndChangedRouteCannotBypassV2) {
   legacy.checksum = ChecksumInfo{ChecksumType::CRC32C, ~request.integrity.wholeCrc32c};
   ASSERT_ERROR(blockingWait(client_->createEcFragment(legacy)), StatusCode::kAuthenticationFail);
   ASSERT_OK(blockingWait(client_->beginEcStageV2({request, token})));
+}
+
+// Twelve logical targets share one real Engine and one physical failure domain.
+// Helper RPCs still traverse TCP at every hop, including ten distinct target
+// incarnations. This fixture does not claim a twelve-node or RDMA experiment.
+class TestEcNativeRepairService : public TestEcStageService {
+ protected:
+  void configureEcAuthorization() override {
+    TestEcStageService::configureEcAuthorization();
+    const auto path = traces_.path() / "helper.key";
+    std::array<uint8_t, 32> bytes;
+    for (size_t i = 0; i != bytes.size(); ++i) bytes[i] = i + 91;
+    const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::write(fd, bytes.data(), bytes.size()), ssize_t(bytes.size()));
+    ASSERT_EQ(::close(fd), 0);
+    config_.storage().set_enable_ec_helpers(true);
+    config_.storage().set_ec_helper_key_file(path);
+  }
+  void SetUp() override {
+    TestEcStageService::SetUp();
+    if (HasFatalFailure()) return;
+    auto key = EcHelperKey::loadFile(std::filesystem::path(config_.storage().ec_helper_key_file().string()));
+    ASSERT_OK(key);
+    helperKey_ = std::move(*key);
+    // The alias never outlives this fixture's owned fake routing source.
+    components_->mgmtdClient.store(std::shared_ptr<hf3fs::client::IMgmtdClientForServer>(mgmtd_.get(), [](auto *) {}));
+    auto next = std::make_shared<flat::RoutingInfo>(*routing_);
+    for (uint16_t i = 0; i != 12; ++i) {
+      const TargetId id(1000 + i);
+      const ChainId chainId(2000 + i);
+      EcCreateTargetReq create;
+      create.settings.targetId = id;
+      create.settings.chainId = chainId;
+      create.settings.onlyChunkEngine = true;
+      ASSERT_OK(blockingWait(client_->createEcTarget(nodeId_, create)));
+      flat::TargetInfo target;
+      target.targetId = id;
+      target.chainId = chainId;
+      target.nodeId = nodeId_;
+      target.diskIndex = 0;
+      target.publicState = flat::PublicTargetState::SERVING;
+      target.localState = flat::LocalTargetState::UPTODATE;
+      next->targets[id] = target;
+      flat::ChainInfo chain;
+      chain.chainId = chainId;
+      chain.chainVersion = ChainVer(1);
+      flat::ChainTargetInfo member;
+      member.targetId = id;
+      member.publicState = flat::PublicTargetState::SERVING;
+      chain.targets.push_back(member);
+      next->chains[chainId] = chain;
+      auto loaded = components_->targetMap.getByTargetId(id);
+      ASSERT_OK(loaded);
+      auto scope = (*loaded)->storageTarget->ecScopeState();
+      ASSERT_OK(scope);
+      endpoints_[i].nodeId = nodeId_;
+      endpoints_[i].chainId = chainId;
+      endpoints_[i].targetId = id;
+      std::copy(scope->second.engine.begin(), scope->second.engine.end(), std::begin(endpoints_[i].engineUuid.data));
+      std::copy(scope->second.incarnation.begin(),
+                scope->second.incarnation.end(),
+                std::begin(endpoints_[i].targetIncarnation.data));
+    }
+    next->routingInfoVersion = flat::RoutingInfoVersion{++routingVersion_};
+    routing_ = next;
+    mgmtd_->setRoutingInfo(next);
+    ASSERT_OK(components_->targetMap.updateRouting(mgmtd_->getRoutingInfo()));
+  }
+  void reopenStorage() {
+    // Exercise actual RocksDB/Engine reopen and restored target incarnations.
+    // Call only after all RPCs have completed; no live target lease is retained.
+    server_->stopAndJoin();
+    server_.reset();
+    ASSERT_OK(components_->storageOperator.stopAndJoin());
+    operatorInitialized_ = false;
+    {
+      auto map = components_->targetMap.release();
+      ASSERT_NE(map, nullptr);
+      for (const auto &[id, target] : map->getTargets()) {
+        if (target.storageTarget) ASSERT_OK(target.storageTarget->release());
+      }
+    }
+    ASSERT_OK(components_->storageTargets.globalFileStore().clear(loader_));
+    components_.reset();
+    components_ = std::make_unique<Components>(config_);
+    components_->appInfo.nodeId = nodeId_;
+    ASSERT_OK(components_->storageTargets.load(loader_));
+    components_->mgmtdClient.store(std::shared_ptr<hf3fs::client::IMgmtdClientForServer>(mgmtd_.get(), [](auto *) {}));
+    ASSERT_OK(components_->targetMap.updateRouting(mgmtd_->getRoutingInfo()));
+    ASSERT_OK(components_->storageOperator.init(1));
+    operatorInitialized_ = true;
+    StorageEcStageAuthorizationTestAccess::clock(components_->storageOperator, [] { return uint64_t{1000}; });
+    server_ = std::make_unique<net::Server>(serverConfig_);
+    ASSERT_OK(server_->addSerdeService(
+        std::make_unique<StageReplyDropStorageService>(components_->storageOperator, replyDrop_),
+        true));
+    ASSERT_OK(server_->setup());
+    flat::AppInfo app;
+    app.nodeId = nodeId_;
+    ASSERT_OK(server_->start(app));
+    auto groups = server_->getServiceGroupInfos();
+    for (auto &group : groups) {
+      const auto loopback = std::find_if(group.endpoints.begin(), group.endpoints.end(), [](const auto &endpoint) {
+        return endpoint.type == net::Address::TCP && endpoint.ipStr() == "127.0.0.1";
+      });
+      ASSERT_NE(loopback, group.endpoints.end());
+      const auto endpoint = *loopback;
+      group.endpoints.assign(1, endpoint);
+      if (group.services.contains("StorageSerde")) address_ = endpoint;
+    }
+    auto next = std::make_shared<flat::RoutingInfo>(*routing_);
+    next->nodes.at(nodeId_).app.serviceGroups = std::move(groups);
+    next->routingInfoVersion = flat::RoutingInfoVersion{++routingVersion_};
+    routing_ = next;
+    mgmtd_->setRoutingInfo(next);
+    ASSERT_OK(components_->targetMap.updateRouting(mgmtd_->getRoutingInfo()));
+    for (const auto &expected : endpoints_) {
+      auto loaded = components_->targetMap.getByTargetId(expected.targetId);
+      ASSERT_OK(loaded);
+      auto state = (*loaded)->storageTarget->ecScopeState();
+      ASSERT_OK(state);
+      Uuid engine = Uuid::zero(), incarnation = Uuid::zero();
+      std::copy(state->second.engine.begin(), state->second.engine.end(), std::begin(engine.data));
+      std::copy(state->second.incarnation.begin(), state->second.incarnation.end(), std::begin(incarnation.data));
+      EXPECT_EQ(engine, expected.engineUuid);
+      EXPECT_EQ(incarnation, expected.targetIncarnation);
+    }
+  }
+  struct Case {
+    repair_test::Data data;
+    std::shared_ptr<const EcRepairPlan> plan;
+    hf3fs::client::ec::EcRepairNativeBindings bindings;
+    std::array<EcHelperCapability, 10> helpers;
+  };
+  Result<EcCapabilityV2> token(const EcRepairFragment &fragment,
+                               const EcRepairPlanInput &plan,
+                               uint16_t rights,
+                               Uuid scope) {
+    EcGrantClaimsV2 claims;
+    claims.engineUuid = fragment.endpoint.engineUuid;
+    claims.targetIncarnation = fragment.endpoint.targetIncarnation;
+    claims.identity = fragment.identity;
+    claims.fragmentOperationId = fragment.operationId;
+    claims.chainId = fragment.endpoint.chainId;
+    claims.targetId = fragment.endpoint.targetId;
+    claims.nodeId = fragment.endpoint.nodeId;
+    claims.expectedLength = fragment.integrity.wholeLength;
+    claims.expectedCrc32c = fragment.integrity.wholeCrc32c;
+    CHECK_RESULT(digest, digestEcIntegrityV2(fragment.identity, fragment.integrity));
+    claims.integrityDigest = digest;
+    claims.ownerUid = plan.ownerUid;
+    claims.clientNamespace = plan.clientNamespace;
+    claims.scopeObject = fragment.identity.object;
+    claims.scopeKind = EcGrantScope::WriteOperation;
+    claims.scopeId = scope;
+    claims.rights = rights;
+    claims.grantId = Uuid::random();
+    claims.issuedAtSeconds = 1000;
+    claims.expiresAtSeconds = 1100;
+    return signEcGrantV2(*signingKey_, claims, 1000);
+  }
+  EcFragmentAccessV2 access(const EcRepairFragment &fragment) {
+    EcFragmentAccessV2 result;
+    result.identity = fragment.identity;
+    result.operationId = fragment.operationId;
+    result.vChainId = {fragment.endpoint.chainId, ChainVer(1)};
+    result.targetId = fragment.endpoint.targetId;
+    result.integrity = fragment.integrity;
+    return result;
+  }
+  Result<Case> prepare(std::vector<uint16_t> missing,
+                       uint32_t length = kEcIntegrityBlockBytes + 7,
+                       uint8_t window = 2,
+                       uint64_t logicalLength = UINT64_MAX) {
+    Case result;
+    result.data = repair_test::makeData(length, missing, window, logicalLength);
+    auto &input = result.data.input;
+    std::copy(endpoints_.begin(), endpoints_.end(), input.operationEndpoints.begin());
+    input.operationEndpointCount = 12;
+    for (auto &fragment : input.sources) {
+      fragment.endpoint = endpoints_[fragment.identity.shard];
+      fragment.writerNamespace = input.clientNamespace;
+    }
+    for (size_t target = 0; target != input.targetCount; ++target) {
+      input.targets[target].endpoint = endpoints_[input.targets[target].identity.shard];
+    }
+    CHECK_RESULT(plan, EcRepairPlan::create(input));
+    result.plan = plan;
+    for (uint8_t i = 0; i != 10; ++i) {
+      const auto &fragment = input.sources[i];
+      auto request = access(fragment);
+      CHECK_RESULT(write, token(fragment, input, kEcGrantAllRightsV2, fragment.operationId));
+      RETURN_ON_ERROR(blockingWait(client_->beginEcStageV2({request, write})));
+      for (uint32_t block = 0; block != fragment.integrity.blockCount; ++block) {
+        EcAppendStageV2Req append;
+        append.request = request;
+        append.grant = write;
+        append.blockIndex = block;
+        append.payload.data = repair_test::blockBytes(result.data, fragment, block);
+        RETURN_ON_ERROR(blockingWait(client_->appendEcStageV2(append)));
+      }
+      RETURN_ON_ERROR(blockingWait(client_->sealEcStageV2({request, write})));
+      CHECK_RESULT(read, token(fragment, input, uint16_t(EcGrantRightV2::ReadBlock), input.operationId));
+      result.bindings.sources[i].request = request;
+      result.bindings.sources[i].grant = read;
+      CHECK_RESULT(claims, makeEcHelperClaims(*plan, i, uint16_t((1u << plan->blockCount()) - 1), 1000, 100));
+      CHECK_RESULT(helper, signEcHelperGrant(*helperKey_, claims, 1000));
+      result.helpers[i] = helper;
+    }
+    for (uint8_t i = 0; i != input.targetCount; ++i) {
+      CHECK_RESULT(write, token(input.targets[i], input, kEcGrantAllRightsV2, input.operationId));
+      result.bindings.targets[i] = {access(input.targets[i]), write};
+    }
+    return result;
+  }
+  EcHelperHopReq request(const Case &value, uint32_t block = 0) {
+    EcHelperHopReq result;
+    result.plan = value.plan->input();
+    result.helpers = value.helpers;
+    for (size_t i = 0; i != 10; ++i) {
+      result.reads[i] = value.bindings.sources[i].grant;
+      result.routeVersions[i] = ChainVer(1);
+    }
+    auto packet = EcRepairBlockCore::begin(*value.plan, block);
+    EXPECT_TRUE(packet);
+    result.packet = helperPacket(std::move(*packet));
+    result.deadlineUnixMillis =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count() +
+        10000;
+    return result;
+  }
+  client::EcRequestControl control() {
+    return {std::chrono::steady_clock::now() + std::chrono::seconds(10),
+            {},
+            client::EcRequestControl::TransportPolicy::TcpOnly};
+  }
+  std::unique_ptr<EcHelperKey> helperKey_;
+  std::array<EcScopeEndpoint, 12> endpoints_;
+};
+
+TEST_F(TestEcNativeRepairService, ThreeNativeStrategiesRepairSingleAndDoubleTargetsThroughTcp) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor executor(2);
+  for (auto missing : {std::vector<uint16_t>{0}, std::vector<uint16_t>{0, 11}}) {
+    for (auto mode : {EcRepairMode::CentralSerial, EcRepairMode::ClientPipeline, EcRepairMode::HelperChain}) {
+      SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<unsigned>(mode) << " missing=" << missing.size()
+                                        << " window=2");
+      auto value = prepare(missing);
+      ASSERT_OK(value);
+      auto transport = NativeEcRepairTransport::create(value->plan, client_, value->bindings, value->helpers);
+      ASSERT_OK(transport);
+      const auto ctl = control();
+      auto result = blockingWait(
+          EcRepairPipeline::run(value->plan, *transport, mode, {ctl.deadline, ctl.cancellation}, executor));
+      ASSERT_OK(result);
+      for (uint8_t target = 0; target != value->plan->input().targetCount; ++target) {
+        std::string bytes;
+        for (uint32_t block = 0; block != value->plan->blockCount(); ++block) {
+          EcReadBlockV2Req read{value->bindings.targets[target].request, block, value->bindings.targets[target].grant};
+          auto actual = blockingWait(client_->readEcBlockV2Controlled(std::move(read), control()));
+          ASSERT_OK(actual);
+          bytes += actual->payload.data;
+        }
+        EXPECT_EQ(bytes, value->data.shards[value->plan->input().targets[target].identity.shard]);
+      }
+    }
+  }
+  std::lock_guard lock(replyDrop_.mutex);
+  for (auto count : replyDrop_.helperHopCalls) EXPECT_EQ(count, 4);  // Two blocks, two erasure scenarios.
+}
+
+TEST_F(TestEcNativeRepairService, ThreeStrategiesResumeOriginalPartialStagesAfterEngineReopen) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor executor(2);
+  constexpr std::array modes{EcRepairMode::CentralSerial, EcRepairMode::ClientPipeline, EcRepairMode::HelperChain};
+  std::vector<Case> cases;
+  for (const auto mode : modes) {
+    (void)mode;
+    auto value = prepare({0, 11});
+    ASSERT_OK(value);
+    for (uint8_t target = 0; target != value->plan->input().targetCount; ++target) {
+      const auto &fixed = value->bindings.targets[target];
+      ASSERT_OK(blockingWait(client_->beginEcStageV2Controlled(fixed, control())));
+      EcAppendStageV2Req append{fixed.request, 0, {}, fixed.grant};
+      append.payload.data = repair_test::blockBytes(value->data, value->plan->input().targets[target], 0);
+      auto progress = blockingWait(client_->appendEcStageV2Controlled(std::move(append), control()));
+      ASSERT_OK(progress);
+      ASSERT_EQ(progress->prefixBytes, kEcIntegrityBlockBytes);
+      ASSERT_FALSE(progress->needsReconcile);
+    }
+    cases.push_back(std::move(*value));
+  }
+  ASSERT_NO_FATAL_FAILURE(reopenStorage());
+  for (size_t index = 0; index != modes.size(); ++index) {
+    SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<unsigned>(modes[index]) << " missing=2 window=2");
+    auto &value = cases[index];
+    for (uint8_t target = 0; target != value.plan->input().targetCount; ++target) {
+      const auto &fixed = value.bindings.targets[target];
+      auto observed = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+      ASSERT_OK(observed);
+      ASSERT_EQ(observed->state, 1);
+      ASSERT_EQ(observed->prefixBytes, kEcIntegrityBlockBytes);
+      ASSERT_TRUE(observed->needsReconcile);  // The actual restored Rust slot is unknown.
+    }
+    auto transport = NativeEcRepairTransport::create(value.plan, client_, value.bindings, value.helpers);
+    ASSERT_OK(transport);
+    auto ctl = control();
+    ctl.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    auto repaired = blockingWait(
+        EcRepairPipeline::run(value.plan, *transport, modes[index], {ctl.deadline, ctl.cancellation}, executor));
+    ASSERT_OK(repaired);
+    EXPECT_EQ(repaired->planDigest, value.plan->digest());
+    for (uint8_t target = 0; target != value.plan->input().targetCount; ++target) {
+      const auto &fixed = value.bindings.targets[target];
+      EXPECT_TRUE(serde::equals(repaired->receipts[target].identity, fixed.request.identity));
+      EXPECT_EQ(repaired->receipts[target].operationId, fixed.request.operationId);
+      std::string bytes;
+      for (uint32_t block = 0; block != value.plan->blockCount(); ++block) {
+        auto read = blockingWait(client_->readEcBlockV2Controlled({fixed.request, block, fixed.grant}, control()));
+        ASSERT_OK(read);
+        bytes += read->payload.data;
+      }
+      EXPECT_EQ(bytes, value.data.shards[value.plan->input().targets[target].identity.shard]);
+    }
+  }
+  // This fixture proves reopened Storage recovery plus real TCP/Seal/readback;
+  // it does not contain Meta and is not a publication or power-failure test.
+}
+
+TEST_F(TestEcNativeRepairService, UnknownSealSurvivesCancellationUntilSameStageIsReconciled) {
+  using namespace hf3fs::client::ec;
+  auto value = prepare({0}, 31);
+  ASSERT_OK(value);
+  auto transport = NativeEcRepairTransport::create(value->plan, client_, value->bindings, value->helpers);
+  ASSERT_OK(transport);
+  auto ctl = control();
+  EcRepairControl live{ctl.deadline, ctl.cancellation};
+  ASSERT_OK(blockingWait((*transport)->begin(value->plan, 0, live)));
+  const auto bytes = repair_test::blockBytes(value->data, value->plan->input().targets[0], 0);
+  ASSERT_OK(blockingWait((*transport)->append(value->plan, 0, 0, bytes, live)));
+  replyDrop_.arm();
+  ASSERT_ERROR(blockingWait((*transport)->seal(value->plan, 0, live)), StorageCode::kEcSealOutcomeUnknown);
+  ASSERT_TRUE(replyDrop_.snapshot().droppedReceipt);
+  CancellationSource stopped;
+  stopped.requestCancellation();
+  ASSERT_ERROR(blockingWait((*transport)->begin(value->plan, 0, {live.deadline, stopped.getToken()})),
+               StorageCode::kEcSealOutcomeUnknown);
+  const auto &fixed = value->bindings.targets[0];
+  auto observed = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+  ASSERT_OK(observed);
+  ASSERT_EQ(observed->state, 2);
+  ASSERT_FALSE(observed->needsReconcile);
+  size_t queries, reconciles;
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    queries = replyDrop_.queryCalls;
+    reconciles = replyDrop_.reconcileCalls;
+  }
+  // A fresh Begin observation of Sealed still cannot clear this adapter's
+  // previously observed unknown completion without the real Reconcile barrier.
+  ctl = control();
+  live = {ctl.deadline, ctl.cancellation};
+  ASSERT_OK(blockingWait((*transport)->begin(value->plan, 0, live)));
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    EXPECT_EQ(replyDrop_.queryCalls, queries + 1);
+    EXPECT_EQ(replyDrop_.reconcileCalls, reconciles + 1);
+  }
+  auto sealed = blockingWait((*transport)->seal(value->plan, 0, live));
+  ASSERT_OK(sealed);
+  EXPECT_TRUE(serde::equals(sealed->identity, fixed.request.identity));
+  ASSERT_ERROR(blockingWait((*transport)->begin(value->plan, 0, {live.deadline, stopped.getToken()})),
+               StorageClientCode::kRequestCanceled);
+}
+
+TEST_F(TestEcNativeRepairService, RecoveryRequiresExplicitQueryAndReconcileRights) {
+  using namespace hf3fs::client::ec;
+  auto value = prepare({0}, 31);
+  ASSERT_OK(value);
+  constexpr auto writes =
+      uint16_t(EcGrantRightV2::Begin) | uint16_t(EcGrantRightV2::Append) | uint16_t(EcGrantRightV2::Seal);
+  for (auto omitted : {EcGrantRightV2::Query, EcGrantRightV2::Reconcile}) {
+    auto bindings = value->bindings;
+    const auto rights = writes | uint16_t(EcGrantRightV2::Query) | uint16_t(EcGrantRightV2::Reconcile);
+    auto grant = token(value->plan->input().targets[0],
+                       value->plan->input(),
+                       uint16_t(rights & ~uint16_t(omitted)),
+                       value->plan->input().operationId);
+    ASSERT_OK(grant);
+    bindings.targets[0].grant = *grant;
+    ASSERT_ERROR(NativeEcRepairTransport::create(value->plan, client_, std::move(bindings), value->helpers),
+                 StatusCode::kInvalidArg);
+  }
+}
+
+TEST_F(TestEcNativeRepairService, WrongHopMacAndMissingReadCredentialFailThroughRealService) {
+  auto value = prepare({0, 11}, 31, 1);
+  ASSERT_OK(value);
+  auto wire = request(*value);
+  auto computed = EcRepairBlockCore::advance(*value->plan,
+                                             0,
+                                             repairBlock(std::move(wire.packet)),
+                                             repair_test::blockBytes(value->data, value->plan->input().sources[0], 0));
+  ASSERT_OK(computed);
+  wire.packet = helperPacket(std::move(*computed));
+  auto stamp = ec_helper_detail::stamp(*helperKey_, *value->plan, wire.packet, 1000, 1100);
+  ASSERT_OK(stamp);
+  auto serialized = serde::serialize(*stamp);
+  serialized.back() ^= 1;
+  ASSERT_OK(serde::deserialize(wire.predecessor, serialized));
+  ASSERT_ERROR(blockingWait(client_->executeEcHelper(wire, control())), StatusCode::kAuthenticationFail);
+  wire = request(*value);
+  serialized = serde::serialize(wire.reads[3]);
+  serialized.back() ^= 1;
+  ASSERT_OK(serde::deserialize(wire.reads[3], serialized));
+  ASSERT_ERROR(blockingWait(client_->executeEcHelper(wire, control())), StatusCode::kAuthenticationFail);
+}
+
+TEST_F(TestEcNativeRepairService, Small112KiBLogicalKvHasOneBlockAndDoesNotClaimPipelineOverlap) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor executor(2);
+  auto value = prepare({0, 11}, (112 * 1024 + 9) / 10, 2, 112 * 1024);
+  ASSERT_OK(value);
+  ASSERT_EQ(value->plan->input().logicalLength, 112u * 1024);
+  ASSERT_EQ(value->plan->blockCount(), 1);
+  auto transport = NativeEcRepairTransport::create(value->plan, client_, value->bindings, value->helpers);
+  ASSERT_OK(transport);
+  auto ctl = control();
+  ASSERT_OK(blockingWait(EcRepairPipeline::run(value->plan,
+                                               *transport,
+                                               EcRepairMode::HelperChain,
+                                               {ctl.deadline, ctl.cancellation},
+                                               executor)));
+  // Same durable allocation/operation replays through a fresh Seal barrier;
+  // the client must not append to a stage already returned as Sealed by Begin.
+  ASSERT_OK(blockingWait(EcRepairPipeline::run(value->plan,
+                                               *transport,
+                                               EcRepairMode::ClientPipeline,
+                                               {ctl.deadline, ctl.cancellation},
+                                               executor)));
+}
+
+TEST_F(TestEcNativeRepairService, MaximumShardRunsSixteenNativeBlocksWithBoundedWindow) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor executor(2);
+  for (auto mode : {EcRepairMode::ClientPipeline, EcRepairMode::HelperChain}) {
+    SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<unsigned>(mode) << " window=2");
+    auto value = prepare({0, 11}, 1u << 20, 2);
+    ASSERT_OK(value);
+    ASSERT_EQ(value->plan->blockCount(), 16);
+    auto transport = NativeEcRepairTransport::create(value->plan, client_, value->bindings, value->helpers);
+    ASSERT_OK(transport);
+    auto ctl = control();
+    ctl.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    auto result =
+        blockingWait(EcRepairPipeline::run(value->plan, *transport, mode, {ctl.deadline, ctl.cancellation}, executor));
+    ASSERT_OK(result);
+    EXPECT_EQ(result->blocks, 16);
+  }
+}
+
+TEST_F(TestEcNativeRepairService, UpstreamTicketRemainsPendingWhileDownstreamTcpHandlerIsBlocked) {
+  auto value = prepare({0}, 31, 1);
+  ASSERT_OK(value);
+  auto delay = std::make_shared<StageReplyDropState::ReadDelay>();
+  auto entered = delay->entered.get_future();
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    replyDrop_.helperDelayPosition = 4;
+    replyDrop_.delayedHelper = delay;
+  }
+  auto wire = request(*value);
+  auto future = std::async(std::launch::async, [&] { return blockingWait(client_->executeEcHelper(wire, control())); });
+  SCOPE_EXIT {
+    delay->unblock();
+    if (future.valid()) future.wait();
+  };
+  ASSERT_EQ(entered.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+  // An in-flight retry must not join/XOR the same block twice or consume a
+  // second per-plan slot while its original downstream request remains owned.
+  ASSERT_ERROR(blockingWait(client_->executeEcHelper(wire, control())), StorageClientCode::kResourceBusy);
+  auto target = components_->targetMap.getByTargetId(value->plan->input().sources[0].endpoint.targetId);
+  ASSERT_OK(target);
+  auto scope = (*target)->storageTarget->ecScopeState();
+  ASSERT_OK(scope);
+  EcScopeRevocation revoke{};
+  revoke.binding.target = scope->second;
+  revoke.binding.kind = 2;
+  const auto copyUuid = [](auto &to, const Uuid &from) {
+    std::copy(std::begin(from.data), std::end(from.data), to.begin());
+  };
+  copyUuid(revoke.binding.object, value->plan->input().sources[0].identity.object);
+  copyUuid(revoke.binding.scope, value->plan->input().operationId);
+  copyUuid(revoke.binding.client_namespace, value->plan->input().clientNamespace);
+  revoke.binding.owner_uid = value->plan->input().ownerUid.toUnderType();
+  copyUuid(revoke.id, Uuid::random());
+  revoke.endpoint_set_digest = value->plan->endpointSetDigest();
+  auto pending = scope->first->revoke(revoke);
+  ASSERT_OK(pending);
+  EXPECT_TRUE(pending->durable);
+  EXPECT_FALSE(pending->drained);
+  EXPECT_GE(pending->inflight, 1);
+  delay->unblock();
+  auto result = future.get();
+  EXPECT_FALSE(result);
+  auto drained = scope->first->drainStatus(revoke);
+  ASSERT_OK(drained);
+  EXPECT_TRUE(drained->drained);
+}
+
+TEST_F(TestEcStageService, ControlledWriteQuotaTimeoutAndPostCommitCancellationKeepOwningWaiters) {
+  auto first = std::make_shared<StageReplyDropState::ReadDelay>();
+  auto second = std::make_shared<StageReplyDropState::ReadDelay>();
+  auto firstEntered = first->entered.get_future();
+  auto secondEntered = second->entered.get_future();
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    replyDrop_.delayedBegins = {first, second};
+  }
+  std::string bytes;
+  auto a = access(31, 901, bytes), b = access(31, 902, bytes), c = access(31, 903, bytes);
+  CancellationSource cancel;
+  auto ctl = client::EcRequestControl{std::chrono::steady_clock::now() + std::chrono::seconds(5),
+                                      cancel.getToken(),
+                                      client::EcRequestControl::TransportPolicy::TcpOnly};
+  auto plain = ctl;
+  plain.cancellation = {};
+  auto fa = std::async(std::launch::async, [&] {
+    return blockingWait(client_->beginEcStageV2Controlled({a, grant(a)}, ctl));
+  });
+  auto fb = std::async(std::launch::async, [&] {
+    return blockingWait(client_->beginEcStageV2Controlled({b, grant(b)}, plain));
+  });
+  SCOPE_EXIT {
+    first->unblock();
+    second->unblock();
+    if (fa.valid()) fa.wait();
+    if (fb.valid()) fb.wait();
+  };
+  ASSERT_EQ(firstEntered.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+  ASSERT_EQ(secondEntered.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+  auto shortControl = plain;
+  shortControl.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(30);
+  auto blocked = blockingWait(client_->beginEcStageV2Controlled({c, grant(c)}, shortControl));
+  ASSERT_ERROR(blocked, StorageClientCode::kTimeout);
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    EXPECT_EQ(replyDrop_.beginCalls, 2);
+  }
+  cancel.requestCancellation();
+  EXPECT_EQ(fa.wait_for(std::chrono::milliseconds(10)), std::future_status::timeout);
+  first->unblock();
+  second->unblock();
+  ASSERT_ERROR(fa.get(), StorageCode::kEcSealOutcomeUnknown);
+  ASSERT_OK(fb.get());
+  auto query = blockingWait(client_->queryEcStageV2Controlled({a, grant(a)}, plain));
+  ASSERT_OK(query);
+  EXPECT_EQ(query->state, 1);
+  EXPECT_FALSE(query->needsReconcile);
+}
+
+// Twelve distinct logical allocations on one local target/Engine. This is a
+// real Storage TCP/authorization/disk/selector test, not twelve failure domains
+// and not an AcquireV2 Meta RPC test; the pinned snapshot is constructed here.
+TEST_F(TestEcStageService, BlockQuorumReadyPrecedesRealTcpLateCleanup) {
+  namespace ec = hf3fs::client::ec;
+  using namespace std::chrono_literals;
+  meta::EcV2PinnedRead pinned;
+  auto &manifest = pinned.manifest;
+  manifest.object.inode = meta::InodeId(54321);
+  manifest.object.incarnation = Uuid::from(811, 812);
+  manifest.stripe = 3;
+  manifest.generation = 1;
+  manifest.revision = 1;
+  manifest.logicalLength = 65543 * 10 - 3;
+  auto &snapshot = pinned.snapshot;
+  snapshot.object = manifest.object;
+  snapshot.pin = Uuid::from(100, 88);  // Same signed read-pin namespace as grant().
+  snapshot.owner = {flat::Uid(1234), Uuid::from(99, 66)};
+  snapshot.stripe = manifest.stripe;
+  snapshot.generation = manifest.generation;
+  snapshot.revision = manifest.revision;
+  std::array<EcCapabilityV2, 12> grants;
+  std::array<VersionedChainId, 12> routes;
+  std::array<EcScopeEndpoint, 12> endpoints;
+  std::string logical(manifest.logicalLength, '\0');
+  for (size_t i = 0; i != logical.size(); ++i) logical[i] = static_cast<char>((i * 37 + 19) & 255);
+  auto encoded = EcCodec::encode(logical, 65543);
+  ASSERT_OK(encoded);
+  auto expected = std::move(*encoded);
+  for (size_t index = 0; index != 12; ++index) {
+    std::string scratch;
+    auto request = access(0, 200 + index, scratch);
+    request.identity.object = manifest.object.incarnation;
+    request.identity.stripe = manifest.stripe;
+    request.identity.shard = static_cast<uint16_t>(index);
+    auto descriptor = computeEcIntegrity(request.identity, expected[index]);
+    ASSERT_OK(descriptor);
+    request.integrity = *descriptor;
+    auto writeGrant = grant(request);
+    ASSERT_OK(blockingWait(client_->beginEcStageV2({request, writeGrant})));
+    ASSERT_NO_FATAL_FAILURE(appendAll(request, writeGrant, expected[index]));
+    ASSERT_OK(blockingWait(client_->sealEcStageV2({request, writeGrant})));
+    grants[index] = grant(request, uint16_t(EcGrantRightV2::ReadBlock), true);
+    routes[index] = request.vChainId;
+    auto &fragment = manifest.fragments[index];
+    fragment.identity = request.identity;
+    fragment.operation = request.operationId;
+    fragment.placement = {chainId_, targetId_, nodeId_};
+    fragment.integrity = request.integrity;
+    auto &mapping = snapshot.endpoints[index];
+    mapping.identity = fragment.identity;
+    mapping.operation = fragment.operation;
+    mapping.endpoint = {fragment.placement, grants[index].claims.engineUuid, grants[index].claims.targetIncarnation};
+    endpoints[index] = mapping.endpoint.controlEndpoint();
+  }
+  auto digest = computeEcScopeEndpointDigest(endpoints);
+  ASSERT_OK(digest);
+  snapshot.endpointSetDigest = *digest;
+  auto input = ec::makeEcBlockReadInput(std::move(pinned), grants, routes, 1);
+  ASSERT_OK(input);
+
+  auto delay = std::make_shared<StageReplyDropState::ReadDelay>();
+  auto entered = delay->entered.get_future();
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    replyDrop_.delayedRead = delay;
+    replyDrop_.delayedReadShard = 10;
+  }
+  class NativeBarrierTransport final : public ec::EcBlockReadTransport {
+   public:
+    NativeBarrierTransport(std::shared_ptr<client::StorageClient> client,
+                           std::shared_ptr<StageReplyDropState::ReadDelay> barrier)
+        : native(std::move(client)),
+          delay(std::move(barrier)) {}
+    CoTryTask<EcReadBlockResultV2> read(EcReadBlockV2Req request, ec::EcReadControl control) override {
+      // Ensure the delayed eleventh response really reached the server before
+      // ten fast sources can finish. This wrapper fabricates no response and
+      // retains the fixture's real two-request StorageClient quota.
+      while (request.request.identity.shard != 10 && !delay->started.load()) {
+        if (std::chrono::steady_clock::now() >= control.deadline) co_return makeError(StorageClientCode::kTimeout);
+        if (control.cancellation.isCancellationRequested()) co_return makeError(StorageClientCode::kRequestCanceled);
+        co_await folly::coro::sleep(1ms);
+      }
+      co_return co_await native.read(std::move(request), control);
+    }
+    ec::NativeEcBlockTransport native;
+    std::shared_ptr<StageReplyDropState::ReadDelay> delay;
+  };
+  folly::CPUThreadPoolExecutor executor(2);
+  auto transport = std::make_shared<NativeBarrierTransport>(client_, delay);
+  ec::EcBlockRead reader(transport, executor, {});
+  SCOPE_EXIT {
+    delay->unblock();
+    blockingWait(reader.close());
+  };
+  ec::EcStripeReadOptions options;
+  options.deadline = std::chrono::steady_clock::now() + 5s;
+  options.hedgeAfter = 2s;
+  auto started = reader.start(std::move(*input), options);
+  ASSERT_OK(started);
+  ASSERT_EQ(entered.wait_for(2s), std::future_status::ready);
+  auto selected = blockingWait(started->takeReady());
+  ASSERT_OK(selected);
+  EXPECT_EQ(selected->attempted, 11);
+  EXPECT_FALSE(started->localCleanupComplete());
+  EXPECT_EQ(reader.snapshot().activeRequests, 1);
+  EXPECT_EQ(reader.snapshot().reservedPayloadBytes, 12 * 7);
+  for (const auto &block : selected->shards) {
+    EXPECT_NE(block.index, 10);
+    EXPECT_EQ(block.result.payload.data, expected[block.index].substr(65536));
+  }
+  std::array<EcCodecShardView, 10> views;
+  for (size_t index = 0; index != 10; ++index) {
+    views[index] = {selected->shards[index].index, selected->shards[index].result.payload.data};
+  }
+  // The final vertical block has ten seven-byte data slices and three padded
+  // bytes in shard nine. Reuse the production codec with its actual indices.
+  auto decoded = EcCodec::recover(views, 10 * 7 - 3, 7);
+  ASSERT_OK(decoded);
+  for (size_t index = 0; index != 12; ++index) EXPECT_EQ((*decoded)[index], expected[index].substr(65536));
+  delay->unblock();
+  blockingWait(started->waitLocalCleanup());
+  EXPECT_EQ(reader.snapshot().activeRequests, 0);
+  EXPECT_EQ(reader.snapshot().reservedPayloadBytes, 10 * 7);
+  selected = makeError(StatusCode::kUnknown);
+  EXPECT_EQ(reader.snapshot().reservedPayloadBytes, 0);
 }
 
 }  // namespace

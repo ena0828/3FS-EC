@@ -419,4 +419,17 @@ CoTryTask<EcSealStageV2Rsp> StorageMessenger::sealEcStageV2(const net::Address &
                                                                                              timestamp);
 }
 
+CoTryTask<EcHelperHopRsp> StorageMessenger::executeEcHelper(const net::Address &address,
+                                                            const EcHelperHopReq &request,
+                                                            const net::UserRequestOptions *options,
+                                                            serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcHelperHopReq,
+                                        EcHelperHopRsp,
+                                        StorageSerde<>::executeEcHelper<serde::ClientContext>>(client_,
+                                                                                               address,
+                                                                                               request,
+                                                                                               options,
+                                                                                               timestamp);
+}
+
 }  // namespace hf3fs::storage::client

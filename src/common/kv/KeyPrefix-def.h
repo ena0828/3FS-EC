@@ -37,6 +37,8 @@ DEFINE_PREFIX(EcV2ObjectMode,   "ECVM")
 DEFINE_PREFIX(EcV2Reservation,  "ECVR")
 DEFINE_PREFIX(EcV2Drain,        "ECVD")
 DEFINE_PREFIX(EcV2Issuance,     "ECVI")
+DEFINE_PREFIX(EcV2PublishedContent, "ECVC")
+DEFINE_PREFIX(EcV2RepairPlan,    "ECRP")
 // clang-format on
 
 #undef DEFINE_PREFIX

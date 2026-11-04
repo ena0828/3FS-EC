@@ -43,6 +43,15 @@ class MetaSerdeService : public serde::ServiceWrapper<MetaSerdeService, MetaSerd
   META_SERVICE_METHOD(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
   META_SERVICE_METHOD(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
   META_SERVICE_METHOD(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
+  META_SERVICE_METHOD(createEcFileV2, CreateEcFileV2Req, CreateEcFileRsp);
+  META_SERVICE_METHOD(beginEcMutationV2, BeginEcMutationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(bindEcMutationV2, BindEcMutationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(publishEcMutationV2, PublishEcMutationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(getEcOperationV2, GetEcOperationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(cancelEcMutationV2, CancelEcMutationV2Req, EcV2MutationRsp);
+  META_SERVICE_METHOD(acquireEcReadV2, AcquireEcReadV2Req, AcquireEcReadV2Rsp);
+  META_SERVICE_METHOD(releaseEcReadV2, ReleaseEcReadV2Req, ReleaseEcReadV2Rsp);
+  META_SERVICE_METHOD(prepareEcRepairV2, PrepareEcRepairV2Req, PrepareEcRepairV2Rsp);
 #undef META_SERVICE_METHOD
 
  private:
