@@ -17,6 +17,8 @@ class EcVerifiedManifest {
   const EcManifest &manifest() const { return manifest_; }
 
  private:
+  // Restores only a T0-persisted V2 proof after every signed drain ACK is checked.
+  friend class EcV2DrainCatalog;
   explicit EcVerifiedManifest(EcManifest manifest)
       : manifest_(std::move(manifest)) {}
   EcManifest manifest_;
@@ -37,6 +39,11 @@ class EcCatalog {
                                                 const EcOwner &creator = {},
                                                 const Uuid &createRequest = Uuid::zero());
   static CoTryTask<EcObjectRecord> getObject(Transaction &, const EcObjectRef &);
+  // Conflict read of an exact historical revision; does not pin or retire it.
+  static CoTryTask<EcManifestRecord> getManifest(Transaction &,
+                                                 const EcObjectRef &,
+                                                 uint64_t stripe,
+                                                 uint64_t revision);
   static CoTryTask<EcOperationRecord> begin(Transaction &, const EcMutationIntent &, const EcOwner &owner = {});
   static CoTryTask<EcOperationRecord> getOperation(Transaction &, const EcObjectRef &, const Uuid &operation);
   static CoTryTask<EcOperationRecord> publish(Transaction &,

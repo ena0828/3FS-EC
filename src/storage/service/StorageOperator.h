@@ -20,7 +20,9 @@
 #include "common/utils/Semaphore.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcStageResultV2.h"
 #include "storage/aio/AioReadWorker.h"
+#include "storage/ec_scope/EcScopeControlExecutor.h"
 #include "storage/service/BufferPool.h"
 #include "storage/service/ReliableForwarding.h"
 #include "storage/service/ReliableUpdate.h"
@@ -48,6 +50,9 @@ class StorageOperator {
     CONFIG_ITEM(enable_ec_fragments, false);
     CONFIG_ITEM(allow_unsafe_ec_fragment_rpc_for_testing, false);
     CONFIG_ITEM(ec_capability_key_file, Path{});
+    CONFIG_ITEM(enable_ec_scope_control, false);
+    CONFIG_ITEM(ec_scope_control_key_file, Path{});
+    CONFIG_ITEM(ec_scope_control_authority, std::string{});
     CONFIG_ITEM(max_concurrent_ec_requests, 8u, [](auto value) { return value > 0 && value <= 64; });
   };
 
@@ -104,6 +109,16 @@ class StorageOperator {
   CoTryTask<EcCreateRsp> authorizedCreateEcFragment(const EcAuthorizedCreateReq &req);
   CoTryTask<EcReadRsp> authorizedReadEcFragment(const EcAuthorizedReadReq &req);
   CoTryTask<EcReconcileRsp> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req);
+
+  CoTryTask<EcScopeControlRsp> revokeEcScope(const EcScopeControlRequest &req);
+  CoTryTask<EcScopeControlRsp> queryEcScopeDrain(const EcScopeControlRequest &req);
+
+  CoTryTask<EcReadBlockV2Rsp> readEcBlockV2(const EcReadBlockV2Req &request);
+  CoTryTask<EcStageV2Rsp> beginEcStageV2(const EcBeginStageV2Req &request);
+  CoTryTask<EcStageV2Rsp> appendEcStageV2(const EcAppendStageV2Req &request);
+  CoTryTask<EcStageV2Rsp> queryEcStageV2(const EcQueryStageV2Req &request);
+  CoTryTask<EcStageV2Rsp> reconcileEcStageV2(const EcReconcileStageV2Req &request);
+  CoTryTask<EcSealStageV2Rsp> sealEcStageV2(const EcSealStageV2Req &request);
 
   CoTryTask<OfflineTargetRsp> offlineTarget(const OfflineTargetReq &req);
 
@@ -162,6 +177,17 @@ class StorageOperator {
  private:
   friend class ReliableUpdate;
   friend class StorageEcAuthorizationTestAccess;
+  friend class StorageEcStageAuthorizationTestAccess;
+
+  Result<Void> initEcScopeControl();
+  CoTryTask<EcScopeControlRsp> controlEcScope(const EcScopeControlRequest &, EcScopeControlAction);
+  std::unique_ptr<EcScopeControlExecutor> ecScopeControl_;
+
+  using EcStageExecution = std::pair<EcStageResult, EcScopeTargetIdentity>;
+  template <typename Request>
+  CoTryTask<EcStageExecution> executeEcStageV2(const Request &, EcStageOperation);
+  template <typename Request>
+  CoTryTask<EcStageV2Rsp> stageStateV2(const Request &, EcStageOperation);
 
   Result<TargetPtr> ecTarget(VersionedChainId chain, TargetId targetId, bool writing) const;
   Result<Void> validateEcTarget(const TargetPtr &expected, bool writing) const;

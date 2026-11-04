@@ -30,6 +30,13 @@ DEFINE_PREFIX(EcFragmentRef,    "ECRF")
 DEFINE_PREFIX(EcNamespaceCount, "ECNS")
 DEFINE_PREFIX(EcNamespaceFile,  "ECNF")
 DEFINE_PREFIX(EcCreateOperation,"ECCR")
+DEFINE_PREFIX(EcV2Allocation,   "ECVA")
+DEFINE_PREFIX(EcV2Operation,    "ECVO")
+DEFINE_PREFIX(EcV2Pin,          "ECVP")
+DEFINE_PREFIX(EcV2ObjectMode,   "ECVM")
+DEFINE_PREFIX(EcV2Reservation,  "ECVR")
+DEFINE_PREFIX(EcV2Drain,        "ECVD")
+DEFINE_PREFIX(EcV2Issuance,     "ECVI")
 // clang-format on
 
 #undef DEFINE_PREFIX

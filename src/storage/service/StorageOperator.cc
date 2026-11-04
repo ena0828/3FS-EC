@@ -59,6 +59,7 @@ monitor::OperationRecorder storageRemoveRangeRecorder{"storage.remove_range"};
 
 Result<Void> StorageOperator::init(uint32_t numberOfDisks) {
   RETURN_ON_ERROR(components_.loadEcCapabilityKey());
+  RETURN_ON_ERROR(initEcScopeControl());
   storageReadAvgBytes.setLambda([&] {
     auto totalReadBytes = totalReadBytes_.exchange(0);
     auto totalReadIOs = totalReadIOs_.exchange(0);
@@ -74,6 +75,7 @@ Result<Void> StorageOperator::init(uint32_t numberOfDisks) {
 }
 
 Result<Void> StorageOperator::stopAndJoin() {
+  if (ecScopeControl_) ecScopeControl_->stopAndJoin();
   storageReadAvgBytes.reset();
   updateWorker_.stopAndJoin();
   storageEventTrace_.close();

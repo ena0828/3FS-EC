@@ -194,6 +194,22 @@ CoTryTask<EcObjectRecord> EcCatalog::getObject(Tx &txn, const EcObjectRef &objec
   co_return record;
 }
 
+CoTryTask<EcManifestRecord> EcCatalog::getManifest(Tx &txn,
+                                                   const EcObjectRef &object,
+                                                   uint64_t stripe,
+                                                   uint64_t revision) {
+  CO_RETURN_ON_ERROR(validObject(object));
+  if (!revision) co_return makeError(StatusCode::kInvalidArg, "zero EC manifest revision");
+  auto record = co_await require<EcManifestRecord>(txn, manifestKey(object.incarnation, stripe, revision));
+  CO_RETURN_ON_ERROR(record);
+  const auto &manifest = record->manifest;
+  if (manifest.object != object || manifest.stripe != stripe || manifest.revision != revision) {
+    co_return makeError(StatusCode::kDataCorruption, "EC manifest key and contents differ");
+  }
+  CO_RETURN_ON_ERROR(validManifest(manifest));
+  co_return record;
+}
+
 CoTryTask<EcOperationRecord> EcCatalog::getOperation(Tx &txn, const EcObjectRef &object, const Uuid &operation) {
   CO_RETURN_ON_ERROR(validObject(object));
   if (operation.is_nil()) co_return makeError(StatusCode::kInvalidArg, "zero EC operation ID");

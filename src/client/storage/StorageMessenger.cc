@@ -315,4 +315,108 @@ CoTryTask<GetAllChunkMetadataRsp> StorageMessenger::getAllChunkMetadata(const hf
       timestamp);
 }
 
+CoTryTask<EcScopeControlRsp> StorageMessenger::revokeEcScope(const net::Address &address,
+                                                             const EcScopeControlRequest &request,
+                                                             const net::UserRequestOptions *options,
+                                                             serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcScopeControlRequest,
+                                        EcScopeControlRsp,
+                                        StorageSerde<>::revokeEcScope<serde::ClientContext>>(client_,
+                                                                                             address,
+                                                                                             request,
+                                                                                             options,
+                                                                                             timestamp);
+}
+
+CoTryTask<EcScopeControlRsp> StorageMessenger::queryEcScopeDrain(const net::Address &address,
+                                                                 const EcScopeControlRequest &request,
+                                                                 const net::UserRequestOptions *options,
+                                                                 serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcScopeControlRequest,
+                                        EcScopeControlRsp,
+                                        StorageSerde<>::queryEcScopeDrain<serde::ClientContext>>(client_,
+                                                                                                 address,
+                                                                                                 request,
+                                                                                                 options,
+                                                                                                 timestamp);
+}
+
+CoTryTask<EcReadBlockV2Rsp> StorageMessenger::readEcBlockV2(const net::Address &address,
+                                                            const EcReadBlockV2Req &request,
+                                                            const net::UserRequestOptions *options,
+                                                            serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcReadBlockV2Req,
+                                        EcReadBlockV2Rsp,
+                                        StorageSerde<>::readEcBlockV2<serde::ClientContext>>(client_,
+                                                                                             address,
+                                                                                             request,
+                                                                                             options,
+                                                                                             timestamp);
+}
+
+CoTryTask<EcStageV2Rsp> StorageMessenger::beginEcStageV2(const net::Address &address,
+                                                         const EcBeginStageV2Req &request,
+                                                         const net::UserRequestOptions *options,
+                                                         serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcBeginStageV2Req,
+                                        EcStageV2Rsp,
+                                        StorageSerde<>::beginEcStageV2<serde::ClientContext>>(client_,
+                                                                                              address,
+                                                                                              request,
+                                                                                              options,
+                                                                                              timestamp);
+}
+
+CoTryTask<EcStageV2Rsp> StorageMessenger::appendEcStageV2(const net::Address &address,
+                                                          const EcAppendStageV2Req &request,
+                                                          const net::UserRequestOptions *options,
+                                                          serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcAppendStageV2Req,
+                                        EcStageV2Rsp,
+                                        StorageSerde<>::appendEcStageV2<serde::ClientContext>>(client_,
+                                                                                               address,
+                                                                                               request,
+                                                                                               options,
+                                                                                               timestamp);
+}
+
+CoTryTask<EcStageV2Rsp> StorageMessenger::queryEcStageV2(const net::Address &address,
+                                                         const EcQueryStageV2Req &request,
+                                                         const net::UserRequestOptions *options,
+                                                         serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcQueryStageV2Req,
+                                        EcStageV2Rsp,
+                                        StorageSerde<>::queryEcStageV2<serde::ClientContext>>(client_,
+                                                                                              address,
+                                                                                              request,
+                                                                                              options,
+                                                                                              timestamp);
+}
+
+CoTryTask<EcStageV2Rsp> StorageMessenger::reconcileEcStageV2(const net::Address &address,
+                                                             const EcReconcileStageV2Req &request,
+                                                             const net::UserRequestOptions *options,
+                                                             serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcReconcileStageV2Req,
+                                        EcStageV2Rsp,
+                                        StorageSerde<>::reconcileEcStageV2<serde::ClientContext>>(client_,
+                                                                                                  address,
+                                                                                                  request,
+                                                                                                  options,
+                                                                                                  timestamp);
+}
+
+CoTryTask<EcSealStageV2Rsp> StorageMessenger::sealEcStageV2(const net::Address &address,
+                                                            const EcSealStageV2Req &request,
+                                                            const net::UserRequestOptions *options,
+                                                            serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcSealStageV2Req,
+                                        EcSealStageV2Rsp,
+                                        StorageSerde<>::sealEcStageV2<serde::ClientContext>>(client_,
+                                                                                             address,
+                                                                                             request,
+                                                                                             options,
+                                                                                             timestamp);
+}
+
 }  // namespace hf3fs::storage::client

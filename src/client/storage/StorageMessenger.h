@@ -11,6 +11,8 @@
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcScopeControl.h"
+#include "fbs/storage/EcStageResultV2.h"
 
 namespace hf3fs::storage::client {
 
@@ -104,6 +106,40 @@ class StorageMessenger {
                                                           const EcAuthorizedReconcileReq &request,
                                                           const net::UserRequestOptions *options = nullptr,
                                                           serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcScopeControlRsp> revokeEcScope(const net::Address &address,
+                                             const EcScopeControlRequest &request,
+                                             const net::UserRequestOptions *options = nullptr,
+                                             serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcScopeControlRsp> queryEcScopeDrain(const net::Address &address,
+                                                 const EcScopeControlRequest &request,
+                                                 const net::UserRequestOptions *options = nullptr,
+                                                 serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcReadBlockV2Rsp> readEcBlockV2(const net::Address &address,
+                                            const EcReadBlockV2Req &request,
+                                            const net::UserRequestOptions *options = nullptr,
+                                            serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcStageV2Rsp> beginEcStageV2(const net::Address &address,
+                                         const EcBeginStageV2Req &request,
+                                         const net::UserRequestOptions *options = nullptr,
+                                         serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcStageV2Rsp> appendEcStageV2(const net::Address &address,
+                                          const EcAppendStageV2Req &request,
+                                          const net::UserRequestOptions *options = nullptr,
+                                          serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcStageV2Rsp> queryEcStageV2(const net::Address &address,
+                                         const EcQueryStageV2Req &request,
+                                         const net::UserRequestOptions *options = nullptr,
+                                         serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcStageV2Rsp> reconcileEcStageV2(const net::Address &address,
+                                             const EcReconcileStageV2Req &request,
+                                             const net::UserRequestOptions *options = nullptr,
+                                             serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcSealStageV2Rsp> sealEcStageV2(const net::Address &address,
+                                            const EcSealStageV2Req &request,
+                                            const net::UserRequestOptions *options = nullptr,
+                                            serde::Timestamp *timestamp = nullptr);
 
   CoTryTask<OfflineTargetRsp> offlineTarget(const hf3fs::net::Address &address,
                                             const OfflineTargetReq &request,

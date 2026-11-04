@@ -75,7 +75,17 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<EcReadResult> authorizedReadEcFragment(const EcAuthorizedReadReq &req) override;
   CoTryTask<EcReadResult> authorizedReadEcFragmentControlled(EcAuthorizedReadReq req,
                                                              EcRequestControl control) override;
+  CoTryTask<EcReadBlockResultV2> readEcBlockV2(const EcReadBlockV2Req &) override;
+  CoTryTask<EcStageStateV2> beginEcStageV2(const EcBeginStageV2Req &) override;
+  CoTryTask<EcStageStateV2> appendEcStageV2(const EcAppendStageV2Req &) override;
+  CoTryTask<EcStageStateV2> queryEcStageV2(const EcQueryStageV2Req &) override;
+  CoTryTask<EcStageStateV2> reconcileEcStageV2(const EcReconcileStageV2Req &) override;
+  CoTryTask<EcFragmentReceiptV2> sealEcStageV2(const EcSealStageV2Req &) override;
+  CoTryTask<EcReadBlockResultV2> readEcBlockV2Controlled(EcReadBlockV2Req, EcRequestControl) override;
   CoTryTask<EcFragmentReceipt> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) override;
+
+  CoTryTask<EcScopeControlAck> revokeEcScope(const EcScopeControlRequest &) override;
+  CoTryTask<EcScopeControlAck> queryEcScopeDrain(const EcScopeControlRequest &) override;
 
   CoTryTask<OfflineTargetRsp> offlineTarget(NodeId nodeId, const OfflineTargetReq &req) override;
 
@@ -88,6 +98,11 @@ class StorageClientImpl : public StorageClient {
  private:
   template <typename WireReq>
   CoTryTask<EcFragmentReceipt> createEcFragmentImpl(const WireReq &request);
+  template <typename WireReq, typename Response, auto Method>
+  CoTryTask<Response> stageRequestV2(const WireReq &,
+                                     MethodType,
+                                     bool durable,
+                                     const EcRequestControl *control = nullptr);
   template <typename WireReq>
   CoTryTask<EcReadResult> readEcFragmentImpl(const WireReq &request, const EcRequestControl *control = nullptr);
   template <typename WireReq>
@@ -142,6 +157,10 @@ class StorageClientImpl : public StorageClient {
                                              const std::vector<TruncateChunkOp *> &ops,
                                              const flat::UserInfo &userInfo,
                                              const WriteOptions &options);
+
+ private:
+  CoTryTask<EcScopeControlAck> controlEcScope(const EcScopeControlRequest &, EcScopeControlAction);
+  hf3fs::Semaphore ecControlConcurrency_{16, 16};
 
  private:
   void setCurrentRoutingInfo(std::shared_ptr<hf3fs::client::RoutingInfo const> latestRoutingInfo);

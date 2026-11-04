@@ -19,6 +19,7 @@
 #include "common/utils/SemaphoreGuard.h"
 #include "common/utils/StatusCodeConversion.h"
 #include "common/utils/StringUtils.h"
+#include "fbs/storage/EcStageValidationV2.h"
 
 namespace hf3fs::storage::client {
 
@@ -2708,6 +2709,10 @@ CoTryTask<EcReadResult> StorageClientImpl::readEcFragmentImpl(const WireReq &wir
                                                                            nullptr,
                                                                            true,
                                                                            control != nullptr);
+  // A native RPC timer can finish before the outer coroutine deadline.
+  // Controlled reads expose one timeout code while preserving the cause.
+  if (control && !response && response.error().code() == RPCCode::kTimeout)
+    co_return makeError(response.error().convert(StorageClientCode::kTimeout));
   CO_RETURN_ON_ERROR(response);
   if (!matchesEcMessageTag(response->tag, request.tag)) {
     co_return makeError(StorageClientCode::kProtocolMismatch, "EC read response tag differs from the request");
@@ -2846,6 +2851,184 @@ CoTryTask<EcReadResult> StorageClientImpl::authorizedReadEcFragmentControlled(Ec
 }
 CoTryTask<EcFragmentReceipt> StorageClientImpl::authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) {
   return reconcileEcFragmentImpl(req);
+}
+
+template <typename WireReq, typename Response, auto Method>
+CoTryTask<Response> StorageClientImpl::stageRequestV2(const WireReq &wire,
+                                                      MethodType methodType,
+                                                      bool durable,
+                                                      const EcRequestControl *control) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  const auto &req = wire.request;
+  CO_RETURN_ON_ERROR(req.identity.validate());
+  CO_RETURN_ON_ERROR(validateEcIntegrity(req.identity, req.integrity));
+  if (req.version != kEcGrantVersionV2 || req.operationId.is_nil() || req.vChainId.chainId == ChainId{} ||
+      req.targetId == TargetId{} || wire.grant.claims.version != kEcGrantVersionV2 ||
+      wire.grant.claims.engineUuid.is_nil() || wire.grant.claims.targetIncarnation.is_nil()) {
+    co_return makeError(StatusCode::kInvalidArg, "invalid V2 request or capability shape");
+  }
+  if constexpr (std::is_same_v<WireReq, EcAppendStageV2Req>) {
+    CO_RETURN_ON_ERROR(verifyEcIntegrityBlock(req.identity, req.integrity, wire.blockIndex, wire.payload.data));
+  }
+  if constexpr (std::is_same_v<WireReq, EcReadBlockV2Req>) {
+    if (wire.blockIndex >= req.integrity.blockCount) co_return makeError(StatusCode::kInvalidArg);
+  }
+  const auto checkControl = [control]() -> Result<Void> {
+    if (!control) return Void{};
+    if (std::chrono::steady_clock::now() >= control->deadline) return makeError(StorageClientCode::kTimeout);
+    if (control->cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
+    return Void{};
+  };
+  CO_RETURN_ON_ERROR(checkControl());
+  const DebugOptions debug;
+  ClientRequestContext context(
+      methodType,
+      req.userInfo,
+      debug,
+      config_,
+      1,
+      0,
+      control ? Duration(control->deadline - std::chrono::steady_clock::now()) : config_.retry().max_wait_time());
+  auto node = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
+  CO_RETURN_ON_ERROR(node);
+  const auto nodeId = node->app.nodeId;
+  if (nodeId != wire.grant.claims.nodeId) {
+    co_return makeError(StorageClientCode::kRoutingVersionMismatch, "V2 capability belongs to another storage node");
+  }
+  auto &limiter = durable ? writeConcurrencyLimit_ : readConcurrencyLimit_;
+  auto serverSemaphore = limiter.getPerServerSemaphore(nodeId);
+  SemaphoreGuard perServer(*serverSemaphore);
+  co_await perServer.coWait();
+  CO_RETURN_ON_ERROR(checkControl());
+  SemaphoreGuard global(limiter.getConcurrencySemaphore());
+  co_await global.coWait();
+  CO_RETURN_ON_ERROR(checkControl());
+  if (context.isTimeout()) co_return makeError(StorageClientCode::kTimeout);
+  node = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
+  CO_RETURN_ON_ERROR(node);
+  if (node->app.nodeId != nodeId) co_return makeError(StorageClientCode::kRoutingVersionMismatch);
+  WireReq request = wire;
+  request.request.tag = MessageTag(clientId_, RequestId(nextRequestId_.fetch_add(1)));
+  context.logWaitingTime();
+  if (control) context.requestTimeout = Duration(control->deadline - std::chrono::steady_clock::now());
+  bool dispatched = false;
+  auto response =
+      co_await callMessengerMethod<WireReq, Response, Method>(durable ? getStorageMessengerForUpdates() : messenger_,
+                                                              context,
+                                                              *node,
+                                                              request,
+                                                              0,
+                                                              &dispatched,
+                                                              true,
+                                                              control != nullptr);
+  if (!response) {
+    if (durable && dispatched) co_return makeError(ecSealOutcomeUnknown(response.error()));
+    // Native Waiter timeout and the outer coroutine timer have the same
+    // controlled-read contract. A dispatched durable mutation above remains
+    // OutcomeUnknown: timeout cannot prove that the server did not commit.
+    if (control && response.error().code() == RPCCode::kTimeout)
+      co_return makeError(response.error().convert(StorageClientCode::kTimeout));
+    co_return makeError(response.error());
+  }
+  if (!matchesEcMessageTag(response->tag, request.request.tag)) {
+    Status error(StorageClientCode::kProtocolMismatch, "V2 response tag differs from this call");
+    co_return makeError(durable ? ecSealOutcomeUnknown(error) : error);
+  }
+  CO_RETURN_ON_ERROR(response->result);
+  auto valid = [&]() -> Result<Void> {
+    if constexpr (std::is_same_v<Response, EcReadBlockV2Rsp>) {
+      return validateEcReadBlockV2(*response->result, request);
+    } else if constexpr (std::is_same_v<Response, EcStageV2Rsp>) {
+      return validateEcStageStateV2(*response->result, request.request, request.grant.claims);
+    } else {
+      return validateEcReceiptV2(*response->result, request.request, request.grant.claims);
+    }
+  }();
+  if (!valid) co_return makeError(durable ? ecSealOutcomeUnknown(valid.error()) : valid.error());
+  CO_RETURN_ON_ERROR(checkControl());
+  co_return std::move(*response);
+}
+
+CoTryTask<EcReadBlockResultV2> StorageClientImpl::readEcBlockV2Controlled(EcReadBlockV2Req request,
+                                                                          EcRequestControl control) {
+  const auto now = std::chrono::steady_clock::now();
+  if (control.deadline <= now) co_return makeError(StorageClientCode::kTimeout);
+  if (control.cancellation.isCancellationRequested()) co_return makeError(StorageClientCode::kRequestCanceled);
+  if (control.deadline - now > std::chrono::hours(1)) co_return makeError(StatusCode::kInvalidArg);
+  if (control.transport != EcRequestControl::TransportPolicy::TcpOnly) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled V2 block reads require TCP-only policy");
+  }
+  try {
+    auto response = co_await folly::coro::co_withCancellation(
+        control.cancellation,
+        folly::coro::timeout(stageRequestV2<EcReadBlockV2Req, EcReadBlockV2Rsp, &StorageMessenger::readEcBlockV2>(
+                                 request,
+                                 MethodType::readEcBlockV2,
+                                 false,
+                                 &control),
+                             std::chrono::ceil<std::chrono::microseconds>(control.deadline - now)));
+    CO_RETURN_ON_ERROR(response);
+    co_return std::move(*response->result);
+  } catch (const folly::FutureTimeout &) {
+    co_return makeError(StorageClientCode::kTimeout);
+  } catch (const OperationCancelled &) {
+    co_return makeError(std::chrono::steady_clock::now() >= control.deadline ? StorageClientCode::kTimeout
+                                                                             : StorageClientCode::kRequestCanceled);
+  }
+}
+
+CoTryTask<EcReadBlockResultV2> StorageClientImpl::readEcBlockV2(const EcReadBlockV2Req &request) {
+  auto response = co_await stageRequestV2<EcReadBlockV2Req, EcReadBlockV2Rsp, &StorageMessenger::readEcBlockV2>(
+      request,
+      MethodType::readEcBlockV2,
+      false);
+  CO_RETURN_ON_ERROR(response);
+  co_return std::move(*response->result);
+}
+
+CoTryTask<EcStageStateV2> StorageClientImpl::beginEcStageV2(const EcBeginStageV2Req &request) {
+  auto response = co_await stageRequestV2<EcBeginStageV2Req, EcStageV2Rsp, &StorageMessenger::beginEcStageV2>(
+      request,
+      MethodType::beginEcStageV2,
+      true);
+  CO_RETURN_ON_ERROR(response);
+  co_return std::move(*response->result);
+}
+
+CoTryTask<EcStageStateV2> StorageClientImpl::appendEcStageV2(const EcAppendStageV2Req &request) {
+  auto response = co_await stageRequestV2<EcAppendStageV2Req, EcStageV2Rsp, &StorageMessenger::appendEcStageV2>(
+      request,
+      MethodType::appendEcStageV2,
+      true);
+  CO_RETURN_ON_ERROR(response);
+  co_return std::move(*response->result);
+}
+
+CoTryTask<EcStageStateV2> StorageClientImpl::queryEcStageV2(const EcQueryStageV2Req &request) {
+  auto response = co_await stageRequestV2<EcQueryStageV2Req, EcStageV2Rsp, &StorageMessenger::queryEcStageV2>(
+      request,
+      MethodType::queryEcStageV2,
+      false);
+  CO_RETURN_ON_ERROR(response);
+  co_return std::move(*response->result);
+}
+
+CoTryTask<EcStageStateV2> StorageClientImpl::reconcileEcStageV2(const EcReconcileStageV2Req &request) {
+  auto response = co_await stageRequestV2<EcReconcileStageV2Req, EcStageV2Rsp, &StorageMessenger::reconcileEcStageV2>(
+      request,
+      MethodType::reconcileEcStageV2,
+      true);
+  CO_RETURN_ON_ERROR(response);
+  co_return std::move(*response->result);
+}
+
+CoTryTask<EcFragmentReceiptV2> StorageClientImpl::sealEcStageV2(const EcSealStageV2Req &request) {
+  auto response = co_await stageRequestV2<EcSealStageV2Req, EcSealStageV2Rsp, &StorageMessenger::sealEcStageV2>(
+      request,
+      MethodType::sealEcStageV2,
+      true);
+  CO_RETURN_ON_ERROR(response);
+  co_return std::move(*response->result);
 }
 
 CoTryTask<OfflineTargetRsp> StorageClientImpl::offlineTarget(NodeId nodeId, const OfflineTargetReq &req) {
@@ -2988,6 +3171,62 @@ CoTryTask<ChunkMetaVector> StorageClientImpl::getAllChunkMetadata(const ChainId 
   CO_RETURN_ON_ERROR(response);
 
   co_return response->chunkMetaVec;
+}
+
+CoTryTask<EcScopeControlAck> StorageClientImpl::controlEcScope(const EcScopeControlRequest &request,
+                                                               EcScopeControlAction action) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  if (request.claims.action != action) co_return makeError(StatusCode::kInvalidArg, "EC control action mismatch");
+  if (!ecControlConcurrency_.try_wait())
+    co_return makeError(StorageClientCode::kResourceBusy, "EC control client limit reached");
+  auto budget = folly::makeGuard([this] { ecControlConcurrency_.signal(); });
+  const DebugOptions debugOptions;
+  ClientRequestContext context(
+      action == EcScopeControlAction::Revoke ? MethodType::revokeEcScope : MethodType::queryEcScopeDrain,
+      flat::UserInfo(),
+      debugOptions,
+      config_,
+      1,
+      0,
+      config_.retry().max_wait_time());
+  auto routing = getCurrentRoutingInfo();
+  if (!routing || !routing->raw()) co_return makeError(StorageClientCode::kRoutingError);
+  auto node = getNodeInfo(routing, flat::NodeId(request.claims.nodeId));
+  CO_RETURN_ON_ERROR(node);
+  // Resolve only the exact signed node's address. Do not replace the persisted
+  // instance using a chain's current owner or require SERVING/heartbeat state.
+  Result<EcScopeControlRsp> response = makeError(StorageClientCode::kNotInitialized);
+  if (action == EcScopeControlAction::Revoke) {
+    response = co_await callMessengerMethod<EcScopeControlRequest, EcScopeControlRsp, &StorageMessenger::revokeEcScope>(
+        messenger_,
+        context,
+        *node,
+        request,
+        0,
+        nullptr,
+        true,
+        true);
+  } else {
+    response =
+        co_await callMessengerMethod<EcScopeControlRequest, EcScopeControlRsp, &StorageMessenger::queryEcScopeDrain>(
+            messenger_,
+            context,
+            *node,
+            request,
+            0,
+            nullptr,
+            true,
+            true);
+  }
+  CO_RETURN_ON_ERROR(response);
+  CO_RETURN_ON_ERROR(response->result);
+  co_return std::move(*response->result);
+}
+CoTryTask<EcScopeControlAck> StorageClientImpl::revokeEcScope(const EcScopeControlRequest &request) {
+  return controlEcScope(request, EcScopeControlAction::Revoke);
+}
+CoTryTask<EcScopeControlAck> StorageClientImpl::queryEcScopeDrain(const EcScopeControlRequest &request) {
+  return controlEcScope(request, EcScopeControlAction::Query);
 }
 
 }  // namespace hf3fs::storage::client

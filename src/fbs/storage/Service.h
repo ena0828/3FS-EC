@@ -4,6 +4,8 @@
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcScopeControl.h"
+#include "fbs/storage/EcStageResultV2.h"
 
 namespace hf3fs::storage {
 
@@ -29,6 +31,14 @@ SERDE_SERVICE(StorageSerde, 3) {
   SERDE_SERVICE_METHOD(authorizedCreateEcFragment, 22, EcAuthorizedCreateReq, EcCreateRsp);
   SERDE_SERVICE_METHOD(authorizedReadEcFragment, 23, EcAuthorizedReadReq, EcReadRsp);
   SERDE_SERVICE_METHOD(authorizedReconcileEcFragment, 24, EcAuthorizedReconcileReq, EcReconcileRsp);
+  SERDE_SERVICE_METHOD(revokeEcScope, 25, EcScopeControlRequest, EcScopeControlRsp);
+  SERDE_SERVICE_METHOD(queryEcScopeDrain, 26, EcScopeControlRequest, EcScopeControlRsp);
+  SERDE_SERVICE_METHOD(readEcBlockV2, 40, EcReadBlockV2Req, EcReadBlockV2Rsp);
+  SERDE_SERVICE_METHOD(beginEcStageV2, 41, EcBeginStageV2Req, EcStageV2Rsp);
+  SERDE_SERVICE_METHOD(appendEcStageV2, 42, EcAppendStageV2Req, EcStageV2Rsp);
+  SERDE_SERVICE_METHOD(queryEcStageV2, 43, EcQueryStageV2Req, EcStageV2Rsp);
+  SERDE_SERVICE_METHOD(reconcileEcStageV2, 44, EcReconcileStageV2Req, EcStageV2Rsp);
+  SERDE_SERVICE_METHOD(sealEcStageV2, 45, EcSealStageV2Req, EcSealStageV2Rsp);
 };
 
 }  // namespace hf3fs::storage

@@ -16,6 +16,8 @@
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcScopeControl.h"
+#include "fbs/storage/EcStageResultV2.h"
 
 namespace hf3fs::storage::client {
 
@@ -366,6 +368,14 @@ class StorageClient : public folly::MoveOnly {
     authorizedCreateEcFragment,
     authorizedReadEcFragment,
     authorizedReconcileEcFragment,
+    readEcBlockV2,
+    beginEcStageV2,
+    appendEcStageV2,
+    queryEcStageV2,
+    reconcileEcStageV2,
+    sealEcStageV2,
+    revokeEcScope,
+    queryEcScopeDrain,
   };
 
   class RetryConfig : public hf3fs::ConfigBase<RetryConfig> {
@@ -599,8 +609,39 @@ class StorageClient : public folly::MoveOnly {
   virtual CoTryTask<EcReadResult> authorizedReadEcFragmentControlled(EcAuthorizedReadReq, EcRequestControl) {
     co_return makeError(StatusCode::kNotImplemented, "controlled EC reads require the RPC storage client");
   }
+  virtual CoTryTask<EcReadBlockResultV2> readEcBlockV2(const EcReadBlockV2Req &) {
+    co_return makeError(StatusCode::kNotImplemented, "V2 data RPC is unavailable in this client implementation");
+  }
+  virtual CoTryTask<EcStageStateV2> beginEcStageV2(const EcBeginStageV2Req &) {
+    co_return makeError(StatusCode::kNotImplemented, "V2 data RPC is unavailable in this client implementation");
+  }
+  virtual CoTryTask<EcStageStateV2> appendEcStageV2(const EcAppendStageV2Req &) {
+    co_return makeError(StatusCode::kNotImplemented, "V2 data RPC is unavailable in this client implementation");
+  }
+  virtual CoTryTask<EcStageStateV2> queryEcStageV2(const EcQueryStageV2Req &) {
+    co_return makeError(StatusCode::kNotImplemented, "V2 data RPC is unavailable in this client implementation");
+  }
+  virtual CoTryTask<EcStageStateV2> reconcileEcStageV2(const EcReconcileStageV2Req &) {
+    co_return makeError(StatusCode::kNotImplemented, "V2 data RPC is unavailable in this client implementation");
+  }
+  virtual CoTryTask<EcFragmentReceiptV2> sealEcStageV2(const EcSealStageV2Req &) {
+    co_return makeError(StatusCode::kNotImplemented, "V2 data RPC is unavailable in this client implementation");
+  }
+  virtual CoTryTask<EcReadBlockResultV2> readEcBlockV2Controlled(EcReadBlockV2Req, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled V2 read is unavailable in this client implementation");
+  }
+
   virtual CoTryTask<EcFragmentReceipt> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &) {
     co_return makeError(StatusCode::kNotImplemented, "authorized EC reconciliation requires the RPC storage client");
+  }
+
+  // Transport returns an untrusted ACK until Meta verifies its control MAC,
+  // exact request binding and Drained state against the persisted endpoint set.
+  virtual CoTryTask<EcScopeControlAck> revokeEcScope(const EcScopeControlRequest &) {
+    co_return makeError(StatusCode::kNotImplemented, "EC scope control requires the RPC storage client");
+  }
+  virtual CoTryTask<EcScopeControlAck> queryEcScopeDrain(const EcScopeControlRequest &) {
+    co_return makeError(StatusCode::kNotImplemented, "EC scope control requires the RPC storage client");
   }
 
   virtual CoTryTask<OfflineTargetRsp> offlineTarget(NodeId nodeId, const OfflineTargetReq &req) = 0;

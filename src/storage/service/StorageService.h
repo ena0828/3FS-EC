@@ -115,6 +115,45 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.authorizedReconcileEcFragment(req);
   }
 
+  CoTryTask<EcScopeControlRsp> revokeEcScope(serde::CallContext &ctx, const EcScopeControlRequest &req) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.revokeEcScope(req);
+  }
+  CoTryTask<EcScopeControlRsp> queryEcScopeDrain(serde::CallContext &ctx, const EcScopeControlRequest &req) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.queryEcScopeDrain(req);
+  }
+
+  CoTryTask<EcReadBlockV2Rsp> readEcBlockV2(serde::CallContext &ctx, const EcReadBlockV2Req &request) {
+    reportReadQueueLatency(ctx);
+    return storageOperator_.readEcBlockV2(request);
+  }
+
+  CoTryTask<EcStageV2Rsp> beginEcStageV2(serde::CallContext &ctx, const EcBeginStageV2Req &request) {
+    reportUpdateQueueLatency(ctx);
+    return storageOperator_.beginEcStageV2(request);
+  }
+
+  CoTryTask<EcStageV2Rsp> appendEcStageV2(serde::CallContext &ctx, const EcAppendStageV2Req &request) {
+    reportUpdateQueueLatency(ctx);
+    return storageOperator_.appendEcStageV2(request);
+  }
+
+  CoTryTask<EcStageV2Rsp> queryEcStageV2(serde::CallContext &ctx, const EcQueryStageV2Req &request) {
+    reportUpdateQueueLatency(ctx);
+    return storageOperator_.queryEcStageV2(request);
+  }
+
+  CoTryTask<EcStageV2Rsp> reconcileEcStageV2(serde::CallContext &ctx, const EcReconcileStageV2Req &request) {
+    reportUpdateQueueLatency(ctx);
+    return storageOperator_.reconcileEcStageV2(request);
+  }
+
+  CoTryTask<EcSealStageV2Rsp> sealEcStageV2(serde::CallContext &ctx, const EcSealStageV2Req &request) {
+    reportUpdateQueueLatency(ctx);
+    return storageOperator_.sealEcStageV2(request);
+  }
+
   CoTryTask<OfflineTargetRsp> offlineTarget(serde::CallContext &ctx, const OfflineTargetReq &req) {
     reportDefaultQueueLatency(ctx);
     return storageOperator_.offlineTarget(req);
