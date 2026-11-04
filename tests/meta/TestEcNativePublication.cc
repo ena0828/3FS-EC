@@ -1,11 +1,14 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
 #include <folly/Random.h>
+#include <folly/ScopeGuard.h>
 #include <folly/experimental/coro/BlockingWait.h>
 #include <folly/experimental/coro/Collect.h>
+#include <folly/experimental/coro/Sleep.h>
 #include <fstream>
 #include <linux/magic.h>
 #include <mutex>
@@ -16,6 +19,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "client/ec/NativeEcReadTransport.h"
 #include "client/meta/MetaClient.h"
 #include "common/net/Client.h"
 #include "common/net/Server.h"
@@ -107,6 +111,89 @@ class DropPublishMetaService : public MetaSerdeService {
   PublishReplyDrop &fault_;
 };
 
+// A bounded test-only barrier after actual authorization and disk completion,
+// before serialization of the real TCP reply. No result/receipt is fabricated.
+// It proves a local request can outlive the ten-result quorum; it does not
+// claim that the disk worker is still running or that remote scopes drained.
+struct ReadResponseGate {
+  using Clock = std::chrono::steady_clock;
+  struct State {
+    uint16_t arrived = 0;
+    uint16_t authenticationFailures = 0;
+    bool released = false;
+    bool timedOut = false;
+  };
+  void arm(const Uuid &scope) {
+    std::lock_guard lock(mutex);
+    armed = scope;
+    state = {};
+    deadline = Clock::now() + std::chrono::seconds(10);
+  }
+  void release() {
+    std::lock_guard lock(mutex);
+    state.released = true;
+  }
+  State snapshot() const {
+    std::lock_guard lock(mutex);
+    return state;
+  }
+  CoTask<void> afterRead(Uuid scope, uint16_t shard, bool authenticationFailed) {
+    {
+      std::lock_guard lock(mutex);
+      if (armed.is_nil() || scope != armed || shard >= 12) co_return;
+      state.arrived |= uint16_t(1u << shard);
+      if (authenticationFailed) state.authenticationFailures |= uint16_t(1u << shard);
+    }
+    while (true) {
+      {
+        std::lock_guard lock(mutex);
+        if (scope != armed || state.released) co_return;
+        if (Clock::now() >= deadline) {
+          state.timedOut = true;
+          state.released = true;
+          co_return;
+        }
+        // Wait until every one of the initial eleven real requests reached
+        // the server, so client cancellation cannot prevent shard 10 dispatch.
+        if ((state.arrived & 0x7ff) == 0x7ff && shard != 10) co_return;
+      }
+      co_await folly::coro::sleep(std::chrono::milliseconds(1));
+    }
+  }
+  mutable std::mutex mutex;
+  Uuid armed = Uuid::zero();
+  Clock::time_point deadline;
+  State state;
+};
+
+class GatedReadStorageService : public storage::StorageService {
+ public:
+  GatedReadStorageService(storage::StorageOperator &storage, ReadResponseGate &gate)
+      : storage::StorageService(storage),
+        gate_(gate) {}
+
+  CoTryTask<storage::EcReadRsp> authorizedReadEcFragment(serde::CallContext &ctx,
+                                                         const storage::EcAuthorizedReadReq &req) {
+    auto response = co_await storage::StorageService::authorizedReadEcFragment(ctx, req);
+    bool authenticationFailed = false;
+    if (!response) {
+      authenticationFailed = response.error().code() == StatusCode::kAuthenticationFail;
+    } else if (!response->result) {
+      authenticationFailed = response->result.error().code() == StatusCode::kAuthenticationFail;
+    }
+    co_await gate_.afterRead(req.grant.claims.scopeId, req.request.identity.shard, authenticationFailed);
+    co_return response;
+  }
+
+ protected:
+  friend struct ::hf3fs::refl::Helper;
+  template <class U = GatedReadStorageService>
+  static auto CollectField(::hf3fs::refl::Rank<>) -> refl::Helper::FieldInfoList<storage::StorageSerde<U>>;
+
+ private:
+  ReadResponseGate &gate_;
+};
+
 // Functional integration, not a durability/power-loss or throughput benchmark.
 // Meta and Storage use real TCP Serde clients/services, actual private FDB and
 // one actual Rust Engine. Only the mgmtd routing provider is a test double.
@@ -116,6 +203,7 @@ class DropPublishMetaService : public MetaSerdeService {
 class TestEcNativePublication : public hf3fs::testing::SetupFDB {
  protected:
   static constexpr uint32_t kShardBytes = 4096;
+  virtual uint32_t ecAdmissionLimit() const { return 2; }
   struct Mutation {
     std::string logical;
     storage::EcCodec::Shards shards;
@@ -177,6 +265,9 @@ class TestEcNativePublication : public hf3fs::testing::SetupFDB {
       meta_->afterStop();
     }
     meta_.reset();
+    readGate_.release();
+    if (selectorClient_) selectorClient_->stop();
+    selectorClient_.reset();
     if (storageClient_) storageClient_->stop();
     if (storageServer_) storageServer_->stopAndJoin();
     if (components_ && storageInitialized_) {
@@ -343,7 +434,7 @@ class TestEcNativePublication : public hf3fs::testing::SetupFDB {
     storage.set_enable_ec_fragments(true);
     storage.set_allow_unsafe_ec_fragment_rpc_for_testing(false);
     storage.set_ec_capability_key_file(keyPath_);
-    storage.set_max_concurrent_ec_requests(2);
+    storage.set_max_concurrent_ec_requests(ecAdmissionLimit());
     storage.write_worker().set_num_threads(2);
     storage.write_worker().set_bg_num_threads(1);
     storage.write_worker().set_queue_size(8);
@@ -371,12 +462,13 @@ class TestEcNativePublication : public hf3fs::testing::SetupFDB {
     storageInitialized_ = true;
     routing_ = std::make_shared<flat::RoutingInfo>();
     routing_->routingInfoVersion = flat::RoutingInfoVersion{1};
-    ASSERT_NO_FATAL_FAILURE(startServer(storageServerConfig_,
-                                        storageServer_,
-                                        std::make_unique<storage::StorageService>(components_->storageOperator),
-                                        storageNode_,
-                                        flat::NodeType::STORAGE,
-                                        "StorageSerde"));
+    ASSERT_NO_FATAL_FAILURE(
+        startServer(storageServerConfig_,
+                    storageServer_,
+                    std::make_unique<GatedReadStorageService>(components_->storageOperator, readGate_),
+                    storageNode_,
+                    flat::NodeType::STORAGE,
+                    "StorageSerde"));
     fakeMgmtd_ = std::make_shared<hf3fs::test::FakeMgmtdClient>(routing_);
     mgmtd_ = std::shared_ptr<hf3fs::client::ICommonMgmtdClient>(fakeMgmtd_, fakeMgmtd_->asCommon());
     storageClientConfig_.set_implementation_type(storage::client::StorageClient::ImplementationType::RPC);
@@ -699,6 +791,101 @@ class TestEcNativePublication : public hf3fs::testing::SetupFDB {
     ASSERT_EQ(reconstructed, expected.logical);
   }
 
+  void startSelectorClient() {
+    // A separate client keeps the existing fixture's two-permit settings.
+    // The real response barrier needs room for all eleven dispatched requests.
+    selectorClientConfig_.set_implementation_type(storage::client::StorageClient::ImplementationType::RPC);
+    selectorClientConfig_.retry().set_max_wait_time(20_s);
+    selectorClientConfig_.traffic_control().read().set_max_concurrent_requests(12);
+    selectorClientConfig_.traffic_control().read().set_max_concurrent_requests_per_server(12);
+    smallClient(selectorClientConfig_.net_client());
+    smallClient(selectorClientConfig_.net_client_for_updates());
+    selectorClient_ = storage::client::StorageClient::create(ClientId::random(), selectorClientConfig_, *mgmtd_);
+    ASSERT_NE(selectorClient_, nullptr);
+  }
+
+  void selectAndRecover(const AcquireEcReadRsp &pinned, const Mutation &expected, bool badMac) {
+    ::hf3fs::client::ec::EcStripeReadInput input;
+    input.manifest = pinned.manifest;
+    for (size_t i = 0; i != input.requests.size(); ++i) {
+      ASSERT_TRUE(pinned.readGrants[i].has_value());
+      const auto &fragment = pinned.manifest.fragments[i];
+      auto &authorized = input.requests[i];
+      auto &req = authorized.request;
+      req.identity = fragment.identity;
+      req.operationId = fragment.operation;
+      req.vChainId = {fragment.placement.chain, storage::ChainVer{1}};
+      req.targetId = fragment.placement.target;
+      req.expectedLength = fragment.integrity.wholeLength;
+      req.checksum = {storage::ChecksumType::CRC32C, ~fragment.integrity.wholeCrc32c};
+      authorized.grant = *pinned.readGrants[i];
+    }
+    if (badMac) {
+      // Preserve a valid schema and request binding, but invalidate the actual
+      // MAC by changing the signed grant UUID. Storage must reject it itself.
+      input.requests[0].grant.claims.grantId = Uuid::random();
+    }
+    readGate_.arm(input.requests[10].grant.claims.scopeId);
+    folly::CPUThreadPoolExecutor executor(2);
+    auto transport = std::make_shared<::hf3fs::client::ec::NativeEcReadTransport>(selectorClient_);
+    ::hf3fs::client::ec::EcStripeRead reader(transport, executor, {});
+    SCOPE_EXIT {
+      readGate_.release();
+      blockingWait(reader.close());
+    };
+    ::hf3fs::client::ec::EcStripeReadOptions options;
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    // Exclude timing-based hedging from this deterministic test. A rejected
+    // response still launches the twelfth request immediately.
+    options.hedgeAfter = std::chrono::seconds(30);
+    auto started = reader.start(std::move(input), options);
+    ASSERT_OK(started);
+    auto handle = std::move(*started);
+    {
+      auto selected = blockingWait(handle.takeReady());
+      ASSERT_OK(selected);
+      EXPECT_EQ(selected->attempted, badMac ? 12u : 11u);
+      EXPECT_EQ(selected->rejected, badMac ? 1u : 0u);
+      const auto gate = readGate_.snapshot();
+      EXPECT_EQ(gate.arrived & 0x7ff, 0x7ff);
+      EXPECT_EQ(gate.authenticationFailures, badMac ? 1u : 0u);
+      EXPECT_FALSE(gate.timedOut);
+      EXPECT_FALSE(gate.released);
+      EXPECT_FALSE(handle.localCleanupComplete());
+      EXPECT_EQ(reader.snapshot().activeOperations, 1u);
+      EXPECT_GE(reader.snapshot().activeRequests, 1u);
+      std::array<storage::EcCodecShardView, 10> sources;
+      bool usedTwelfth = false;
+      for (size_t i = 0; i != selected->shards.size(); ++i) {
+        const auto &shard = selected->shards[i];
+        EXPECT_NE(shard.index, 10);
+        if (badMac) EXPECT_NE(shard.index, 0);
+        usedTwelfth |= shard.index == 11;
+        EXPECT_EQ(shard.result.payload.data, expected.shards[shard.index]);
+        sources[i] = {shard.index, shard.result.payload.data};
+      }
+      EXPECT_EQ(usedTwelfth, badMac);
+      auto recovered = storage::EcCodec::recover(sources, pinned.manifest.logicalLength, kShardBytes);
+      ASSERT_OK(recovered);
+      EXPECT_EQ(*recovered, expected.shards);
+      std::string logical;
+      for (size_t i = 0; i != 10; ++i) logical += (*recovered)[i];
+      logical.resize(pinned.manifest.logicalLength);
+      EXPECT_EQ(logical, expected.logical);
+      // Neither reaching quorum nor recovering bytes releases the last TCP
+      // request. The server still owns its real response at the explicit gate.
+      EXPECT_FALSE(handle.localCleanupComplete());
+      readGate_.release();
+      blockingWait(handle.waitLocalCleanup());
+      EXPECT_TRUE(handle.localCleanupComplete());
+      EXPECT_EQ(reader.snapshot().activeOperations, 0u);
+      EXPECT_EQ(reader.snapshot().activeRequests, 0u);
+      EXPECT_EQ(reader.snapshot().reservedPayloadBytes, 12u * kShardBytes);
+    }
+    EXPECT_EQ(reader.snapshot().reservedPayloadBytes, 0u);
+    EXPECT_FALSE(readGate_.snapshot().timedOut);
+  }
+
   void expectHead(const EcObjectRef &object, uint64_t revision) {
     auto head = blockingWait(metaClient_->acquireEcRead(readRequest(object)));
     ASSERT_OK(head);
@@ -741,6 +928,9 @@ class TestEcNativePublication : public hf3fs::testing::SetupFDB {
   UserInfo user_;
   InodeId parent_;
   PublishReplyDrop replyDrop_;
+  ReadResponseGate readGate_;
+  storage::client::StorageClient::Config selectorClientConfig_;
+  std::shared_ptr<storage::client::StorageClient> selectorClient_;
   net::Server::Config metaServerConfig_;
   std::unique_ptr<net::Server> metaServer_;
   net::Client::Config metaNetConfig_;
@@ -1049,6 +1239,52 @@ TEST_F(TestEcNativePublication, RepairsOneAndTwoAllocationsFromTenActualHealthyR
   RecordProperty("actual_healthy_reads_per_recovery", "10");
   RecordProperty("repair_erasure_model", "source omission; old physical allocations retained for pinned reads");
   RecordProperty("physical_fragment_deletion", "false");
+}
+
+// Raise only this fixture's explicit service admission limit. The existing
+// publication/repair fixtures preserve their two-request bound.
+class TestEcNativeReadSelector : public TestEcNativePublication {
+ protected:
+  uint32_t ecAdmissionLimit() const override { return 12; }
+};
+
+TEST_F(TestEcNativeReadSelector, QuorumPrecedesTcpCleanupAndRejectsBadGrant) {
+  auto create = request<CreateEcFileReq>();
+  create.path = PathAt(parent_, fmt::format("ec-select-{}", Uuid::random()));
+  create.shardBytes = kShardBytes;
+  auto created = blockingWait(metaClient_->createEcFile(create));
+  ASSERT_OK(created);
+  const auto object = created->object.object;
+  Mutation initial;
+  ASSERT_NO_FATAL_FAILURE(prepare(initial, object, 0, 67));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(initial));
+  auto published = blockingWait(metaClient_->publishEcMutation(initial.publish));
+  ASSERT_OK(published);
+  ASSERT_EQ(published->record.state, EcOperationState::Published);
+  ASSERT_NO_FATAL_FAILURE(startSelectorClient());
+  for (bool badMac : {false, true}) {
+    SCOPED_TRACE(badMac ? "actual Storage authentication failure and twelfth source" : "eleven real TCP candidates");
+    const auto acquire = readRequest(object);
+    auto pinned = blockingWait(metaClient_->acquireEcRead(acquire));
+    ASSERT_OK(pinned);
+    ASSERT_EQ(pinned->manifest.revision, 1u);
+    ASSERT_NO_FATAL_FAILURE(selectAndRecover(*pinned, initial, badMac));
+    // Local cleanup proves only local buffers and request frames have ended.
+    // The unfinished authenticated remote-drain protocol remains fail-closed.
+    auto release = request<ReleaseEcReadReq>();
+    static_cast<AcquireEcReadReq &>(release) = acquire;
+    ASSERT_ERROR(blockingWait(metaClient_->releaseEcRead(release)), StatusCode::kNotImplemented);
+    auto retained = blockingWait(metaClient_->acquireEcRead(acquire));
+    ASSERT_OK(retained);
+    EXPECT_EQ(retained->manifest.revision, pinned->manifest.revision);
+  }
+  ASSERT_NO_FATAL_FAILURE(expectReferences(published->record.candidate, 1));
+  RecordProperty("selector_transport", "native controlled StorageClient TCP, real capability verification");
+  RecordProperty("selector_quorum", "11 initial candidates, 10 actual validated responses before local cleanup");
+  RecordProperty("selector_failure", "one invalid MAC at real service; shard 12 replaces rejected candidate");
+  RecordProperty("selector_gate",
+                 "after actual service completion, before TCP response serialization; not remote drain");
+  RecordProperty("selector_decode", "EcCodec recover from selected actual bytes equals original logical data");
 }
 
 }  // namespace

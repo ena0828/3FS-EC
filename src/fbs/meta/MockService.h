@@ -38,5 +38,12 @@ class MockMetaService : public serde::ServiceWrapper<MockMetaService, MetaSerde>
   META_MOCK_SERVICE_METHOD(testRpc, TestRpcReq, TestRpcRsp);
   META_MOCK_SERVICE_METHOD(batchStat, BatchStatReq, BatchStatRsp);
   META_MOCK_SERVICE_METHOD(batchStatByPath, BatchStatByPathReq, BatchStatByPathRsp);
+  META_MOCK_SERVICE_METHOD(createEcFile, CreateEcFileReq, CreateEcFileRsp);
+  META_MOCK_SERVICE_METHOD(beginEcMutation, BeginEcMutationReq, EcOperationRsp);
+  META_MOCK_SERVICE_METHOD(publishEcMutation, PublishEcMutationReq, EcOperationRsp);
+  META_MOCK_SERVICE_METHOD(getEcOperation, GetEcOperationReq, EcOperationRsp);
+  META_MOCK_SERVICE_METHOD(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
+  META_MOCK_SERVICE_METHOD(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
+  META_MOCK_SERVICE_METHOD(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
 };
 }  // namespace hf3fs::meta

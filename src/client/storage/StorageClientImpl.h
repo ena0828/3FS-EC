@@ -73,6 +73,8 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<EcFragmentReceipt> reconcileEcFragment(const EcReconcileReq &req) override;
   CoTryTask<EcFragmentReceipt> authorizedCreateEcFragment(const EcAuthorizedCreateReq &req) override;
   CoTryTask<EcReadResult> authorizedReadEcFragment(const EcAuthorizedReadReq &req) override;
+  CoTryTask<EcReadResult> authorizedReadEcFragmentControlled(EcAuthorizedReadReq req,
+                                                             EcRequestControl control) override;
   CoTryTask<EcFragmentReceipt> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) override;
 
   CoTryTask<OfflineTargetRsp> offlineTarget(NodeId nodeId, const OfflineTargetReq &req) override;
@@ -87,7 +89,7 @@ class StorageClientImpl : public StorageClient {
   template <typename WireReq>
   CoTryTask<EcFragmentReceipt> createEcFragmentImpl(const WireReq &request);
   template <typename WireReq>
-  CoTryTask<EcReadResult> readEcFragmentImpl(const WireReq &request);
+  CoTryTask<EcReadResult> readEcFragmentImpl(const WireReq &request, const EcRequestControl *control = nullptr);
   template <typename WireReq>
   CoTryTask<EcFragmentReceipt> reconcileEcFragmentImpl(const WireReq &request);
 
@@ -157,7 +159,8 @@ class StorageClientImpl : public StorageClient {
                                      const Req &request,
                                      uint32_t sendRetryTimes = 1,
                                      bool *dispatched = nullptr,
-                                     bool allowTcp = false);
+                                     bool allowTcp = false,
+                                     bool tcpOnly = false);
 
   template <typename Op, typename BatchReq, typename BatchRsp, auto Method>
   CoTryTask<BatchRsp> sendBatchRequest(StorageMessenger &messenger,

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <fcntl.h>
+#include <folly/ScopeGuard.h>
 #include <folly/experimental/coro/BlockingWait.h>
 #include <linux/magic.h>
 #include <mutex>
@@ -468,6 +469,46 @@ TEST_F(TestEcAuthorizedService, NativeAuthorizedRoundtripRejectsUncredentialedMe
                StatusCode::kAuthenticationFail);
   auto longLived = createRequest(17, 200);
   ASSERT_OK(blockingWait(client_->authorizedCreateEcFragment({longLived, grantFor(longLived, 7, 1600)})));
+}
+
+TEST_F(TestEcAuthorizedService, ControlledTcpReadKeepsAuthorizationAndFiniteQueueDeadline) {
+  const auto create = createRequest(257, 9090);
+  const auto grant = grantFor(create);
+  ASSERT_OK(blockingWait(client_->authorizedCreateEcFragment({create, grant})));
+  client::EcRequestControl control;
+  control.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  auto result = blockingWait(client_->authorizedReadEcFragmentControlled({readFor(create), grant}, control));
+  ASSERT_OK(result);
+  EXPECT_EQ(result->payload.data, create.payload.data);
+
+  auto wrong = grantFor(create, static_cast<uint8_t>(EcGrantRight::Create));
+  ASSERT_ERROR(blockingWait(client_->authorizedReadEcFragmentControlled({readFor(create), wrong}, control)),
+               StatusCode::kAuthenticationFail);
+  control.deadline = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+  ASSERT_ERROR(blockingWait(client_->authorizedReadEcFragmentControlled({readFor(create), grant}, control)),
+               StorageClientCode::kTimeout);
+  control.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  CancellationSource cancelled;
+  cancelled.requestCancellation();
+  control.cancellation = cancelled.getToken();
+  ASSERT_ERROR(blockingWait(client_->authorizedReadEcFragmentControlled({readFor(create), grant}, control)),
+               StorageClientCode::kRequestCanceled);
+
+  // A real RPC client's zero-capacity global admission queue must be released
+  // by the deadline token. This is not a fake transport or a remote drain ACK.
+  client::StorageClient::Config queuedConfig;
+  queuedConfig.set_implementation_type(client::StorageClient::ImplementationType::RPC);
+  queuedConfig.traffic_control().read().set_max_concurrent_requests(0);
+  queuedConfig.traffic_control().read().set_max_concurrent_requests_per_server(2);
+  smallClient(queuedConfig.net_client());
+  smallClient(queuedConfig.net_client_for_updates());
+  auto queued = client::StorageClient::create(ClientId::random(), queuedConfig, *mgmtd_->asCommon());
+  ASSERT_NE(queued, nullptr);
+  auto stop = folly::makeGuard([&] { queued->stop(); });
+  control.cancellation = {};
+  control.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+  ASSERT_ERROR(blockingWait(queued->authorizedReadEcFragmentControlled({readFor(create), grant}, control)),
+               StorageClientCode::kTimeout);
 }
 
 TEST_F(TestEcAuthorizedService, RejectsMacBindingRightsExpiryAndPayloadMismatch) {

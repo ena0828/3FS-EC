@@ -3,6 +3,7 @@
 #include <span>
 #include <vector>
 
+#include "EcRequestControl.h"
 #include "TargetSelection.h"
 #include "UpdateChannelAllocator.h"
 #include "client/mgmtd/ICommonMgmtdClient.h"
@@ -592,6 +593,11 @@ class StorageClient : public folly::MoveOnly {
   }
   virtual CoTryTask<EcReadResult> authorizedReadEcFragment(const EcAuthorizedReadReq &) {
     co_return makeError(StatusCode::kNotImplemented, "authorized EC fragments require the RPC storage client");
+  }
+  // Own the request across cancellation/deadline-controlled admission and RPC.
+  // No fallback to an uncredentialed or InMem implementation is permitted.
+  virtual CoTryTask<EcReadResult> authorizedReadEcFragmentControlled(EcAuthorizedReadReq, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled EC reads require the RPC storage client");
   }
   virtual CoTryTask<EcFragmentReceipt> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &) {
     co_return makeError(StatusCode::kNotImplemented, "authorized EC reconciliation requires the RPC storage client");

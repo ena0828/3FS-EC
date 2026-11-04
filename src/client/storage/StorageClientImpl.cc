@@ -4,6 +4,7 @@
 #include <folly/Random.h>
 #include <folly/experimental/coro/Collect.h>
 #include <folly/experimental/coro/Sleep.h>
+#include <folly/experimental/coro/Timeout.h>
 #include <folly/experimental/symbolizer/Symbolizer.h>
 #include <memory>
 #include <random>
@@ -892,7 +893,8 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
                                                       const Req &request,
                                                       uint32_t sendRetryTimes,
                                                       bool *dispatched,
-                                                      bool allowTcp) {
+                                                      bool allowTcp,
+                                                      bool tcpOnly) {
   if (dispatched) *dispatched = false;
   monitor::ScopedLatencyWriter latencyWriter(request_latency, requestCtx.requestTagSet);
   monitor::ScopedCounterWriter inflightRequests(inflight_requests,
@@ -917,7 +919,7 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
     for (const auto &serviceGroup : nodeInfo.app.serviceGroups) {
       if (allowTcp && !serviceGroup.services.contains("StorageSerde")) continue;
       for (const auto &address : serviceGroup.endpoints) {
-        if (address.type == net::Address::Type::RDMA) return &address;
+        if (!tcpOnly && address.type == net::Address::Type::RDMA) return &address;
         if (allowTcp && !tcpAddress && address.type == net::Address::Type::TCP) tcpAddress = &address;
       }
     }
@@ -2646,27 +2648,37 @@ CoTryTask<EcFragmentReceipt> StorageClientImpl::createEcFragmentImpl(const WireR
 }
 
 template <typename WireReq>
-CoTryTask<EcReadResult> StorageClientImpl::readEcFragmentImpl(const WireReq &wire) {
+CoTryTask<EcReadResult> StorageClientImpl::readEcFragmentImpl(const WireReq &wire, const EcRequestControl *control) {
   const auto &req = ecRequest(wire);
   constexpr bool authorized = std::is_same_v<WireReq, EcAuthorizedReadReq>;
   if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
   CO_RETURN_ON_ERROR(req.validate());
+  const auto checkControl = [control]() -> Result<Void> {
+    if (!control) return Void{};
+    if (std::chrono::steady_clock::now() >= control->deadline) return makeError(StorageClientCode::kTimeout);
+    if (control->cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
+    return Void{};
+  };
+  CO_RETURN_ON_ERROR(checkControl());
   const DebugOptions debugOptions;
-  ClientRequestContext requestCtx(authorized ? MethodType::authorizedReadEcFragment : MethodType::readEcFragment,
-                                  req.userInfo,
-                                  debugOptions,
-                                  config_,
-                                  1,
-                                  0,
-                                  config_.retry().max_wait_time());
+  ClientRequestContext requestCtx(
+      authorized ? MethodType::authorizedReadEcFragment : MethodType::readEcFragment,
+      req.userInfo,
+      debugOptions,
+      config_,
+      1,
+      0,
+      control ? Duration(control->deadline - std::chrono::steady_clock::now()) : config_.retry().max_wait_time());
   auto nodeInfo = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
   CO_RETURN_ON_ERROR(nodeInfo);
   const auto nodeId = nodeInfo->app.nodeId;
   auto perServerSemaphore = readConcurrencyLimit_.getPerServerSemaphore(nodeId);
   SemaphoreGuard perServerReq(*perServerSemaphore);
   co_await perServerReq.coWait();
+  CO_RETURN_ON_ERROR(checkControl());
   SemaphoreGuard concurrentReq(readConcurrencyLimit_.getConcurrencySemaphore());
   co_await concurrentReq.coWait();
+  CO_RETURN_ON_ERROR(checkControl());
   if (requestCtx.isTimeout()) co_return makeError(StorageClientCode::kTimeout, "EC request expired while waiting");
 
   nodeInfo = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
@@ -2684,13 +2696,18 @@ CoTryTask<EcReadResult> StorageClientImpl::readEcFragmentImpl(const WireReq &wir
     else
       return &StorageMessenger::readEcFragment;
   }();
+  if (control) {
+    CO_RETURN_ON_ERROR(checkControl());
+    requestCtx.requestTimeout = Duration(control->deadline - std::chrono::steady_clock::now());
+  }
   auto response = co_await callMessengerMethod<WireReq, EcReadRsp, method>(messenger_,
                                                                            requestCtx,
                                                                            *nodeInfo,
                                                                            wireRequest,
                                                                            1,
                                                                            nullptr,
-                                                                           true);
+                                                                           true,
+                                                                           control != nullptr);
   CO_RETURN_ON_ERROR(response);
   if (!matchesEcMessageTag(response->tag, request.tag)) {
     co_return makeError(StorageClientCode::kProtocolMismatch, "EC read response tag differs from the request");
@@ -2800,6 +2817,32 @@ CoTryTask<EcFragmentReceipt> StorageClientImpl::authorizedCreateEcFragment(const
 }
 CoTryTask<EcReadResult> StorageClientImpl::authorizedReadEcFragment(const EcAuthorizedReadReq &req) {
   return readEcFragmentImpl(req);
+}
+CoTryTask<EcReadResult> StorageClientImpl::authorizedReadEcFragmentControlled(EcAuthorizedReadReq req,
+                                                                              EcRequestControl control) {
+  const auto now = std::chrono::steady_clock::now();
+  if (control.deadline <= now) co_return makeError(StorageClientCode::kTimeout);
+  if (control.cancellation.isCancellationRequested()) co_return makeError(StorageClientCode::kRequestCanceled);
+  if (control.deadline - now > std::chrono::hours(1)) {
+    co_return makeError(StatusCode::kInvalidArg, "controlled EC read deadline exceeds one hour");
+  }
+  if (control.transport != EcRequestControl::TransportPolicy::TcpOnly) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled EC reads currently require explicit TCP-only policy");
+  }
+  try {
+    // Folly timeout waits for its child to finish after requesting cancellation.
+    // Queue semaphore waits observe that token; an already sent ClientContext
+    // keeps its borrowed Waiter::Item alive until the native timeout/response.
+    co_return co_await folly::coro::co_withCancellation(
+        control.cancellation,
+        folly::coro::timeout(readEcFragmentImpl(req, &control),
+                             std::chrono::ceil<std::chrono::microseconds>(control.deadline - now)));
+  } catch (const folly::FutureTimeout &) {
+    co_return makeError(StorageClientCode::kTimeout);
+  } catch (const OperationCancelled &) {
+    co_return makeError(std::chrono::steady_clock::now() >= control.deadline ? StorageClientCode::kTimeout
+                                                                             : StorageClientCode::kRequestCanceled);
+  }
 }
 CoTryTask<EcFragmentReceipt> StorageClientImpl::authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) {
   return reconcileEcFragmentImpl(req);
