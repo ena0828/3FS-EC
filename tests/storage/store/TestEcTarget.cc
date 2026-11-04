@@ -117,7 +117,7 @@ TEST(TestEcTarget, WorkerCreateReadAndCleanReopen) {
     if (reopen == 0) {
       // A stale route at dequeue must prevent creation, not merely suppress
       // its response after an otherwise successful write.
-      EcCreateJob stale(create, store, []() -> Result<Void> {
+      EcCreateJob stale(EcLegacyV1Admission{}, create, store, []() -> Result<Void> {
         return makeError(StorageClientCode::kRoutingVersionMismatch, "injected stale route");
       });
       runJob(worker, stale);
@@ -125,15 +125,15 @@ TEST(TestEcTarget, WorkerCreateReadAndCleanReopen) {
       ASSERT_EQ(stale.result().error().code(), StorageClientCode::kRoutingVersionMismatch);
       ASSERT_FALSE(store->readEcFragment(read));
 
-      EcCreateJob job(create, store, validRoute);
+      EcCreateJob job(EcLegacyV1Admission{}, create, store, validRoute);
       runJob(worker, job);
       ASSERT_OK(job.result());
       ASSERT_EQ(job.result()->length, create.payload.data.size());
       ASSERT_EQ(job.result()->checksum, create.checksum);
-      EcCreateJob emptyJob(empty, store, validRoute);
+      EcCreateJob emptyJob(EcLegacyV1Admission{}, empty, store, validRoute);
       runJob(worker, emptyJob);
       ASSERT_OK(emptyJob.result());
-      EcCreateJob duplicate(create, store, validRoute);
+      EcCreateJob duplicate(EcLegacyV1Admission{}, create, store, validRoute);
       runJob(worker, duplicate);
       ASSERT_FALSE(duplicate.result());
       ASSERT_EQ(duplicate.result().error().code(), StorageCode::kChunkAlreadyExists);
@@ -141,7 +141,7 @@ TEST(TestEcTarget, WorkerCreateReadAndCleanReopen) {
       auto invalid = create;
       invalid.identity.allocation = Uuid::from(8, 9);
       invalid.checksum.value ^= 1;
-      EcCreateJob corrupt(invalid, store, validRoute);
+      EcCreateJob corrupt(EcLegacyV1Admission{}, invalid, store, validRoute);
       runJob(worker, corrupt);
       ASSERT_FALSE(corrupt.result());
       ASSERT_EQ(corrupt.result().error().code(), StorageCode::kChecksumMismatch);
@@ -172,7 +172,7 @@ TEST(TestEcTarget, WorkerCreateReadAndCleanReopen) {
         ASSERT_TRUE(error.empty()) << error;
         ASSERT_NE(inFlight, nullptr);
         SCOPE_EXIT { targets.engines()[0]->release_writing_chunk(inFlight); };
-        EcCreateJob uncertain(pending, store, validRoute);
+        EcCreateJob uncertain(EcLegacyV1Admission{}, pending, store, validRoute);
         runJob(worker, uncertain);
         ASSERT_FALSE(uncertain.result());
         ASSERT_EQ(uncertain.result().error().code(), StorageCode::kEcSealOutcomeUnknown);
@@ -216,7 +216,7 @@ TEST(TestEcTarget, WorkerCreateReadAndCleanReopen) {
       ASSERT_FALSE(targets.removeChunkEngineTarget(create.vChainId.chainId, 0));
       ASSERT_FALSE(map.removeTarget(create.targetId));
     }
-    EcReadJob job(read, store, validRoute);
+    EcReadJob job(EcLegacyV1Admission{}, read, store, validRoute);
     runJob(worker, job);
     ASSERT_OK(job.result());
     ASSERT_EQ(job.result()->payload.data, create.payload.data);
@@ -226,7 +226,7 @@ TEST(TestEcTarget, WorkerCreateReadAndCleanReopen) {
     ASSERT_TRUE(emptyRead->payload.data.empty());
     auto reconcile = reconcileRequest(create);
     reconcile.vChainId.chainVer = ChainVer{2};
-    EcReconcileJob confirmation(reconcile, store, validRoute);
+    EcReconcileJob confirmation(EcLegacyV1Admission{}, reconcile, store, validRoute);
     runJob(worker, confirmation);
     ASSERT_OK(confirmation.result());
     ASSERT_EQ(confirmation.result()->vChainId, reconcile.vChainId);
@@ -235,7 +235,7 @@ TEST(TestEcTarget, WorkerCreateReadAndCleanReopen) {
     ASSERT_EQ(confirmation.result()->length, create.payload.data.size());
     ASSERT_OK(store->reconcileEcFragment(reconcileRequest(empty)));
 
-    EcReconcileJob staleConfirmation(reconcile, store, []() -> Result<Void> {
+    EcReconcileJob staleConfirmation(EcLegacyV1Admission{}, reconcile, store, []() -> Result<Void> {
       return makeError(StorageClientCode::kRoutingVersionMismatch, "injected stale route");
     });
     runJob(worker, staleConfirmation);

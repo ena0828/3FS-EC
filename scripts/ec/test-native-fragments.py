@@ -19,7 +19,10 @@ import time
 import xml.etree.ElementTree as ET
 
 
-STORAGE_FILTER = "TestEcProtocol.*:TestEcTarget.*:TestEcIntegrity.*:TestEcCodec.*:TestEcAuthorization.*"
+STORAGE_FILTER = (
+    "TestEcProtocol.*:TestEcTarget.*:TestEcIntegrity.*:TestEcCodec.*:TestEcAuthorization.*:"
+    "TestEcScopeBridge.*:TestEcStagingBridge.*:TestEcAuthorizationV2.*"
+)
 SERVICE_FILTER = "TestEcService.*:TestEcServiceWithoutEngine.*:TestEcAuthorizedService.*:TestEcAuthorizedNoKeyService.*:TestEcCapabilityComponents.*"
 LEGACY_FILTER = "TestChunkEngine.ReadWrite:TestStorageTarget.ReadWrite:TestStorageTarget.Uncommitted"
 # TestChunkEngine.ReadWrite retains default 4 MiB/64 MiB buffers and 32 AIO

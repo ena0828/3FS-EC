@@ -1,11 +1,14 @@
 #pragma once
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/experimental/coro/WithCancellation.h>
 #include <variant>
 
 #include "common/utils/BoundedQueue.h"
 #include "storage/store/StorageTargets.h"
+#include "storage/update/EcAdmissionJob.h"
 #include "storage/update/EcJob.h"
+#include "storage/update/EcStageJob.h"
 #include "storage/update/UpdateJob.h"
 
 namespace hf3fs::storage {
@@ -28,6 +31,36 @@ class UpdateWorker {
 
   Result<Void> start(uint32_t numberOfDisks);
   void stopAndJoin();
+  Result<std::shared_ptr<EcWorkerSession>> acquireEcSession() { return ecSessions_->acquire(); }
+
+  CoTask<void> enqueue(EcAdmissionJob *job) {
+    job->claimSubmission();
+    if (!job->sessionMatches(ecSessions_)) {
+      job->reject(Status(StatusCode::kInvalidArg, "EC admission session belongs to another worker"));
+      co_return;
+    }
+    assert(job->target()->diskIndex() < queueVec_.size());
+    // Once claimed, this borrowed job must either enqueue and complete or
+    // remain owned. Semaphore::co_wait is cancellation-aware, unlike Baton.
+    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
+                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
+  }
+
+  CoTask<void> enqueue(EcStageJob *job) {
+    job->claimSubmission();
+    if (!job->sessionMatches(ecSessions_)) {
+      job->setResult(makeError(StatusCode::kInvalidArg, "stage session belongs to another worker"));
+      co_return;
+    }
+    auto valid = job->validateSubmission();
+    if (!valid) {
+      job->setResult(makeError(valid.error()));
+      co_return;
+    }
+    assert(job->target()->diskIndex() < queueVec_.size());
+    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
+                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
+  }
 
   CoTask<void> enqueue(UpdateJob *job) {
     assert(job->target()->diskIndex() < queueVec_.size());
@@ -35,22 +68,52 @@ class UpdateWorker {
   }
 
   CoTask<void> enqueue(EcCreateJob *job) {
+    job->claimSubmission();
+    if (!job->sessionMatches(ecSessions_)) {
+      job->setResult(makeError(StatusCode::kInvalidArg, "scoped EC session belongs to another worker"));
+      co_return;
+    }
     assert(job->target()->diskIndex() < queueVec_.size());
-    co_await queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job});
+    // Once claimed, this borrowed job must either enqueue and complete or
+    // remain owned. Semaphore::co_wait is cancellation-aware, unlike Baton.
+    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
+                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
   }
 
   CoTask<void> enqueue(EcReadJob *job) {
+    job->claimSubmission();
+    if (!job->sessionMatches(ecSessions_)) {
+      job->setResult(makeError(StatusCode::kInvalidArg, "scoped EC session belongs to another worker"));
+      co_return;
+    }
     assert(job->target()->diskIndex() < queueVec_.size());
-    co_await queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job});
+    // Once claimed, this borrowed job must either enqueue and complete or
+    // remain owned. Semaphore::co_wait is cancellation-aware, unlike Baton.
+    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
+                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
   }
 
   CoTask<void> enqueue(EcReconcileJob *job) {
+    job->claimSubmission();
+    if (!job->sessionMatches(ecSessions_)) {
+      job->setResult(makeError(StatusCode::kInvalidArg, "scoped EC session belongs to another worker"));
+      co_return;
+    }
     assert(job->target()->diskIndex() < queueVec_.size());
-    co_await queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job});
+    // Once claimed, this borrowed job must either enqueue and complete or
+    // remain owned. Semaphore::co_wait is cancellation-aware, unlike Baton.
+    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
+                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
   }
 
  protected:
-  using QueueItem = std::variant<std::monostate, UpdateJob *, EcCreateJob *, EcReadJob *, EcReconcileJob *>;
+  using QueueItem = std::variant<std::monostate,
+                                 UpdateJob *,
+                                 EcCreateJob *,
+                                 EcReadJob *,
+                                 EcReconcileJob *,
+                                 EcAdmissionJob *,
+                                 EcStageJob *>;
   using Queue = BoundedQueue<QueueItem>;
   void run(Queue &queue);
 
@@ -60,6 +123,7 @@ class UpdateWorker {
   std::vector<std::unique_ptr<Queue>> queueVec_;
   folly::CPUThreadPoolExecutor executors_;
   folly::CPUThreadPoolExecutor bgExecutors_;
+  std::shared_ptr<EcWorkerSessions> ecSessions_ = std::make_shared<EcWorkerSessions>();
   std::atomic_flag stopped_;
 };
 

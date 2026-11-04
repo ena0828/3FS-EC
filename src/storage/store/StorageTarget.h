@@ -10,6 +10,8 @@
 #include "common/utils/LockManager.h"
 #include "common/utils/Path.h"
 #include "storage/aio/BatchReadJob.h"
+#include "storage/ec_scope/EcScope.h"
+#include "storage/ec_stage/EcStagingEngine.h"
 #include "storage/store/ChunkEngine.h"
 #include "storage/store/ChunkStore.h"
 #include "storage/store/PhysicalConfig.h"
@@ -22,7 +24,8 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   StorageTarget(const ChunkStore::Config &config,
                 GlobalFileStore &globalFileStore,
                 uint32_t diskIndex,
-                chunk_engine::Engine *engine);
+                chunk_engine::Engine *engine,
+                std::shared_ptr<EcStagingEngine> staging = nullptr);
 
  public:
   using Config = ChunkStore::Config;
@@ -77,6 +80,17 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   // update chunk (write/remove/truncate).
   void updateChunk(UpdateJob &job, folly::CPUThreadPoolExecutor &executor);
 
+  enum class EcScopeOpenMode { RegisterNew, LoadExisting };
+  // Process-local startup hook only; not reachable from an RPC wire flag.
+  Result<Void> initializeEcScope(EcScopeOpenMode mode);
+  Result<Void> checkEcScopeTarget(const EcScopeTargetIdentity &identity) const;
+  Result<std::pair<std::shared_ptr<EcScope>, EcScopeTargetIdentity>> ecScopeState() const;
+
+  Result<EcStageResult> executeEcStage(const EcStageRequest &request);
+  bool usesEcStagingEngine() const {
+    return staging_ != nullptr && targetConfig_.ec_staging_v2 && initialized_ && ecOnly();
+  }
+
   Result<EcFragmentReceipt> createEcFragment(const EcCreateReq &request);
   Result<EcReadResult> readEcFragment(const EcReadReq &request);
   Result<EcFragmentReceipt> reconcileEcFragment(const EcReconcileReq &request);
@@ -110,6 +124,14 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
 
   // get used size.
   uint64_t usedSize() const {
+    if (staging_) {
+      auto size = staging_->committedSize(chainId());
+      if (!size) {
+        XLOGF(ERR, "stage accounting failed: {}", size.error());
+        return 0;
+      }
+      return *size;
+    }
     if (useChunkEngine()) {
       return ChunkEngine::chainUsedSize(*engine_, ChainId{targetConfig_.chain_id});
     } else {
@@ -181,6 +203,10 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   uint32_t diskIndex_;
   uint32_t generationId_;
   chunk_engine::Engine *engine_{};
+  std::shared_ptr<EcStagingEngine> staging_;
+  mutable std::mutex ecScopeMutex_;
+  std::shared_ptr<EcScope> ecScope_;
+  EcScopeTargetIdentity ecScopeIdentity_{};
   std::atomic<uint64_t> unusedSize_{};
   monitor::TagSet diskTag_;
   monitor::TagSet targetTag_;

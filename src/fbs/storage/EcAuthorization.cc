@@ -1,5 +1,3 @@
-#include "fbs/storage/EcAuthorization.h"
-
 #include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
@@ -8,6 +6,8 @@
 #include <openssl/hmac.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "fbs/storage/EcAuthorizationCrypto.h"
 
 namespace hf3fs::storage {
 namespace {
@@ -154,28 +154,23 @@ Result<EcGrantClaims> decodeClaims(std::string_view bytes) {
   return claims;
 }
 
-struct Access {
-  static Result<EcSha256> authenticate(const EcCapabilityKey &key,
-                                       const std::array<uint8_t, kEcGrantCanonicalBytes> &bytes) {
-    EcSha256 signature{};
-    unsigned int length = 0;
-    if (HMAC(EVP_sha256(),
-             key.bytes_.data(),
-             key.bytes_.size(),
-             bytes.data(),
-             bytes.size(),
-             signature.data(),
-             &length) == nullptr ||
-        length != signature.size()) {
-      return makeError(StatusCode::kIOError, "EC HMAC-SHA256 calculation failed");
-    }
-    return signature;
+Result<EcSha256> Access::authenticate(const EcCapabilityKey &key, std::span<const uint8_t> bytes) {
+  EcSha256 signature{};
+  unsigned int length = 0;
+  if (HMAC(EVP_sha256(), key.bytes_.data(), key.bytes_.size(), bytes.data(), bytes.size(), signature.data(), &length) ==
+          nullptr ||
+      length != signature.size()) {
+    return makeError(StatusCode::kIOError, "EC HMAC-SHA256 calculation failed");
   }
-  static void setSignature(EcCapability &grant, const EcSha256 &signature) { grant.signature_ = signature; }
-  static bool matches(const EcCapability &grant, const EcSha256 &signature) {
-    return CRYPTO_memcmp(grant.signature_.data(), signature.data(), signature.size()) == 0;
-  }
-};
+  return signature;
+}
+bool Access::constantTimeEqual(const EcSha256 &left, const EcSha256 &right) {
+  return CRYPTO_memcmp(left.data(), right.data(), left.size()) == 0;
+}
+void Access::setSignature(EcCapability &grant, const EcSha256 &signature) { grant.signature_ = signature; }
+bool Access::matches(const EcCapability &grant, const EcSha256 &signature) {
+  return constantTimeEqual(grant.signature_, signature);
+}
 
 }  // namespace ec_authorization_detail
 

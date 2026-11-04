@@ -3,6 +3,8 @@ mod core;
 mod cxx;
 mod ec_codec;
 pub mod ec_scope;
+mod ec_scope_bridge;
+mod ec_stage_bridge;
 mod file;
 mod meta;
 mod types;

@@ -119,11 +119,13 @@ Result<std::string> getDeviceUUID(const Path &path) {
 StorageTarget::StorageTarget(const Config &config,
                              GlobalFileStore &globalFileStore,
                              uint32_t diskIndex,
-                             chunk_engine::Engine *engine)
+                             chunk_engine::Engine *engine,
+                             std::shared_ptr<EcStagingEngine> staging)
     : config_(config),
       diskIndex_(diskIndex),
       generationId_(++gGenerationId),
       engine_(engine),
+      staging_(std::move(staging)),
       diskTag_(monitor::instanceTagSet(std::to_string(diskIndex))),
       targetTag_(monitor::instanceTagSet(std::to_string(0))),
       readCountPerDisk_(aioReadCountPerDisk.getRecorderWithTag(diskTag_)),
@@ -146,6 +148,10 @@ StorageTarget::~StorageTarget() {
 }
 
 Result<Void> StorageTarget::create(const PhysicalConfig &config) {
+  if (config.ec_staging_v2 != (staging_ != nullptr) || (staging_ && engine_) ||
+      (config.ec_staging_v2 && !config.ec_only)) {
+    return makeError(StorageCode::kStorageInitFailed, "target staging mode differs from its engine facade");
+  }
   if (config.ec_only && (!config.only_chunk_engine || config.chain_id == 0)) {
     return makeError(StorageCode::kStorageInitFailed, "EC target requires ChunkEngine and a nonzero fixed chain id");
   }
@@ -159,7 +165,8 @@ Result<Void> StorageTarget::create(const PhysicalConfig &config) {
       return makeError(StorageCode::kStorageInitFailed, std::move(msg));
     }
     RETURN_AND_LOG_ON_ERROR(load(config.path));
-    if (targetConfig_.ec_only != config.ec_only || (config.ec_only && targetConfig_.chain_id != config.chain_id)) {
+    if (targetConfig_.ec_only != config.ec_only || targetConfig_.ec_staging_v2 != config.ec_staging_v2 ||
+        (config.ec_only && targetConfig_.chain_id != config.chain_id)) {
       return makeError(StorageCode::kStorageInitFailed,
                        "existing target mode or EC chain differs; conversion is forbidden");
     }
@@ -248,7 +255,8 @@ Result<PhysicalConfig> StorageTarget::readPhysicalConfig(const Path &path) {
   PhysicalConfig config;
   RETURN_AND_LOG_ON_ERROR(serde::fromTomlFile(config, configPath));
   const bool hasEcConfig = configPath.filename() == kEcPhysicalConfigFileName;
-  if (config.ec_only != hasEcConfig || (hasEcConfig && (!config.only_chunk_engine || config.chain_id == 0))) {
+  if ((config.ec_staging_v2 && !config.ec_only) || config.ec_only != hasEcConfig ||
+      (hasEcConfig && (!config.only_chunk_engine || config.chain_id == 0))) {
     return makeError(StorageCode::kStorageInitFailed, "EC target files and physical mode disagree");
   }
   if (path != config.path) {
@@ -261,6 +269,10 @@ Result<PhysicalConfig> StorageTarget::readPhysicalConfig(const Path &path) {
 
 Result<Void> StorageTarget::load(const Path &path) {
   CHECK_RESULT(config, readPhysicalConfig(path));
+  if (config.ec_staging_v2 != (staging_ != nullptr) || (staging_ && engine_) ||
+      (config.ec_staging_v2 && !config.ec_only)) {
+    return makeError(StorageCode::kStorageInitFailed, "restored target staging mode differs from its engine facade");
+  }
   targetConfig_ = std::move(config);
 
   auto getDeviceUUIDResult = getDeviceUUID(path);
@@ -354,7 +366,7 @@ Result<Void> StorageTarget::addChunkSize(const std::vector<Size> &sizeList) {
 }
 
 Result<EcFragmentReceipt> StorageTarget::createEcFragment(const EcCreateReq &request) {
-  if (!ecOnly() || !useChunkEngine() || engine_ == nullptr || request.targetId != targetId() ||
+  if (usesEcStagingEngine() || !ecOnly() || !useChunkEngine() || engine_ == nullptr || request.targetId != targetId() ||
       request.vChainId.chainId != chainId()) {
     return makeError(StatusCode::kInvalidArg, "EC creation requires the matching dedicated ChunkEngine target");
   }
@@ -362,7 +374,7 @@ Result<EcFragmentReceipt> StorageTarget::createEcFragment(const EcCreateReq &req
 }
 
 Result<EcReadResult> StorageTarget::readEcFragment(const EcReadReq &request) {
-  if (!ecOnly() || !useChunkEngine() || engine_ == nullptr || request.targetId != targetId() ||
+  if (usesEcStagingEngine() || !ecOnly() || !useChunkEngine() || engine_ == nullptr || request.targetId != targetId() ||
       request.vChainId.chainId != chainId()) {
     return makeError(StatusCode::kInvalidArg, "EC read requires the matching dedicated ChunkEngine target");
   }
@@ -370,7 +382,7 @@ Result<EcReadResult> StorageTarget::readEcFragment(const EcReadReq &request) {
 }
 
 Result<EcFragmentReceipt> StorageTarget::reconcileEcFragment(const EcReconcileReq &request) {
-  if (!ecOnly() || !useChunkEngine() || engine_ == nullptr || request.targetId != targetId() ||
+  if (usesEcStagingEngine() || !ecOnly() || !useChunkEngine() || engine_ == nullptr || request.targetId != targetId() ||
       request.vChainId.chainId != chainId()) {
     return makeError(StatusCode::kInvalidArg, "EC reconciliation requires the matching dedicated ChunkEngine target");
   }

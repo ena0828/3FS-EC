@@ -186,7 +186,7 @@ CoTryTask<EcCreateRsp> StorageOperator::createEcFragmentImpl(const EcCreateReq &
     rsp.result = makeError(route.error());
     co_return rsp;
   }
-  EcCreateJob job(req, target->storageTarget, validateRoute);
+  EcCreateJob job(EcLegacyV1Admission{}, req, target->storageTarget, validateRoute);
   co_await updateWorker_.enqueue(&job);
   // The disk worker borrows both job and request. Always drain it, even if the
   // RPC peer timed out; timeout is not evidence that no fragment was committed.
@@ -233,7 +233,7 @@ CoTryTask<EcReadRsp> StorageOperator::readEcFragmentImpl(const EcReadReq &req, E
     RETURN_ON_ERROR(authorization());
     return validateEcTarget(target, false);
   };
-  EcReadJob job(req, target->storageTarget, validateRoute);
+  EcReadJob job(EcLegacyV1Admission{}, req, target->storageTarget, validateRoute);
   co_await updateWorker_.enqueue(&job);
   co_await job.complete();
   rsp.result = std::move(job.result());
@@ -290,7 +290,7 @@ CoTryTask<EcReconcileRsp> StorageOperator::reconcileEcFragmentImpl(const EcRecon
     rsp.result = makeError(route.error());
     co_return rsp;
   }
-  EcReconcileJob job(req, target->storageTarget, validateRoute);
+  EcReconcileJob job(EcLegacyV1Admission{}, req, target->storageTarget, validateRoute);
   co_await updateWorker_.enqueue(&job);
   co_await job.complete();
   rsp.result = std::move(job.result());

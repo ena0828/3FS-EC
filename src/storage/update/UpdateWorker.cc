@@ -24,6 +24,9 @@ void UpdateWorker::stopAndJoin() {
     return;
   }
 
+  // Must run outside disk/proc workers. Existing sessions may still enqueue
+  // their admitted jobs; wait before stop sentinels, not behind them.
+  ecSessions_->closeAndWait();
   for (auto i = 0u; i < config_.num_threads() && !queueVec_.empty(); ++i) {
     queueVec_[i % queueVec_.size()]->enqueue(QueueItem{});
   }
@@ -43,9 +46,18 @@ void UpdateWorker::run(Queue &queue) {
       (*legacy)->target()->updateChunk(**legacy, bgExecutors_);
       continue;
     }
+    if (auto *admission = std::get_if<EcAdmissionJob *>(&job)) {
+      (*admission)->execute();
+      continue;
+    }
+    if (auto *stage = std::get_if<EcStageJob *>(&job)) {
+      (*stage)->execute();
+      continue;
+    }
     const auto execute = [](auto *ecJob, auto operation, bool durableOperation) {
       try {
         auto route = ecJob->validateRoute();
+        if (route) route = ecJob->validateAdmission();
         if (!route) {
           ecJob->setResult(makeError(route.error()));
           return;

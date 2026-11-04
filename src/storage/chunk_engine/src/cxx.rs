@@ -5,10 +5,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::ec_codec::{ec_codec_contribute, ec_codec_encode, ec_codec_recover, ec_codec_verify};
+use crate::ec_scope_bridge::*;
+use crate::ec_stage_bridge::*;
 use crate::*;
 pub use ::cxx::CxxString;
 
-fn storage_error_code(error: &Error) -> u16 {
+pub(crate) fn storage_error_code(error: &Error) -> u16 {
     match error {
         Error::IoError(_) => 4011,              // ChunkWriteFailed
         Error::RocksDBError(_) => 4003,         // ChunkMetadataSetError
@@ -25,7 +27,7 @@ fn storage_error_code(error: &Error) -> u16 {
     }
 }
 
-fn raw_meta_value(meta: &ChunkMeta) -> ffi::RawMeta {
+pub(crate) fn raw_meta_value(meta: &ChunkMeta) -> ffi::RawMeta {
     ffi::RawMeta {
         pos: meta.pos.0,
         chain_ver: meta.chain_ver,
@@ -532,6 +534,84 @@ impl RawChunks {
 
 #[::cxx::bridge(namespace = "hf3fs::chunk_engine")]
 pub mod ffi {
+    // Process-local scope ABI, deliberately unrelated to capability v1 wire.
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcScopeTarget {
+        engine: [u8; 16],
+        incarnation: [u8; 16],
+        chain: u32,
+        target: u64,
+    }
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcScopeBinding {
+        target: RawEcScopeTarget,
+        object: [u8; 16],
+        kind: u8,
+        scope: [u8; 16],
+        owner_uid: u32,
+        client_namespace: [u8; 16],
+    }
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcScopeRevocation {
+        binding: RawEcScopeBinding,
+        id: [u8; 16],
+        endpoint_set_digest: [u8; 32],
+    }
+    struct RawEcScopeStatus {
+        error_code: u16,
+        error: String,
+    }
+    struct RawEcScopeOpenResult {
+        status: RawEcScopeStatus,
+        handle: Box<EcScopeHandle>,
+    }
+    struct RawEcTargetResult {
+        status: RawEcScopeStatus,
+        target: RawEcScopeTarget,
+    }
+    struct RawEcTicketResult {
+        status: RawEcScopeStatus,
+        ticket: Box<EcScopeTicketHandle>,
+    }
+    struct RawEcDrainResult {
+        status: RawEcScopeStatus,
+        durable: bool,
+        inflight: u64,
+        drained: bool,
+    }
+    extern "Rust" {
+        type EcScopeHandle;
+        type EcScopeTicketHandle;
+        fn ec_scope_open(engine: &Engine) -> RawEcScopeOpenResult;
+        fn ec_scope_register_target(
+            handle: &EcScopeHandle,
+            chain: u32,
+            target: u64,
+        ) -> RawEcTargetResult;
+        fn ec_scope_load_target(
+            handle: &EcScopeHandle,
+            chain: u32,
+            target: u64,
+        ) -> RawEcTargetResult;
+        fn ec_scope_prepare(
+            handle: &EcScopeHandle,
+            binding: &RawEcScopeBinding,
+        ) -> RawEcScopeStatus;
+        fn ec_scope_try_admit(
+            handle: &EcScopeHandle,
+            binding: &RawEcScopeBinding,
+        ) -> RawEcTicketResult;
+        fn ec_scope_ticket_check(ticket: &EcScopeTicketHandle) -> RawEcScopeStatus;
+        fn ec_scope_revoke(
+            handle: &EcScopeHandle,
+            revocation: &RawEcScopeRevocation,
+        ) -> RawEcDrainResult;
+        fn ec_scope_drain_status(
+            handle: &EcScopeHandle,
+            revocation: &RawEcScopeRevocation,
+        ) -> RawEcDrainResult;
+    }
+
     #[derive(Clone, Copy, Debug)]
     struct EcCodecFormat {
         codec_id: u16,
@@ -616,6 +696,89 @@ pub mod ffi {
     struct GetReq<'a> {
         chunk_id: &'a [u8],
         chunk_ptr: *const Chunk,
+    }
+
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcStageBinding {
+        operation: [u8; 16],
+        length: u32,
+        checksum: u32,
+    }
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcStageLimits {
+        max_cached_records: u32,
+        max_active: u32,
+        max_concurrent_io: u32,
+    }
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcStageState {
+        operation: [u8; 16],
+        state: u8,
+        prefix_bytes: u32,
+        pending_block: bool,
+        revision: u64,
+        needs_reconcile: bool,
+    }
+    struct RawEcStageOpenResult {
+        status: RawEcScopeStatus,
+        handle: Box<EcStageHandle>,
+    }
+    struct RawEcStageResult {
+        status: RawEcScopeStatus,
+        state: RawEcStageState,
+    }
+    struct RawEcStageReadResult {
+        status: RawEcScopeStatus,
+        data: Vec<u8>,
+    }
+    struct RawEcStageUsedResult {
+        status: RawEcScopeStatus,
+        committed: u64,
+    }
+    extern "Rust" {
+        type EcStageHandle;
+        fn stage_open(
+            path: &str,
+            create: bool,
+            prefix_len: u32,
+            limits: &RawEcStageLimits,
+        ) -> RawEcStageOpenResult;
+        fn stage_scope_open(handle: &EcStageHandle) -> RawEcScopeOpenResult;
+        fn stage_begin(
+            handle: &EcStageHandle,
+            key: &[u8],
+            binding: &RawEcStageBinding,
+            writer: &[u8; 16],
+        ) -> RawEcStageResult;
+        fn stage_append(
+            handle: &EcStageHandle,
+            key: &[u8],
+            binding: &RawEcStageBinding,
+            index: u8,
+            bytes: &[u8],
+        ) -> RawEcStageResult;
+        fn stage_query(
+            handle: &EcStageHandle,
+            key: &[u8],
+            binding: &RawEcStageBinding,
+        ) -> RawEcStageResult;
+        fn stage_reconcile(
+            handle: &EcStageHandle,
+            key: &[u8],
+            binding: &RawEcStageBinding,
+        ) -> RawEcStageResult;
+        fn stage_seal(
+            handle: &EcStageHandle,
+            key: &[u8],
+            binding: &RawEcStageBinding,
+        ) -> ImmutableReconcileResult;
+        fn stage_read_block(
+            handle: &EcStageHandle,
+            key: &[u8],
+            binding: &RawEcStageBinding,
+            index: u8,
+        ) -> RawEcStageReadResult;
+        fn stage_used_size(handle: &EcStageHandle, prefix: &[u8]) -> RawEcStageUsedResult;
     }
 
     #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]

@@ -27,6 +27,7 @@ class StorageTargets {
     CONFIG_ITEM(target_paths, std::vector<Path>{}, [](auto &vec) { return !vec.empty(); });
     CONFIG_ITEM(target_num_per_path, 0u);
     CONFIG_ITEM(ec_only, false);
+    CONFIG_ITEM(ec_staging_v2, false);
     CONFIG_HOT_UPDATED_ITEM(collect_all_fds, true);
     CONFIG_HOT_UPDATED_ITEM(space_info_cache_timeout, 5_s);
     CONFIG_HOT_UPDATED_ITEM(allow_disk_without_uuid, false);
@@ -110,6 +111,7 @@ class StorageTargets {
   std::vector<std::string> manufacturers_;
   std::map<Path, uint32_t> pathToDiskIndex_;
   std::vector<rust::Box<chunk_engine::Engine>> engines_;
+  std::vector<std::shared_ptr<EcStagingEngine>> stagingEngines_;
 
   CoLockManager<> targetLocks_;
   RelativeTime spaceInfoUpdatedTime_;

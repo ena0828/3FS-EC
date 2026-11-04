@@ -28,6 +28,7 @@ class PhysicalConfig {
   SERDE_STRUCT_FIELD(kv_path, std::optional<Path>{});
   SERDE_STRUCT_FIELD(only_chunk_engine, false);
   SERDE_STRUCT_FIELD(ec_only, false);
+  SERDE_STRUCT_FIELD(ec_staging_v2, false);
 
  public:
   Path kvPath() const {

@@ -462,6 +462,37 @@ impl ImmutableStagingEngine {
         &self.0.scopes
     }
 
+    // Internal bridge binding check. Identity is immutable for the lifetime of
+    // this key, including terminal tombstones. This performs no sync barrier.
+    pub(crate) fn check_fragment_binding(
+        &self,
+        key: &[u8],
+        id: &[u8; 16],
+        length: u32,
+        checksum: u32,
+    ) -> ImmutableStageResult<()> {
+        self.check_key(key)?;
+        let slot = self.slot(key)?;
+        let slot = slot.lock().map_err(|_| ImmutableStageError::Busy)?;
+        let record = slot.record.as_ref().ok_or_else(|| {
+            ImmutableStageError::OutcomeUnknown("stage reservation not yet confirmed".into())
+        })?;
+        if record.spec.stage_id != *id
+            || record.spec.length != length
+            || record.spec.checksum != checksum
+        {
+            return Err(ImmutableStageError::Conflict);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn committed_size(&self, prefix: &[u8]) -> ImmutableStageResult<u64> {
+        if prefix.len() != self.0.engine.prefix_len {
+            return Err(ImmutableStageError::Invalid("invalid accounting prefix"));
+        }
+        Ok(self.0.engine.meta_store.query_used_size(prefix)?)
+    }
+
     fn check_key(&self, key: &[u8]) -> ImmutableStageResult<()> {
         if key.len() <= self.0.engine.prefix_len || key.len() > IMMUTABLE_STAGE_MAX_KEY_BYTES {
             return Err(ImmutableStageError::Invalid("invalid immutable stage key"));

@@ -35,13 +35,12 @@ Result<Void> syncRootFd(int fd, const Path &path) {
   return Void{};
 }
 
-Result<Void> validateEcRootMarker(const Path &marker) {
+Result<Void> validateEcRootMarker(const Path &marker, std::string_view expected = kEcEngineRootMarker) {
   const int fd = ::open(marker.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) {
     return makeError(StorageCode::kStorageInitFailed, fmt::format("open EC root marker {} failed: {}", marker, errno));
   }
   SCOPE_EXIT { ::close(fd); };
-  const std::string_view expected{kEcEngineRootMarker};
   struct stat info {};
   if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size != static_cast<off_t>(expected.size())) {
     return makeError(StorageCode::kStorageInitFailed, "EC root marker must be a regular file with the exact format");
@@ -58,14 +57,13 @@ Result<Void> validateEcRootMarker(const Path &marker) {
   return syncRootFd(fd, marker);
 }
 
-Result<Void> createEcRootMarker(const Path &marker) {
+Result<Void> createEcRootMarker(const Path &marker, std::string_view bytes = kEcEngineRootMarker) {
   const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
   if (fd < 0) {
     return makeError(StorageCode::kStorageInitFailed,
                      fmt::format("create EC root marker {} failed: {}", marker, errno));
   }
   SCOPE_EXIT { ::close(fd); };
-  std::string_view bytes{kEcEngineRootMarker};
   while (!bytes.empty()) {
     const auto count = ::write(fd, bytes.data(), bytes.size());
     if (count < 0 && errno == EINTR) continue;
@@ -78,9 +76,19 @@ Result<Void> createEcRootMarker(const Path &marker) {
 // Run before opening any engine: opening RocksDB already performs recovery.
 // This protects EC roots from the old root/engine layout without depending on
 // the old executable understanding any new target or engine format field.
-Result<Path> prepareEngineRoot(const Path &root, bool ecOnly) {
+// V2 opens only through the owned staging facade, which restores all
+// persistent reservations before exposing any data or admission operation.
+Result<Path> prepareEngineRoot(const Path &root, bool ecOnly, bool stagingV2 = false) {
+  constexpr std::string_view v2Marker = "3FS_EC_ENGINE_ROOT_V2\n";
+  constexpr std::string_view v1BlockerBytes = "3FS_EC_ENGINE_V1_BLOCKED_BY_V2\n";
+  if (stagingV2 && !ecOnly) {
+    return makeError(StorageCode::kStorageInitFailed, "staging requires an EC-only process");
+  }
   const auto legacyEngine = root / "engine";
-  const auto ecEngine = root / kEcEngineDirectoryName;
+  const auto v1Blocker = root / "engine-ec-v1";
+  const auto v2Engine = root / "engine-ec-v2";
+  const auto ecEngine = stagingV2 ? v2Engine : root / kEcEngineDirectoryName;
+  const std::string_view expectedMarker = stagingV2 ? v2Marker : kEcEngineRootMarker;
   if (ecOnly) {
     if (!boost::filesystem::is_directory(root) || boost::filesystem::is_symlink(root)) {
       return makeError(StorageCode::kStorageInitFailed, "EC target root must be a real directory");
@@ -90,9 +98,28 @@ Result<Path> prepareEngineRoot(const Path &root, bool ecOnly) {
         return makeError(StorageCode::kStorageInitFailed,
                          "unmarked EC target root must be empty; migration is forbidden");
       }
-      RETURN_ON_ERROR(createEcRootMarker(legacyEngine));
+      RETURN_ON_ERROR(createEcRootMarker(legacyEngine, expectedMarker));
     } else {
-      RETURN_ON_ERROR(validateEcRootMarker(legacyEngine));
+      RETURN_ON_ERROR(validateEcRootMarker(legacyEngine, expectedMarker));
+    }
+    if (stagingV2) {
+      if (!pathPresent(v1Blocker)) {
+        // A crash between writing the two blockers is recoverable only before
+        // engine creation. Never repurpose an existing V1 engine directory.
+        if (pathPresent(v2Engine)) {
+          return makeError(StorageCode::kStorageInitFailed, "V2 engine has lost its V1 downgrade blocker");
+        }
+        for (const auto &entry : boost::filesystem::directory_iterator(root)) {
+          if (entry.path() != legacyEngine) {
+            return makeError(StorageCode::kStorageInitFailed, "incomplete V2 root contains unexpected entries");
+          }
+        }
+        RETURN_ON_ERROR(createEcRootMarker(v1Blocker, v1BlockerBytes));
+      } else {
+        RETURN_ON_ERROR(validateEcRootMarker(v1Blocker, v1BlockerBytes));
+      }
+    } else if (pathPresent(v2Engine)) {
+      return makeError(StorageCode::kStorageInitFailed, "V1 process cannot open a V2 staging root");
     }
     const bool hasEngine = pathPresent(ecEngine);
     if (hasEngine && (!boost::filesystem::is_directory(ecEngine) || boost::filesystem::is_symlink(ecEngine))) {
@@ -100,7 +127,7 @@ Result<Path> prepareEngineRoot(const Path &root, bool ecOnly) {
     }
     for (const auto &entry : boost::filesystem::directory_iterator(root)) {
       const auto &path = entry.path();
-      if (path == legacyEngine || path == ecEngine) continue;
+      if (path == legacyEngine || path == ecEngine || (stagingV2 && path == v1Blocker)) continue;
       if (path.filename() == ".hf3fs_check" && boost::filesystem::is_regular_file(path) &&
           !boost::filesystem::is_symlink(path))
         continue;
@@ -109,7 +136,8 @@ Result<Path> prepareEngineRoot(const Path &root, bool ecOnly) {
                          "EC root contains an unexpected entry or has lost its engine");
       }
       CHECK_RESULT(config, StorageTarget::readPhysicalConfig(path));
-      if (!config.ec_only || path.filename().string() != std::to_string(config.target_id)) {
+      if (!config.ec_only || config.ec_staging_v2 != stagingV2 ||
+          path.filename().string() != std::to_string(config.target_id)) {
         return makeError(StorageCode::kStorageInitFailed, "EC root contains a legacy or mismatched target");
       }
     }
@@ -119,8 +147,9 @@ Result<Path> prepareEngineRoot(const Path &root, bool ecOnly) {
     RETURN_ON_ERROR(syncRootFd(fd, root));
     return ecEngine;
   }
-  if (pathPresent(ecEngine) || (pathPresent(legacyEngine) && (!boost::filesystem::is_directory(legacyEngine) ||
-                                                              boost::filesystem::is_symlink(legacyEngine)))) {
+  if (pathPresent(v2Engine) || pathPresent(ecEngine) ||
+      (pathPresent(legacyEngine) &&
+       (!boost::filesystem::is_directory(legacyEngine) || boost::filesystem::is_symlink(legacyEngine)))) {
     return makeError(StorageCode::kStorageInitFailed, "legacy mode cannot open an EC or incompatible engine root");
   }
   for (const auto &entry : boost::filesystem::directory_iterator(root)) {
@@ -168,8 +197,15 @@ Result<Void> StorageTargets::init(CPUExecutorGroup &executor) {
   std::vector<folly::coro::TaskWithExecutor<Result<rust::Box<chunk_engine::Engine>>>> tasks;
   std::vector<Path> enginePaths;
   for (auto &path : targetPaths_) {
-    CHECK_RESULT(enginePath, prepareEngineRoot(path, config_.ec_only()));
+    CHECK_RESULT(enginePath, prepareEngineRoot(path, config_.ec_only(), config_.ec_staging_v2()));
     enginePaths.push_back(std::move(enginePath));
+  }
+  if (config_.ec_staging_v2()) {
+    for (const auto &path : enginePaths) {
+      CHECK_RESULT(engine, EcStagingEngine::open(path, !boost::filesystem::exists(path)));
+      stagingEngines_.push_back(std::move(engine));
+    }
+    return Void{};
   }
   for (auto &engine_path : enginePaths) {
     bool create = !boost::filesystem::exists(engine_path);
@@ -323,10 +359,12 @@ Result<Void> StorageTargets::create(const CreateTargetReq &req, bool ecOnly) {
     }
   }
 
-  auto storageTarget = StorageTarget::enable_shared_from_this::create(config_.storage_target(),
-                                                                      globalFileStore_,
-                                                                      req.diskIndex,
-                                                                      &*engines_[req.diskIndex]);
+  auto storageTarget = StorageTarget::enable_shared_from_this::create(
+      config_.storage_target(),
+      globalFileStore_,
+      req.diskIndex,
+      config_.ec_staging_v2() ? nullptr : &*engines_[req.diskIndex],
+      config_.ec_staging_v2() ? stagingEngines_[req.diskIndex] : nullptr);
   PhysicalConfig targetConfig;
   auto targetPath = config_.target_paths()[req.diskIndex] / std::to_string(req.targetId);
   targetConfig.path = targetPath;
@@ -339,7 +377,22 @@ Result<Void> StorageTargets::create(const CreateTargetReq &req, bool ecOnly) {
   targetConfig.kv_store_type = config_.storage_target().kv_store().type();
   targetConfig.only_chunk_engine = req.onlyChunkEngine;
   targetConfig.ec_only = ecOnly;
+  targetConfig.ec_staging_v2 = config_.ec_staging_v2();
+  if (config_.ec_staging_v2()) {
+    CHECK_RESULT(scope, stagingEngines_[req.diskIndex]->scope());
+    // Reserve the stable target identity before publishing physical config.
+    // A failed fresh creation can retry this idempotent reservation; loading
+    // any existing physical target never invents a missing incarnation.
+    const bool existing =
+        pathPresent(targetPath / kPhysicalConfigFileName) || pathPresent(targetPath / kEcPhysicalConfigFileName);
+    auto identity =
+        existing ? scope->loadTarget(req.chainId, req.targetId) : scope->registerTarget(req.chainId, req.targetId);
+    RETURN_ON_ERROR(identity);
+  }
   RETURN_AND_LOG_ON_ERROR(storageTarget->create(targetConfig));
+  if (config_.ec_staging_v2()) {
+    RETURN_AND_LOG_ON_ERROR(storageTarget->initializeEcScope(StorageTarget::EcScopeOpenMode::LoadExisting));
+  }
   XLOGF(INFO, "Create storage target {} at {}", storageTarget->targetId(), targetPath.string());
   RETURN_AND_LOG_ON_ERROR(targetMap_.addStorageTarget(std::move(storageTarget)));
   return Void{};
@@ -386,14 +439,19 @@ Result<Void> StorageTargets::loadTarget(const Path &targetPath) {
 
   auto diskIndex = pathToDiskIndex_[diskPath];
   CHECK_RESULT(physical, StorageTarget::readPhysicalConfig(targetPath));
-  if (physical.ec_only != config_.ec_only()) {
+  if (physical.ec_only != config_.ec_only() || physical.ec_staging_v2 != config_.ec_staging_v2()) {
     return makeError(StorageCode::kStorageInitFailed, "restored target mode differs from the process mode");
   }
-  auto storageTarget = StorageTarget::enable_shared_from_this::create(config_.storage_target(),
-                                                                      globalFileStore_,
-                                                                      diskIndex,
-                                                                      &*engines_[diskIndex]);
+  auto storageTarget =
+      StorageTarget::enable_shared_from_this::create(config_.storage_target(),
+                                                     globalFileStore_,
+                                                     diskIndex,
+                                                     config_.ec_staging_v2() ? nullptr : &*engines_[diskIndex],
+                                                     config_.ec_staging_v2() ? stagingEngines_[diskIndex] : nullptr);
   RETURN_AND_LOG_ON_ERROR(storageTarget->load(targetPath));
+  if (config_.ec_staging_v2()) {
+    RETURN_AND_LOG_ON_ERROR(storageTarget->initializeEcScope(StorageTarget::EcScopeOpenMode::LoadExisting));
+  }
   XLOGF(INFO, "Load storage target {} at {}", storageTarget->targetId(), targetPath.string());
   auto targetId = storageTarget->targetId();
   if (UNLIKELY(targetPath.filename().string() != fmt::format("{}", targetId.toUnderType()))) {
@@ -441,9 +499,9 @@ Result<std::vector<SpaceInfo>> StorageTargets::spaceInfos(bool force) {
       XLOG(ERR, msg);
       return makeError(StorageCode::kChunkOpenFailed, std::move(msg));
     }
-    auto usedSize = engines_[index]->raw_used_size();
+    const uint64_t reusable = config_.ec_staging_v2() ? 0 : engines_[index]->raw_used_size().reserved_size;
     info.capacity = spaceInfo.capacity;
-    info.free = spaceInfo.free + diskUnusedSize[info.path] + usedSize.reserved_size;
+    info.free = spaceInfo.free + diskUnusedSize[info.path] + reusable;
     info.available = spaceInfo.available;
     info.manufacturer = manufacturers_[index];
     ret.push_back(std::move(info));
