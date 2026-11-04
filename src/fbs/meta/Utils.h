@@ -364,6 +364,9 @@ struct RoutingInfoChecker {
           break;
         case Layout::Type::Empty:
           break;
+        case Layout::Type::ErasureCoded:
+          // A replicated chain-table lookup cannot validate manifest placement.
+          return false;
       }
     }
     return true;

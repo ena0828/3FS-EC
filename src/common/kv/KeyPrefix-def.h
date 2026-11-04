@@ -21,6 +21,12 @@ DEFINE_PREFIX(TargetInfo,       "TGIF")
 DEFINE_PREFIX(KvTable,          "KVTB")
 DEFINE_PREFIX(KvNamespace,      "KVNS")
 DEFINE_PREFIX(KvWorkerGroup,    "KVWG")
+DEFINE_PREFIX(EcObject,         "ECOB")
+DEFINE_PREFIX(EcHead,           "ECHD")
+DEFINE_PREFIX(EcManifest,       "ECMF")
+DEFINE_PREFIX(EcOperation,      "ECOP")
+DEFINE_PREFIX(EcPin,            "ECPN")
+DEFINE_PREFIX(EcFragmentRef,    "ECRF")
 // clang-format on
 
 #undef DEFINE_PREFIX

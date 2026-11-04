@@ -123,6 +123,8 @@ class OpenOp : public Operation<Rsp> {
     CO_RETURN_ON_ERROR(inode.acl.checkPermission(req_.user, req_.flags.accessType()));
 
     // check hole
+    // Reject before O_TRUNC replacement, session creation, or inode changes.
+    CO_RETURN_ON_ERROR(inode.asFile().layout.checkReplicated());
     auto rdonly = req_.flags.accessType() == AccessType::READ;
     if (rdonly && inode.asFile().hasHole() && checkHole) {
       XLOGF(WARN, "Inode {} contains hole, don't allow O_RDONLY", inode.id);

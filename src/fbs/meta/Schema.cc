@@ -60,6 +60,7 @@ Result<Void> Acl::checkRecursiveRmPerm(const UserInfo &user, bool owner) const {
 }
 
 Result<ChunkId> File::getChunkId(InodeId id, uint64_t offset) const {
+  RETURN_ON_ERROR(layout.checkReplicated());
   if (!layout.chunkSize) {
     XLOGF(CRITICAL, "File {} chunkSize == 0.", *this);
     return makeError(MetaCode::kInvalidFileLayout, "chunk size = 0");
@@ -76,6 +77,7 @@ Result<ChainId> File::getChainId(const Inode &inode,
                                  size_t offset,
                                  const flat::RoutingInfo &routingInfo,
                                  uint16_t track) const {
+  RETURN_ON_ERROR(layout.checkReplicated());
   if ((!layout.chunkSize || !layout.stripeSize)) {
     XLOGF(CRITICAL, "File {} chunkSize {}, stripeSize {}.", inode.id, layout.chunkSize, layout.stripeSize);
     return makeError(MetaCode::kInvalidFileLayout, !layout.chunkSize ? "empty chunksize" : "empty stripesize");
@@ -127,6 +129,9 @@ Layout Layout::newChainRange(ChainTableId table,
 }
 
 Result<Void> Layout::valid(bool allowEmpty) const {
+  // This validator is used by existing replicated-file creation and I/O.
+  // EC descriptor validation is separate until native file dispatch is enabled.
+  RETURN_ON_ERROR(checkReplicated());
 #define INVALID_LAYOUT(msg) makeError(MetaCode::kInvalidFileLayout, msg)
   if (chunkSize == 0) return INVALID_LAYOUT("chunksize is 0");
   if (!folly::isPowTwo(chunkSize.u64())) return INVALID_LAYOUT("chunksize should be power of 2.");
@@ -153,7 +158,11 @@ Result<Void> Layout::valid(bool allowEmpty) const {
     return VALID;
   };
   XLOGF_IF(FATAL, chains.valueless_by_exception(), "Chains is valueless");
-  return folly::variant_match(chains, checkEmptyLayout, checkChainRange, checkChainList);
+  return folly::variant_match(chains,
+                              checkEmptyLayout,
+                              checkChainRange,
+                              checkChainList,
+                              [&](const EcManifestLayoutV1 &) { return checkReplicated(); });
 #undef INVALID_LAYOUT
 }
 

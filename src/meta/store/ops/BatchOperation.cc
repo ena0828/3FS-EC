@@ -66,6 +66,10 @@ CoTryTask<Inode> BatchedOp::run(IReadWriteTransaction &txn) {
   auto inode = (co_await Inode::snapshotLoad(txn, inodeId_)).then(checkMetaFound<Inode>);
   CO_RETURN_ON_ERROR(inode);
 
+  // Legacy sync/close must not publish length hints or remove sessions for an
+  // EC file before its manifest-aware operations have been implemented.
+  if (inode->isFile()) CO_RETURN_ON_ERROR(inode->asFile().layout.checkReplicated());
+
   // sanity check for file length, if we hold the lock, and versionstamp not changed file length shouldn't changed
   if (inode->isFile()) {
     if (versionstamp != versionstamp_) {

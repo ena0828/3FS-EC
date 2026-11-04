@@ -102,6 +102,7 @@ Result<Void> PioV::chunkIo(
     size_t len,
     std::function<void(storage::ChainId, storage::ChunkId, uint32_t, uint32_t, uint32_t)> &&consumeChunk) {
   const auto &f = inode.asFile();
+  RETURN_ON_ERROR(f.layout.checkReplicated());
   auto chunkSize = f.layout.chunkSize;
   auto chunkOff = off % chunkSize;
 

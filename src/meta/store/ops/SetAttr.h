@@ -102,6 +102,9 @@ class SetAttr {
     if (!inode.isFile() && req.dynStripe) {
       return makeError(MetaCode::kNotFile, "extend dynStripe but not file");
     }
+    if (req.dynStripe) {
+      RETURN_ON_ERROR(inode.asFile().layout.checkReplicated());
+    }
 
     return Void{};
   }

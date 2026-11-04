@@ -14,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -29,6 +30,7 @@
 #include "common/utils/Uuid.h"
 #include "fbs/core/user/User.h"
 #include "fbs/meta/Common.h"
+#include "fbs/meta/EcLayout.h"
 #include "fbs/mgmtd/ChainRef.h"
 #include "fbs/mgmtd/ChainTable.h"
 #include "fbs/mgmtd/MgmtdTypes.h"
@@ -73,6 +75,7 @@ struct Layout {
     Empty,
     ChainRange,
     ChainList,
+    ErasureCoded,
   };
   struct Empty {
     static constexpr auto kType = Type::Empty;
@@ -141,7 +144,7 @@ struct Layout {
   SERDE_STRUCT_FIELD(tableVersion, ChainTableVersion());
   SERDE_STRUCT_FIELD(chunkSize, ChunkSize(0));
   SERDE_STRUCT_FIELD(stripeSize, uint32_t(0));
-  SERDE_STRUCT_FIELD(chains, (std::variant<Empty, ChainRange, ChainList>{}));
+  SERDE_STRUCT_FIELD(chains, (std::variant<Empty, ChainRange, ChainList, EcManifestLayoutV1>{}));
 
  public:
   static Layout newEmpty(ChainTableId table, uint32_t chunk, uint32_t stripe);
@@ -160,10 +163,24 @@ struct Layout {
   std::span<const uint32_t> getChainIndexList() const;
   ChainRef getChainOfChunk(const Inode &inode, size_t chunkIndex) const;
   bool empty() const { return std::holds_alternative<Empty>(chains); }
+  bool isErasureCoded() const { return std::holds_alternative<EcManifestLayoutV1>(chains); }
+  const EcManifestLayoutV1 *ecLayout() const { return std::get_if<EcManifestLayoutV1>(&chains); }
+  Result<Void> checkReplicated() const {
+    if (isErasureCoded()) {
+      return makeError(StatusCode::kNotImplemented, "EC manifest layout requires native EC file operations");
+    }
+    return Void{};
+  }
   Result<Void> valid(bool allowEmpty) const;
   Type type() const {
     XLOGF_IF(FATAL, chains.valueless_by_exception(), "Chains is valueless");
-    return folly::variant_match(chains, [](const auto &v) { return std::decay_t<decltype(v)>::kType; });
+    return folly::variant_match(chains, [](const auto &v) {
+      if constexpr (std::is_same_v<std::decay_t<decltype(v)>, EcManifestLayoutV1>) {
+        return Type::ErasureCoded;
+      } else {
+        return std::decay_t<decltype(v)>::kType;
+      }
+    });
   }
   bool operator==(const Layout &o) const { return serde::equals(*this, o); }
 };

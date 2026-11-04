@@ -123,7 +123,11 @@ CoTryTask<void> Inode::store(IReadWriteTransaction &txn) const {
       co_return makeError(MetaCode::kFoundBug, fmt::format("Directory {} invalid DirEntry name {}", id, name));
     }
   } else if (isFile()) {
-    if (auto valid = asFile().layout.valid(false /*allowEmpty*/); valid.hasError()) {
+    // Persistence checks metadata structure; replicated data-path validation must
+    // continue to reject EC layouts until the caller dispatches to native EC I/O.
+    const auto &layout = asFile().layout;
+    const auto *ec = layout.ecLayout();
+    if (auto valid = ec ? ec->valid() : layout.valid(false /*allowEmpty*/); valid.hasError()) {
       XLOGF(DFATAL, "File {} has a invalid layout {}, error {}", id, asFile().layout, valid.error());
       co_return makeError(MetaCode::kFoundBug,
                           fmt::format("File {} invalid layout {}, {}", id, asFile().layout, valid.error()));
