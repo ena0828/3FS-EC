@@ -33,16 +33,23 @@ class EcCatalog {
   static CoTryTask<EcObjectRecord> createObject(Transaction &,
                                                 const EcObjectRef &,
                                                 uint32_t shardBytes,
-                                                bool allowColocated = false);
+                                                bool allowColocated = false,
+                                                const EcOwner &creator = {},
+                                                const Uuid &createRequest = Uuid::zero());
   static CoTryTask<EcObjectRecord> getObject(Transaction &, const EcObjectRef &);
-  static CoTryTask<EcOperationRecord> begin(Transaction &, const EcMutationIntent &);
+  static CoTryTask<EcOperationRecord> begin(Transaction &, const EcMutationIntent &, const EcOwner &owner = {});
   static CoTryTask<EcOperationRecord> getOperation(Transaction &, const EcObjectRef &, const Uuid &operation);
   static CoTryTask<EcOperationRecord> publish(Transaction &,
                                               const EcObjectRef &,
                                               const Uuid &operation,
                                               const EcVerifiedManifest &);
   static CoTryTask<EcOperationRecord> cancel(Transaction &, const EcObjectRef &, const Uuid &operation);
-  static CoTryTask<EcManifest> acquireRead(Transaction &, const EcObjectRef &, uint64_t stripe, const Uuid &pin);
+  static CoTryTask<EcManifest> acquireRead(Transaction &,
+                                           const EcObjectRef &,
+                                           uint64_t stripe,
+                                           const Uuid &pin,
+                                           const EcOwner &owner = {});
+  static CoTryTask<EcPinRecord> getPin(Transaction &, const EcObjectRef &, const Uuid &pin);
   // The service may release a pin only after all its admitted reads have drained.
   // There is intentionally no expiry-based or administrative forced release.
   static CoTryTask<Void> releaseRead(Transaction &, const EcObjectRef &, const Uuid &pin);

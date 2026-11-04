@@ -154,7 +154,9 @@ Result<EcVerifiedManifest> EcVerifiedManifest::fromStorageResponses(
 CoTryTask<EcObjectRecord> EcCatalog::createObject(Tx &txn,
                                                   const EcObjectRef &object,
                                                   uint32_t shardBytes,
-                                                  bool allowColocated) {
+                                                  bool allowColocated,
+                                                  const EcOwner &creator,
+                                                  const Uuid &createRequest) {
   CO_RETURN_ON_ERROR(validObject(object));
   if (!shardBytes || shardBytes > storage::kEcFragmentRpcMaxBytes) {
     co_return makeError(StatusCode::kInvalidArg, "invalid EC shard capacity");
@@ -164,7 +166,8 @@ CoTryTask<EcObjectRecord> EcCatalog::createObject(Tx &txn,
   CO_RETURN_ON_ERROR(previous);
   if (*previous) {
     if (!same((**previous).object, object) || (**previous).shardBytes != shardBytes ||
-        (**previous).allowColocated != allowColocated) {
+        (**previous).allowColocated != allowColocated || !same((**previous).creator, creator) ||
+        (**previous).createRequest != createRequest) {
       co_return makeError(StatusCode::kTokenMismatch, "EC incarnation already has different immutable settings");
     }
     co_return **previous;
@@ -173,6 +176,8 @@ CoTryTask<EcObjectRecord> EcCatalog::createObject(Tx &txn,
   record.object = object;
   record.shardBytes = shardBytes;
   record.allowColocated = allowColocated;
+  record.creator = creator;
+  record.createRequest = createRequest;
   CO_RETURN_ON_ERROR(co_await store(txn, packed, record));
   co_return record;
 }
@@ -204,7 +209,7 @@ CoTryTask<EcOperationRecord> EcCatalog::getOperation(Tx &txn, const EcObjectRef 
   co_return record;
 }
 
-CoTryTask<EcOperationRecord> EcCatalog::begin(Tx &txn, const EcMutationIntent &intent) {
+CoTryTask<EcOperationRecord> EcCatalog::begin(Tx &txn, const EcMutationIntent &intent, const EcOwner &owner) {
   CO_RETURN_ON_ERROR(validObject(intent.object));
   if (intent.version != kEcCatalogVersion || intent.operation.is_nil() || intent.placements.size() != 12 ||
       std::all_of(intent.requestDigest.begin(), intent.requestDigest.end(), [](uint8_t byte) { return byte == 0; }) ||
@@ -217,7 +222,7 @@ CoTryTask<EcOperationRecord> EcCatalog::begin(Tx &txn, const EcMutationIntent &i
   auto duplicate = co_await load<EcOperationRecord>(txn, opKey);
   CO_RETURN_ON_ERROR(duplicate);
   if (*duplicate) {
-    if (!same((**duplicate).intent, intent)) {
+    if (!same((**duplicate).intent, intent) || !same((**duplicate).owner, owner)) {
       co_return makeError(StatusCode::kTokenMismatch, "EC operation ID reused with different parameters");
     }
     co_return **duplicate;
@@ -257,6 +262,7 @@ CoTryTask<EcOperationRecord> EcCatalog::begin(Tx &txn, const EcMutationIntent &i
   }
   EcOperationRecord op;
   op.intent = intent;
+  op.owner = owner;
   auto &candidate = op.candidate;
   if (intent.kind == EcMutationKind::Repair) {
     if (!intent.expectedRevision) co_return makeError(StatusCode::kInvalidArg, "cannot repair an absent EC stripe");
@@ -409,14 +415,18 @@ CoTryTask<EcOperationRecord> EcCatalog::cancel(Tx &txn, const EcObjectRef &objec
   co_return *op;
 }
 
-CoTryTask<EcManifest> EcCatalog::acquireRead(Tx &txn, const EcObjectRef &object, uint64_t stripe, const Uuid &pin) {
+CoTryTask<EcManifest> EcCatalog::acquireRead(Tx &txn,
+                                             const EcObjectRef &object,
+                                             uint64_t stripe,
+                                             const Uuid &pin,
+                                             const EcOwner &owner) {
   CO_RETURN_ON_ERROR(validObject(object));
   if (pin.is_nil()) co_return makeError(StatusCode::kInvalidArg, "zero EC read pin");
   auto packed = idKey(KeyPrefix::EcPin, object.incarnation, pin);
   auto duplicate = co_await load<EcPinRecord>(txn, packed);
   CO_RETURN_ON_ERROR(duplicate);
   if (*duplicate) {
-    if (!same((**duplicate).object, object) || (**duplicate).stripe != stripe) {
+    if (!same((**duplicate).object, object) || (**duplicate).stripe != stripe || !same((**duplicate).owner, owner)) {
       co_return makeError(StatusCode::kTokenMismatch, "EC pin reused for another read");
     }
     if ((**duplicate).released) co_return makeError(StatusCode::kTokenStale, "released EC pin cannot be reactivated");
@@ -443,9 +453,19 @@ CoTryTask<EcManifest> EcCatalog::acquireRead(Tx &txn, const EcObjectRef &object,
   record.id = pin;
   record.stripe = stripe;
   record.revision = head->revision;
+  record.owner = owner;
   CO_RETURN_ON_ERROR(co_await store(txn, mKey, *manifest));
   CO_RETURN_ON_ERROR(co_await store(txn, packed, record));
   co_return manifest->manifest;
+}
+
+CoTryTask<EcPinRecord> EcCatalog::getPin(Tx &txn, const EcObjectRef &object, const Uuid &pin) {
+  CO_RETURN_ON_ERROR(validObject(object));
+  if (pin.is_nil()) co_return makeError(StatusCode::kInvalidArg, "zero EC read pin");
+  auto record = co_await require<EcPinRecord>(txn, idKey(KeyPrefix::EcPin, object.incarnation, pin));
+  CO_RETURN_ON_ERROR(record);
+  if (!same(record->object, object) || record->id != pin) co_return makeError(StatusCode::kTokenMismatch);
+  co_return *record;
 }
 
 CoTryTask<Void> EcCatalog::releaseRead(Tx &txn, const EcObjectRef &object, const Uuid &pin) {

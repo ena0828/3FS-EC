@@ -1,22 +1,39 @@
 #pragma once
 
 #include "fbs/meta/Common.h"
+#include "fbs/storage/EcAuthorization.h"
 #include "fbs/storage/EcIntegrity.h"
 
 namespace hf3fs::meta {
 
-inline constexpr uint16_t kEcCatalogVersion = 1;
+// Version 2 adds authenticated owners, permanent create identity and CRC grant
+// commitments. Reject experimental v1 records rather than defaulting ownership.
+// Fragment identities, integrity descriptors and EcManifestLayoutV1 stay v1.
+inline constexpr uint16_t kEcCatalogVersion = 2;
 inline constexpr uint16_t kEcAllShards = (1u << 12) - 1;
 
 struct EcObjectRef {
   SERDE_STRUCT_FIELD(inode, InodeId{});
   SERDE_STRUCT_FIELD(incarnation, Uuid::zero());
+
+ public:
+  bool operator==(const EcObjectRef &) const = default;
 };
 
 struct EcPlacement {
   SERDE_STRUCT_FIELD(chain, storage::ChainId{});
   SERDE_STRUCT_FIELD(target, storage::TargetId{});
   SERDE_STRUCT_FIELD(node, flat::NodeId{});
+
+ public:
+  bool operator==(const EcPlacement &) const = default;
+};
+
+// The UID is authenticated by Meta. The caller-selected client UUID is an
+// idempotency namespace, not an authenticated process identity or credential.
+struct EcOwner {
+  SERDE_STRUCT_FIELD(uid, flat::Uid{});
+  SERDE_STRUCT_FIELD(client, Uuid::zero());
 };
 
 struct EcFragment {
@@ -24,15 +41,24 @@ struct EcFragment {
   SERDE_STRUCT_FIELD(placement, EcPlacement{});
   SERDE_STRUCT_FIELD(operation, Uuid::zero());
   SERDE_STRUCT_FIELD(integrity, storage::EcIntegrityDescriptor{});
+
+ public:
+  bool operator==(const EcFragment &other) const {
+    return serde::equals(identity, other.identity) && placement == other.placement && operation == other.operation &&
+           integrity == other.integrity;
+  }
 };
 
 }  // namespace hf3fs::meta
 
-// Only the two fixed twelve-shard catalog collections use this specialization.
-// Reject wire counts before constructing or decoding any element.
+// Fixed twelve-shard catalog and control-plane collections. Reject wire counts
+// before constructing or decoding any element, including capability objects.
 template <typename T>
-requires(std::is_same_v<T, hf3fs::meta::EcPlacement> ||
-         std::is_same_v<T, hf3fs::meta::EcFragment>) struct hf3fs::serde::SerdeMethod<std::array<T, 12>> {
+requires(
+    std::is_same_v<T, hf3fs::meta::EcPlacement> || std::is_same_v<T, hf3fs::meta::EcFragment> ||
+    std::is_same_v<T, hf3fs::storage::EcIntegrityDescriptor> || std::is_same_v<T, uint32_t> ||
+    std::is_same_v<T,
+                   std::optional<hf3fs::storage::EcCapability>>) struct hf3fs::serde::SerdeMethod<std::array<T, 12>> {
   static void serialize(const std::array<T, 12> &values, auto &out) {
     out.arrayBegin();
     if constexpr (requires { typename std::decay_t<decltype(out)>::is_binary_out; }) {
@@ -68,6 +94,9 @@ struct EcManifest {
   SERDE_STRUCT_FIELD(revision, uint64_t{});
   SERDE_STRUCT_FIELD(logicalLength, uint64_t{});
   SERDE_STRUCT_FIELD(fragments, (std::array<EcFragment, 12>{}));
+
+ public:
+  bool operator==(const EcManifest &) const = default;
 };
 
 enum class EcMutationKind : uint8_t { Write = 1, Repair = 2 };
@@ -89,6 +118,8 @@ struct EcMutationIntent {
   SERDE_STRUCT_FIELD(kind, EcMutationKind::Write);
   SERDE_STRUCT_FIELD(replacementMask, kEcAllShards);
   SERDE_STRUCT_FIELD(placements, (std::array<EcPlacement, 12>{}));
+  // Standard CRC32C values constrain allocation grants, not content trust.
+  SERDE_STRUCT_FIELD(fragmentCrc32c, (std::array<uint32_t, 12>{}));
 };
 
 struct EcObjectRecord {
@@ -101,6 +132,8 @@ struct EcObjectRecord {
   SERDE_STRUCT_FIELD(nextRevision, uint64_t{1});
   SERDE_STRUCT_FIELD(length, uint64_t{});
   SERDE_STRUCT_FIELD(deleting, false);
+  SERDE_STRUCT_FIELD(creator, EcOwner{});
+  SERDE_STRUCT_FIELD(createRequest, Uuid::zero());
 };
 
 struct EcHead {
@@ -122,6 +155,7 @@ struct EcOperationRecord {
   SERDE_STRUCT_FIELD(intent, EcMutationIntent{});
   SERDE_STRUCT_FIELD(state, EcOperationState::Preparing);
   SERDE_STRUCT_FIELD(candidate, EcManifest{});
+  SERDE_STRUCT_FIELD(owner, EcOwner{});
 };
 
 struct EcPinRecord {
@@ -131,6 +165,7 @@ struct EcPinRecord {
   SERDE_STRUCT_FIELD(stripe, uint64_t{});
   SERDE_STRUCT_FIELD(revision, uint64_t{});
   SERDE_STRUCT_FIELD(released, false);
+  SERDE_STRUCT_FIELD(owner, EcOwner{});
 };
 
 struct EcFragmentRefRecord {

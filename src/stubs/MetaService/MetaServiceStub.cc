@@ -38,6 +38,13 @@ IMPL_META_STUB_METHOD(lockDirectory, LockDirectoryReq, LockDirectoryRsp);
 IMPL_META_STUB_METHOD(testRpc, TestRpcReq, TestRpcRsp);
 IMPL_META_STUB_METHOD(batchStat, BatchStatReq, BatchStatRsp);
 IMPL_META_STUB_METHOD(batchStatByPath, BatchStatByPathReq, BatchStatByPathRsp);
+IMPL_META_STUB_METHOD(createEcFile, CreateEcFileReq, CreateEcFileRsp);
+IMPL_META_STUB_METHOD(beginEcMutation, BeginEcMutationReq, EcOperationRsp);
+IMPL_META_STUB_METHOD(publishEcMutation, PublishEcMutationReq, EcOperationRsp);
+IMPL_META_STUB_METHOD(getEcOperation, GetEcOperationReq, EcOperationRsp);
+IMPL_META_STUB_METHOD(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
+IMPL_META_STUB_METHOD(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
+IMPL_META_STUB_METHOD(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
 
 template class MetaServiceStub<serde::ClientContext>;
 template class MetaServiceStub<serde::ClientMockContext>;

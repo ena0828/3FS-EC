@@ -38,6 +38,13 @@ class MetaServiceStub : public IMetaServiceStub {
   META_STUB_METHOD(testRpc, TestRpcReq, TestRpcRsp);
   META_STUB_METHOD(batchStat, BatchStatReq, BatchStatRsp);
   META_STUB_METHOD(batchStatByPath, BatchStatByPathReq, BatchStatByPathRsp);
+  META_STUB_METHOD(createEcFile, CreateEcFileReq, CreateEcFileRsp);
+  META_STUB_METHOD(beginEcMutation, BeginEcMutationReq, EcOperationRsp);
+  META_STUB_METHOD(publishEcMutation, PublishEcMutationReq, EcOperationRsp);
+  META_STUB_METHOD(getEcOperation, GetEcOperationReq, EcOperationRsp);
+  META_STUB_METHOD(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
+  META_STUB_METHOD(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
+  META_STUB_METHOD(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
 
 #undef META_STUB_METHOD
 

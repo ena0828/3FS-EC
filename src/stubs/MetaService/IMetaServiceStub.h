@@ -41,6 +41,13 @@ class IMetaServiceStub {
   IMETA_STUB_METHOD(testRpc, TestRpcReq, TestRpcRsp);
   IMETA_STUB_METHOD(batchStat, BatchStatReq, BatchStatRsp);
   IMETA_STUB_METHOD(batchStatByPath, BatchStatByPathReq, BatchStatByPathRsp);
+  IMETA_STUB_METHOD(createEcFile, CreateEcFileReq, CreateEcFileRsp);
+  IMETA_STUB_METHOD(beginEcMutation, BeginEcMutationReq, EcOperationRsp);
+  IMETA_STUB_METHOD(publishEcMutation, PublishEcMutationReq, EcOperationRsp);
+  IMETA_STUB_METHOD(getEcOperation, GetEcOperationReq, EcOperationRsp);
+  IMETA_STUB_METHOD(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
+  IMETA_STUB_METHOD(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
+  IMETA_STUB_METHOD(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
 
 #undef IMETA_STUB_METHOD
 };

@@ -9,6 +9,7 @@
 #include "common/utils/PriorityCoroutinePool.h"
 #include "common/utils/Size.h"
 #include "core/user/UserCache.h"
+#include "fbs/meta/Ec.h"
 #include "meta/components/Distributor.h"
 #include "meta/components/Forward.h"
 #include "meta/components/SessionManager.h"
@@ -54,7 +55,31 @@ struct GcConfig : ConfigBase<GcConfig> {
   });
 };
 
+struct EcTargetConfig : ConfigBase<EcTargetConfig> {
+  CONFIG_ITEM(chain, uint32_t{});
+  CONFIG_ITEM(target, uint64_t{});
+  CONFIG_ITEM(node, uint32_t{});
+
+ public:
+  EcPlacement placement() const {
+    EcPlacement p;
+    p.chain = storage::ChainId(chain());
+    p.target = storage::TargetId(target());
+    p.node = flat::NodeId(node());
+    return p;
+  }
+};
+
 struct Config : ConfigBase<Config> {
+  // Native EC remains opt-in while storage capability enforcement is integrated.
+  CONFIG_ITEM(enable_ec_catalog, false);
+  CONFIG_ITEM(ec_allow_colocated_test_targets, false);
+  CONFIG_ITEM(ec_allow_unauthorized_storage_for_tests, false);
+  CONFIG_ITEM(ec_capability_key_file, Path{});
+  CONFIG_ITEM(ec_grant_ttl_seconds, uint64_t{300});
+  CONFIG_OBJ_ARRAY(ec_targets, EcTargetConfig, 13, [](auto &) { return 0ul; });
+  CONFIG_ITEM(ec_max_verifying_stripes, 1u, ConfigCheckers::checkPositive);
+  CONFIG_ITEM(ec_verify_timeout, 60_s);
   CONFIG_HOT_UPDATED_ITEM(readonly, false);
   CONFIG_HOT_UPDATED_ITEM(authenticate, false);
   CONFIG_HOT_UPDATED_ITEM(grv_cache, false);

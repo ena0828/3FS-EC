@@ -104,6 +104,13 @@ class MetaClient {
   void stop();
 
   CoTryTask<UserInfo> authenticate(const UserInfo &userInfo);
+  CoTryTask<CreateEcFileRsp> createEcFile(CreateEcFileReq req);
+  CoTryTask<EcOperationRsp> beginEcMutation(BeginEcMutationReq req);
+  CoTryTask<EcOperationRsp> publishEcMutation(PublishEcMutationReq req);
+  CoTryTask<EcOperationRsp> getEcOperation(GetEcOperationReq req);
+  CoTryTask<EcOperationRsp> cancelEcMutation(CancelEcMutationReq req);
+  CoTryTask<AcquireEcReadRsp> acquireEcRead(AcquireEcReadReq req);
+  CoTryTask<ReleaseEcReadRsp> releaseEcRead(ReleaseEcReadReq req);
 
   CoTryTask<Inode> stat(const UserInfo &userInfo,
                         InodeId inodeId,

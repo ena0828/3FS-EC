@@ -32,6 +32,7 @@
 #include "meta/base/Config.h"
 #include "meta/components/ChainAllocator.h"
 #include "meta/components/Distributor.h"
+#include "meta/components/EcCoordinator.h"
 #include "meta/components/FileHelper.h"
 #include "meta/components/Forward.h"
 #include "meta/components/GcManager.h"
@@ -72,6 +73,13 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<CloseRsp> close(CloseReq req);
 
   CoTryTask<CreateRsp> create(CreateReq req);
+  CoTryTask<CreateEcFileRsp> createEcFile(CreateEcFileReq req);
+  CoTryTask<EcOperationRsp> beginEcMutation(BeginEcMutationReq req);
+  CoTryTask<EcOperationRsp> publishEcMutation(PublishEcMutationReq req);
+  CoTryTask<EcOperationRsp> getEcOperation(GetEcOperationReq req);
+  CoTryTask<EcOperationRsp> cancelEcMutation(CancelEcMutationReq req);
+  CoTryTask<AcquireEcReadRsp> acquireEcRead(AcquireEcReadReq req);
+  CoTryTask<ReleaseEcReadRsp> releaseEcRead(ReleaseEcReadReq req);
 
   CoTryTask<MkdirsRsp> mkdirs(MkdirsReq req);
 
@@ -187,6 +195,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<Rsp> runInBatch(InodeId inodeId, Req req);
 
   CoTryTask<void> authenticate(UserInfo &userInfo);
+  CoTryTask<void> authenticateEc(ReqBase &req);
 
   const Config &config_;
   flat::NodeId nodeId_;
@@ -203,6 +212,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   std::unique_ptr<Forward> forward_;
 
   std::unique_ptr<MetaStore> metaStore_;
+  std::unique_ptr<EcCoordinator> ecCoordinator_;
 
   Shards<std::map<InodeId, Batch>, 63> batches_;
 

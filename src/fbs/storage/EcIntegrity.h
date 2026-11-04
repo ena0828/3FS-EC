@@ -16,6 +16,9 @@ struct EcIntegrityBlock {
   SERDE_STRUCT_FIELD(validLength, uint32_t{});
   SERDE_STRUCT_FIELD(crc32c, uint32_t{});
   SERDE_STRUCT_FIELD(sha256, EcSha256{});
+
+ public:
+  bool operator==(const EcIntegrityBlock &) const = default;
 };
 
 }  // namespace hf3fs::storage
@@ -109,6 +112,9 @@ struct EcIntegrityDescriptor {
   SERDE_STRUCT_FIELD(blockCount, uint16_t{});
   SERDE_STRUCT_FIELD(blocks, (std::array<EcIntegrityBlock, kEcIntegrityMaxBlocks>{}));
   SERDE_STRUCT_FIELD(root, EcSha256{});
+
+ public:
+  bool operator==(const EcIntegrityDescriptor &) const = default;
 };
 
 // Format 1: systematic Cauchy 10+2 over GF(2^8), polynomial 0x11d;

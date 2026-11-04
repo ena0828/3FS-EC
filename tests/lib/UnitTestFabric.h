@@ -154,7 +154,7 @@ struct SystemSetupConfig : public ConfigBase<SystemSetupConfig> {
     set_use_temp_path(useTempPath);
   }
 
-  static std::string prettyPrintConfig(const testing::TestParamInfo<SystemSetupConfig> &info) {
+  static std::string prettyPrintConfig(const ::testing::TestParamInfo<SystemSetupConfig> &info) {
     return fmt::format("{}replicas_{}nodes_client{}_metastore{}_fakemgmtd{}",
                        info.param.num_replicas(),
                        info.param.num_storage_nodes(),

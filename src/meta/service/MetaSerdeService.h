@@ -36,6 +36,13 @@ class MetaSerdeService : public serde::ServiceWrapper<MetaSerdeService, MetaSerd
   META_SERVICE_METHOD(testRpc, TestRpcReq, TestRpcRsp);
   META_SERVICE_METHOD(batchStat, BatchStatReq, BatchStatRsp);
   META_SERVICE_METHOD(batchStatByPath, BatchStatByPathReq, BatchStatByPathRsp);
+  META_SERVICE_METHOD(createEcFile, CreateEcFileReq, CreateEcFileRsp);
+  META_SERVICE_METHOD(beginEcMutation, BeginEcMutationReq, EcOperationRsp);
+  META_SERVICE_METHOD(publishEcMutation, PublishEcMutationReq, EcOperationRsp);
+  META_SERVICE_METHOD(getEcOperation, GetEcOperationReq, EcOperationRsp);
+  META_SERVICE_METHOD(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
+  META_SERVICE_METHOD(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
+  META_SERVICE_METHOD(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
 #undef META_SERVICE_METHOD
 
  private:

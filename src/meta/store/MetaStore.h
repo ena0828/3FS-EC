@@ -40,6 +40,8 @@
 #include "meta/store/Utils.h"
 
 namespace hf3fs::meta::server {
+struct EcBeginContext;
+struct EcPublishCommit;
 using hf3fs::kv::IReadOnlyTransaction;
 using hf3fs::kv::IReadWriteTransaction;
 
@@ -114,6 +116,14 @@ class MetaStore {
   OpPtr<OpenRsp> open(OpenReq &req);
 
   OpPtr<CreateRsp> tryOpen(CreateReq &req);
+  OpPtr<CreateEcFileRsp> createEcFile(const CreateEcFileReq &req);
+  OpPtr<EcOperationRsp> beginEcMutation(const EcBeginContext &req);
+  OpPtr<EcOperationRsp> prepareEcPublish(const PublishEcMutationReq &req);
+  OpPtr<EcOperationRsp> publishEcMutation(const EcPublishCommit &req);
+  OpPtr<EcOperationRsp> getEcOperation(const GetEcOperationReq &req);
+  OpPtr<EcOperationRsp> cancelEcMutation(const CancelEcMutationReq &req);
+  OpPtr<AcquireEcReadRsp> acquireEcRead(const AcquireEcReadReq &req);
+  OpPtr<ReleaseEcReadRsp> releaseEcRead(const ReleaseEcReadReq &req);
 
   OpPtr<MkdirsRsp> mkdirs(const MkdirsReq &req);
 

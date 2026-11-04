@@ -56,6 +56,7 @@
 #include "meta/store/PathResolve.h"
 #include "meta/store/Utils.h"
 #include "meta/store/ops/BatchOperation.h"
+#include "meta/store/ops/EcOperations.h"
 
 #define AUTHENTICATE(user)                             \
   do {                                                 \
@@ -166,13 +167,15 @@ MetaOperator::MetaOperator(const Config &cfg,
                                              chainAlloc_,
                                              fileHelper_,
                                              sessionManager_,
-                                             gcManager_)) {
+                                             gcManager_)),
+      ecCoordinator_(std::make_unique<EcCoordinator>(cfg, mgmtdClient, storageClient)) {
   sessionManager_->setCloseFunc(
       [&](const auto &req) -> CoTryTask<void> { co_return (co_await close(req)).then([](auto &) { return Void{}; }); });
 }
 
 CoTryTask<void> MetaOperator::init(std::optional<Layout> layout) {
   XLOGF(INFO, "MetaOperator::init");
+  if (config_.enable_ec_catalog()) CO_RETURN_ON_ERROR(ecCoordinator_->checkEnabled());
   if (layout.has_value()) {
     CO_RETURN_ON_ERROR(co_await runOp(&MetaStore::initFs, *layout));
   }
@@ -279,6 +282,85 @@ CoTryTask<void> MetaOperator::authenticate(UserInfo &userInfo) {
 CoTryTask<AuthRsp> MetaOperator::authenticate(AuthReq req) {
   AUTHENTICATE(req.user);
   co_return AuthRsp(std::move(req.user));
+}
+
+CoTryTask<void> MetaOperator::authenticateEc(ReqBase &req) {
+  CO_RETURN_ON_ERROR(ecCoordinator_->checkEnabled());
+  CO_RETURN_ON_ERROR(req.checkUuid());
+  CO_RETURN_ON_ERROR(co_await authenticate(req.user));
+  co_return Void{};
+}
+
+CoTryTask<CreateEcFileRsp> MetaOperator::createEcFile(CreateEcFileReq req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEc(req));
+  CO_RETURN_ON_ERROR(ecCoordinator_->placements());
+  co_return co_await runOp(&MetaStore::createEcFile, req);
+}
+
+CoTryTask<EcOperationRsp> MetaOperator::beginEcMutation(BeginEcMutationReq req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEc(req));
+  EcBeginContext context;
+  static_cast<BeginEcMutationReq &>(context) = std::move(req);
+  context.coordinator = ecCoordinator_.get();
+  auto result = co_await runOp(&MetaStore::beginEcMutation, context);
+  CO_RETURN_ON_ERROR(result);
+  CO_RETURN_ON_ERROR(ecCoordinator_->addCreateGrants(*result));
+  co_return *result;
+}
+
+CoTryTask<EcOperationRsp> MetaOperator::publishEcMutation(PublishEcMutationReq req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEc(req));
+  if (config_.readonly()) co_return makeError(StatusCode::kReadOnlyMode);
+  // T0 is fully destroyed by runOp before any storage operation is started.
+  auto snapshot = co_await runOp(&MetaStore::prepareEcPublish, req);
+  CO_RETURN_ON_ERROR(snapshot);
+  if (snapshot->record.state == EcOperationState::Published) co_return *snapshot;
+  if (snapshot->record.state != EcOperationState::Preparing) {
+    co_return makeError(StatusCode::kTokenStale, "EC operation was canceled");
+  }
+  auto evidence = co_await ecCoordinator_->verifyForPublish(req, *snapshot);
+  CO_RETURN_ON_ERROR(evidence);
+  // Authentication is refreshed as well as inode ACLs after the I/O interval.
+  CO_RETURN_ON_ERROR(co_await authenticateEc(req));
+  CO_RETURN_ON_ERROR(ecCoordinator_->validatePlacements(snapshot->record));
+  EcPublishCommit commit;
+  static_cast<PublishEcMutationReq &>(commit) = std::move(req);
+  commit.evidence = std::move(*evidence);
+  co_return co_await runOp(&MetaStore::publishEcMutation, commit);
+}
+
+CoTryTask<EcOperationRsp> MetaOperator::getEcOperation(GetEcOperationReq req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEc(req));
+  co_return co_await runOp(&MetaStore::getEcOperation, req);
+}
+
+CoTryTask<EcOperationRsp> MetaOperator::cancelEcMutation(CancelEcMutationReq req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEc(req));
+  co_return co_await runOp(&MetaStore::cancelEcMutation, req);
+}
+
+CoTryTask<AcquireEcReadRsp> MetaOperator::acquireEcRead(AcquireEcReadReq req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEc(req));
+  CO_RETURN_ON_ERROR(req.valid());
+  auto txn = kvEngine_->createReadWriteTransaction();
+  auto op = metaStore_->acquireEcRead(req);
+  auto deadline = config_.operation_timeout() == 0_s
+                      ? std::optional<SteadyTime>{}
+                      : std::optional<SteadyTime>{SteadyClock::now() + config_.operation_timeout()};
+  auto driver = OperationDriver(*op, req, deadline);
+  // Narrow readonly exception: acquiring a read reference changes no file data.
+  auto result = co_await driver.run(std::move(txn), createRetryConfig(), false, false);
+  CO_RETURN_ON_ERROR(result);
+  EcOwner owner;
+  owner.uid = req.user.uid;
+  owner.client = req.client.uuid;
+  CO_RETURN_ON_ERROR(ecCoordinator_->addReadGrants(*result, owner));
+  co_return *result;
+}
+
+CoTryTask<ReleaseEcReadRsp> MetaOperator::releaseEcRead(ReleaseEcReadReq req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEc(req));
+  co_return co_await runOp(&MetaStore::releaseEcRead, req);
 }
 
 CoTryTask<StatFsRsp> MetaOperator::statFs(StatFsReq req) {

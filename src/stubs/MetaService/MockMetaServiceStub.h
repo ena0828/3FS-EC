@@ -50,6 +50,13 @@ class DummyMetaServiceStub : public IMetaServiceStub {
   NOT_IMPLEMENTED_FUNC(testRpc, TestRpcReq, TestRpcRsp);
   NOT_IMPLEMENTED_FUNC(batchStat, BatchStatReq, BatchStatRsp);
   NOT_IMPLEMENTED_FUNC(batchStatByPath, BatchStatByPathReq, BatchStatByPathRsp);
+  NOT_IMPLEMENTED_FUNC(createEcFile, CreateEcFileReq, CreateEcFileRsp);
+  NOT_IMPLEMENTED_FUNC(beginEcMutation, BeginEcMutationReq, EcOperationRsp);
+  NOT_IMPLEMENTED_FUNC(publishEcMutation, PublishEcMutationReq, EcOperationRsp);
+  NOT_IMPLEMENTED_FUNC(getEcOperation, GetEcOperationReq, EcOperationRsp);
+  NOT_IMPLEMENTED_FUNC(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
+  NOT_IMPLEMENTED_FUNC(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
+  NOT_IMPLEMENTED_FUNC(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
 
   virtual CoTryTask<AuthRsp> authenticate(const AuthReq &req) { co_return AuthRsp{req.user}; }
   CoTryTask<AuthRsp> authenticate(const AuthReq &req, const net::UserRequestOptions &, serde::Timestamp *) override {
@@ -138,6 +145,13 @@ class MetaServiceStub<hf3fs::stubs::StubMockContext<IMetaServiceStub>> : public 
   FORWARD_RPC_FUNC(testRpc, TestRpcReq, TestRpcRsp);
   FORWARD_RPC_FUNC(batchStat, BatchStatReq, BatchStatRsp);
   FORWARD_RPC_FUNC(batchStatByPath, BatchStatByPathReq, BatchStatByPathRsp);
+  FORWARD_RPC_FUNC(createEcFile, CreateEcFileReq, CreateEcFileRsp);
+  FORWARD_RPC_FUNC(beginEcMutation, BeginEcMutationReq, EcOperationRsp);
+  FORWARD_RPC_FUNC(publishEcMutation, PublishEcMutationReq, EcOperationRsp);
+  FORWARD_RPC_FUNC(getEcOperation, GetEcOperationReq, EcOperationRsp);
+  FORWARD_RPC_FUNC(cancelEcMutation, CancelEcMutationReq, EcOperationRsp);
+  FORWARD_RPC_FUNC(acquireEcRead, AcquireEcReadReq, AcquireEcReadRsp);
+  FORWARD_RPC_FUNC(releaseEcRead, ReleaseEcReadReq, ReleaseEcReadRsp);
 
 #undef FORWARD_RPC_FUNC
 

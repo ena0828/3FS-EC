@@ -4,6 +4,7 @@
 #include <folly/logging/xlog.h>
 #include <functional>
 #include <optional>
+#include <sys/stat.h>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -18,6 +19,7 @@
 #include "common/utils/Uuid.h"
 #include "fbs/core/user/User.h"
 #include "fbs/meta/Common.h"
+#include "fbs/meta/Ec.h"
 #include "fbs/meta/Schema.h"
 #include "fbs/mgmtd/MgmtdTypes.h"
 
@@ -693,6 +695,94 @@ struct LockDirectoryRsp : RspBase {
   LockDirectoryRsp() = default;
 };
 
+// Experimental native EC control plane. The server computes requestDigest;
+// descriptors supplied to Publish are read hints, never trusted seal receipts.
+struct CreateEcFileReq : ReqBase {
+  SERDE_STRUCT_FIELD(path, PathAt{});
+  SERDE_STRUCT_FIELD(perm, Permission{0600});
+  SERDE_STRUCT_FIELD(shardBytes, uint32_t{1u << 20});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    RETURN_ON_ERROR(path.validForCreate());
+    if ((perm & ~ALLPERMS) != 0) return INVALID("invalid EC file permission bits");
+    if (!shardBytes || shardBytes > storage::kEcFragmentRpcMaxBytes) return INVALID("invalid EC shard capacity");
+    return VALID;
+  }
+};
+struct CreateEcFileRsp : RspBase {
+  SERDE_STRUCT_FIELD(inode, Inode{});
+  SERDE_STRUCT_FIELD(object, EcObjectRecord{});
+};
+
+struct EcOperationReq : ReqBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(operation, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (object.incarnation.is_nil() || object.inode.isTreeRoot() || object.inode > InodeId::normalMax() ||
+        operation.is_nil())
+      return INVALID("invalid EC object or operation");
+    return VALID;
+  }
+};
+struct BeginEcMutationReq : EcOperationReq {
+  SERDE_STRUCT_FIELD(stripe, uint64_t{});
+  SERDE_STRUCT_FIELD(expectedEpoch, uint64_t{});
+  SERDE_STRUCT_FIELD(expectedRevision, uint64_t{});
+  SERDE_STRUCT_FIELD(logicalLength, uint64_t{});
+  SERDE_STRUCT_FIELD(kind, EcMutationKind::Write);
+  SERDE_STRUCT_FIELD(replacementMask, kEcAllShards);
+  SERDE_STRUCT_FIELD(contentSha256, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(fragmentCrc32c, (std::array<uint32_t, 12>{}));
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcOperationReq::valid());
+    if (!expectedEpoch || !logicalLength || logicalLength > 10 * storage::kEcFragmentRpcMaxBytes || !replacementMask ||
+        (replacementMask & ~kEcAllShards) || (kind != EcMutationKind::Write && kind != EcMutationKind::Repair) ||
+        (kind == EcMutationKind::Write && replacementMask != kEcAllShards))
+      return INVALID("invalid EC intent");
+    return VALID;
+  }
+};
+struct PublishEcMutationReq : EcOperationReq {
+  SERDE_STRUCT_FIELD(descriptors, (std::array<storage::EcIntegrityDescriptor, 12>{}));
+};
+struct GetEcOperationReq : EcOperationReq {};
+struct CancelEcMutationReq : EcOperationReq {};
+struct EcOperationRsp : RspBase {
+  SERDE_STRUCT_FIELD(record, EcOperationRecord{});
+  SERDE_STRUCT_FIELD(object, EcObjectRecord{});
+  SERDE_STRUCT_FIELD(createGrants, (std::array<std::optional<storage::EcCapability>, 12>{}));
+};
+
+struct AcquireEcReadReq : ReqBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(stripe, uint64_t{});
+  SERDE_STRUCT_FIELD(pin, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (object.incarnation.is_nil() || object.inode.isTreeRoot() || object.inode > InodeId::normalMax() ||
+        pin.is_nil()) {
+      return INVALID("invalid EC object or read pin");
+    }
+    return VALID;
+  }
+};
+struct ReleaseEcReadReq : AcquireEcReadReq {};
+struct AcquireEcReadRsp : RspBase {
+  SERDE_STRUCT_FIELD(manifest, EcManifest{});
+  SERDE_STRUCT_FIELD(pin, Uuid::zero());
+  SERDE_STRUCT_FIELD(readGrants, (std::array<std::optional<storage::EcCapability>, 12>{}));
+};
+struct ReleaseEcReadRsp : RspBase {};
+
 // testRpc
 struct TestRpcReq : ReqBase {
   SERDE_STRUCT_FIELD(path, PathAt());
@@ -737,6 +827,13 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(lockDirectory, 19, LockDirectoryReq, LockDirectoryRsp);
   META_SERVICE_METHOD(batchStat, 20, BatchStatReq, BatchStatRsp);
   META_SERVICE_METHOD(batchStatByPath, 21, BatchStatByPathReq, BatchStatByPathRsp);
+  META_SERVICE_METHOD(createEcFile, 22, CreateEcFileReq, CreateEcFileRsp);
+  META_SERVICE_METHOD(beginEcMutation, 23, BeginEcMutationReq, EcOperationRsp);
+  META_SERVICE_METHOD(publishEcMutation, 24, PublishEcMutationReq, EcOperationRsp);
+  META_SERVICE_METHOD(getEcOperation, 25, GetEcOperationReq, EcOperationRsp);
+  META_SERVICE_METHOD(cancelEcMutation, 26, CancelEcMutationReq, EcOperationRsp);
+  META_SERVICE_METHOD(acquireEcRead, 27, AcquireEcReadReq, AcquireEcReadRsp);
+  META_SERVICE_METHOD(releaseEcRead, 28, ReleaseEcReadReq, ReleaseEcReadRsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
 
