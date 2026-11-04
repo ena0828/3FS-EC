@@ -2,6 +2,7 @@ mod alloc;
 mod core;
 mod cxx;
 mod ec_codec;
+pub mod ec_scope;
 mod file;
 mod meta;
 mod types;

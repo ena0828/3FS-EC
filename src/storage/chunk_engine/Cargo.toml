@@ -23,6 +23,7 @@ rand = "0"
 rocksdb = "0"
 rolling-file = "0"
 serde = { version = "1", features = ["derive"] }
+sha2 = "=0.10.9"
 static_assertions = "1"
 tinyvec = { version = "1", features = ["alloc"] }
 toml = "0"

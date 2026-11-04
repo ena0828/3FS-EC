@@ -21,16 +21,24 @@ impl MetaStore {
     }
 
     pub fn open(config: &MetaStoreConfig) -> Result<Self> {
-        let rocksdb = RocksDB::open::<MetaMergeOp>(&config.rocksdb)?;
+        Self::open_with_validation(config, |_| Ok(())).map(|(store, ())| store)
+    }
 
+    /// Validate logical records under the same exclusive RocksDB writer lock
+    /// before prefix migration or any other MetaStore initialization mutates
+    /// them. The validated handle is retained; there is no reopen/TOCTOU gap.
+    pub(crate) fn open_with_validation<T>(
+        config: &MetaStoreConfig,
+        validate: impl FnOnce(&RocksDB) -> Result<T>,
+    ) -> Result<(Self, T)> {
+        let rocksdb = RocksDB::open::<MetaMergeOp>(&config.rocksdb)?;
+        let validation = validate(&rocksdb)?;
         let mut this = MetaStore {
             rocksdb,
             config: config.clone(),
         };
-
         this.update_used_size_if_need()?;
-
-        Ok(this)
+        Ok((this, validation))
     }
 
     pub fn get_chunk_meta(&self, chunk_id: &[u8]) -> Result<Option<ChunkMeta>> {

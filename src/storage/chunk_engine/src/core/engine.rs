@@ -49,6 +49,7 @@ pub struct Engine {
     // their positions referenced until a later synchronous replacement wins.
     retained_writing: Arc<Mutex<HashMap<Bytes, Vec<Chunk>>>>,
     immutable_namespace: Arc<ImmutableNamespace>,
+    pub(crate) ec_scope_bootstrap: Arc<crate::ec_scope::EcScopeBootstrap>,
 }
 
 struct ImmutableNamespace {
@@ -61,6 +62,23 @@ struct ImmutableNamespace {
 
 impl Engine {
     pub fn open(config: &EngineConfig) -> Result<Self> {
+        // V2 staging must restore its durable reservations before exposing any
+        // data API. Reject the ordinary entry point before RocksDB recovery.
+        if config.path.file_name().and_then(|name| name.to_str())
+            == Some(IMMUTABLE_STAGE_ENGINE_DIRECTORY)
+        {
+            return Err(Error::InvalidArg(
+                "V2 engine requires immutable staging entry point".into(),
+            ));
+        }
+        Self::open_with_mode(config, false)
+    }
+
+    pub(crate) fn open_staging(config: &EngineConfig) -> Result<Self> {
+        Self::open_with_mode(config, true)
+    }
+
+    fn open_with_mode(config: &EngineConfig, immutable_staging: bool) -> Result<Self> {
         // Capture the pre-existing ancestor before RocksDB's create_dir_all
         // creates missing engine/metadata parents. Do not recursively walk
         // arbitrary directories: only this explicitly configured path chain.
@@ -91,10 +109,42 @@ impl Engine {
             prefix_len: config.prefix_len,
         };
 
-        let mut meta_store = MetaStore::open(&meta_config)?;
+        // Ordinary/V1 identity creation keeps its existing new-store rule.
+        // V2 initialization instead uses the exclusive preflight token below.
+        let ec_scope_create = config.create && !meta_config.rocksdb.path.exists();
+        let (mut meta_store, staging_provision) = if immutable_staging {
+            let (store, provision) = MetaStore::open_with_validation(&meta_config, |raw| {
+                let provision = crate::ec_scope::preflight_staging(raw, config.prefix_len)
+                    .map_err(|error| Error::MetaError(format!("staging preflight: {error}")))?;
+                if provision.is_empty() {
+                    validate_empty_immutable_stage_paths(&config.path)?;
+                }
+                Ok(provision)
+            })?;
+            (store, Some(provision))
+        } else {
+            (MetaStore::open(&meta_config)?, None)
+        };
+        // The empty conclusion remains bound to this same writer handle.
+        // A complete provisioned store must never recreate missing clusters.
+        let create_clusters = staging_provision
+            .as_ref()
+            .map_or(config.create, |provision| provision.is_empty());
+        if immutable_staging {
+            let mut it = meta_store.iterator();
+            it.seek([MetaKey::WRITING_CHUNK_KEY_PREFIX])?;
+            if it
+                .key()
+                .is_some_and(|key| key.first() == Some(&MetaKey::WRITING_CHUNK_KEY_PREFIX))
+            {
+                return Err(Error::MetaError(
+                    "legacy writing log is forbidden in a V2 staging engine".into(),
+                ));
+            }
+        }
         let uncommitted_chunks = meta_store.occupy_uncommitted_positions()?;
         let meta_store = Arc::new(meta_store);
-        let allocators = Allocators::new(&config.path, config.create, meta_store.clone())?;
+        let allocators = Allocators::new(&config.path, create_clusters, meta_store.clone())?;
         let meta_cache = Arc::new(LockMap::with_capacity_and_shard_amount(1 << 20, 256));
 
         let engine = Self {
@@ -107,6 +157,10 @@ impl Engine {
             prefix_len: config.prefix_len,
             writing_list: Default::default(),
             retained_writing: Default::default(),
+            ec_scope_bootstrap: Arc::new(match staging_provision {
+                Some(provision) => crate::ec_scope::EcScopeBootstrap::for_staging(provision),
+                None => crate::ec_scope::EcScopeBootstrap::new(ec_scope_create),
+            }),
             immutable_namespace: Arc::new(ImmutableNamespace {
                 engine_path,
                 parents_to_sync,
@@ -453,7 +507,7 @@ impl Engine {
         result
     }
 
-    fn sync_immutable_data(chunk: &Chunk) -> Result<()> {
+    pub(crate) fn sync_immutable_data(chunk: &Chunk) -> Result<()> {
         let fd = chunk.fd_and_offset().fd;
         loop {
             // SAFETY: chunk keeps the owning Cluster alive; this call borrows
@@ -487,7 +541,7 @@ impl Engine {
             .map_err(|error| Error::IoError(format!("sync immutable directory {path:?}: {error}")))
     }
 
-    fn sync_immutable_namespace(&self) -> Result<()> {
+    pub(crate) fn sync_immutable_namespace(&self) -> Result<()> {
         self.sync_immutable_namespace_with(Self::sync_immutable_directory)
     }
 

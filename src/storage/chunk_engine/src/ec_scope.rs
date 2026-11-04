@@ -1,0 +1,969 @@
+//! Persistent identities and local admission/drain primitives for EC scopes.
+//!
+//! This module does not authenticate RPCs, sign drain receipts, release Meta
+//! pins, or delete fragments. Callers must validate control/data authority and
+//! route identity first. Disk methods must run on a bounded disk executor;
+//! `try_admit`, ticket completion and `drain_status` do not perform disk I/O.
+//! A ticket must outlive queued work and every borrowed request/job reference.
+
+use crate::{Engine, Error, MetaKey, MetaStore, RocksDB, RocksDBIterator};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+const DENY_PREFIX: u8 = 10;
+const ENGINE_PREFIX: u8 = 11;
+const TARGET_PREFIX: u8 = 12;
+const VERSION: u16 = 1;
+const MAX_GATES: usize = 16_384;
+const ENGINE_RECORD_BYTES: usize = 26;
+const TARGET_RECORD_BYTES: usize = 54;
+const FENCE_RECORD_BYTES: usize = 155;
+const STAGING_FORMAT_PREFIX: u8 = 15;
+const STAGING_FORMAT_RECORD_BYTES: usize = 32;
+const STAGING_FORMAT_VERSION: u16 = 2;
+
+pub type EcIdentity = [u8; 16];
+pub type EcScopeResult<T> = std::result::Result<T, EcScopeError>;
+
+#[derive(Debug, PartialEq)]
+pub enum EcScopeError {
+    Storage(Error),
+    Invalid(&'static str),
+    Corrupt(&'static str),
+    IdentityMismatch,
+    RevocationMismatch,
+    MissingIdentity,
+    MissingFence,
+    Revoked,
+    Busy,
+    Poisoned,
+}
+
+impl From<Error> for EcScopeError {
+    fn from(error: Error) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl fmt::Display for EcScopeError {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(out, "{self:?}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EcScopeKind {
+    ReadPin = 1,
+    WriteOperation = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EcTargetIdentity {
+    pub engine: EcIdentity,
+    pub incarnation: EcIdentity,
+    pub chain: u32,
+    pub target: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EcScopeBinding {
+    pub target: EcTargetIdentity,
+    pub object: EcIdentity,
+    pub kind: EcScopeKind,
+    pub scope: EcIdentity,
+    pub owner_uid: u32,
+    // A retry namespace, not authenticated process identity.
+    pub client_namespace: EcIdentity,
+}
+
+impl EcScopeBinding {
+    fn validate(&self) -> EcScopeResult<()> {
+        if self.target.engine == [0; 16]
+            || self.target.incarnation == [0; 16]
+            || self.target.chain == 0
+            || self.target.target == 0
+            || self.object == [0; 16]
+            || self.scope == [0; 16]
+            || self.client_namespace == [0; 16]
+        {
+            return Err(EcScopeError::Invalid("zero EC scope identity"));
+        }
+        Ok(())
+    }
+
+    // Owner is a checked value, not part of the deny lookup key. Changing an
+    // owner must never create another admission namespace for the same scope.
+    fn key(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(62);
+        key.push(DENY_PREFIX);
+        key.extend_from_slice(&self.target.incarnation);
+        key.extend_from_slice(&self.target.chain.to_be_bytes());
+        key.extend_from_slice(&self.target.target.to_be_bytes());
+        key.extend_from_slice(&self.object);
+        key.push(self.kind as u8);
+        key.extend_from_slice(&self.scope);
+        key
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EcScopeRevocation {
+    pub binding: EcScopeBinding,
+    pub id: EcIdentity,
+    pub endpoint_set_digest: [u8; 32],
+}
+
+impl EcScopeRevocation {
+    fn validate(&self) -> EcScopeResult<()> {
+        self.binding.validate()?;
+        if self.id == [0; 16] {
+            return Err(EcScopeError::Invalid("zero EC revocation ID"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EcDrainStatus {
+    Pending { inflight: u64, durable: bool },
+    Drained,
+}
+
+/// Created only by the raw, same-writer-handle preflight. It must remain bound
+/// to that open MetaStore: closing and reopening between validation and use is
+/// not an admissible initialization sequence. No public Empty constructor or
+/// Clone implementation lets an RPC caller manufacture/reuse the permission.
+#[derive(Debug)]
+pub(crate) struct EcStagingProvision {
+    empty: bool,
+    identity: EcIdentity,
+    prefix_len: u32,
+}
+
+impl EcStagingProvision {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.empty
+    }
+}
+
+/// Run while RocksDB holds its writer lock, before MetaStore changes prefix
+/// accounting or Engine performs a legacy version upgrade. The caller must
+/// already validate the V2 root markers and must validate an Empty result's
+/// physical namespace before using its provisioning permission. Metadata
+/// emptiness alone cannot prove that data files are empty.
+pub(crate) fn preflight_staging(
+    raw: &RocksDB,
+    prefix_len: usize,
+) -> EcScopeResult<EcStagingProvision> {
+    let prefix_len = u32::try_from(prefix_len)
+        .map_err(|_| EcScopeError::Invalid("staging prefix length exceeds u32"))?;
+    let identity = inspect_staging(
+        |key| exact_raw_get(raw, key),
+        raw.new_iterator(),
+        prefix_len,
+    )?;
+    Ok(EcStagingProvision {
+        empty: identity.is_none(),
+        // Keep one candidate through unknown-commit retries within this open.
+        identity: identity.unwrap_or_else(new_identity),
+        prefix_len,
+    })
+}
+
+/// Publish both protocol roots in one synchronous batch, with the exact
+/// baseline metadata needed to reopen the pair. A partial/contradictory pair
+/// is never repaired. The same writer handle remains open throughout. The
+/// Engine caller synchronizes its physical namespace before publishing pair.
+pub(crate) fn joint_provision_staging(
+    store: &MetaStore,
+    provision: &EcStagingProvision,
+) -> EcScopeResult<EcIdentity> {
+    joint_provision_staging_with(store, provision, |store, batch| {
+        store.write(batch, true).map_err(EcScopeError::from)
+    })
+}
+
+fn joint_provision_staging_with(
+    store: &MetaStore,
+    provision: &EcStagingProvision,
+    commit: impl FnOnce(&MetaStore, rocksdb::WriteBatch) -> EcScopeResult<()>,
+) -> EcScopeResult<EcIdentity> {
+    let actual = inspect_staging(|key| exact_get(store, key), store.iterator(), provision.prefix_len)?;
+    match actual {
+        Some(identity) if identity == provision.identity => {}
+        Some(_) => return Err(EcScopeError::IdentityMismatch),
+        None if !provision.empty => return Err(EcScopeError::MissingIdentity),
+        None => {
+            let mut batch = RocksDB::new_write_batch();
+            batch.put([ENGINE_PREFIX], encode_engine(provision.identity));
+            batch.put(
+                [STAGING_FORMAT_PREFIX],
+                encode_staging_format(provision.identity, provision.prefix_len),
+            );
+            batch.put(MetaKey::used_size_prefix_len_key(), provision.prefix_len.to_le_bytes());
+            batch.put(MetaKey::version_key(), [MetaStore::LATEST_VERSION]);
+            commit(store, batch)?;
+        }
+    }
+    // Covers the unknown-write/cached-visible branch as well as a new batch.
+    store.sync_wal()?;
+    Ok(provision.identity)
+}
+
+fn inspect_staging(
+    mut get: impl FnMut(&[u8]) -> EcScopeResult<Option<Vec<u8>>>,
+    mut iterator: RocksDBIterator<'_>,
+    prefix_len: u32,
+) -> EcScopeResult<Option<EcIdentity>> {
+    let identity = get(&[ENGINE_PREFIX])?;
+    let format = get(&[STAGING_FORMAT_PREFIX])?;
+    match (identity, format) {
+        (None, None) => {
+            // These are the only exact keys that pristine MetaStore/Engine
+            // startup can have committed before the joint transaction.
+            iterator.seek([])?;
+            while iterator.valid() {
+                let key = iterator.key().ok_or(EcScopeError::Corrupt("missing metadata key"))?;
+                let value = iterator.value().ok_or(EcScopeError::Corrupt("missing metadata value"))?;
+                let allowed = match key {
+                    [MetaKey::USED_SIZE_PREFIX_LEN_KEY] => value == prefix_len.to_le_bytes(),
+                    [MetaKey::VERSION_KEY] => value == [MetaStore::LATEST_VERSION],
+                    [MetaKey::USED_SIZE_KEY_PREFIX] if prefix_len == 0 => value == 0u64.to_le_bytes(),
+                    _ => false,
+                };
+                if !allowed {
+                    return Err(EcScopeError::Corrupt("unprovisioned staging database is not pristine"));
+                }
+                iterator.next();
+            }
+            iterator.status()?;
+            Ok(None)
+        }
+        (Some(identity), Some(format)) => {
+            let identity = decode_engine(&identity)?;
+            decode_staging_format(&format, identity, prefix_len)?;
+            let prefix = get(&[MetaKey::USED_SIZE_PREFIX_LEN_KEY])?;
+            if !matches!(prefix.as_deref(), Some(bytes) if bytes == prefix_len.to_le_bytes())
+                && !(prefix_len == 0 && prefix.is_none())
+            {
+                return Err(EcScopeError::Corrupt("provisioned staging prefix configuration mismatch"));
+            }
+            if get(&[MetaKey::VERSION_KEY])?.as_deref() != Some(&[MetaStore::LATEST_VERSION]) {
+                return Err(EcScopeError::Corrupt("provisioned staging baseline version mismatch"));
+            }
+            // A singleton key with an appended suffix is not another valid
+            // protocol root. Reject it before legacy normalization can run.
+            for prefix in [MetaKey::USED_SIZE_PREFIX_LEN_KEY, MetaKey::VERSION_KEY, ENGINE_PREFIX, STAGING_FORMAT_PREFIX] {
+                iterator.seek([prefix])?;
+                while iterator.valid() && iterator.key().is_some_and(|key| key.first() == Some(&prefix)) {
+                    if iterator.key() != Some(&[prefix]) {
+                        return Err(EcScopeError::Corrupt("noncanonical staging singleton key"));
+                    }
+                    iterator.next();
+                }
+                iterator.status()?;
+            }
+            iterator.seek([MetaKey::WRITING_CHUNK_KEY_PREFIX])?;
+            if iterator.key().is_some_and(|key| key.first() == Some(&MetaKey::WRITING_CHUNK_KEY_PREFIX)) {
+                return Err(EcScopeError::Corrupt("legacy writing log in staging database"));
+            }
+            iterator.status()?;
+            Ok(Some(identity))
+        }
+        _ => Err(EcScopeError::Corrupt("one-sided staging identity/format initialization")),
+    }
+}
+
+// Shared by every clone of one Engine. It is deliberately not constructed by
+// RPC callers. Existing stores without an identity cannot silently upgrade.
+pub(crate) struct EcScopeBootstrap {
+    mode: BootstrapMode,
+    registry: Mutex<Option<Arc<EcScopeRegistry>>>,
+}
+
+enum BootstrapMode {
+    Ordinary { allow_create_identity: bool },
+    Staging(EcStagingProvision),
+}
+
+impl EcScopeBootstrap {
+    pub(crate) fn new(allow_create_identity: bool) -> Self {
+        Self {
+            mode: BootstrapMode::Ordinary { allow_create_identity },
+            registry: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn for_staging(provision: EcStagingProvision) -> Self {
+        Self {
+            mode: BootstrapMode::Staging(provision),
+            registry: Mutex::new(None),
+        }
+    }
+}
+
+impl Engine {
+    /// Disk-executor/startup operation. Initialize before advertising EC scope
+    /// service. The Engine integration patch supplies the shared bootstrap.
+    pub fn ec_scope_registry(&self) -> EcScopeResult<Arc<EcScopeRegistry>> {
+        self.ec_scope_registry_with(|| self.sync_immutable_namespace().map_err(EcScopeError::from))
+    }
+
+    fn ec_scope_registry_with(
+        &self,
+        sync_namespace: impl FnOnce() -> EcScopeResult<()>,
+    ) -> EcScopeResult<Arc<EcScopeRegistry>> {
+        let bootstrap = &self.ec_scope_bootstrap;
+        let mut slot = lock(&bootstrap.registry)?;
+        if let Some(registry) = &*slot {
+            return Ok(registry.clone());
+        }
+        let registry = match &bootstrap.mode {
+            BootstrapMode::Ordinary { allow_create_identity } => {
+                let registry = EcScopeRegistry::open(self.meta_store.clone(), *allow_create_identity, MAX_GATES)?;
+                sync_namespace()?;
+                registry
+            }
+            BootstrapMode::Staging(provision) => {
+                // Commit the protocol pair only after the fully opened V2
+                // physical namespace has established directory reachability.
+                sync_namespace()?;
+                let identity = joint_provision_staging(&self.meta_store, provision)?;
+                EcScopeRegistry::from_identity(self.meta_store.clone(), identity, MAX_GATES)
+            }
+        };
+        // A synchronous WAL alone does not establish a newly created parent
+        // directory. No identity/receipt escapes before this succeeds.
+        self.meta_store.sync_wal()?;
+        let registry = Arc::new(registry);
+        *slot = Some(registry.clone());
+        Ok(registry)
+    }
+}
+
+pub struct EcScopeRegistry {
+    store: Arc<MetaStore>,
+    identity: EcIdentity,
+    // Only serializes target registration, never data admission or drain.
+    target_registration: Mutex<()>,
+    gates: Mutex<HashMap<Vec<u8>, Arc<Gate>>>,
+    max_gates: usize,
+}
+
+impl EcScopeRegistry {
+    fn open(store: Arc<MetaStore>, allow_create: bool, max_gates: usize) -> EcScopeResult<Self> {
+        let key = [ENGINE_PREFIX];
+        let identity = match exact_get(&store, &key)? {
+            Some(bytes) => decode_engine(&bytes)?,
+            None if allow_create => {
+                let identity = new_identity();
+                put_sync(&store, &key, &encode_engine(identity))?;
+                identity
+            }
+            None => return Err(EcScopeError::MissingIdentity),
+        };
+        store.sync_wal()?;
+        Ok(Self::from_identity(store, identity, max_gates))
+    }
+
+    fn from_identity(store: Arc<MetaStore>, identity: EcIdentity, max_gates: usize) -> Self {
+        Self {
+            store,
+            identity,
+            target_registration: Mutex::new(()),
+            gates: Mutex::new(HashMap::new()),
+            max_gates,
+        }
+    }
+
+    pub fn engine_identity(&self) -> EcIdentity {
+        self.identity
+    }
+
+    pub(crate) fn confirm_staging_identity(&self, prefix_len: usize) -> EcScopeResult<()> {
+        let prefix_len = u32::try_from(prefix_len)
+            .map_err(|_| EcScopeError::Invalid("staging prefix length exceeds u32"))?;
+        let actual = inspect_staging(|key| exact_get(&self.store, key), self.store.iterator(), prefix_len)?;
+        if actual != Some(self.identity) {
+            return Err(EcScopeError::IdentityMismatch);
+        }
+        self.store.sync_wal()?;
+        Ok(())
+    }
+
+    /// Trusted target-creation operation, not data admission. No removal or
+    /// replacement API is provided. A repeated registration preserves identity.
+    pub fn register_target(&self, chain: u32, target: u64) -> EcScopeResult<EcTargetIdentity> {
+        validate_target_numbers(chain, target)?;
+        let _registration = lock(&self.target_registration)?;
+        let key = target_key(chain, target);
+        let identity = match exact_get(&self.store, &key)? {
+            Some(bytes) => decode_target(&bytes)?,
+            None => {
+                let identity = EcTargetIdentity {
+                    engine: self.identity,
+                    incarnation: new_identity(),
+                    chain,
+                    target,
+                };
+                put_sync(&self.store, &key, &encode_target(identity))?;
+                identity
+            }
+        };
+        self.check_target(identity, chain, target)?;
+        self.store.sync_wal()?;
+        Ok(identity)
+    }
+
+    pub fn load_target(&self, chain: u32, target: u64) -> EcScopeResult<EcTargetIdentity> {
+        self.load_target_with(chain, target, |store| store.sync_wal().map_err(EcScopeError::from))
+    }
+
+    fn load_target_with(
+        &self,
+        chain: u32,
+        target: u64,
+        confirm: impl FnOnce(&MetaStore) -> EcScopeResult<()>,
+    ) -> EcScopeResult<EcTargetIdentity> {
+        validate_target_numbers(chain, target)?;
+        let bytes = exact_get(&self.store, &target_key(chain, target))?
+            .ok_or(EcScopeError::MissingIdentity)?;
+        let identity = decode_target(&bytes)?;
+        self.check_target(identity, chain, target)?;
+        // Registration can have an unknown sync outcome while its value is
+        // already visible. Loading that value must reconfirm its durability
+        // before exporting the incarnation or admitting a fresh scope.
+        confirm(&self.store)?;
+        Ok(identity)
+    }
+
+    fn check_target(&self, identity: EcTargetIdentity, chain: u32, target: u64) -> EcScopeResult<()> {
+        if identity.engine != self.identity || identity.chain != chain || identity.target != target {
+            return Err(EcScopeError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Disk-executor operation. Unknown scopes cannot be admitted until this
+    /// exact persistent deny lookup completes. No global/gate lock spans I/O.
+    pub fn prepare_scope(&self, binding: EcScopeBinding) -> EcScopeResult<()> {
+        self.prepare_with(binding, |registry, binding| registry.load_fence(binding))
+    }
+
+    fn prepare_with(
+        &self,
+        binding: EcScopeBinding,
+        load: impl FnOnce(&Self, EcScopeBinding) -> EcScopeResult<Option<EcScopeRevocation>>,
+    ) -> EcScopeResult<()> {
+        let gate = self.get_gate(binding)?;
+        {
+            let mut state = lock(&gate.state)?;
+            state.ensure_live()?;
+            match state.phase {
+                Phase::Open => return Ok(()),
+                Phase::Closing | Phase::Denied => return Err(EcScopeError::Revoked),
+                Phase::Loading => return Err(EcScopeError::Busy),
+                Phase::Unloaded => state.phase = Phase::Loading,
+            }
+        }
+        let loaded = load(self, binding);
+        let mut state = lock(&gate.state)?;
+        state.ensure_live()?;
+        // A concurrent revoke has a monotonic precedence over a stale miss.
+        if state.phase != Phase::Loading {
+            return Err(EcScopeError::Revoked);
+        }
+        match loaded {
+            Ok(Some(revocation)) => {
+                state.phase = Phase::Denied;
+                state.revocation = Some(revocation);
+                state.durable = true;
+                Err(EcScopeError::Revoked)
+            }
+            Ok(None) => {
+                state.phase = Phase::Open;
+                Ok(())
+            }
+            Err(error) => {
+                state.phase = Phase::Unloaded;
+                Err(error)
+            }
+        }
+    }
+
+    /// No disk I/O. Successful admission is linearized under the same mutex
+    /// that closes a scope. Call before waiting for chunk locks or job queues.
+    pub fn try_admit(&self, binding: EcScopeBinding) -> EcScopeResult<EcAdmissionTicket> {
+        let gate = self.get_gate(binding)?;
+        {
+            let mut state = lock(&gate.state)?;
+            state.ensure_live()?;
+            match state.phase {
+                Phase::Open => {}
+                Phase::Closing | Phase::Denied => return Err(EcScopeError::Revoked),
+                Phase::Unloaded | Phase::Loading => return Err(EcScopeError::Busy),
+            }
+            state.inflight = state.inflight.checked_add(1).ok_or(EcScopeError::Busy)?;
+        }
+        Ok(EcAdmissionTicket { gate, _store_lease: self.store.clone() })
+    }
+
+    /// Disk-executor operation. Closes before persisting; never waits for
+    /// admitted work. The caller polls status after queued jobs can run.
+    pub fn revoke(&self, request: EcScopeRevocation) -> EcScopeResult<EcDrainStatus> {
+        self.revoke_with(request, |registry, request| registry.persist_fence(request))
+    }
+
+    fn revoke_with(
+        &self,
+        request: EcScopeRevocation,
+        persist: impl FnOnce(&Self, EcScopeRevocation) -> EcScopeResult<EcScopeRevocation>,
+    ) -> EcScopeResult<EcDrainStatus> {
+        request.validate()?;
+        let gate = self.get_gate(request.binding)?;
+        {
+            let mut state = lock(&gate.state)?;
+            state.ensure_live()?;
+            if let Some(prior) = state.revocation {
+                if prior != request {
+                    return Err(EcScopeError::RevocationMismatch);
+                }
+            }
+            if state.durable {
+                return Ok(state.drain_status());
+            }
+            if state.persisting {
+                return Err(EcScopeError::Busy);
+            }
+            state.phase = Phase::Closing;
+            state.revocation = Some(request);
+            state.persisting = true;
+        }
+        let stored = persist(self, request);
+        let mut state = lock(&gate.state)?;
+        state.ensure_live()?;
+        state.persisting = false;
+        match stored {
+            Ok(stored) => {
+                // A reloaded persistent fence may identify an earlier revoke;
+                // preserve that immutable identity even for a wrong retry.
+                state.revocation = Some(stored);
+                state.durable = true;
+                state.phase = Phase::Denied;
+                if stored != request {
+                    return Err(EcScopeError::RevocationMismatch);
+                }
+                Ok(state.drain_status())
+            }
+            Err(error) => Err(error), // Closing remains fail-closed.
+        }
+    }
+
+    /// No disk I/O. Use prepare_scope on a cold cache before querying. A
+    /// missing or unconfirmed fence cannot produce a Drained observation.
+    pub fn drain_status(&self, request: EcScopeRevocation) -> EcScopeResult<EcDrainStatus> {
+        request.validate()?;
+        let gate = self.get_gate(request.binding)?;
+        let state = lock(&gate.state)?;
+        state.ensure_live()?;
+        match state.revocation {
+            Some(prior) if prior == request => Ok(state.drain_status()),
+            Some(_) => Err(EcScopeError::RevocationMismatch),
+            None => Err(EcScopeError::MissingFence),
+        }
+    }
+
+    fn load_fence(&self, binding: EcScopeBinding) -> EcScopeResult<Option<EcScopeRevocation>> {
+        let target = self.load_target(binding.target.chain, binding.target.target)?;
+        if target != binding.target {
+            return Err(EcScopeError::IdentityMismatch);
+        }
+        match exact_get(&self.store, &binding.key())? {
+            Some(bytes) => {
+                let record = decode_fence(&bytes)?;
+                if record.binding != binding {
+                    return Err(EcScopeError::IdentityMismatch);
+                }
+                // A prior failed synchronous write may still be cache-visible.
+                // Reconfirm durability instead of treating visibility as ACK.
+                self.store.sync_wal()?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn persist_fence(&self, request: EcScopeRevocation) -> EcScopeResult<EcScopeRevocation> {
+        if let Some(prior) = self.load_fence(request.binding)? {
+            return Ok(prior);
+        }
+        put_sync(&self.store, &request.binding.key(), &encode_fence(request))?;
+        self.store.sync_wal()?;
+        Ok(request)
+    }
+
+    fn get_gate(&self, binding: EcScopeBinding) -> EcScopeResult<Arc<Gate>> {
+        binding.validate()?;
+        if binding.target.engine != self.identity {
+            return Err(EcScopeError::IdentityMismatch);
+        }
+        let key = binding.key();
+        let mut gates = lock(&self.gates)?;
+        if let Some(gate) = gates.get(&key) {
+            if gate.binding != binding {
+                return Err(EcScopeError::IdentityMismatch);
+            }
+            return Ok(gate.clone());
+        }
+        if gates.len() >= self.max_gates {
+            // Registry -> gate is the only nested lock order. Retiring before
+            // removal prevents an outstanding Arc from admitting on an old
+            // gate while a cache miss creates another gate for the same key.
+            let mut victim = None;
+            for (key, gate) in gates.iter() {
+                let mut state = lock(&gate.state)?;
+                if state.inflight == 0
+                    && !state.persisting
+                    && matches!(state.phase, Phase::Unloaded | Phase::Open | Phase::Denied)
+                {
+                    state.retired = true;
+                    victim = Some(key.clone());
+                    break;
+                }
+            }
+            if let Some(key) = victim {
+                gates.remove(&key);
+            } else {
+                return Err(EcScopeError::Busy);
+            }
+        }
+        let gate = Arc::new(Gate {
+            binding,
+            state: Mutex::new(GateState::default()),
+        });
+        gates.insert(key, gate.clone());
+        Ok(gate)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Unloaded,
+    Loading,
+    Open,
+    Closing,
+    Denied,
+}
+
+struct Gate {
+    binding: EcScopeBinding,
+    state: Mutex<GateState>,
+}
+
+struct GateState {
+    phase: Phase,
+    revocation: Option<EcScopeRevocation>,
+    inflight: u64,
+    durable: bool,
+    persisting: bool,
+    retired: bool,
+    broken: bool,
+}
+
+impl Default for GateState {
+    fn default() -> Self {
+        Self {
+            phase: Phase::Unloaded,
+            revocation: None,
+            inflight: 0,
+            durable: false,
+            persisting: false,
+            retired: false,
+            broken: false,
+        }
+    }
+}
+
+impl GateState {
+    fn ensure_live(&self) -> EcScopeResult<()> {
+        if self.broken {
+            return Err(EcScopeError::Corrupt("EC admission counter invariant"));
+        }
+        if self.retired {
+            return Err(EcScopeError::Busy);
+        }
+        Ok(())
+    }
+
+    fn drain_status(&self) -> EcDrainStatus {
+        if self.durable && self.inflight == 0 {
+            EcDrainStatus::Drained
+        } else {
+            EcDrainStatus::Pending {
+                inflight: self.inflight,
+                durable: self.durable,
+            }
+        }
+    }
+}
+
+/// Move-only ownership of one admitted job, including time spent queued.
+/// Drop only after the worker and all borrowed request references have ended.
+pub struct EcAdmissionTicket {
+    gate: Arc<Gate>,
+    // Keep this physical instance exclusively open until its last old ticket
+    // completes. Gate alone would let Engine/registry drop release the RocksDB
+    // writer lock; a reopened registry could then falsely report zero inflight.
+    // This field drops after Drop::drop decrements the original gate count.
+    _store_lease: Arc<MetaStore>,
+}
+
+impl EcAdmissionTicket {
+    pub fn binding(&self) -> EcScopeBinding {
+        self.gate.binding
+    }
+
+    /// Worker-side recheck. No new admission is counted. A queued job can be
+    /// rejected after revoke, while its ticket remains until completion.
+    pub fn check_execution(&self) -> EcScopeResult<()> {
+        let state = lock(&self.gate.state)?;
+        state.ensure_live()?;
+        if state.phase == Phase::Open {
+            Ok(())
+        } else {
+            Err(EcScopeError::Revoked)
+        }
+    }
+
+    pub fn complete(self) {
+        drop(self);
+    }
+}
+
+impl fmt::Debug for EcAdmissionTicket {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_struct("EcAdmissionTicket")
+            .field("binding", &self.gate.binding)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for EcAdmissionTicket {
+    fn drop(&mut self) {
+        // Poisoning remains an explicit fail-closed error on all later calls.
+        // Never panic while unwinding a caller's failed worker operation.
+        if let Ok(mut state) = self.gate.state.lock() {
+            if let Some(next) = state.inflight.checked_sub(1) {
+                state.inflight = next;
+            } else {
+                state.broken = true;
+            }
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> EcScopeResult<MutexGuard<'_, T>> {
+    mutex.lock().map_err(|_| EcScopeError::Poisoned)
+}
+
+fn validate_target_numbers(chain: u32, target: u64) -> EcScopeResult<()> {
+    if chain == 0 || target == 0 {
+        return Err(EcScopeError::Invalid("zero EC target or chain"));
+    }
+    Ok(())
+}
+
+fn new_identity() -> EcIdentity {
+    loop {
+        let value = rand::random::<EcIdentity>();
+        if value != [0; 16] {
+            return value;
+        }
+    }
+}
+
+fn exact_get(store: &MetaStore, key: &[u8]) -> EcScopeResult<Option<Vec<u8>>> {
+    let mut iterator = store.iterator();
+    iterator.seek(key)?;
+    if iterator.key() != Some(key) {
+        iterator.status()?;
+        return Ok(None);
+    }
+    let bytes = iterator
+        .value()
+        .ok_or(EcScopeError::Corrupt("EC metadata value absent"))?;
+    // All three records are smaller than this bound; malformed values never
+    // allocate an attacker-controlled extent before their length is checked.
+    if bytes.len() > FENCE_RECORD_BYTES {
+        return Err(EcScopeError::Corrupt("EC metadata exceeds fixed record size"));
+    }
+    let value = bytes.to_vec();
+    iterator.status()?;
+    Ok(Some(value))
+}
+
+fn exact_raw_get(store: &RocksDB, key: &[u8]) -> EcScopeResult<Option<Vec<u8>>> {
+    let Some(value) = store.get(key)? else { return Ok(None) };
+    if value.len() > FENCE_RECORD_BYTES {
+        return Err(EcScopeError::Corrupt("EC raw metadata exceeds fixed record size"));
+    }
+    Ok(Some(value.to_vec()))
+}
+
+fn put_sync(store: &MetaStore, key: &[u8], value: &[u8]) -> EcScopeResult<()> {
+    let mut batch = RocksDB::new_write_batch();
+    batch.put(key, value);
+    store.write(batch, true)?;
+    Ok(())
+}
+
+fn target_key(chain: u32, target: u64) -> Vec<u8> {
+    let mut key = vec![TARGET_PREFIX];
+    key.extend_from_slice(&chain.to_be_bytes());
+    key.extend_from_slice(&target.to_be_bytes());
+    key
+}
+
+fn record(magic: &[u8; 4]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(FENCE_RECORD_BYTES);
+    bytes.extend_from_slice(magic);
+    bytes.extend_from_slice(&VERSION.to_be_bytes());
+    bytes
+}
+
+fn checksum(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes.extend_from_slice(&crc32c::crc32c(&bytes).to_be_bytes());
+    bytes
+}
+
+fn checked_record<'a>(bytes: &'a [u8], magic: &[u8; 4], length: usize) -> EcScopeResult<&'a [u8]> {
+    if bytes.len() != length
+        || bytes[..4] != magic[..]
+        || bytes[4..6] != VERSION.to_be_bytes()
+        || bytes[length - 4..] != crc32c::crc32c(&bytes[..length - 4]).to_be_bytes()
+    {
+        return Err(EcScopeError::Corrupt("EC metadata version, length, magic or checksum"));
+    }
+    Ok(&bytes[6..length - 4])
+}
+
+fn encode_engine(identity: EcIdentity) -> Vec<u8> {
+    let mut bytes = record(b"ECID");
+    bytes.extend_from_slice(&identity);
+    checksum(bytes)
+}
+
+fn decode_engine(bytes: &[u8]) -> EcScopeResult<EcIdentity> {
+    let body = checked_record(bytes, b"ECID", ENGINE_RECORD_BYTES)?;
+    let identity = body.try_into().map_err(|_| EcScopeError::Corrupt("EC engine identity"))?;
+    if identity == [0; 16] {
+        return Err(EcScopeError::Corrupt("zero persistent EC engine identity"));
+    }
+    Ok(identity)
+}
+
+fn encode_staging_format(identity: EcIdentity, prefix_len: u32) -> Vec<u8> {
+    let mut bytes = record(b"ECSF");
+    bytes.extend_from_slice(&identity);
+    bytes.extend_from_slice(&prefix_len.to_be_bytes());
+    bytes.extend_from_slice(&STAGING_FORMAT_VERSION.to_be_bytes());
+    checksum(bytes)
+}
+
+fn decode_staging_format(bytes: &[u8], identity: EcIdentity, prefix_len: u32) -> EcScopeResult<()> {
+    let mut reader = Reader(checked_record(bytes, b"ECSF", STAGING_FORMAT_RECORD_BYTES)?);
+    let recorded_identity: EcIdentity = reader.take()?;
+    let recorded_prefix = u32::from_be_bytes(reader.take()?);
+    let recorded_version = u16::from_be_bytes(reader.take()?);
+    if recorded_identity != identity || recorded_prefix != prefix_len || recorded_version != STAGING_FORMAT_VERSION {
+        return Err(EcScopeError::Corrupt("staging format and engine identity disagree"));
+    }
+    Ok(())
+}
+
+fn encode_target(identity: EcTargetIdentity) -> Vec<u8> {
+    let mut bytes = record(b"ECTG");
+    encode_target_into(&mut bytes, identity);
+    checksum(bytes)
+}
+
+fn encode_target_into(bytes: &mut Vec<u8>, identity: EcTargetIdentity) {
+    bytes.extend_from_slice(&identity.engine);
+    bytes.extend_from_slice(&identity.incarnation);
+    bytes.extend_from_slice(&identity.chain.to_be_bytes());
+    bytes.extend_from_slice(&identity.target.to_be_bytes());
+}
+
+fn decode_target(bytes: &[u8]) -> EcScopeResult<EcTargetIdentity> {
+    let mut reader = Reader(checked_record(bytes, b"ECTG", TARGET_RECORD_BYTES)?);
+    reader.target()
+}
+
+fn encode_fence(request: EcScopeRevocation) -> Vec<u8> {
+    let mut bytes = record(b"ECRV");
+    encode_target_into(&mut bytes, request.binding.target);
+    bytes.extend_from_slice(&request.binding.object);
+    bytes.push(request.binding.kind as u8);
+    bytes.extend_from_slice(&request.binding.scope);
+    bytes.extend_from_slice(&request.binding.owner_uid.to_be_bytes());
+    bytes.extend_from_slice(&request.binding.client_namespace);
+    bytes.extend_from_slice(&request.id);
+    bytes.extend_from_slice(&request.endpoint_set_digest);
+    checksum(bytes)
+}
+
+fn decode_fence(bytes: &[u8]) -> EcScopeResult<EcScopeRevocation> {
+    let mut reader = Reader(checked_record(bytes, b"ECRV", FENCE_RECORD_BYTES)?);
+    let target = reader.target()?;
+    let object = reader.take()?;
+    let kind = match reader.take::<1>()?[0] {
+        1 => EcScopeKind::ReadPin,
+        2 => EcScopeKind::WriteOperation,
+        _ => return Err(EcScopeError::Corrupt("unknown EC scope kind")),
+    };
+    let scope = reader.take()?;
+    let owner_uid = u32::from_be_bytes(reader.take()?);
+    let client_namespace = reader.take()?;
+    let request = EcScopeRevocation {
+        binding: EcScopeBinding { target, object, kind, scope, owner_uid, client_namespace },
+        id: reader.take()?,
+        endpoint_set_digest: reader.take()?,
+    };
+    request.validate()?;
+    if !reader.0.is_empty() {
+        return Err(EcScopeError::Corrupt("trailing EC scope record bytes"));
+    }
+    Ok(request)
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl Reader<'_> {
+    fn take<const N: usize>(&mut self) -> EcScopeResult<[u8; N]> {
+        if self.0.len() < N {
+            return Err(EcScopeError::Corrupt("short EC metadata field"));
+        }
+        let (head, rest) = self.0.split_at(N);
+        self.0 = rest;
+        head.try_into().map_err(|_| EcScopeError::Corrupt("EC field extent"))
+    }
+
+    fn target(&mut self) -> EcScopeResult<EcTargetIdentity> {
+        let identity = EcTargetIdentity {
+            engine: self.take()?,
+            incarnation: self.take()?,
+            chain: u32::from_be_bytes(self.take()?),
+            target: u64::from_be_bytes(self.take()?),
+        };
+        validate_target_numbers(identity.chain, identity.target)?;
+        if identity.engine == [0; 16] || identity.incarnation == [0; 16] {
+            return Err(EcScopeError::Corrupt("zero persistent EC target identity"));
+        }
+        Ok(identity)
+    }
+}
+
+#[cfg(test)]
+#[path = "ec_scope_tests.rs"]
+mod tests;

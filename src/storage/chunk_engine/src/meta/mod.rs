@@ -7,3 +7,6 @@ pub use meta_key::*;
 pub use meta_merge::*;
 pub use meta_store::*;
 pub use rocksdb::*;
+
+mod immutable_stage;
+pub use immutable_stage::*;
