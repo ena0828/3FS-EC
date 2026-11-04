@@ -24,6 +24,7 @@
 #include "fbs/meta/Service.h"
 #include "meta/components/GcManager.h"
 #include "meta/store/DirEntry.h"
+#include "meta/store/EcNamespaceGuard.h"
 #include "meta/store/Inode.h"
 #include "meta/store/MetaStore.h"
 #include "meta/store/Operation.h"
@@ -297,6 +298,21 @@ class RenameOp : public Operation<RenameRsp> {
     std::optional<Inode> srcInode, dstInode;
     CO_RETURN_ON_ERROR(co_await checkPermission(txn, *srcResult, srcInode, false));
     CO_RETURN_ON_ERROR(co_await checkPermission(txn, *dstResult, dstInode, true));
+
+    // EC file namespace changes remain disabled until their lifecycle is integrated.
+    // Directory moves preserve descendants and checkLoop validates destination ancestors.
+    if (srcInode->isFile()) {
+      CO_RETURN_ON_ERROR(srcInode->asFile().layout.checkReplicated());
+    }
+    if (dstInode && dstInode->isFile()) {
+      CO_RETURN_ON_ERROR(dstInode->asFile().layout.checkReplicated());
+    }
+    if (dstInode && dstInode->isDirectory()) {
+      CO_RETURN_ON_ERROR(co_await EcNamespaceGuard::checkRemove(txn, dstInode->id));
+    }
+    if (srcInode->isDirectory()) {
+      CO_RETURN_ON_ERROR(co_await EcNamespaceGuard::moveDirectory(txn, *srcInode, dstResult->getParentId()));
+    }
 
     // NOTE: add src/dst's parent inode and dirEntry into read conflict set.
     CO_RETURN_ON_ERROR(co_await Inode(srcResult->getParentId()).addIntoReadConflict(txn));

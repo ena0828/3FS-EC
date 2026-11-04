@@ -13,6 +13,7 @@ anyhow = "1"
 byteorder = "1"
 crc32c = "0"
 cxx = "1"
+hf3fs-ec = { path = "../ec" }
 dashmap = "6"
 derse = { version = ">=0.1.32", features = ["tinyvec"] }
 lazy_static = "1"
@@ -30,7 +31,6 @@ tracing-appender = "0"
 tracing-subscriber = { version = "0", features = ["fmt"] }
 
 [dev-dependencies]
-hf3fs-ec = { path = "../ec" }
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 criterion = "0"

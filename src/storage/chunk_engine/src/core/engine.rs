@@ -245,6 +245,34 @@ impl Engine {
         self.get_with_entry(chunk_id, &mut entry)
     }
 
+    /// Lookup for the isolated immutable namespace, without a durability barrier.
+    /// A final metadata write may have taken effect although its caller received
+    /// an error, leaving a writing holder but no cache entry for this position.
+    /// Always consult the actual record and retain a cache reference before
+    /// returning; cache visibility alone is not evidence of committed metadata.
+    pub(crate) fn get_immutable(&self, chunk_id: &[u8]) -> Result<Option<ChunkArc>> {
+        let mut entry = self.meta_cache.entry_by_ref(chunk_id);
+        let Some(meta) = self.meta_store.get_chunk_meta(chunk_id)? else {
+            // Keep an existing reference even when the record is missing. An
+            // unknown result must not cause the allocation to be reclaimed.
+            return Ok(None);
+        };
+        if let Some(chunk) = entry.get() {
+            if chunk.meta() != &meta {
+                return Err(Error::MetaError(
+                    "immutable cache and committed metadata differ".into(),
+                ));
+            }
+            return Ok(Some(chunk.clone()));
+        }
+        let allocator = self.allocators.select_by_pos(meta.pos)?;
+        // A failed commit's writing holder can already own this position.
+        // first_ref=true would assert after incrementing its reference count.
+        let chunk = Arc::new(allocator.reference(meta, false));
+        entry.insert(chunk.clone());
+        Ok(Some(chunk))
+    }
+
     fn get_with_entry(
         &self,
         chunk_id: &[u8],

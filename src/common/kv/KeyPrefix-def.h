@@ -27,6 +27,8 @@ DEFINE_PREFIX(EcManifest,       "ECMF")
 DEFINE_PREFIX(EcOperation,      "ECOP")
 DEFINE_PREFIX(EcPin,            "ECPN")
 DEFINE_PREFIX(EcFragmentRef,    "ECRF")
+DEFINE_PREFIX(EcNamespaceCount, "ECNS")
+DEFINE_PREFIX(EcNamespaceFile,  "ECNF")
 // clang-format on
 
 #undef DEFINE_PREFIX

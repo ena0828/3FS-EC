@@ -36,6 +36,14 @@ Components::Components(const Config &config)
       storageOperator(config.storage(), *this),
       reliableUpdate(config.reliable_update(), *this) {}
 
+Result<Void> Components::loadEcCapabilityKey() {
+  const auto &path = config.storage().ec_capability_key_file();
+  if (path.empty()) return Void{};
+  CHECK_RESULT(key, EcCapabilityKey::loadFile(std::filesystem::path(path.string())));
+  ecCapabilityKey_ = std::move(key);
+  return Void{};
+}
+
 Result<Void> Components::start(const flat::AppInfo &appInfo, net::ThreadPoolGroup &tpg) {
   this->appInfo = appInfo;
 

@@ -14,6 +14,7 @@
 #include "fbs/mgmtd/RoutingInfo.h"
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
+#include "fbs/storage/EcAuthorized.h"
 
 namespace hf3fs::storage::client {
 
@@ -361,6 +362,9 @@ class StorageClient : public folly::MoveOnly {
     createEcFragment,
     readEcFragment,
     reconcileEcFragment,
+    authorizedCreateEcFragment,
+    authorizedReadEcFragment,
+    authorizedReconcileEcFragment,
   };
 
   class RetryConfig : public hf3fs::ConfigBase<RetryConfig> {
@@ -581,6 +585,16 @@ class StorageClient : public folly::MoveOnly {
   // target's synchronous durability barrier for this exact operation.
   virtual CoTryTask<EcFragmentReceipt> reconcileEcFragment(const EcReconcileReq &) {
     co_return makeError(StatusCode::kNotImplemented, "EC durability reconciliation requires the RPC storage client");
+  }
+
+  virtual CoTryTask<EcFragmentReceipt> authorizedCreateEcFragment(const EcAuthorizedCreateReq &) {
+    co_return makeError(StatusCode::kNotImplemented, "authorized EC fragments require the RPC storage client");
+  }
+  virtual CoTryTask<EcReadResult> authorizedReadEcFragment(const EcAuthorizedReadReq &) {
+    co_return makeError(StatusCode::kNotImplemented, "authorized EC fragments require the RPC storage client");
+  }
+  virtual CoTryTask<EcFragmentReceipt> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &) {
+    co_return makeError(StatusCode::kNotImplemented, "authorized EC reconciliation requires the RPC storage client");
   }
 
   virtual CoTryTask<OfflineTargetRsp> offlineTarget(NodeId nodeId, const OfflineTargetReq &req) = 0;

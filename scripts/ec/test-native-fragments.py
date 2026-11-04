@@ -19,8 +19,8 @@ import time
 import xml.etree.ElementTree as ET
 
 
-STORAGE_FILTER = "TestEcProtocol.*:TestEcTarget.*:TestEcIntegrity.*"
-SERVICE_FILTER = "TestEcService.*:TestEcServiceWithoutEngine.*"
+STORAGE_FILTER = "TestEcProtocol.*:TestEcTarget.*:TestEcIntegrity.*:TestEcCodec.*:TestEcAuthorization.*"
+SERVICE_FILTER = "TestEcService.*:TestEcServiceWithoutEngine.*:TestEcAuthorizedService.*:TestEcAuthorizedNoKeyService.*:TestEcCapabilityComponents.*"
 LEGACY_FILTER = "TestChunkEngine.ReadWrite:TestStorageTarget.ReadWrite:TestStorageTarget.Uncommitted"
 # TestChunkEngine.ReadWrite retains default 4 MiB/64 MiB buffers and 32 AIO
 # workers: (4 * 4 + 64) * 32 = 2560 MiB of repeated ring registration accounting.

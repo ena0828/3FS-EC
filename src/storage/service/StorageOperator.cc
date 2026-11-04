@@ -58,6 +58,7 @@ monitor::OperationRecorder storageReqRemoveChunksRecorder{"storage.req_remove_ch
 monitor::OperationRecorder storageRemoveRangeRecorder{"storage.remove_range"};
 
 Result<Void> StorageOperator::init(uint32_t numberOfDisks) {
+  RETURN_ON_ERROR(components_.loadEcCapabilityKey());
   storageReadAvgBytes.setLambda([&] {
     auto totalReadBytes = totalReadBytes_.exchange(0);
     auto totalReadIOs = totalReadIOs_.exchange(0);

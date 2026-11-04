@@ -3,6 +3,7 @@
 #include "common/serde/Service.h"
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
+#include "fbs/storage/EcAuthorized.h"
 
 namespace hf3fs::storage {
 
@@ -25,6 +26,9 @@ SERDE_SERVICE(StorageSerde, 3) {
   SERDE_SERVICE_METHOD(createEcFragment, 19, EcCreateReq, EcCreateRsp);
   SERDE_SERVICE_METHOD(readEcFragment, 20, EcReadReq, EcReadRsp);
   SERDE_SERVICE_METHOD(reconcileEcFragment, 21, EcReconcileReq, EcReconcileRsp);
+  SERDE_SERVICE_METHOD(authorizedCreateEcFragment, 22, EcAuthorizedCreateReq, EcCreateRsp);
+  SERDE_SERVICE_METHOD(authorizedReadEcFragment, 23, EcAuthorizedReadReq, EcReadRsp);
+  SERDE_SERVICE_METHOD(authorizedReconcileEcFragment, 24, EcAuthorizedReconcileReq, EcReconcileRsp);
 };
 
 }  // namespace hf3fs::storage

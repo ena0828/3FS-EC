@@ -60,6 +60,9 @@ class HardLinkOp : public Operation<HardLinkRsp> {
     if (inode.acl.iflags & FS_IMMUTABLE_FL) {
       co_return makeError(MetaCode::kNoPermission, fmt::format("FS_IMMUTABLE_FL set on target inode {}", inode.id));
     }
+    if (inode.isFile()) {
+      CO_RETURN_ON_ERROR(inode.asFile().layout.checkReplicated());
+    }
 
     assert(inode.nlink);
 

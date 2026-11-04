@@ -2555,7 +2555,21 @@ CoTryTask<EcCreateTargetRsp> StorageClientImpl::createEcTarget(NodeId nodeId, co
   co_return std::move(*response);
 }
 
-CoTryTask<EcFragmentReceipt> StorageClientImpl::createEcFragment(const EcCreateReq &req) {
+namespace {
+template <typename WireReq>
+decltype(auto) ecRequest(WireReq &wire) {
+  if constexpr (requires { wire.request; }) {
+    return (wire.request);
+  } else {
+    return (wire);
+  }
+}
+}  // namespace
+
+template <typename WireReq>
+CoTryTask<EcFragmentReceipt> StorageClientImpl::createEcFragmentImpl(const WireReq &wire) {
+  const auto &req = ecRequest(wire);
+  constexpr bool authorized = std::is_same_v<WireReq, EcAuthorizedCreateReq>;
   if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
   CO_RETURN_ON_ERROR(req.validate());
   const auto checksum = ChecksumInfo::create(ChecksumType::CRC32C,
@@ -2565,7 +2579,7 @@ CoTryTask<EcFragmentReceipt> StorageClientImpl::createEcFragment(const EcCreateR
     co_return makeError(StorageClientCode::kChecksumMismatch, "EC creation payload differs from its checksum");
   }
   const DebugOptions debugOptions;
-  ClientRequestContext requestCtx(MethodType::createEcFragment,
+  ClientRequestContext requestCtx(authorized ? MethodType::authorizedCreateEcFragment : MethodType::createEcFragment,
                                   req.userInfo,
                                   debugOptions,
                                   config_,
@@ -2589,18 +2603,24 @@ CoTryTask<EcFragmentReceipt> StorageClientImpl::createEcFragment(const EcCreateR
   }
   // Copy the bounded payload only after admission. operationId remains the
   // caller's persisted value; the transport correlation tag belongs to this call.
-  EcCreateReq request = req;
+  WireReq wireRequest = wire;
+  auto &request = ecRequest(wireRequest);
   request.tag = MessageTag(clientId_, RequestId(nextRequestId_.fetch_add(1)));
   requestCtx.logWaitingTime();
   bool dispatched = false;
-  auto response = co_await callMessengerMethod<EcCreateReq, EcCreateRsp, &StorageMessenger::createEcFragment>(
-      getStorageMessengerForUpdates(),
-      requestCtx,
-      *nodeInfo,
-      request,
-      0,
-      &dispatched,
-      true);
+  constexpr auto method = [] {
+    if constexpr (authorized)
+      return &StorageMessenger::authorizedCreateEcFragment;
+    else
+      return &StorageMessenger::createEcFragment;
+  }();
+  auto response = co_await callMessengerMethod<WireReq, EcCreateRsp, method>(getStorageMessengerForUpdates(),
+                                                                             requestCtx,
+                                                                             *nodeInfo,
+                                                                             wireRequest,
+                                                                             0,
+                                                                             &dispatched,
+                                                                             true);
   if (!response) {
     if (!dispatched || response.error().code() == StorageCode::kChunkAlreadyExists) {
       co_return makeError(response.error());
@@ -2625,11 +2645,14 @@ CoTryTask<EcFragmentReceipt> StorageClientImpl::createEcFragment(const EcCreateR
   co_return std::move(*response->result);
 }
 
-CoTryTask<EcReadResult> StorageClientImpl::readEcFragment(const EcReadReq &req) {
+template <typename WireReq>
+CoTryTask<EcReadResult> StorageClientImpl::readEcFragmentImpl(const WireReq &wire) {
+  const auto &req = ecRequest(wire);
+  constexpr bool authorized = std::is_same_v<WireReq, EcAuthorizedReadReq>;
   if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
   CO_RETURN_ON_ERROR(req.validate());
   const DebugOptions debugOptions;
-  ClientRequestContext requestCtx(MethodType::readEcFragment,
+  ClientRequestContext requestCtx(authorized ? MethodType::authorizedReadEcFragment : MethodType::readEcFragment,
                                   req.userInfo,
                                   debugOptions,
                                   config_,
@@ -2651,16 +2674,23 @@ CoTryTask<EcReadResult> StorageClientImpl::readEcFragment(const EcReadReq &req) 
   if (nodeInfo->app.nodeId != nodeId) {
     co_return makeError(StorageClientCode::kRoutingVersionMismatch, "EC target owner changed while waiting");
   }
-  EcReadReq request = req;
+  WireReq wireRequest = wire;
+  auto &request = ecRequest(wireRequest);
   request.tag = MessageTag(clientId_, RequestId(nextRequestId_.fetch_add(1)));
   requestCtx.logWaitingTime();
-  auto response = co_await callMessengerMethod<EcReadReq, EcReadRsp, &StorageMessenger::readEcFragment>(messenger_,
-                                                                                                        requestCtx,
-                                                                                                        *nodeInfo,
-                                                                                                        request,
-                                                                                                        1,
-                                                                                                        nullptr,
-                                                                                                        true);
+  constexpr auto method = [] {
+    if constexpr (authorized)
+      return &StorageMessenger::authorizedReadEcFragment;
+    else
+      return &StorageMessenger::readEcFragment;
+  }();
+  auto response = co_await callMessengerMethod<WireReq, EcReadRsp, method>(messenger_,
+                                                                           requestCtx,
+                                                                           *nodeInfo,
+                                                                           wireRequest,
+                                                                           1,
+                                                                           nullptr,
+                                                                           true);
   CO_RETURN_ON_ERROR(response);
   if (!matchesEcMessageTag(response->tag, request.tag)) {
     co_return makeError(StorageClientCode::kProtocolMismatch, "EC read response tag differs from the request");
@@ -2686,17 +2716,21 @@ CoTryTask<EcReadResult> StorageClientImpl::readEcFragment(const EcReadReq &req) 
   co_return std::move(result);
 }
 
-CoTryTask<EcFragmentReceipt> StorageClientImpl::reconcileEcFragment(const EcReconcileReq &req) {
+template <typename WireReq>
+CoTryTask<EcFragmentReceipt> StorageClientImpl::reconcileEcFragmentImpl(const WireReq &wire) {
+  const auto &req = ecRequest(wire);
+  constexpr bool authorized = std::is_same_v<WireReq, EcAuthorizedReconcileReq>;
   if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
   CO_RETURN_ON_ERROR(req.validate());
   const DebugOptions debugOptions;
-  ClientRequestContext requestCtx(MethodType::reconcileEcFragment,
-                                  req.userInfo,
-                                  debugOptions,
-                                  config_,
-                                  1,
-                                  0,
-                                  config_.retry().max_wait_time());
+  ClientRequestContext requestCtx(
+      authorized ? MethodType::authorizedReconcileEcFragment : MethodType::reconcileEcFragment,
+      req.userInfo,
+      debugOptions,
+      config_,
+      1,
+      0,
+      config_.retry().max_wait_time());
   auto nodeInfo = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);
   CO_RETURN_ON_ERROR(nodeInfo);
   const auto nodeId = nodeInfo->app.nodeId;
@@ -2714,18 +2748,24 @@ CoTryTask<EcFragmentReceipt> StorageClientImpl::reconcileEcFragment(const EcReco
   if (nodeInfo->app.nodeId != nodeId) {
     co_return makeError(StorageClientCode::kRoutingVersionMismatch, "EC target owner changed while waiting");
   }
-  EcReconcileReq request = req;
+  WireReq wireRequest = wire;
+  auto &request = ecRequest(wireRequest);
   request.tag = MessageTag(clientId_, RequestId(nextRequestId_.fetch_add(1)));
   requestCtx.logWaitingTime();
   bool dispatched = false;
-  auto response = co_await callMessengerMethod<EcReconcileReq, EcReconcileRsp, &StorageMessenger::reconcileEcFragment>(
-      getStorageMessengerForUpdates(),
-      requestCtx,
-      *nodeInfo,
-      request,
-      0,
-      &dispatched,
-      true);
+  constexpr auto method = [] {
+    if constexpr (authorized)
+      return &StorageMessenger::authorizedReconcileEcFragment;
+    else
+      return &StorageMessenger::reconcileEcFragment;
+  }();
+  auto response = co_await callMessengerMethod<WireReq, EcReconcileRsp, method>(getStorageMessengerForUpdates(),
+                                                                                requestCtx,
+                                                                                *nodeInfo,
+                                                                                wireRequest,
+                                                                                0,
+                                                                                &dispatched,
+                                                                                true);
   if (!response) {
     if (!dispatched || response.error().code() == StorageCode::kChunkAlreadyExists) {
       co_return makeError(response.error());
@@ -2746,6 +2786,23 @@ CoTryTask<EcFragmentReceipt> StorageClientImpl::reconcileEcFragment(const EcReco
                                         request.checksum);
   if (!validReceipt) co_return makeError(ecSealOutcomeUnknown(validReceipt.error()));
   co_return std::move(*response->result);
+}
+
+CoTryTask<EcFragmentReceipt> StorageClientImpl::createEcFragment(const EcCreateReq &req) {
+  return createEcFragmentImpl(req);
+}
+CoTryTask<EcReadResult> StorageClientImpl::readEcFragment(const EcReadReq &req) { return readEcFragmentImpl(req); }
+CoTryTask<EcFragmentReceipt> StorageClientImpl::reconcileEcFragment(const EcReconcileReq &req) {
+  return reconcileEcFragmentImpl(req);
+}
+CoTryTask<EcFragmentReceipt> StorageClientImpl::authorizedCreateEcFragment(const EcAuthorizedCreateReq &req) {
+  return createEcFragmentImpl(req);
+}
+CoTryTask<EcReadResult> StorageClientImpl::authorizedReadEcFragment(const EcAuthorizedReadReq &req) {
+  return readEcFragmentImpl(req);
+}
+CoTryTask<EcFragmentReceipt> StorageClientImpl::authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) {
+  return reconcileEcFragmentImpl(req);
 }
 
 CoTryTask<OfflineTargetRsp> StorageClientImpl::offlineTarget(NodeId nodeId, const OfflineTargetReq &req) {

@@ -1,9 +1,12 @@
 #include <algorithm>
+#include <atomic>
+#include <fcntl.h>
 #include <folly/experimental/coro/BlockingWait.h>
 #include <linux/magic.h>
 #include <mutex>
 #include <optional>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/vfs.h>
 
 #include "client/storage/StorageClient.h"
@@ -15,6 +18,14 @@
 #include "tests/lib/UnitTestFabric.h"
 
 namespace hf3fs::storage {
+
+// A private, local-only clock seam makes admission/worker/completion expiry
+// tests deterministic without sleeping or introducing a configurable bypass.
+class StorageEcAuthorizationTestAccess {
+ public:
+  static void clock(StorageOperator &op, std::function<uint64_t()> now) { op.ecAuthorizationNow_ = std::move(now); }
+};
+
 namespace {
 
 using folly::coro::blockingWait;
@@ -121,6 +132,8 @@ class ReplyDropStorageService : public StorageService {
 
 class TestEcService : public ::testing::Test {
  protected:
+  virtual void configureEcAuthorization() { config_.storage().set_allow_unsafe_ec_fragment_rpc_for_testing(true); }
+
   void SetUp() override {
     // The Rust engine uses direct I/O. Keep its real files on local ext4;
     // TMPDIR may select the test location, but a DrvFS path is not equivalent.
@@ -136,6 +149,7 @@ class TestEcService : public ::testing::Test {
     config_.targets().set_allow_disk_without_uuid(true);
     config_.targets().set_collect_all_fds(false);
     config_.storage().set_enable_ec_fragments(true);
+    configureEcAuthorization();
     config_.storage().set_max_concurrent_ec_requests(2);
     config_.storage().write_worker().set_num_threads(2);
     config_.storage().write_worker().set_bg_num_threads(1);
@@ -156,6 +170,7 @@ class TestEcService : public ::testing::Test {
     smallClient(config_.forward_client());
     smallClient(config_.client());
     components_ = std::make_unique<Components>(config_);
+    components_->appInfo.nodeId = nodeId_;
     // Deliberately do not call Components::start: no allocator workers,
     // RDMA buffers, AIO readers, resync loops or fabricated data backend.
     ASSERT_OK(components_->storageTargets.load(loader_));
@@ -355,6 +370,204 @@ class TestEcService : public ::testing::Test {
   net::Address address_;
   net::UserRequestOptions options_;
 };
+
+class TestEcAuthorizedService : public TestEcService {
+ protected:
+  virtual bool provisionKey() const { return true; }
+
+  void configureEcAuthorization() override {
+    config_.storage().set_allow_unsafe_ec_fragment_rpc_for_testing(false);
+    for (size_t i = 0; i != keyBytes_.size(); ++i) keyBytes_[i] = static_cast<uint8_t>(i + 1);
+    if (!provisionKey()) return;
+    const auto path = traces_.path() / "ec-capability.key";
+    auto fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    const auto written = ::write(fd, keyBytes_.data(), keyBytes_.size());
+    const auto closed = ::close(fd);
+    ASSERT_EQ(written, static_cast<ssize_t>(keyBytes_.size()));
+    ASSERT_EQ(closed, 0);
+    config_.storage().set_ec_capability_key_file(path);
+  }
+
+  void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(TestEcService::SetUp());
+    signingKey_ = std::make_unique<EcCapabilityKey>(std::span<const uint8_t, 32>(keyBytes_));
+    StorageEcAuthorizationTestAccess::clock(components_->storageOperator, [] { return uint64_t{1000}; });
+  }
+
+  EcCapability grantFor(const EcCreateReq &request, uint8_t rights = 7, uint64_t expiry = 1100) {
+    EcGrantClaims claims;
+    claims.identity = request.identity;
+    claims.fragmentOperationId = request.operationId;
+    claims.chainId = request.vChainId.chainId;
+    claims.targetId = request.targetId;
+    claims.nodeId = nodeId_;
+    claims.expectedLength = static_cast<uint32_t>(request.payload.data.size());
+    claims.expectedCrc32c = ~request.checksum.value;
+    claims.ownerUid = flat::Uid(1234);
+    claims.clientUuid = Uuid::from(55, 66);
+    claims.scopeObject = request.identity.object;
+    claims.scopeKind = EcGrantScope::WriteOperation;
+    claims.scopeId = Uuid::from(77, 88);
+    claims.rights = rights;
+    claims.grantId = Uuid::random();
+    claims.issuedAtSeconds = 1000;
+    claims.expiresAtSeconds = expiry;
+    auto signedGrant = signEcGrant(*signingKey_, claims, 1000, kEcGrantMaxTtlSeconds);
+    EXPECT_TRUE(signedGrant.hasValue());
+    return signedGrant.value();
+  }
+
+  void expireOnValidation(size_t firstExpiredCall) {
+    auto calls = std::make_shared<std::atomic<size_t>>(0);
+    StorageEcAuthorizationTestAccess::clock(components_->storageOperator, [calls, firstExpiredCall] {
+      return ++*calls >= firstExpiredCall ? uint64_t{1100} : uint64_t{1000};
+    });
+  }
+
+  std::array<uint8_t, 32> keyBytes_{};
+  std::unique_ptr<EcCapabilityKey> signingKey_;
+};
+
+class TestEcAuthorizedNoKeyService : public TestEcAuthorizedService {
+ protected:
+  bool provisionKey() const override { return false; }
+  void configureEcAuthorization() override {
+    TestEcAuthorizedService::configureEcAuthorization();
+    // Even explicit experimental access cannot become an authorization fallback.
+    config_.storage().set_allow_unsafe_ec_fragment_rpc_for_testing(true);
+  }
+};
+
+TEST_F(TestEcAuthorizedService, NativeAuthorizedRoundtripRejectsUncredentialedMethods) {
+  for (auto length : {size_t{0}, size_t{257}, kEcFragmentRpcMaxBytes}) {
+    const auto create = createRequest(length, length + 100);
+    const auto grant = grantFor(create);
+    ASSERT_OK(blockingWait(client_->authorizedCreateEcFragment({create, grant})));
+    auto read = blockingWait(client_->authorizedReadEcFragment({readFor(create), grant}));
+    ASSERT_OK(read);
+    ASSERT_EQ(read->payload.data, create.payload.data);
+    ASSERT_OK(blockingWait(client_->authorizedReconcileEcFragment({reconcileFor(create), grant})));
+    ASSERT_ERROR(blockingWait(client_->createEcFragment(create)), StatusCode::kAuthenticationFail);
+    ASSERT_ERROR(blockingWait(client_->readEcFragment(readFor(create))), StatusCode::kAuthenticationFail);
+    ASSERT_ERROR(blockingWait(client_->reconcileEcFragment(reconcileFor(create))), StatusCode::kAuthenticationFail);
+  }
+  auto create = createRequest(17, 199);
+  auto grant = grantFor(create);
+  ASSERT_OK(blockingWait(client_->authorizedCreateEcFragment({create, grant})));
+  auto readClaims = grant.claims;
+  readClaims.scopeKind = EcGrantScope::ReadPin;
+  readClaims.scopeId = Uuid::random();
+  readClaims.rights = static_cast<uint8_t>(EcGrantRight::Read);
+  auto readGrant = signEcGrant(*signingKey_, readClaims, 1000);
+  ASSERT_OK(readGrant);
+  auto readReq = readFor(create);
+  readReq.userInfo.uid = flat::Uid(9999);  // userInfo is not used as proof of the bearer's identity.
+  ASSERT_OK(blockingWait(client_->authorizedReadEcFragment({readReq, *readGrant})));
+  ASSERT_ERROR(blockingWait(client_->authorizedReconcileEcFragment({reconcileFor(create), *readGrant})),
+               StatusCode::kAuthenticationFail);
+  auto longLived = createRequest(17, 200);
+  ASSERT_OK(blockingWait(client_->authorizedCreateEcFragment({longLived, grantFor(longLived, 7, 1600)})));
+}
+
+TEST_F(TestEcAuthorizedService, RejectsMacBindingRightsExpiryAndPayloadMismatch) {
+  const auto create = createRequest(513, 201);
+  const auto grant = grantFor(create);
+  for (unsigned scenario = 0; scenario != 7; ++scenario) {
+    SCOPED_TRACE(scenario);
+    EcAuthorizedCreateReq request{create, grant};
+    if (scenario == 0) request.grant.claims.grantId = Uuid::random();  // Wrong MAC, otherwise valid schema.
+    if (scenario == 1) request.request.targetId = TargetId{999};
+    if (scenario == 2) request.request.operationId = Uuid::random();
+    if (scenario == 3) request.request.identity.allocation = Uuid::random();
+    if (scenario == 4) request.request.payload.data.push_back('x');
+    if (scenario == 5) request.request.checksum.value ^= 1;
+    if (scenario == 6) request.grant = grantFor(create, static_cast<uint8_t>(EcGrantRight::Read));
+    auto result = blockingWait(messenger_->authorizedCreateEcFragment(address_, request, &options_));
+    ASSERT_OK(result);
+    ASSERT_ERROR(result->result, StatusCode::kAuthenticationFail);
+  }
+  auto wrongNode = grant.claims;
+  wrongNode.nodeId = NodeId{62};
+  auto signedWrongNode = signEcGrant(*signingKey_, wrongNode, 1000);
+  ASSERT_OK(signedWrongNode);
+  ASSERT_ERROR(blockingWait(client_->authorizedCreateEcFragment({create, *signedWrongNode})),
+               StatusCode::kAuthenticationFail);
+
+  StorageEcAuthorizationTestAccess::clock(components_->storageOperator, [] { return uint64_t{1100}; });
+  ASSERT_ERROR(blockingWait(client_->authorizedCreateEcFragment({create, grant})), StatusCode::kAuthenticationFail);
+  StorageEcAuthorizationTestAccess::clock(components_->storageOperator, [] { return uint64_t{1000}; });
+  auto corrupt = create;
+  corrupt.payload.data.front() ^= 1;
+  auto server = blockingWait(messenger_->authorizedCreateEcFragment(address_, {corrupt, grant}, &options_));
+  ASSERT_OK(server);
+  ASSERT_ERROR(server->result, StorageCode::kChecksumMismatch);
+  auto stale = create;
+  stale.vChainId.chainVer = ChainVer{2};
+  auto staleResponse = blockingWait(messenger_->authorizedCreateEcFragment(address_, {stale, grant}, &options_));
+  ASSERT_OK(staleResponse);
+  // The messenger sends directly to StorageSerde. Its server-side TargetMap
+  // uses the shared routing error code before any immutable fragment I/O.
+  ASSERT_ERROR(staleResponse->result, StorageClientCode::kRoutingVersionMismatch);
+  auto directResponse = blockingWait(components_->storageOperator.authorizedCreateEcFragment({stale, grant}));
+  ASSERT_OK(directResponse);
+  ASSERT_ERROR(directResponse->result, StorageClientCode::kRoutingVersionMismatch);
+  // Earlier rejections never created the fragment; the first valid create succeeds.
+  ASSERT_OK(blockingWait(client_->authorizedCreateEcFragment({create, grant})));
+}
+
+TEST_F(TestEcAuthorizedNoKeyService, MissingKeyNeverFallsBackToUncredentialedIo) {
+  auto create = createRequest(257, 301);
+  auto grant = grantFor(create);
+  ASSERT_ERROR(blockingWait(client_->authorizedCreateEcFragment({create, grant})), StatusCode::kAuthenticationFail);
+  ASSERT_ERROR(blockingWait(client_->authorizedReadEcFragment({readFor(create), grant})),
+               StatusCode::kAuthenticationFail);
+  ASSERT_ERROR(blockingWait(client_->authorizedReconcileEcFragment({reconcileFor(create), grant})),
+               StatusCode::kAuthenticationFail);
+  ASSERT_OK(blockingWait(client_->createEcFragment(create)));
+  ASSERT_ERROR(blockingWait(client_->authorizedReadEcFragment({readFor(create), grant})),
+               StatusCode::kAuthenticationFail);
+}
+
+TEST(TestEcCapabilityComponents, InvalidConfiguredKeyFailsBeforeStartingWorkers) {
+  folly::test::TemporaryDirectory directory;
+  Components::Config config;
+  config.targets().set_target_paths({directory.path()});
+  config.storage().set_ec_capability_key_file(directory.path() / "missing-key");
+  config.storage().event_trace_log().set_enabled(false);
+  Components components(config);
+  ASSERT_ERROR(components.storageOperator.init(1), StatusCode::kIOError);
+}
+
+TEST_F(TestEcAuthorizedService, WorkerExpiryRejectsBeforeIoAndCompletionExpiryRetainsCommittedData) {
+  const auto rejected = createRequest(257, 401);
+  const auto rejectedGrant = grantFor(rejected);
+  // Calls 1/2 admit and validate after the chunk lock; call 3 runs on the disk worker.
+  expireOnValidation(3);
+  ASSERT_ERROR(blockingWait(client_->authorizedCreateEcFragment({rejected, rejectedGrant})),
+               StatusCode::kAuthenticationFail);
+  StorageEcAuthorizationTestAccess::clock(components_->storageOperator, [] { return uint64_t{1000}; });
+  ASSERT_OK(blockingWait(client_->authorizedCreateEcFragment({rejected, rejectedGrant})));
+
+  const auto committed = createRequest(4097, 402);
+  const auto committedGrant = grantFor(committed);
+  // The fourth validation follows the real Engine commit and worker drain.
+  expireOnValidation(4);
+  ASSERT_ERROR(blockingWait(client_->authorizedCreateEcFragment({committed, committedGrant})),
+               StorageCode::kEcSealOutcomeUnknown);
+  StorageEcAuthorizationTestAccess::clock(components_->storageOperator, [] { return uint64_t{1000}; });
+  auto read = blockingWait(client_->authorizedReadEcFragment({readFor(committed), grantFor(committed)}));
+  ASSERT_OK(read);
+  ASSERT_EQ(read->payload.data, committed.payload.data);
+  ASSERT_OK(blockingWait(client_->authorizedReconcileEcFragment({reconcileFor(committed), grantFor(committed)})));
+  expireOnValidation(4);
+  ASSERT_ERROR(blockingWait(client_->authorizedReconcileEcFragment({reconcileFor(committed), committedGrant})),
+               StorageCode::kEcSealOutcomeUnknown);
+  // Read has admission/worker/completion checks; it must not return bytes after expiry.
+  expireOnValidation(3);
+  ASSERT_ERROR(blockingWait(client_->authorizedReadEcFragment({readFor(committed), committedGrant})),
+               StatusCode::kAuthenticationFail);
+}
 
 TEST_F(TestEcService, TcpNativeRoundtripAndGuards) {
   uint64_t index = 10;

@@ -99,6 +99,22 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.reconcileEcFragment(req);
   }
 
+  CoTryTask<EcCreateRsp> authorizedCreateEcFragment(serde::CallContext &ctx, const EcAuthorizedCreateReq &req) {
+    reportUpdateQueueLatency(ctx);
+    return storageOperator_.authorizedCreateEcFragment(req);
+  }
+
+  CoTryTask<EcReadRsp> authorizedReadEcFragment(serde::CallContext &ctx, const EcAuthorizedReadReq &req) {
+    reportReadQueueLatency(ctx);
+    return storageOperator_.authorizedReadEcFragment(req);
+  }
+
+  CoTryTask<EcReconcileRsp> authorizedReconcileEcFragment(serde::CallContext &ctx,
+                                                          const EcAuthorizedReconcileReq &req) {
+    reportUpdateQueueLatency(ctx);
+    return storageOperator_.authorizedReconcileEcFragment(req);
+  }
+
   CoTryTask<OfflineTargetRsp> offlineTarget(serde::CallContext &ctx, const OfflineTargetReq &req) {
     reportDefaultQueueLatency(ctx);
     return storageOperator_.offlineTarget(req);

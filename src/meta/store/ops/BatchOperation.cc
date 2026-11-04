@@ -534,6 +534,15 @@ CoTryTask<void> BatchedOp::openExists(IReadWriteTransaction &txn,
   for (auto iter = begin; iter != end; iter++) {
     auto &waiter = iter->get();
     auto &req = waiter.req;
+    // A matching create UUID must not bypass the replicated-layout boundary.
+    // Reject only this waiter so unrelated names in the batch can proceed.
+    if (inode.isFile()) {
+      auto replicated = inode.asFile().layout.checkReplicated();
+      if (replicated.hasError()) {
+        waiter.result = makeError(std::move(replicated.error()));
+        continue;
+      }
+    }
     if (entry.uuid != Uuid::zero() && entry.uuid == req.uuid) {
       // this may happens when FDB returns commit_unknown_result, or we failed to send response to client
       XLOGF(CRITICAL, "Create already finished, dst {}, req {}, uuid {}", entry, req, req.uuid);

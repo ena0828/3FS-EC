@@ -33,6 +33,7 @@
 #include "meta/components/SessionManager.h"
 #include "meta/event/Event.h"
 #include "meta/store/DirEntry.h"
+#include "meta/store/EcNamespaceGuard.h"
 #include "meta/store/Inode.h"
 #include "meta/store/MetaStore.h"
 #include "meta/store/Operation.h"
@@ -117,6 +118,9 @@ class RemoveOp : public Operation<RemoveRsp> {
       XLOG(DBG, msg);
       co_return makeError(MetaCode::kNoPermission, msg);
     }
+    if (inode.isFile()) {
+      CO_RETURN_ON_ERROR(inode.asFile().layout.checkReplicated());
+    }
 
     auto type = std::string(magic_enum::enum_name(inode.getType()));
     folly::toLowerAscii(type);
@@ -148,6 +152,7 @@ class RemoveOp : public Operation<RemoveRsp> {
       auto result = co_await DirEntryList::checkEmpty(txn, entry.id);
       CO_RETURN_ON_ERROR(result);
       if (auto empty = *result; empty) {
+        CO_RETURN_ON_ERROR(co_await EcNamespaceGuard::checkRemove(txn, inode.id));
         XLOGF_IF(DFATAL, inode.nlink != 1, "Directory {} nlink != 1", inode);
         // remove directory directly
         CO_RETURN_ON_ERROR(co_await entry.addIntoReadConflict(txn));
@@ -165,13 +170,16 @@ class RemoveOp : public Operation<RemoveRsp> {
         co_return makeError(MetaCode::kNotEmpty);
       }
 
+      // The root is detached before asynchronous GC visits descendants. A conflict
+      // read of the subtree count prevents racing with EC creation or directory moves.
+      CO_RETURN_ON_ERROR(co_await EcNamespaceGuard::checkRemove(txn, inode.id));
+
       CO_RETURN_ON_ERROR(inode.acl.checkRecursiveRmPerm(req_.user, config().recursive_remove_check_owner()));
       auto recursiveCheck = config().recursive_remove_perm_check();
       if (recursiveCheck) {
         auto res = co_await DirEntryList::recursiveCheckRmPerm(txn, inode.id, req_.user, recursiveCheck, 128);
         CO_RETURN_ON_ERROR(res);
       }
-
       // recursive remove, save original path
       auto ancestors = std::vector<Inode>();
       CO_RETURN_ON_ERROR(co_await Inode::loadAncestors(txn, ancestors, entry.parent));

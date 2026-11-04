@@ -71,6 +71,9 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<EcReadResult> readEcFragment(const EcReadReq &req) override;
 
   CoTryTask<EcFragmentReceipt> reconcileEcFragment(const EcReconcileReq &req) override;
+  CoTryTask<EcFragmentReceipt> authorizedCreateEcFragment(const EcAuthorizedCreateReq &req) override;
+  CoTryTask<EcReadResult> authorizedReadEcFragment(const EcAuthorizedReadReq &req) override;
+  CoTryTask<EcFragmentReceipt> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) override;
 
   CoTryTask<OfflineTargetRsp> offlineTarget(NodeId nodeId, const OfflineTargetReq &req) override;
 
@@ -81,6 +84,13 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<ChunkMetaVector> getAllChunkMetadata(const ChainId &chainId, const TargetId &targetId) override;
 
  private:
+  template <typename WireReq>
+  CoTryTask<EcFragmentReceipt> createEcFragmentImpl(const WireReq &request);
+  template <typename WireReq>
+  CoTryTask<EcReadResult> readEcFragmentImpl(const WireReq &request);
+  template <typename WireReq>
+  CoTryTask<EcFragmentReceipt> reconcileEcFragmentImpl(const WireReq &request);
+
   CoTryTask<void> batchReadWithRetry(ClientRequestContext &requestCtx,
                                      const std::vector<ReadIO *> &readIOs,
                                      const flat::UserInfo &userInfo,

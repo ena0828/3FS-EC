@@ -73,6 +73,7 @@ struct Components {
   Result<Void> stopAndJoin(CPUExecutorGroup &executor);
   Result<Void> stopMgmtdClient();
   const flat::AppInfo &getAppInfo() const { return appInfo; }
+  const EcCapabilityKey *getEcCapabilityKey() const { return ecCapabilityKey_.get(); }
 
   Result<robin_hood::unordered_set<std::string>> getActiveClientsList();
   void triggerHeartbeatIfNeed();
@@ -93,6 +94,12 @@ struct Components {
 
  protected:
   void updateHeartbeatPayload(const TargetMap &map, bool offline = false);
+
+ private:
+  friend class StorageOperator;
+  Result<Void> loadEcCapabilityKey();
+  // Initialized before workers start and kept alive until all borrowed jobs drain.
+  std::unique_ptr<EcCapabilityKey> ecCapabilityKey_;
 
  public:
   ConstructLog<"storage::Components"> constructLog_;

@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::ec_codec::{ec_codec_contribute, ec_codec_encode, ec_codec_recover, ec_codec_verify};
 use crate::*;
 pub use ::cxx::CxxString;
 
@@ -238,7 +239,7 @@ impl Engine {
 
         // Keep this exact allocation referenced until the complete read and
         // checksum validation finish, even if the key's cache entry changes.
-        let chunk = match self.get(chunk_id) {
+        let chunk = match self.get_immutable(chunk_id) {
             Ok(Some(chunk)) => chunk,
             Ok(None) => return immutable_read_error(4001, "immutable chunk not found"),
             Err(error) => return immutable_read_error(4002, error.to_string()),
@@ -531,6 +532,57 @@ impl RawChunks {
 
 #[::cxx::bridge(namespace = "hf3fs::chunk_engine")]
 pub mod ffi {
+    #[derive(Clone, Copy, Debug)]
+    struct EcCodecFormat {
+        codec_id: u16,
+        matrix_version: u16,
+        data_shards: u16,
+        parity_shards: u16,
+        field_polynomial: u16,
+    }
+
+    #[derive(Clone, Copy)]
+    struct EcCodecInput<'a> {
+        index: u16,
+        data: &'a [u8],
+    }
+
+    struct EcCodecShard {
+        index: u16,
+        data: Vec<u8>,
+    }
+
+    // Failure always has an empty output. These arithmetic results are neither
+    // authenticated fragment identities nor durable seal acknowledgements.
+    struct EcCodecResult {
+        error_code: u16,
+        error: String,
+        shards: Vec<EcCodecShard>,
+    }
+
+    extern "Rust" {
+        fn ec_codec_encode(format: &EcCodecFormat, data: &[u8], shard_bytes: u32) -> EcCodecResult;
+        fn ec_codec_verify(
+            format: &EcCodecFormat,
+            shards: &[EcCodecInput],
+            logical_length: u64,
+            shard_bytes: u32,
+        ) -> EcCodecResult;
+        fn ec_codec_recover(
+            format: &EcCodecFormat,
+            shards: &[EcCodecInput],
+            logical_length: u64,
+            shard_bytes: u32,
+        ) -> EcCodecResult;
+        fn ec_codec_contribute(
+            format: &EcCodecFormat,
+            healthy: &[u16],
+            targets: &[u16],
+            helper: u16,
+            data: &[u8],
+        ) -> EcCodecResult;
+    }
+
     #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
     struct UpdateReq {
         without_checksum: bool,
@@ -928,6 +980,170 @@ mod tests {
     }
 
     #[test]
+    fn test_read_immutable_raw_committed_metadata_without_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        };
+        let key = b"ec-committed-without-confirmation";
+        let tag = b"same-allocation-and-operation";
+        let data: Vec<_> = (0..4097).map(|i| (i * 29 + 7) as u8).collect();
+        let checksum = crc32c::crc32c(&data);
+        let (owned, accounted) = {
+            let engine = Engine::open(&config).unwrap();
+            let mut request = UpdateReq {
+                data: data.as_ptr() as u64,
+                length: data.len() as u32,
+                checksum,
+                create_new: true,
+                desired_tag: tag,
+                ..Default::default()
+            };
+            let pending = engine.update_chunk(key, &mut request).unwrap();
+            let mut committed = pending.chunk.clone();
+            committed.set_committed();
+            let meta = committed.meta().clone();
+            let clusters = &engine.allocators.select_by_pos(meta.pos).unwrap().clusters;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(clusters.path.join(format!("{:02X}", meta.pos.cluster())))
+                .unwrap()
+                .sync_data()
+                .unwrap();
+            // Real final metadata commit, followed by the exact caller state
+            // left when its confirmation is lost: no cache insertion and no
+            // WritingChunk::commit_succ. This constructs that post-state; it
+            // does not inject an actual RocksDB error or simulate power loss.
+            engine.meta_store.add_chunk(key, &meta, true).unwrap();
+            drop(committed);
+            drop(pending);
+            assert!(engine
+                .meta_cache
+                .entry_by_ref(key.as_slice())
+                .get()
+                .is_none());
+            assert_eq!(engine.meta_store.get_chunk_meta(key).unwrap(), Some(meta));
+            let pending = engine.query_uncommitted_chunks(b"ec").unwrap();
+            assert_eq!(pending.len(), 1);
+            let before = engine.used_size();
+            assert_eq!(before.position_count, 1);
+            assert_eq!(before.position_rc, 1);
+            let accounted = engine.meta_store.query_used_size(b"ec").unwrap();
+
+            // Exercise the actual owned CXX implementation before reconcile.
+            // The old lookup asserts first_ref with an already held position.
+            // Do not catch this panic: the pre-fix run belongs in its own process.
+            let read = engine.read_immutable_raw_chunk(key, data.len() as u32, checksum, tag);
+            assert_eq!(read.error_code, 0, "{}", read.error);
+            assert_eq!(read.data, data);
+            let after = engine.used_size();
+            assert_eq!(after.allocated_size, before.allocated_size);
+            assert_eq!(after.reserved_size, before.reserved_size);
+            assert_eq!(after.position_count, before.position_count);
+            assert_eq!(after.position_rc, before.position_rc + 1);
+            for _ in 0..3 {
+                let confirmed =
+                    engine.reconcile_immutable_raw_chunk(key, data.len() as u32, checksum, tag);
+                assert_eq!(confirmed.error_code, 0, "{}", confirmed.error);
+                assert_eq!(confirmed.meta, read.meta);
+                assert_eq!(confirmed.etag, tag);
+                let repeated =
+                    engine.read_immutable_raw_chunk(key, data.len() as u32, checksum, tag);
+                assert_eq!(repeated.error_code, 0, "{}", repeated.error);
+                assert_eq!(repeated.data, data);
+                assert_eq!(engine.used_size(), after);
+                assert_eq!(engine.meta_store.query_used_size(b"ec").unwrap(), accounted);
+                assert_eq!(engine.query_uncommitted_chunks(b"ec").unwrap(), pending);
+            }
+            (read, accounted)
+        };
+        config.create = false;
+        let reopened = Engine::open(&config).unwrap();
+        assert!(reopened.query_uncommitted_chunks(b"ec").unwrap().is_empty());
+        let read = reopened.read_immutable_raw_chunk(key, data.len() as u32, checksum, tag);
+        assert_eq!(read.error_code, 0, "{}", read.error);
+        assert_eq!(read.meta, owned.meta);
+        assert_eq!(read.data, owned.data);
+        assert_eq!(
+            reopened.meta_store.query_used_size(b"ec").unwrap(),
+            accounted
+        );
+    }
+
+    #[test]
+    fn test_read_immutable_raw_cache_cannot_override_actual_metadata() {
+        use derse::Serialize;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&EngineConfig {
+            path: dir.path().into(),
+            create: true,
+            prefix_len: 2,
+        })
+        .unwrap();
+        let key = b"ec-actual-read-metadata";
+        let data = b"cache visibility is not committed metadata";
+        let tag = b"actual-metadata-operation";
+        let checksum = crc32c::crc32c(data);
+        let original = engine
+            .create_immutable_with_context(
+                key,
+                data,
+                checksum,
+                true,
+                &ImmutableCreateContext {
+                    desired_etag: tag,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let write_meta = |meta: &ChunkMeta| {
+            let bytes: derse::DownwardBytes = meta.serialize().unwrap();
+            let mut batch = RocksDB::new_write_batch();
+            batch.put(MetaKey::chunk_meta_key(key), bytes.as_slice());
+            engine.meta_store.write(batch, true).unwrap();
+        };
+
+        let mut absent = RocksDB::new_write_batch();
+        absent.delete(MetaKey::chunk_meta_key(key));
+        engine.meta_store.write(absent, true).unwrap();
+        assert_read_error(
+            engine.read_immutable_raw_chunk(key, data.len() as u32, checksum, tag),
+            4001,
+        );
+        let mut corrupt = RocksDB::new_write_batch();
+        corrupt.put(MetaKey::chunk_meta_key(key), [0xff]);
+        engine.meta_store.write(corrupt, true).unwrap();
+        assert_read_error(
+            engine.read_immutable_raw_chunk(key, data.len() as u32, checksum, tag),
+            4002,
+        );
+        let mut different = original.meta().clone();
+        different.chain_ver += 1;
+        write_meta(&different);
+        assert_read_error(
+            engine.read_immutable_raw_chunk(key, data.len() as u32, checksum, tag),
+            4002,
+        );
+        assert_eq!(
+            engine
+                .meta_cache
+                .entry_by_ref(key.as_slice())
+                .get()
+                .as_ref()
+                .unwrap()
+                .meta(),
+            original.meta()
+        );
+        write_meta(original.meta());
+        let read = engine.read_immutable_raw_chunk(key, data.len() as u32, checksum, tag);
+        assert_eq!(read.error_code, 0, "{}", read.error);
+        assert_eq!(read.data, data);
+    }
+
+    #[test]
     fn test_read_immutable_raw_roundtrip_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = EngineConfig {
@@ -1098,6 +1314,7 @@ mod tests {
 
     #[test]
     fn test_read_immutable_raw_rejects_uncommitted_metadata() {
+        use derse::Serialize;
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&EngineConfig {
             path: dir.path().into(),
@@ -1125,8 +1342,12 @@ mod tests {
             ..Default::default()
         });
         assert!(unsealed.meta().uncommitted);
-        // Inject a visible uncommitted cache entry to test the guard directly.
-        // Ordinary writing-list entries are not returned by Engine::get.
+        // Persist the same uncommitted record as the cache entry. A cache-only
+        // discrepancy is rejected by lookup before the explicit sealed guard.
+        let bytes: derse::DownwardBytes = unsealed.meta().serialize().unwrap();
+        let mut batch = RocksDB::new_write_batch();
+        batch.put(MetaKey::chunk_meta_key(key), bytes.as_slice());
+        engine.meta_store.write(batch, true).unwrap();
         engine
             .meta_cache
             .entry_by_ref(key.as_slice())

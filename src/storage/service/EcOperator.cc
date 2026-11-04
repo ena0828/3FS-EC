@@ -1,3 +1,4 @@
+#include <chrono>
 #include <folly/ScopeGuard.h>
 
 #include "common/monitor/Recorder.h"
@@ -9,7 +10,82 @@ namespace {
 monitor::OperationRecorder ecCreateRecorder{"storage.ec_create_fragment"};
 monitor::OperationRecorder ecReadRecorder{"storage.ec_read_fragment"};
 monitor::OperationRecorder ecReconcileRecorder{"storage.ec_reconcile_fragment"};
+
+template <typename Request>
+EcGrantBinding grantBinding(const Request &request, const EcCapability &grant, NodeId localNode) {
+  EcGrantBinding expected;
+  expected.identity = request.identity;
+  expected.fragmentOperationId = request.operationId;
+  expected.chainId = request.vChainId.chainId;
+  expected.targetId = request.targetId;
+  expected.nodeId = localNode;
+  if constexpr (std::is_same_v<Request, EcCreateReq>) {
+    expected.expectedLength = static_cast<uint32_t>(request.payload.data.size());
+  } else {
+    expected.expectedLength = request.expectedLength;
+  }
+  expected.expectedCrc32c = ~request.checksum.value;
+  // These are signed bearer-scope claims, not authenticated request.userInfo.
+  expected.ownerUid = grant.claims.ownerUid;
+  expected.clientUuid = grant.claims.clientUuid;
+  expected.scopeObject = request.identity.object;
+  expected.scopeKind = grant.claims.scopeKind;
+  expected.scopeId = grant.claims.scopeId;
+  return expected;
+}
 }  // namespace
+
+Result<Void> StorageOperator::validateUnsafeEcAccess() const {
+  if (!config_.allow_unsafe_ec_fragment_rpc_for_testing()) {
+    return makeError(StatusCode::kAuthenticationFail, "uncredentialed EC fragment RPC is disabled");
+  }
+  return Void{};
+}
+
+StorageOperator::EcValidation StorageOperator::ecAuthorization(const EcCapability &grant,
+                                                               EcGrantBinding expected,
+                                                               EcGrantRight right) const {
+  return [this, &grant, expected = std::move(expected), right]() -> Result<Void> {
+    const auto *key = components_.getEcCapabilityKey();
+    if (!key) return makeError(StatusCode::kAuthenticationFail, "EC capability verification key is not configured");
+    if (right != EcGrantRight::Read && expected.scopeKind != EcGrantScope::WriteOperation) {
+      return makeError(StatusCode::kAuthenticationFail, "EC durable operations require a write-operation grant");
+    }
+    return verifyEcGrant(*key, grant, expected, right, ecAuthorizationNow_(), kEcGrantMaxTtlSeconds);
+  };
+}
+
+CoTryTask<EcCreateRsp> StorageOperator::createEcFragment(const EcCreateReq &req) {
+  return createEcFragmentImpl(req, [this] { return validateUnsafeEcAccess(); });
+}
+
+CoTryTask<EcReadRsp> StorageOperator::readEcFragment(const EcReadReq &req) {
+  return readEcFragmentImpl(req, [this] { return validateUnsafeEcAccess(); });
+}
+
+CoTryTask<EcReconcileRsp> StorageOperator::reconcileEcFragment(const EcReconcileReq &req) {
+  return reconcileEcFragmentImpl(req, [this] { return validateUnsafeEcAccess(); });
+}
+
+CoTryTask<EcCreateRsp> StorageOperator::authorizedCreateEcFragment(const EcAuthorizedCreateReq &req) {
+  return createEcFragmentImpl(req.request,
+                              ecAuthorization(req.grant,
+                                              grantBinding(req.request, req.grant, components_.appInfo.nodeId),
+                                              EcGrantRight::Create));
+}
+
+CoTryTask<EcReadRsp> StorageOperator::authorizedReadEcFragment(const EcAuthorizedReadReq &req) {
+  return readEcFragmentImpl(
+      req.request,
+      ecAuthorization(req.grant, grantBinding(req.request, req.grant, components_.appInfo.nodeId), EcGrantRight::Read));
+}
+
+CoTryTask<EcReconcileRsp> StorageOperator::authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) {
+  return reconcileEcFragmentImpl(req.request,
+                                 ecAuthorization(req.grant,
+                                                 grantBinding(req.request, req.grant, components_.appInfo.nodeId),
+                                                 EcGrantRight::Reconcile));
+}
 
 Result<TargetPtr> StorageOperator::ecTarget(VersionedChainId chain, TargetId targetId, bool writing) const {
   if (!config_.enable_ec_fragments()) {
@@ -58,13 +134,25 @@ CoTryTask<EcCreateTargetRsp> StorageOperator::createEcTarget(const EcCreateTarge
   co_return rsp;
 }
 
-CoTryTask<EcCreateRsp> StorageOperator::createEcFragment(const EcCreateReq &req) {
+CoTryTask<EcCreateRsp> StorageOperator::createEcFragmentImpl(const EcCreateReq &req, EcValidation authorization) {
   auto record = ecCreateRecorder.record();
   EcCreateRsp rsp;
   rsp.tag = req.tag;
+  auto authorized = authorization();
+  if (!authorized) {
+    rsp.result = makeError(authorized.error());
+    co_return rsp;
+  }
   auto valid = req.validate();
   if (!valid) {
     rsp.result = makeError(valid.error());
+    co_return rsp;
+  }
+  const auto checksum = ChecksumInfo::create(ChecksumType::CRC32C,
+                                             reinterpret_cast<const uint8_t *>(req.payload.data.data()),
+                                             req.payload.data.size());
+  if (checksum != req.checksum) {
+    rsp.result = makeError(StorageCode::kChecksumMismatch, "EC creation payload differs from its checksum");
     co_return rsp;
   }
   auto targetResult = ecTarget(req.vChainId, req.targetId, true);
@@ -89,7 +177,10 @@ CoTryTask<EcCreateRsp> StorageOperator::createEcFragment(const EcCreateReq &req)
   auto lock = target->storageTarget->lockChunk(baton, *key, fmt::to_string(req.tag));
   if (!lock.locked()) co_await lock.lock();
 
-  auto validateRoute = [this, target] { return validateEcTarget(target, true); };
+  auto validateRoute = [this, target, &authorization]() -> Result<Void> {
+    RETURN_ON_ERROR(authorization());
+    return validateEcTarget(target, true);
+  };
   auto route = validateRoute();
   if (!route) {
     rsp.result = makeError(route.error());
@@ -104,19 +195,24 @@ CoTryTask<EcCreateRsp> StorageOperator::createEcFragment(const EcCreateReq &req)
   if (rsp.result) {
     route = validateRoute();
     if (!route) {
-      rsp.result =
-          makeError(StorageCode::kEcSealOutcomeUnknown,
-                    fmt::format("fragment committed but routing changed: {}; retain allocation", route.error()));
+      rsp.result = makeError(
+          StorageCode::kEcSealOutcomeUnknown,
+          fmt::format("fragment committed but final access validation failed: {}; retain allocation", route.error()));
     }
   }
   record.report(rsp.result.hasValue());
   co_return rsp;
 }
 
-CoTryTask<EcReadRsp> StorageOperator::readEcFragment(const EcReadReq &req) {
+CoTryTask<EcReadRsp> StorageOperator::readEcFragmentImpl(const EcReadReq &req, EcValidation authorization) {
   auto record = ecReadRecorder.record();
   EcReadRsp rsp;
   rsp.tag = req.tag;
+  auto authorized = authorization();
+  if (!authorized) {
+    rsp.result = makeError(authorized.error());
+    co_return rsp;
+  }
   auto valid = req.validate();
   if (!valid) {
     rsp.result = makeError(valid.error());
@@ -133,7 +229,10 @@ CoTryTask<EcReadRsp> StorageOperator::readEcFragment(const EcReadReq &req) {
   }
   auto admission = folly::makeGuard([this] { ecFragmentSemaphore_.signal(); });
   auto target = std::move(*targetResult);
-  auto validateRoute = [this, target] { return validateEcTarget(target, false); };
+  auto validateRoute = [this, target, &authorization]() -> Result<Void> {
+    RETURN_ON_ERROR(authorization());
+    return validateEcTarget(target, false);
+  };
   EcReadJob job(req, target->storageTarget, validateRoute);
   co_await updateWorker_.enqueue(&job);
   co_await job.complete();
@@ -146,10 +245,16 @@ CoTryTask<EcReadRsp> StorageOperator::readEcFragment(const EcReadReq &req) {
   co_return rsp;
 }
 
-CoTryTask<EcReconcileRsp> StorageOperator::reconcileEcFragment(const EcReconcileReq &req) {
+CoTryTask<EcReconcileRsp> StorageOperator::reconcileEcFragmentImpl(const EcReconcileReq &req,
+                                                                   EcValidation authorization) {
   auto record = ecReconcileRecorder.record();
   EcReconcileRsp rsp;
   rsp.tag = req.tag;
+  auto authorized = authorization();
+  if (!authorized) {
+    rsp.result = makeError(authorized.error());
+    co_return rsp;
+  }
   auto valid = req.validate();
   if (!valid) {
     rsp.result = makeError(valid.error());
@@ -176,7 +281,10 @@ CoTryTask<EcReconcileRsp> StorageOperator::reconcileEcFragment(const EcReconcile
   folly::coro::Baton baton;
   auto lock = target->storageTarget->lockChunk(baton, *key, fmt::to_string(req.tag));
   if (!lock.locked()) co_await lock.lock();
-  auto validateRoute = [this, target] { return validateEcTarget(target, false); };
+  auto validateRoute = [this, target, &authorization]() -> Result<Void> {
+    RETURN_ON_ERROR(authorization());
+    return validateEcTarget(target, false);
+  };
   auto route = validateRoute();
   if (!route) {
     rsp.result = makeError(route.error());
@@ -189,9 +297,9 @@ CoTryTask<EcReconcileRsp> StorageOperator::reconcileEcFragment(const EcReconcile
   if (rsp.result) {
     route = validateRoute();
     if (!route) {
-      rsp.result =
-          makeError(StorageCode::kEcSealOutcomeUnknown,
-                    fmt::format("fragment reconciled but routing changed: {}; retain allocation", route.error()));
+      rsp.result = makeError(
+          StorageCode::kEcSealOutcomeUnknown,
+          fmt::format("fragment reconciled but final access validation failed: {}; retain allocation", route.error()));
     }
   }
   record.report(rsp.result.hasValue());

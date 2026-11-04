@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <folly/concurrency/ConcurrentHashMap.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <functional>
 
 #include "analytics/StructuredTraceLog.h"
 #include "client/mgmtd/IMgmtdClientForServer.h"
@@ -17,6 +19,7 @@
 #include "common/utils/LockManager.h"
 #include "common/utils/Semaphore.h"
 #include "fbs/storage/Ec.h"
+#include "fbs/storage/EcAuthorized.h"
 #include "storage/aio/AioReadWorker.h"
 #include "storage/service/BufferPool.h"
 #include "storage/service/ReliableForwarding.h"
@@ -43,6 +46,8 @@ class StorageOperator {
     CONFIG_HOT_UPDATED_ITEM(rdma_transmission_req_timeout, 0_ms);
     CONFIG_HOT_UPDATED_ITEM(apply_transmission_before_getting_semaphore, true);
     CONFIG_ITEM(enable_ec_fragments, false);
+    CONFIG_ITEM(allow_unsafe_ec_fragment_rpc_for_testing, false);
+    CONFIG_ITEM(ec_capability_key_file, Path{});
     CONFIG_ITEM(max_concurrent_ec_requests, 8u, [](auto value) { return value > 0 && value <= 64; });
   };
 
@@ -96,6 +101,9 @@ class StorageOperator {
   CoTryTask<EcCreateRsp> createEcFragment(const EcCreateReq &req);
   CoTryTask<EcReadRsp> readEcFragment(const EcReadReq &req);
   CoTryTask<EcReconcileRsp> reconcileEcFragment(const EcReconcileReq &req);
+  CoTryTask<EcCreateRsp> authorizedCreateEcFragment(const EcAuthorizedCreateReq &req);
+  CoTryTask<EcReadRsp> authorizedReadEcFragment(const EcAuthorizedReadReq &req);
+  CoTryTask<EcReconcileRsp> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req);
 
   CoTryTask<OfflineTargetRsp> offlineTarget(const OfflineTargetReq &req);
 
@@ -153,9 +161,20 @@ class StorageOperator {
 
  private:
   friend class ReliableUpdate;
+  friend class StorageEcAuthorizationTestAccess;
 
   Result<TargetPtr> ecTarget(VersionedChainId chain, TargetId targetId, bool writing) const;
   Result<Void> validateEcTarget(const TargetPtr &expected, bool writing) const;
+  using EcValidation = std::function<Result<Void>()>;
+  Result<Void> validateUnsafeEcAccess() const;
+  EcValidation ecAuthorization(const EcCapability &grant, EcGrantBinding expected, EcGrantRight right) const;
+  CoTryTask<EcCreateRsp> createEcFragmentImpl(const EcCreateReq &req, EcValidation authorization);
+  CoTryTask<EcReadRsp> readEcFragmentImpl(const EcReadReq &req, EcValidation authorization);
+  CoTryTask<EcReconcileRsp> reconcileEcFragmentImpl(const EcReconcileReq &req, EcValidation authorization);
+  std::function<uint64_t()> ecAuthorizationNow_ = [] {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  };
 
   ConstructLog<"storage::StorageOperator"> constructLog_;
   const Config &config_;

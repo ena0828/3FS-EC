@@ -10,6 +10,7 @@
 #include "common/utils/Result.h"
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
+#include "fbs/storage/EcAuthorized.h"
 
 namespace hf3fs::storage::client {
 
@@ -90,6 +91,19 @@ class StorageMessenger {
                                                 const EcReconcileReq &request,
                                                 const net::UserRequestOptions *options = nullptr,
                                                 serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcCreateRsp> authorizedCreateEcFragment(const net::Address &address,
+                                                    const EcAuthorizedCreateReq &request,
+                                                    const net::UserRequestOptions *options = nullptr,
+                                                    serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcReadRsp> authorizedReadEcFragment(const net::Address &address,
+                                                const EcAuthorizedReadReq &request,
+                                                const net::UserRequestOptions *options = nullptr,
+                                                serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcReconcileRsp> authorizedReconcileEcFragment(const net::Address &address,
+                                                          const EcAuthorizedReconcileReq &request,
+                                                          const net::UserRequestOptions *options = nullptr,
+                                                          serde::Timestamp *timestamp = nullptr);
 
   CoTryTask<OfflineTargetRsp> offlineTarget(const hf3fs::net::Address &address,
                                             const OfflineTargetReq &request,

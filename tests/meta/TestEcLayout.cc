@@ -140,6 +140,57 @@ TEST(TestEcLayout, DescriptorValidationAndLegacyCreationRemainDisabled) {
 
 class TestEcLayoutGuards : public MetaTestBase<mem::MemKV> {};
 
+TEST_F(TestEcLayoutGuards, BatchedCreateRejectsEcBeforeMatchingUuidFastPath) {
+  folly::coro::blockingWait([&]() -> CoTask<void> {
+    auto cluster = this->createMockCluster();
+    auto &meta = cluster.meta().getOperator();
+    CreateReq original(SUPER_USER, PathAt(InodeId::root(), "ec-batch-guard"), {}, O_RDONLY, p644);
+    auto created = co_await meta.create(original);
+    CO_ASSERT_OK(created);
+    Inode inode(created->stat);
+    inode.asFile().layout = ecLayout();
+    inode.asFile().length = 2u << 20;
+    inode.asFile().dynStripe = 1;
+    const auto preserved = inode;
+    auto entry = DirEntry::newFile(InodeId::root(), "ec-batch-guard", inode.id);
+    entry.uuid = original.uuid;
+    const auto preservedEntry = serde::serialize(static_cast<const meta::DirEntry &>(entry));
+    const auto existingSession = MetaTestHelper::randomSession();
+    READ_WRITE_TRANSACTION_OK({
+      CO_ASSERT_OK(co_await inode.store(*txn));
+      CO_ASSERT_OK(co_await entry.store(*txn));
+      CO_ASSERT_OK(co_await FileSession::create(inode.id, existingSession).store(*txn));
+    });
+
+    CreateReq retry(SUPER_USER, original.path, MetaTestHelper::randomSession(), O_RDWR | O_TRUNC, p644);
+    retry.uuid = original.uuid;
+    CO_ASSERT_FALSE(retry.uuid.is_nil());
+    CO_ASSERT_EQ(retry.uuid, entry.uuid);
+    // MetaOperator::create dispatches this short name directly to runInBatch;
+    // there is no preceding tryOpen call and no race is needed to hit the UUID
+    // fast path. A different UUID also checks the ordinary batch-open branch.
+    CO_ASSERT_FALSE(retry.path.path->has_parent_path());
+    for (bool matchingUuid : {true, false}) {
+      if (!matchingUuid) retry.uuid = Uuid::random();
+      CO_ASSERT_ERROR(co_await meta.create(retry), StatusCode::kNotImplemented);
+      READ_ONLY_TRANSACTION({
+        auto current = co_await Inode::snapshotLoad(*txn, inode.id);
+        CO_ASSERT_OK(current);
+        CO_ASSERT_TRUE(current->has_value());
+        CO_ASSERT_EQ(**current, preserved);
+        auto currentEntry = co_await DirEntry::snapshotLoad(*txn, entry.parent, entry.name);
+        CO_ASSERT_OK(currentEntry);
+        CO_ASSERT_TRUE(currentEntry->has_value());
+        CO_ASSERT_EQ(serde::serialize(static_cast<const meta::DirEntry &>(**currentEntry)), preservedEntry);
+        auto sessions = co_await FileSession::list(*txn, inode.id, false);
+        CO_ASSERT_OK(sessions);
+        CO_ASSERT_EQ(sessions->size(), 1);
+        CO_ASSERT_EQ(sessions->front().sessionId, existingSession.session);
+      });
+    }
+  }());
+}
+
 TEST_F(TestEcLayoutGuards, RejectsLegacyMutationsBeforeChangingInodeOrSession) {
   folly::coro::blockingWait([&]() -> CoTask<void> {
     MockCluster::Config config;
