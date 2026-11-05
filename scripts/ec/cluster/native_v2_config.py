@@ -114,7 +114,9 @@ def generate_configs(source, root, port_base, authority, cluster_id):
         launcher = load(f"{kind}_main_launcher")
         launcher["cluster_id"] = cluster_id
         launcher["ib_devices"].update(allow_no_usable_devices=True, device_filter=[])
-        put(launcher, "mgmtd_client.network_type", "TCP")
+        # Mgmtd's launcher loads FDB directly and has no mgmtd_client object.
+        if "mgmtd_client" in launcher:
+            put(launcher, "mgmtd_client.network_type", "TCP")
         configs[f"{kind}_main_launcher.toml"] = launcher
         configs[f"{kind}_main_app.toml"] = {"allow_empty_node_id": False, "node_id": node}
 
@@ -126,6 +128,12 @@ def generate_configs(source, root, port_base, authority, cluster_id):
     # the helper runtime retains its independent fixed 64-request budget.
     store["base"]["groups"][0]["processor"].update(
         max_coroutines_num=128, max_processing_requests_num=128)
+    # StorageServer installs Components.getCoroutinesPool for ingress. Its
+    # default workers retain a whole nested helper RPC until downstream joins;
+    # the processor limit above cannot enlarge that distinct custom pool.
+    # Leave ingress room beyond the helper runtime's 64 admitted requests for
+    # control RPCs and other default-pool methods in this single-node profile.
+    store["coroutines_pool_default"]["coroutines_num"] = 128
     store["speed_up_quit"] = False
     store["buffer_pool"].update(rdmabuf_count=16, rdmabuf_size="1MB", big_rdmabuf_count=4, big_rdmabuf_size="4MB")
     store["aio_read_worker"].update(num_threads=1, queue_size=128, max_events=32, min_complete=1,

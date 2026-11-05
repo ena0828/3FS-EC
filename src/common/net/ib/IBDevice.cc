@@ -50,6 +50,7 @@
 #include <variant>
 #include <vector>
 
+#include "IBDeviceList.h"
 #include "common/monitor/Recorder.h"
 #include "common/monitor/Sample.h"
 #include "common/net/EventLoop.h"
@@ -309,21 +310,14 @@ Result<std::vector<IBDevice::Ptr>> IBDevice::openAll(const IBConfig &config) {
     return makeError(RPCCode::kIBInitFailed);
   }
 
-  int deviceCnt = 0;
-  auto deviceList = ibv_get_device_list(&deviceCnt);
-  if (deviceList == nullptr) {
-    XLOGF(ERR, "Failed to load verbs device list, errno {}", errno);
-    return makeError(RPCCode::kIBInitFailed, "Failed to load verbs devices.");
-  }
-  SCOPE_EXIT { ibv_free_device_list(deviceList); };
-  if (deviceCnt <= 0) {
-    XLOGF(WARN, "No RDMA devices!!!");
-    return makeError(RPCCode::kIBInitFailed, "No usable RDMA devices.");
+  auto deviceList = detail::loadIBDeviceList(config.allow_no_usable_devices());
+  if (deviceList.hasError()) {
+    return makeError(deviceList.error());
   }
 
   std::vector<IBDevice::Ptr> devices;
-  for (int idx = 0; idx < deviceCnt; idx++) {
-    auto dev = deviceList[idx];
+  for (int idx = 0; idx < deviceList->count; idx++) {
+    auto dev = deviceList->devices.get()[idx];
     auto devId = devices.size();
     auto devName = ibv_get_device_name(dev);
 

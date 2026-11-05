@@ -1191,3 +1191,60 @@ fn test_immutable_stage_nonempty_or_unknown_files_do_not_qualify_as_new() {
         assert!(!class_path.join("01").exists());
     }
 }
+
+#[test]
+fn test_immutable_stage_disk_gate_preserves_reserved_stage_completion() {
+    let _serial = ENGINE_TEST.lock().unwrap();
+    let (_dir, config) = root();
+    let engine = ImmutableStagingEngine::open(&config, ImmutableStageLimits::default()).unwrap();
+    let bytes = data(65536, 17);
+    let requested = spec(&bytes, 11);
+    let key = b"ec-maintenance-gate";
+    let empty = engine.physical_used_size();
+    engine.set_allow_to_allocate(false);
+    assert!(matches!(
+        engine.begin(key, &requested),
+        Err(ImmutableStageError::Storage(Error::NoSpace))
+    ));
+    assert_eq!(engine.physical_used_size(), empty);
+    assert!(engine
+        .0
+        .engine
+        .meta_store
+        .stage_record(key)
+        .unwrap()
+        .is_none());
+    assert_eq!(engine.0.registry.lock().unwrap().active, 0);
+
+    engine.set_allow_to_allocate(true);
+    engine.begin(key, &requested).unwrap();
+    let reserved = engine.physical_used_size();
+    assert_eq!(reserved.position_count, empty.position_count + 1);
+    engine.set_allow_to_allocate(false);
+    // This gate forbids new physical groups, not reuse within a group. The
+    // Storage target's rejectCreateChunk check separately rejects new Begin.
+    let second = spec(&bytes, 12);
+    engine.begin(b"ec-maintenance-reuse", &second).unwrap();
+    assert_eq!(
+        engine.physical_used_size().allocated_size,
+        reserved.allocated_size
+    );
+    let position = position(&engine, key);
+    append_all(&engine, key, &requested, &bytes);
+    let sealed = engine.seal(key, &requested.stage_id).unwrap();
+    assert_eq!(sealed.pos, position);
+    assert_eq!(
+        engine
+            .read_sealed_block(key, &requested.stage_id, 0)
+            .unwrap(),
+        bytes
+    );
+    assert_eq!(
+        engine.begin(key, &requested).unwrap().state,
+        ImmutableStageState::Sealed
+    );
+    assert_eq!(
+        engine.0.engine.meta_store.query_used_size(b"ec").unwrap(),
+        position.chunk_size().0
+    );
+}

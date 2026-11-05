@@ -1505,6 +1505,47 @@ TEST_F(TestEcV2NativeHelperPlan, KeyFileAliasesAreRejectedAtCoordinatorInitializ
   metaConfig_.set_ec_v2_helper_key_file(originalHelper);
 }
 
+TEST_F(TestEcV2NativeLifecycle, StripeManagerCreateUsesConnectedIdentityBeforeValidatingCallerRequest) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor pool(2);
+  auto borrowedMeta = std::shared_ptr<meta::client::MetaClient>(metaClient_.get(), [](auto *) {});
+  auto connected =
+      blockingWait(EcStripeClient::connect(borrowedMeta, storageClient_, mgmtd_, user_, metaClientId_.uuid, pool, {}));
+  ASSERT_OK(connected);
+  auto manager = *connected;
+  SCOPE_EXIT { blockingWait(manager->close()); };
+  auto control = [] { return EcStripeControl{std::chrono::steady_clock::now() + std::chrono::seconds(30), {}}; };
+  CreateEcFileV2Req create;
+  // Default production requests have no client identity. Clear it explicitly
+  // because ReqBase can inherit a test-global client ID in this fixture.
+  create.client = ClientId{Uuid::zero()};
+  create.path = PathAt(parent_, "stripe-manager-default-create");
+  create.shardBytes = 65543;
+  ASSERT_ERROR(blockingWait(manager->createFile(create, control())), StatusCode::kInvalidArg);
+  create.uuid = Uuid::random();
+  const auto originalRequest = create.uuid;
+  auto created = blockingWait(manager->createFile(create, control()));
+  ASSERT_OK(created);
+  EXPECT_EQ(created->object.creator.uid, user_.uid);
+  EXPECT_EQ(created->object.creator.client, metaClientId_.uuid);
+  EXPECT_EQ(created->object.createRequest, originalRequest);
+
+  // A caller cannot select a different owner by filling the wire DTO. Replay
+  // still uses the same authenticated manager, original UUID and object.
+  create.client = ClientId::random();
+  create.user = flat::UserInfo{};
+  create.user.uid = flat::Uid(0);
+  auto replayed = blockingWait(manager->createFile(create, control()));
+  ASSERT_OK(replayed);
+  EXPECT_EQ(replayed->object.object, created->object.object);
+  EXPECT_EQ(replayed->object.creator.uid, created->object.creator.uid);
+  EXPECT_EQ(replayed->object.creator.client, created->object.creator.client);
+  EXPECT_EQ(replayed->object.createRequest, originalRequest);
+  blockingWait(manager->close());
+  EXPECT_EQ(manager->snapshot().activeOperations, 0);
+  EXPECT_EQ(manager->snapshot().reservedApplicationBytes, 0);
+}
+
 TEST_F(TestEcV2NativeLifecycle, StripeManagerOwnsWriteAndReadsThroughTwoMissingRoutes) {
   using namespace hf3fs::client::ec;
   folly::CPUThreadPoolExecutor pool(4);

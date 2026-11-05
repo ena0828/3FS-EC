@@ -285,6 +285,58 @@ pub(crate) fn stage_used_size(handle: &EcStageHandle, prefix: &[u8]) -> ffi::Raw
     }
 }
 
+// Disk maintenance is process-local policy, not a grant or a persistence
+// barrier. A bad/empty handle returns an error, never a fabricated snapshot.
+pub(crate) fn stage_physical_used_size(
+    handle: &EcStageHandle,
+) -> ffi::RawEcStagePhysicalSizeResult {
+    match boundary(false, || Ok(engine(handle)?.physical_used_size())) {
+        Ok(value) => ffi::RawEcStagePhysicalSizeResult {
+            status: error(0, ""),
+            value: ffi::RawUsedSize {
+                allocated_size: value.allocated_size.0,
+                reserved_size: value.reserved_size.0,
+                position_count: value.position_count,
+                position_rc: value.position_rc,
+            },
+        },
+        Err(status) => ffi::RawEcStagePhysicalSizeResult {
+            status,
+            value: ffi::RawUsedSize::default(),
+        },
+    }
+}
+
+pub(crate) fn stage_sample_metrics(handle: &EcStageHandle) -> ffi::RawEcStageMetricsResult {
+    match boundary(false, || {
+        Ok(crate::cxx::sample_metrics(
+            engine(handle)?.allocation_metrics(),
+        ))
+    }) {
+        Ok(value) => ffi::RawEcStageMetricsResult {
+            status: error(0, ""),
+            value,
+        },
+        Err(status) => ffi::RawEcStageMetricsResult {
+            status,
+            value: ffi::Metrics::default(),
+        },
+    }
+}
+
+pub(crate) fn stage_set_allow_to_allocate(
+    handle: &EcStageHandle,
+    allow: bool,
+) -> ffi::RawEcScopeStatus {
+    match boundary(false, || {
+        engine(handle)?.set_allow_to_allocate(allow);
+        Ok(())
+    }) {
+        Ok(()) => error(0, ""),
+        Err(status) => status,
+    }
+}
+
 #[cfg(test)]
 #[path = "ec_stage_bridge_tests.rs"]
 mod tests;

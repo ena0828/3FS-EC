@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <fstream>
 #include <folly/Random.h>
 #include <folly/experimental/TestUtil.h>
 #include <folly/logging/xlog.h>

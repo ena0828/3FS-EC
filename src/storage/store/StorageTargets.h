@@ -82,6 +82,12 @@ class StorageTargets {
   auto &engines() const { return engines_; }
   bool ecOnly() const { return config_.ec_only(); }
 
+  // Exact per-disk maintenance, for legacy/V1 and owned V2 staging engines.
+  // These methods cannot obtain a mutable Engine or bypass immutable writes.
+  Result<chunk_engine::RawUsedSize> physicalUsedSize(uint32_t diskIndex) const;
+  Result<chunk_engine::Metrics> sampleEngineMetrics(uint32_t diskIndex) const;
+  Result<Void> setAllowToAllocate(uint32_t diskIndex, bool allow) const;
+
   // remove target.
   Result<Void> removeChunkEngineTarget(ChainId chainId, uint32_t diskIndex) {
     if (config_.ec_only()) {

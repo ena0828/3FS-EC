@@ -38,6 +38,12 @@ class NativeV2Configuration(unittest.TestCase):
             self.assertEqual(group["listener"]["listen_port"], port)
             self.assertTrue(self.configs[f"{kind}_main_launcher.toml"]["ib_devices"]["allow_no_usable_devices"])
             to_toml(data)  # Existing generator checks the complete TOML round trip.
+        # MgmtdLauncherConfig uses FDB directly; ServerLauncherConfig (used by
+        # Meta and Storage) contains the mgmtd client. The real Mgmtd binary
+        # rejects an injected mgmtd_client section before it can start.
+        self.assertNotIn("mgmtd_client", self.configs["mgmtd_main_launcher.toml"])
+        for kind in ("meta", "storage"):
+            self.assertEqual(self.configs[f"{kind}_main_launcher.toml"]["mgmtd_client"]["network_type"], "TCP")
 
     def test_one_engine_profile_has_bounded_positive_io_resources(self):
         storage = self.configs["storage_main.toml"]["server"]
@@ -58,6 +64,10 @@ class NativeV2Configuration(unittest.TestCase):
         self.assertEqual(processor["max_coroutines_num"], 128)
         self.assertEqual(processor["max_processing_requests_num"], 128)
         self.assertGreater(processor["max_coroutines_num"], 10 * 4)
+        # Production StorageServer bypasses the processor coroutine pool with
+        # its own getter. Nested helpers retain those ingress workers as well.
+        self.assertGreater(storage["coroutines_pool_default"]["coroutines_num"], 64)
+        self.assertEqual(storage["coroutines_pool_default"]["threads_num"], 1)
         self.assertEqual(storage["storage"]["max_concurrent_ec_requests"], 16)
         for kind in ("mgmtd", "meta"):
             other = self.configs[f"{kind}_main.toml"]["server"]["base"]["groups"][0]["processor"]

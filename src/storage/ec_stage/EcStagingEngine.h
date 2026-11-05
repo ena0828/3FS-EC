@@ -54,6 +54,9 @@ class EcStagingEngine {
   Result<std::shared_ptr<EcScope>> scope() const;
   Result<EcStageResult> execute(const EcStageRequest &request) const;
   Result<uint64_t> committedSize(ChainId chain) const;
+  Result<chunk_engine::RawUsedSize> physicalUsedSize() const;
+  Result<chunk_engine::Metrics> sampleMetrics() const;
+  Result<Void> setAllowToAllocate(bool allow) const;
 
  private:
   explicit EcStagingEngine(rust::Box<chunk_engine::EcStageHandle> handle)

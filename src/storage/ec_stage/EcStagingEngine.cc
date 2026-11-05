@@ -70,6 +70,20 @@ Result<uint64_t> EcStagingEngine::committedSize(ChainId chain) const {
   return result.committed;
 }
 
+Result<chunk_engine::RawUsedSize> EcStagingEngine::physicalUsedSize() const {
+  auto result = chunk_engine::stage_physical_used_size(*handle_);
+  RETURN_ON_ERROR(check(result.status));
+  return result.value;
+}
+Result<chunk_engine::Metrics> EcStagingEngine::sampleMetrics() const {
+  auto result = chunk_engine::stage_sample_metrics(*handle_);
+  RETURN_ON_ERROR(check(result.status));
+  return result.value;
+}
+Result<Void> EcStagingEngine::setAllowToAllocate(bool allow) const {
+  return check(chunk_engine::stage_set_allow_to_allocate(*handle_, allow));
+}
+
 Result<EcStageResult> EcStagingEngine::execute(const EcStageRequest &request) const {
   RETURN_ON_ERROR(request.validate());
   CHECK_RESULT(id, request.identity.chunkId());

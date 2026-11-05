@@ -249,6 +249,10 @@ class TestEcStageService : public ::testing::Test {
       pool->set_coroutines_num(2);
       pool->set_queue_size(8);
     }
+    // StorageServer installs Components::getCoroutinesPool independently of
+    // group.processor.max_coroutines_num. Colocated ten-hop helpers retain a
+    // pool slot while awaiting downstream; exercise that exact dispatch path.
+    if (config_.storage().enable_ec_helpers()) config_.coroutines_pool_default().set_coroutines_num(128);
     smallClient(config_.forward_client());
     smallClient(config_.client());
     components_ = std::make_unique<Components>(config_);
@@ -280,6 +284,7 @@ class TestEcStageService : public ::testing::Test {
         std::make_unique<StageReplyDropStorageService>(components_->storageOperator, replyDrop_),
         true));
     ASSERT_OK(server_->setup());
+    ASSERT_NO_FATAL_FAILURE(startProductionHelperDispatch());
     flat::AppInfo app;
     app.nodeId = nodeId_;
     ASSERT_OK(server_->start(app));
@@ -361,6 +366,13 @@ class TestEcStageService : public ::testing::Test {
     if (messenger_) messenger_->stopAndJoin();
     // Drain real RPC handlers before stopping their borrowed disk jobs.
     if (server_) server_->stopAndJoin();
+    // The network has joined every request, including queued handlers. Only
+    // then stop its custom dispatch pool, before destroying borrowed targets.
+    if (components_ && helperDispatchStarted_) {
+      auto stoppedPool = components_->defaultPool.stopAndJoin();
+      EXPECT_TRUE(stoppedPool) << stoppedPool.error().describe();
+      helperDispatchStarted_ = false;
+    }
     if (components_ && operatorInitialized_) {
       auto stopped = components_->storageOperator.stopAndJoin();
       EXPECT_TRUE(stopped) << stopped.error().describe();
@@ -385,6 +397,29 @@ class TestEcStageService : public ::testing::Test {
       EXPECT_TRUE(cleared) << cleared.error().describe();
       components_.reset();
     }
+  }
+
+  void startProductionHelperDispatch() {
+    if (!config_.storage().enable_ec_helpers()) return;
+    ASSERT_FALSE(helperDispatchStarted_);
+    ASSERT_EQ(config_.coroutines_pool_default().coroutines_num(), 128);
+    ASSERT_OK(components_->defaultPool.start());
+    helperDispatchStarted_ = true;
+    size_t selected = 0;
+    for (auto &group : server_->groups()) {
+      if (!group->serviceNameList().contains("StorageSerde")) continue;
+      ++selected;
+      group->setCoroutinesPoolGetter([this](const serde::MessagePacket<> &packet) -> DynamicCoroutinesPool & {
+        if (packet.serviceId == StorageSerde<>::kServiceID) {
+          if (packet.methodId == StorageSerde<>::executeEcHelperMethodId) ++helperDispatches_;
+          // This is the production Components routing function, not a
+          // test-only decision duplicating its method classification.
+          return components_->getCoroutinesPool(packet.methodId);
+        }
+        return components_->defaultPool;
+      });
+    }
+    ASSERT_EQ(selected, 1);
   }
 
   void publishRouting(bool multipleMembers) {
@@ -490,6 +525,8 @@ class TestEcStageService : public ::testing::Test {
   CPUExecutorGroup loader_{1, "EcRpcDisk"};
   std::unique_ptr<Components> components_;
   bool operatorInitialized_ = false;
+  bool helperDispatchStarted_ = false;
+  std::atomic<size_t> helperDispatches_{0};
   StageReplyDropState replyDrop_;
   net::Server::Config serverConfig_;
   std::unique_ptr<net::Server> server_;
@@ -842,6 +879,9 @@ class TestEcNativeRepairService : public TestEcStageService {
     // Call only after all RPCs have completed; no live target lease is retained.
     server_->stopAndJoin();
     server_.reset();
+    ASSERT_TRUE(helperDispatchStarted_);
+    ASSERT_OK(components_->defaultPool.stopAndJoin());
+    helperDispatchStarted_ = false;
     ASSERT_OK(components_->storageOperator.stopAndJoin());
     operatorInitialized_ = false;
     {
@@ -866,6 +906,7 @@ class TestEcNativeRepairService : public TestEcStageService {
         std::make_unique<StageReplyDropStorageService>(components_->storageOperator, replyDrop_),
         true));
     ASSERT_OK(server_->setup());
+    ASSERT_NO_FATAL_FAILURE(startProductionHelperDispatch());
     flat::AppInfo app;
     app.nodeId = nodeId_;
     ASSERT_OK(server_->start(app));
@@ -1039,6 +1080,8 @@ TEST_F(TestEcNativeRepairService, ThreeNativeStrategiesRepairSingleAndDoubleTarg
   }
   std::lock_guard lock(replyDrop_.mutex);
   for (auto count : replyDrop_.helperHopCalls) EXPECT_EQ(count, 4);  // Two blocks, two erasure scenarios.
+  EXPECT_EQ(helperDispatches_.load(), 40);  // Every nested TCP hop used the production pool getter.
+  RecordProperty("helper_rpc_dispatch", "Components::getCoroutinesPool, started defaultPool128, real TCP hops");
 }
 
 TEST_F(TestEcNativeRepairService, ThreeStrategiesResumeOriginalPartialStagesAfterEngineReopen) {

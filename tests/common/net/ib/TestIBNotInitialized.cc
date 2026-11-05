@@ -38,6 +38,12 @@ TEST_F(TestIBNotInitialized, Basic) {
   ASSERT_TRUE(IBDevice::all().empty());
 }
 
+TEST_F(TestIBNotInitialized, MissingDeviceLookupReturnsNull) {
+  ASSERT_TRUE(IBDevice::all().empty());
+  EXPECT_EQ(IBDevice::get(0), nullptr);
+  EXPECT_EQ(IBDevice::get(255), nullptr);
+}
+
 class EchoServiceImpl : public serde::ServiceWrapper<EchoServiceImpl, Echo> {
  public:
   CoTryTask<EchoRsp> echo(serde::CallContext &ctx, const EchoReq &req) {

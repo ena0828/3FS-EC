@@ -128,6 +128,40 @@ impl WritingChunk {
     }
 }
 
+pub(crate) fn sample_metrics(metrics: &crate::Metrics) -> ffi::Metrics {
+    let copy_on_write_times = metrics.copy_on_write_times.swap(0, Ordering::AcqRel);
+    let copy_on_write_latency = metrics.copy_on_write_latency.swap(0, Ordering::AcqRel);
+    let copy_on_write_read_times = metrics.copy_on_write_read_times.swap(0, Ordering::AcqRel);
+    let copy_on_write_read_latency = metrics.copy_on_write_read_latency.swap(0, Ordering::AcqRel);
+    let allocate_total_latency = metrics.allocate_latency.swap(0, Ordering::AcqRel);
+    let allocate_total_times = metrics.allocate_times.swap(0, Ordering::AcqRel);
+    let pwrite_total_latency = metrics.pwrite_latency.swap(0, Ordering::AcqRel);
+    let pwrite_total_times = metrics.pwrite_times.swap(0, Ordering::AcqRel);
+    ffi::Metrics {
+        copy_on_write_times,
+        copy_on_write_latency: copy_on_write_latency / std::cmp::max(1, copy_on_write_times),
+        copy_on_write_read_bytes: metrics.copy_on_write_read_bytes.swap(0, Ordering::AcqRel),
+        copy_on_write_read_times,
+        copy_on_write_read_latency: copy_on_write_read_latency
+            / std::cmp::max(1, copy_on_write_read_times),
+        checksum_reuse: metrics.checksum_reuse.swap(0, Ordering::AcqRel),
+        checksum_combine: metrics.checksum_combine.swap(0, Ordering::AcqRel),
+        checksum_recalculate: metrics.checksum_recalculate.swap(0, Ordering::AcqRel),
+        safe_write_direct_append: metrics.safe_write_direct_append.swap(0, Ordering::AcqRel),
+        safe_write_indirect_append: metrics.safe_write_indirect_append.swap(0, Ordering::AcqRel),
+        safe_write_truncate_shorten: metrics
+            .safe_write_truncate_shorten
+            .swap(0, Ordering::AcqRel),
+        safe_write_truncate_extend: metrics.safe_write_truncate_extend.swap(0, Ordering::AcqRel),
+        safe_write_read_tail_times: metrics.safe_write_read_tail_times.swap(0, Ordering::AcqRel),
+        safe_write_read_tail_bytes: metrics.safe_write_read_tail_bytes.swap(0, Ordering::AcqRel),
+        allocate_latency: allocate_total_latency / std::cmp::max(1, allocate_total_times),
+        allocate_times: allocate_total_times,
+        pwrite_latency: pwrite_total_latency / std::cmp::max(1, pwrite_total_times),
+        pwrite_times: pwrite_total_times,
+    }
+}
+
 impl Engine {
     fn raw_used_size(&self) -> ffi::RawUsedSize {
         unsafe { std::mem::transmute(self.used_size()) }
@@ -432,47 +466,7 @@ impl Engine {
     }
 
     fn get_metrics(&self) -> ffi::Metrics {
-        let metrics = self.metrics.as_ref();
-        let copy_on_write_times = metrics.copy_on_write_times.swap(0, Ordering::AcqRel);
-        let copy_on_write_latency = metrics.copy_on_write_latency.swap(0, Ordering::AcqRel);
-        let copy_on_write_read_times = metrics.copy_on_write_read_times.swap(0, Ordering::AcqRel);
-        let copy_on_write_read_latency =
-            metrics.copy_on_write_read_latency.swap(0, Ordering::AcqRel);
-        let allocate_total_latency = metrics.allocate_latency.swap(0, Ordering::AcqRel);
-        let allocate_total_times = metrics.allocate_times.swap(0, Ordering::AcqRel);
-        let pwrite_total_latency = metrics.pwrite_latency.swap(0, Ordering::AcqRel);
-        let pwrite_total_times = metrics.pwrite_times.swap(0, Ordering::AcqRel);
-        ffi::Metrics {
-            copy_on_write_times,
-            copy_on_write_latency: copy_on_write_latency / std::cmp::max(1, copy_on_write_times),
-            copy_on_write_read_bytes: metrics.copy_on_write_read_bytes.swap(0, Ordering::AcqRel),
-            copy_on_write_read_times,
-            copy_on_write_read_latency: copy_on_write_read_latency
-                / std::cmp::max(1, copy_on_write_read_times),
-            checksum_reuse: metrics.checksum_reuse.swap(0, Ordering::AcqRel),
-            checksum_combine: metrics.checksum_combine.swap(0, Ordering::AcqRel),
-            checksum_recalculate: metrics.checksum_recalculate.swap(0, Ordering::AcqRel),
-            safe_write_direct_append: metrics.safe_write_direct_append.swap(0, Ordering::AcqRel),
-            safe_write_indirect_append: metrics
-                .safe_write_indirect_append
-                .swap(0, Ordering::AcqRel),
-            safe_write_truncate_shorten: metrics
-                .safe_write_truncate_shorten
-                .swap(0, Ordering::AcqRel),
-            safe_write_truncate_extend: metrics
-                .safe_write_truncate_extend
-                .swap(0, Ordering::AcqRel),
-            safe_write_read_tail_times: metrics
-                .safe_write_read_tail_times
-                .swap(0, Ordering::AcqRel),
-            safe_write_read_tail_bytes: metrics
-                .safe_write_read_tail_bytes
-                .swap(0, Ordering::AcqRel),
-            allocate_latency: allocate_total_latency / std::cmp::max(1, allocate_total_times),
-            allocate_times: allocate_total_times,
-            pwrite_latency: pwrite_total_latency / std::cmp::max(1, pwrite_total_times),
-            pwrite_times: pwrite_total_times,
-        }
+        sample_metrics(self.metrics.as_ref())
     }
 
     fn query_uncommitted_raw_chunks(
@@ -740,6 +734,14 @@ pub mod ffi {
         status: RawEcScopeStatus,
         committed: u64,
     }
+    struct RawEcStagePhysicalSizeResult {
+        status: RawEcScopeStatus,
+        value: RawUsedSize,
+    }
+    struct RawEcStageMetricsResult {
+        status: RawEcScopeStatus,
+        value: Metrics,
+    }
     extern "Rust" {
         type EcStageHandle;
         fn stage_open(
@@ -784,6 +786,9 @@ pub mod ffi {
             index: u8,
         ) -> RawEcStageReadResult;
         fn stage_used_size(handle: &EcStageHandle, prefix: &[u8]) -> RawEcStageUsedResult;
+        fn stage_physical_used_size(handle: &EcStageHandle) -> RawEcStagePhysicalSizeResult;
+        fn stage_sample_metrics(handle: &EcStageHandle) -> RawEcStageMetricsResult;
+        fn stage_set_allow_to_allocate(handle: &EcStageHandle, allow: bool) -> RawEcScopeStatus;
     }
 
     #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]

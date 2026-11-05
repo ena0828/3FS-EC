@@ -119,7 +119,7 @@ class IBDevice : public std::enable_shared_from_this<IBDevice> {
   static constexpr size_t kMaxDeviceCnt = 4;
   static const std::vector<IBDevice::Ptr> &all();
   static IBDevice::Ptr get(uint8_t devId) {
-    if (all().size() < devId) {
+    if (devId >= all().size()) {
       return nullptr;
     }
     return all().at(devId);

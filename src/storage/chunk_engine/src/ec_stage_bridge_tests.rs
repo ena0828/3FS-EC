@@ -186,3 +186,67 @@ fn stage_bridge_empty_fragment_and_invalid_open_remain_owned() {
     assert_ne!(read.status.error_code, 0);
     assert!(read.data.is_empty());
 }
+
+#[test]
+fn stage_bridge_maintenance_has_owned_snapshots_and_rejects_empty_handle() {
+    let invalid = EcStageHandle { engine: None };
+    let size = stage_physical_used_size(&invalid);
+    assert_ne!(size.status.error_code, 0);
+    assert_eq!(size.value, ffi::RawUsedSize::default());
+    let metrics = stage_sample_metrics(&invalid);
+    assert_ne!(metrics.status.error_code, 0);
+    assert_eq!(metrics.value, ffi::Metrics::default());
+    assert_ne!(stage_set_allow_to_allocate(&invalid, false).error_code, 0);
+
+    let _serial = ENGINE_TEST.lock().unwrap();
+    let (_root, path, limits) = setup();
+    let opened = stage_open(&path, true, 2, &limits);
+    assert_eq!(opened.status.error_code, 0);
+    let live = opened.handle;
+    let before = stage_physical_used_size(&live);
+    assert_eq!(before.status.error_code, 0);
+    let payload = [5; 4096];
+    let binding = ffi::RawEcStageBinding {
+        operation: [5; 16],
+        length: payload.len() as u32,
+        checksum: crc32c::crc32c(&payload),
+    };
+    assert_eq!(stage_set_allow_to_allocate(&live, false).error_code, 0);
+    assert_eq!(
+        stage_begin(&live, b"ec-gate", &binding, &[6; 16])
+            .status
+            .error_code,
+        7021
+    );
+    assert_eq!(stage_set_allow_to_allocate(&live, true).error_code, 0);
+    assert_eq!(
+        stage_begin(&live, b"ec-gate", &binding, &[6; 16])
+            .status
+            .error_code,
+        0
+    );
+    let size = stage_physical_used_size(&live);
+    assert_eq!(size.status.error_code, 0);
+    assert_eq!(size.value.position_count, before.value.position_count + 1);
+    // Exercise the shared sampling implementation with real atomic counters;
+    // no second sample may report the same event again.
+    engine(&live)
+        .unwrap()
+        .allocation_metrics()
+        .pwrite_times
+        .store(2, std::sync::atomic::Ordering::Release);
+    engine(&live)
+        .unwrap()
+        .allocation_metrics()
+        .pwrite_latency
+        .store(10, std::sync::atomic::Ordering::Release);
+    let first = stage_sample_metrics(&live);
+    assert_eq!(first.status.error_code, 0);
+    assert_eq!(first.value.pwrite_times, 2);
+    assert_eq!(first.value.pwrite_latency, 5);
+    let second = stage_sample_metrics(&live);
+    assert_eq!(second.status.error_code, 0);
+    assert_eq!(second.value.pwrite_times, 0);
+    drop(live);
+    assert_eq!(size.value.position_count, 1);
+}

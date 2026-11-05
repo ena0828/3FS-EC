@@ -486,6 +486,20 @@ impl ImmutableStagingEngine {
         Ok(())
     }
 
+    // Maintenance access never exposes the underlying mutable Engine or any
+    // legacy compaction/deletion entry point.
+    pub(crate) fn physical_used_size(&self) -> UsedSize {
+        self.0.engine.used_size()
+    }
+
+    pub(crate) fn allocation_metrics(&self) -> &Metrics {
+        self.0.engine.metrics.as_ref()
+    }
+
+    pub(crate) fn set_allow_to_allocate(&self, allow: bool) {
+        self.0.engine.set_allow_to_allocate(allow);
+    }
+
     pub(crate) fn committed_size(&self, prefix: &[u8]) -> ImmutableStageResult<u64> {
         if prefix.len() != self.0.engine.prefix_len {
             return Err(ImmutableStageError::Invalid("invalid accounting prefix"));
@@ -737,7 +751,10 @@ impl ImmutableStagingEngine {
             {
                 return Err(ImmutableStageError::Conflict);
             }
-            Ok(engine.allocators.allocate(Size::from(spec.length), true)?)
+            Ok(engine.allocators.allocate(
+                Size::from(spec.length),
+                engine.allow_to_allocate.load(Ordering::Acquire),
+            )?)
         })();
         let chunk = match allocation {
             Ok(chunk) => Arc::new(chunk),

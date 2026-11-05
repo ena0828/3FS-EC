@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import shlex
 import signal
 import socket
 import subprocess
@@ -15,6 +16,18 @@ import sys
 import threading
 import time
 import tomllib
+
+
+def admin_command_line(command):
+    """Encode one command for admin_cli's join-and-reparse interface."""
+    arguments = list(map(str, command))
+    # Dispatcher splits on semicolons before parsing quotes, and ArgsParser
+    # stops at an empty argument. Neither can be represented safely here.
+    if not arguments or any(not value or any(char in value for char in ";\r\n\0") for value in arguments):
+        raise ValueError("Admin arguments must be nonempty and contain no semicolons, newlines or NUL bytes")
+    # ArgsParser accepts adjacent single/double quoted spans. Pass one encoded
+    # command after -- so admin_cli's argv join preserves argument boundaries.
+    return shlex.join(arguments)
 
 
 class Cluster:
@@ -49,7 +62,8 @@ class Cluster:
         return result.stdout.decode(errors="replace")
 
     def admin(self, command, name="admin-command.log", secret=False):
-        return self.call([self.root / "bin/admin_cli", "--cfg", self.config / "admin_cli.toml", "--", *command], name, secret=secret)
+        return self.call([self.root / "bin/admin_cli", "--cfg", self.config / "admin_cli.toml", "--",
+                          admin_command_line(command)], name, secret=secret)
 
     def start(self, name, command):
         log = (self.run_dir / f"{name}.stdout.log").open("wb")

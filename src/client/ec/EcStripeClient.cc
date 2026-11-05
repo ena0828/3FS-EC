@@ -108,6 +108,9 @@ CoTryTask<std::shared_ptr<EcStripeClient>> EcStripeClient::connect(
   }
 }
 CoTryTask<meta::CreateEcFileRsp> EcStripeClient::createFile(meta::CreateEcFileV2Req request, EcStripeControl control) {
+  // The connected manager owns the namespace. Validate the caller's fixed
+  // request UUID after installing it, as createOwned does before sending RPCs.
+  request.client = ClientId{core_->owner.client};
   if (!request.path.path || request.path.path->native().size() > 4096 || !request.valid()) {
     return detail::EcStripeClientCore::immediate(Result<meta::CreateEcFileRsp>(
         makeError(StatusCode::kInvalidArg, "Create requires a persisted UUID and a valid path of at most 4096 bytes")));

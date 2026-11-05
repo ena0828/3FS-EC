@@ -230,6 +230,38 @@ Result<Void> StorageTargets::init(CPUExecutorGroup &executor) {
   return Void{};
 }
 
+Result<chunk_engine::RawUsedSize> StorageTargets::physicalUsedSize(uint32_t diskIndex) const {
+  if (diskIndex >= targetPaths_.size()) return makeError(StatusCode::kInvalidArg, "invalid disk index");
+  if (config_.ec_staging_v2()) {
+    if (diskIndex >= stagingEngines_.size() || !stagingEngines_[diskIndex])
+      return makeError(StorageCode::kStorageInitFailed, "V2 disk engine is not loaded");
+    return stagingEngines_[diskIndex]->physicalUsedSize();
+  }
+  if (diskIndex >= engines_.size()) return makeError(StorageCode::kStorageInitFailed, "disk engine is not loaded");
+  return engines_[diskIndex]->raw_used_size();
+}
+Result<chunk_engine::Metrics> StorageTargets::sampleEngineMetrics(uint32_t diskIndex) const {
+  if (diskIndex >= targetPaths_.size()) return makeError(StatusCode::kInvalidArg, "invalid disk index");
+  if (config_.ec_staging_v2()) {
+    if (diskIndex >= stagingEngines_.size() || !stagingEngines_[diskIndex])
+      return makeError(StorageCode::kStorageInitFailed, "V2 disk engine is not loaded");
+    return stagingEngines_[diskIndex]->sampleMetrics();
+  }
+  if (diskIndex >= engines_.size()) return makeError(StorageCode::kStorageInitFailed, "disk engine is not loaded");
+  return engines_[diskIndex]->get_metrics();
+}
+Result<Void> StorageTargets::setAllowToAllocate(uint32_t diskIndex, bool allow) const {
+  if (diskIndex >= targetPaths_.size()) return makeError(StatusCode::kInvalidArg, "invalid disk index");
+  if (config_.ec_staging_v2()) {
+    if (diskIndex >= stagingEngines_.size() || !stagingEngines_[diskIndex])
+      return makeError(StorageCode::kStorageInitFailed, "V2 disk engine is not loaded");
+    return stagingEngines_[diskIndex]->setAllowToAllocate(allow);
+  }
+  if (diskIndex >= engines_.size()) return makeError(StorageCode::kStorageInitFailed, "disk engine is not loaded");
+  engines_[diskIndex]->set_allow_to_allocate(allow);
+  return Void{};
+}
+
 Result<Void> StorageTargets::create(const CreateConfig &createConfig) {
   if (config_.ec_only()) {
     return makeError(StorageCode::kStorageInitFailed, "legacy batch creation is forbidden in an EC-only process");

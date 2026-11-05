@@ -2,6 +2,7 @@
 """Prepare and supervise a private, one-Storage-process native EC V2 lab."""
 import argparse
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -68,6 +69,32 @@ def doctor(root, check_ports=True):
         problems.append("missing lib/libfdb_c.so")
     for path in list((root / "config").glob("*.toml")) + list((root / "client").glob("*.toml")):
         tomllib.loads(path.read_text(encoding="utf-8"))
+    # This flag exits before IB, FDB or server initialization. The three
+    # launchers have fixed top-level objects. Do not treat the full default
+    # dump as a schema: unset optional nested fields (e.g. network_type) are
+    # omitted even though the native parser accepts them.
+    observations["launcher_section_checks"] = []
+    for kind in ("mgmtd", "meta", "storage"):
+        binary = root / "bin" / f"{kind}_main"
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            continue
+        path = root / "config" / f"{kind}_main_launcher.toml"
+        argv = [str(binary), "--dump_default_launcher_cfg", "--app_cfg", str(root / "config" / f"{kind}_main_app.toml")]
+        try:
+            dumped = subprocess.run(argv, env=env, text=True, capture_output=True, timeout=15)
+            if dumped.returncode:
+                problems.append(f"cannot inspect launcher sections for {path.name}: exit {dumped.returncode}")
+                continue
+            defaults = tomllib.loads(dumped.stdout)
+            unknown = sorted(tomllib.loads(path.read_text(encoding="utf-8")).keys() - defaults.keys())
+            observations["launcher_section_checks"].append({
+                "config": path.name, "argv": argv, "unknown_keys": unknown,
+                "default_toml_sha256": hashlib.sha256(dumped.stdout.encode()).hexdigest(),
+                "scope": "top-level launcher keys only; nested/optional fields and values require native startup validation"})
+            if unknown:
+                problems.append(f"unknown native launcher keys in {path.name}: {', '.join(unknown)}")
+        except (OSError, subprocess.TimeoutExpired, tomllib.TOMLDecodeError) as error:
+            problems.append(f"cannot inspect launcher sections for {path.name}: {type(error).__name__}")
     inodes = set()
     for role in ("data", "control", "helper"):
         path = root / "secrets" / f"{role}.key"

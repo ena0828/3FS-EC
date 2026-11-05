@@ -99,7 +99,9 @@ void CheckWorker::loop(const std::vector<Path> &targetPaths, const std::vector<s
   (void)manufacturers;
 
   // 0. initialize records.
-  static auto recorders = [&] {
+  // Each worker owns the recorder vector for its own disk list. A process may
+  // construct another Components instance with a different number of disks.
+  auto recorders = [&] {
     std::vector<std::unique_ptr<Recorders>> recorders;
     for (auto i = 0ul; i < targetPaths.size(); ++i) {
       monitor::TagSet tag;
@@ -178,7 +180,12 @@ void CheckWorker::loop(const std::vector<Path> &targetPaths, const std::vector<s
 
         bool lowSpace = diskUsage[i] >= diskLowSpaceThreshold;
         bool rejectCreateChunk = diskUsage[i] >= diskRejectCreateChunkThreshold;
-        components_.storageTargets.engines()[i]->set_allow_to_allocate(!rejectCreateChunk);
+        auto allocationGate = components_.storageTargets.setAllowToAllocate(i, !rejectCreateChunk);
+        if (!allocationGate) {
+          XLOGF(ERR, "cannot set disk {} allocation gate: {}", i, allocationGate.error());
+          components_.targetMap.offlineTargets(targetPath);
+          continue;
+        }
         components_.targetMap.updateDiskState(targetPath, lowSpace, rejectCreateChunk);
       }
       XLOGF(DBG9, "check disk status finished");
@@ -224,7 +231,12 @@ void CheckWorker::loop(const std::vector<Path> &targetPaths, const std::vector<s
         auto [new_count, old_count] = chunkEngineCount[i];
         new_chunk_engine_count.set(new_count, tag);
         old_chunk_engine_count.set(old_count, tag);
-        auto rawUsedSize = components_.storageTargets.engines()[i]->raw_used_size();
+        auto physical = components_.storageTargets.physicalUsedSize(i);
+        if (!physical) {
+          XLOGF(ERR, "cannot inspect disk {} physical size: {}", i, physical.error());
+          continue;
+        }
+        const auto &rawUsedSize = *physical;
         auto &recorder = *recorders[i];
         recorder.disk_available.set(diskUnusedSize[i] + rawUsedSize.reserved_size + recorder.disk_free.value());
         recorder.position_count.set(rawUsedSize.position_count);
@@ -244,7 +256,12 @@ void CheckWorker::loop(const std::vector<Path> &targetPaths, const std::vector<s
       lastChunkEngineMetricsReportTime = now;
       for (auto i = 0ul; i < targetPaths.size(); ++i) {
         auto &recorder = *recorders[i];
-        auto metrics = components_.storageTargets.engines()[i]->get_metrics();
+        auto sampled = components_.storageTargets.sampleEngineMetrics(i);
+        if (!sampled) {
+          XLOGF(ERR, "cannot sample disk {} engine metrics: {}", i, sampled.error());
+          continue;
+        }
+        const auto &metrics = *sampled;
         recorder.copy_on_write_times.addSample(metrics.copy_on_write_times);
         if (metrics.copy_on_write_latency) {
           recorder.copy_on_write_latency.addSample(std::chrono::microseconds(metrics.copy_on_write_latency));
