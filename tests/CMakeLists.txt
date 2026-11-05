@@ -1,3 +1,4 @@
+add_subdirectory(erasure)
 add_subdirectory(lib)
 add_subdirectory(main)
 add_subdirectory(common)

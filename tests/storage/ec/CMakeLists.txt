@@ -1,0 +1,9 @@
+add_executable(test_ec_shard_store TestECShardStore.cc)
+target_link_libraries(test_ec_shard_store PRIVATE ec_shard_store GTest::gtest_main)
+set_target_properties(test_ec_shard_store PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME test_ec_shard_store COMMAND test_ec_shard_store)
+
+add_executable(test_storage_target_ec TestStorageTargetEC.cc)
+target_link_libraries(test_storage_target_ec PRIVATE storage GTest::gtest_main)
+set_target_properties(test_storage_target_ec PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME test_storage_target_ec COMMAND test_storage_target_ec)

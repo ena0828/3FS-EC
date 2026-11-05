@@ -1,3 +1,4 @@
+add_subdirectory(erasure)
 add_subdirectory(fbs)
 add_subdirectory(common)
 add_subdirectory(meta)

@@ -2,6 +2,7 @@
 
 #include <boost/filesystem/operations.hpp>
 #include <folly/experimental/symbolizer/Symbolizer.h>
+#include <folly/ScopeGuard.h>
 #include <fstream>
 #include <sys/stat.h>
 
@@ -60,8 +61,10 @@ Result<std::string> getDeviceUUID(const Path &path) {
 StorageTarget::StorageTarget(const Config &config,
                              GlobalFileStore &globalFileStore,
                              uint32_t diskIndex,
-                             chunk_engine::Engine *engine)
+                             chunk_engine::Engine *engine,
+                             bool enableEC)
     : config_(config),
+      enableEC_(enableEC),
       diskIndex_(diskIndex),
       generationId_(++gGenerationId),
       engine_(engine),
@@ -86,13 +89,41 @@ StorageTarget::~StorageTarget() {
   }
 }
 
+Result<Void> StorageTarget::openEC(bool create) {
+  if (!enableEC_) return Void{};
+  const auto directory = targetConfig_.path / fmt::format("ec_shards_{}", targetConfig_.target_id);
+  if (!create) {
+    boost::system::error_code error;
+    if (!boost::filesystem::is_directory(directory, error) || error) {
+      return makeError(StorageCode::kStorageInitFailed,
+                       fmt::format("EC database directory {} unavailable: {}", directory, error.message()));
+    }
+  }
+  auto opened = ec::ECShardStore::open(directory, create);
+  if (!opened) {
+    return makeError(StorageCode::kStorageInitFailed,
+                     fmt::format("Open EC database {} failed: {}", directory, static_cast<int>(opened.error)));
+  }
+  ecShardStore_ = std::move(opened.value);
+  return Void{};
+}
+
 Result<Void> StorageTarget::create(const PhysicalConfig &config) {
+  auto rollback = folly::makeGuard([&] { ecShardStore_.reset(); });
   Path targetConfigFilePath = config.path / kPhysicalConfigFileName;
   if (boost::filesystem::exists(targetConfigFilePath)) {
     auto msg = fmt::format("Target config file {} already exists", targetConfigFilePath.string());
     XLOG(INFO, msg);
     if (!config.allow_existing_targets) {
       return makeError(StorageCode::kStorageInitFailed, std::move(msg));
+    }
+    // Check requested identity before load can open the EC database.
+    if (enableEC_) {
+      PhysicalConfig existing;
+      RETURN_AND_LOG_ON_ERROR(serde::fromTomlFile(existing, targetConfigFilePath));
+      if (existing.target_id != config.target_id || existing.physical_file_count != config.physical_file_count) {
+        return makeError(StorageCode::kStorageInitFailed, "Existing target identity/config mismatch");
+      }
     }
     RETURN_AND_LOG_ON_ERROR(load(config.path));
     if (targetConfig_.target_id != config.target_id) {
@@ -108,6 +139,7 @@ Result<Void> StorageTarget::create(const PhysicalConfig &config) {
       return makeError(StorageCode::kStorageInitFailed, std::move(msg));
     }
     RETURN_AND_LOG_ON_ERROR(addChunkSize(config.chunk_size_list));
+    rollback.dismiss();
     XLOGF(INFO, "Target config file {} check passed", targetConfigFilePath.string());
     return Void{};
   }
@@ -130,6 +162,7 @@ Result<Void> StorageTarget::create(const PhysicalConfig &config) {
     }
   } else {
     RETURN_AND_LOG_ON_ERROR(chunkStore_.create(targetConfig_));
+    chunkStoreReady_ = true;
   }
 
   auto getDeviceUUIDResult = getDeviceUUID(targetConfig_.path);
@@ -141,6 +174,7 @@ Result<Void> StorageTarget::create(const PhysicalConfig &config) {
     RETURN_AND_LOG_ON_ERROR(getDeviceUUIDResult);
   }
 
+  RETURN_AND_LOG_ON_ERROR(openEC(true));
   std::ofstream targetConfigFile(targetConfigFilePath, std::ios::out);
   if (!targetConfigFile) {
     auto msg = fmt::format("Open target config file {} failed", targetConfigFilePath.string());
@@ -157,10 +191,12 @@ Result<Void> StorageTarget::create(const PhysicalConfig &config) {
   targetUsedSize_ = targetUsedSize.getRecorderWithTag(targetTag_);
   targetReservedSize_ = targetReservedSize.getRecorderWithTag(targetTag_);
   targetUnrecycledSize_ = targetUnrecycledSize.getRecorderWithTag(targetTag_);
+  rollback.dismiss();
   return Void{};
 }
 
 Result<Void> StorageTarget::load(const Path &path) {
+  auto rollback = folly::makeGuard([&] { ecShardStore_.reset(); });
   RETURN_AND_LOG_ON_ERROR(serde::fromTomlFile(targetConfig_, path / kPhysicalConfigFileName));
   if (path != targetConfig_.path) {
     auto msg = fmt::format("Path config mismatch {} != real {}", targetConfig_.path, path);
@@ -184,6 +220,7 @@ Result<Void> StorageTarget::load(const Path &path) {
 
   if (!targetConfig_.only_chunk_engine) {
     RETURN_AND_LOG_ON_ERROR(chunkStore_.load(targetConfig_));
+    chunkStoreReady_ = true;
   }
   if (!targetConfig_.only_chunk_engine && config_.migrate_kv_store() &&
       config_.kv_store().type() != targetConfig_.kv_store_type) {
@@ -206,6 +243,8 @@ Result<Void> StorageTarget::load(const Path &path) {
   targetUsedSize_ = targetUsedSize.getRecorderWithTag(targetTag_);
   targetReservedSize_ = targetReservedSize.getRecorderWithTag(targetTag_);
   targetUnrecycledSize_ = targetUnrecycledSize.getRecorderWithTag(targetTag_);
+  RETURN_AND_LOG_ON_ERROR(openEC(false));
+  rollback.dismiss();
   return Void{};
 }
 

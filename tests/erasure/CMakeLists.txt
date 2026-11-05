@@ -1,0 +1,10 @@
+find_package(GTest REQUIRED)
+add_executable(test_erasure_codec TestErasureCodec.cc)
+target_link_libraries(test_erasure_codec PRIVATE erasure_codec GTest::gtest_main)
+set_target_properties(test_erasure_codec PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME test_erasure_codec COMMAND test_erasure_codec)
+
+add_executable(test_ec_layout TestECLayout.cc)
+target_link_libraries(test_ec_layout PRIVATE ec_layout GTest::gtest_main)
+set_target_properties(test_ec_layout PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME test_ec_layout COMMAND test_ec_layout)

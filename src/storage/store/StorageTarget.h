@@ -10,6 +10,7 @@
 #include "common/utils/LockManager.h"
 #include "common/utils/Path.h"
 #include "storage/aio/BatchReadJob.h"
+#include "storage/ec/ECShardStore.h"
 #include "storage/store/ChunkEngine.h"
 #include "storage/store/ChunkStore.h"
 #include "storage/store/PhysicalConfig.h"
@@ -22,12 +23,16 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   StorageTarget(const ChunkStore::Config &config,
                 GlobalFileStore &globalFileStore,
                 uint32_t diskIndex,
-                chunk_engine::Engine *engine);
+                chunk_engine::Engine *engine,
+                bool enableEC = false);
 
  public:
   using Config = ChunkStore::Config;
 
   ~StorageTarget();
+
+  // Borrowed handle: EC operations and release/destruction must be serialized.
+  ec::ECShardStore *ecShardStore() const { return ecShardStore_.get(); }
 
   // create storage target.
   Result<Void> create(const PhysicalConfig &config);
@@ -91,7 +96,7 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
 
   // sync meta kv.
   Result<Void> sync() {
-    if (useChunkEngine()) {
+    if (useChunkEngine() || !chunkStoreReady_) {
       return Void{};
     } else {
       return chunkStore_.sync();
@@ -155,14 +160,21 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   // release self.
   Result<Void> release() {
     released_ = true;
-    return sync();
+    auto result = sync();
+    ecShardStore_.reset();
+    return result;
   }
 
   // check if chunk engine is used.
   inline bool useChunkEngine() const { return targetConfig_.only_chunk_engine; }
 
  private:
+  Result<Void> openEC(bool create);
+
   const Config &config_;
+  const bool enableEC_;
+  bool chunkStoreReady_ = false;
+  std::unique_ptr<ec::ECShardStore> ecShardStore_;
   std::shared_ptr<bool> alive_ = std::make_shared<bool>();
   uint32_t diskIndex_;
   uint32_t generationId_;
