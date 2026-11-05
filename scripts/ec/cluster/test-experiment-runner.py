@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Small portable standard-library tests; fake CLI only, no native services."""
+import importlib.util
+import contextlib
+import io
+import os
+import signal
+import json
+from pathlib import Path
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("experiment_runner", HERE / "experiment-runner.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+
+class RunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="ec-executor-fake-", dir=HERE)
+        self.root = Path(self.temp.name).resolve()
+        self.assertEqual(self.root.parent, HERE)
+        self.addCleanup(self.temp.cleanup)
+        self.root.chmod(0o700)
+        for name in ("client", "logs", "lib"):
+            (self.root / name).mkdir(mode=0o700)
+        (self.root / "client/stripe-client.toml").write_text("# Fake only, no token or service address\n")
+        mod.generate_inputs(self.root)
+
+    def runner(self, mode="normal"):
+        return mod.Runner(self.root, [sys.executable, str(HERE / "testdata/fake-ec-cli.py")],
+                          extra_env={"EC_FAKE_MODE": mode})
+
+    def calls(self):
+        return [json.loads(line) for line in (self.root / "fake-invocations.jsonl").read_text().splitlines()]
+
+    def test_root_is_mandatory_and_preserves_explicit_paths(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as missing:
+                mod.parser().parse_args(["inputs"])
+        self.assertEqual(missing.exception.code, 2)
+        supplied = self.root / "bundle with spaces"
+        parsed = mod.parser().parse_args(["--root", str(supplied), "inputs"])
+        self.assertEqual(parsed.root, supplied)
+        self.assertFalse(supplied.exists())  # Parsing cannot initialize a lab.
+
+    @unittest.skipUnless(sys.platform == "linux", "Real POSIX signals require Linux; not native 3FS")
+    def test_linux_signals_wait_for_actual_child_exit_without_starting_another(self):
+        worker = (
+            "import os,signal,sys,time;from pathlib import Path;"
+            "assert os.getsid(0)!=os.getsid(os.getppid());"
+            "os.kill(os.getppid(),int(sys.argv[1]));time.sleep(0.2);"
+            "Path(sys.argv[2]).write_text('child completed')"
+        )
+        for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+            with self.subTest(signal=name):
+                marker = self.root / (name + "-completed")
+                r = mod.Runner(self.root, [sys.executable, "-c", worker,
+                    str(int(getattr(signal, name))), str(marker)])
+                with r.signal_scope():
+                    with self.assertRaises(mod.StopRequested):
+                        r.invoke(r.runs / ("signal-" + name), "new-write")
+                    with self.assertRaises(mod.StopRequested):
+                        r.invoke(r.runs / ("after-" + name), "new-write")
+                self.assertEqual(marker.read_text(), "child completed")
+                self.assertIsNone(r.child)
+                self.assertEqual(len(r.commands), 1)
+                self.assertEqual(r.commands[0]["returncode"], 0)
+                self.assertTrue(r.commands[0]["process_exited"])
+                self.assertFalse(r.commands[0]["remote_release_proven_by_exit"])
+                self.assertEqual(r.interrupt_count, 1)
+
+    def test_reporting_failure_after_launch_still_joins_the_owned_child(self):
+        r = self.runner("delayed")
+        original = r.event
+        def failed_event(value):
+            if value["event"] == "command_started":
+                raise OSError("injected report failure after Popen")
+            original(value)
+        r.event = failed_event
+        with self.assertRaisesRegex(OSError, "after Popen"):
+            r.case("report-failure", "multi", "central", 1)
+        self.assertTrue((self.root / "fake-exited").exists())
+        self.assertIsNone(r.child)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(r.commands[0]["returncode"], 0)
+        self.assertTrue(r.commands[0]["process_exited"])
+        self.assertFalse(r.commands[0]["remote_release_proven_by_exit"])
+
+    def test_inputs_are_deterministic_and_never_overwritten(self):
+        report = mod.generate_inputs(self.root)
+        self.assertEqual(report["samples"]["multi"]["bytes"], 1048576)
+        path = self.root / "client/inputs/multi.bin"
+        path.write_bytes(b"modified")
+        with self.assertRaises(mod.CheckError):
+            mod.generate_inputs(self.root)
+        self.assertEqual(path.read_bytes(), b"modified")
+
+    def test_six_cases_boundaries_and_new_read_use_exact_explicit_commands(self):
+        r = self.runner()
+        r.matrix("six")
+        r.boundaries("bounds")
+        self.assertEqual(len(r.checked), 8)
+        for item in r.checked:
+            self.assertTrue(item["readback"]["byte_equal"])
+            self.assertTrue(item["readback"]["remote_released"])
+            self.assertFalse(item["fault_injected"])
+        source = r.runs / "repair-six-multi-helper-two"
+        r.read_from(source, r.runs / "read-new-after-restart", mod.sample_info(self.root, "multi"))
+        self.assertEqual(len(self.calls()), 42)
+        result = r.summary("passed")
+        self.assertTrue(result["all_started_cli_processes_exited"])
+        self.assertFalse(result["cluster_stop_or_restart_performed"])
+        with self.assertRaises(mod.CheckError):
+            r.matrix("six")
+
+    def test_exit_zero_without_published_stops_before_repair(self):
+        r = self.runner("false-published")
+        with self.assertRaisesRegex(mod.CheckError, "Published"):
+            r.case("bad", "multi", "central", 1)
+        self.assertEqual([c["command"] for c in self.calls()], ["new-write"])
+        self.assertTrue((r.runs / "write-bad-multi-central-one/record.json").is_file())
+
+    def test_incomplete_ack_does_not_become_remote_released(self):
+        r = self.runner("incomplete-release")
+        with self.assertRaisesRegex(mod.CheckError, "ACK"):
+            r.case("ack", "multi", "pipeline", 2)
+        self.assertEqual([c["command"] for c in self.calls()], ["new-write", "new-repair", "release"])
+
+    def test_stale_success_and_changed_permanent_record_are_rejected(self):
+        for index, (mode, message) in enumerate((("stale-release", "new observation"),
+                                                 ("mutated-record", "immutable run record"))):
+            r = self.runner(mode)
+            with self.assertRaisesRegex(mod.CheckError, message):
+                r.case(f"stale{index}", "multi", "central", 1)
+            self.assertEqual(r.commands[-1]["command"], "release")
+
+    def test_corrupt_read_preserves_journal_and_does_not_release_failed_read(self):
+        r = self.runner("corrupt-read")
+        with self.assertRaisesRegex(mod.CheckError, "bytes differ"):
+            r.case("crc", "multi", "helper", 2)
+        self.assertEqual(self.calls()[-1]["command"], "new-read")
+        self.assertEqual(len(self.calls()), 4)
+        self.assertTrue((r.runs / "read-crc-multi-helper-two/record.json").exists())
+
+    def test_unknown_is_not_retried_with_a_new_operation(self):
+        r = self.runner("unknown")
+        with self.assertRaisesRegex(mod.CheckError, "exit1"):
+            r.case("unknown", "multi", "central", 1)
+        self.assertEqual(len(self.calls()), 1)
+        record, observation = mod.journal(r.runs / "write-unknown-multi-central-one")
+        self.assertEqual(observation["errorCode"], 4085)
+        self.assertTrue(record["operation"])
+
+    def test_record_only_failure_resumes_same_ids_and_requires_first_observation(self):
+        info = mod.sample_info(self.root, "multi")
+        early = self.runner("record-only")
+        run = early.runs / "write-record-only"
+        with self.assertRaisesRegex(mod.CheckError, "exit2"):
+            early.invoke(run, "new-write", input_file=info[0],
+                         remote_path="/ec-lab/record-only", shard_bytes=info[2])
+        fixed = (run / "record.json").read_bytes()
+        record = json.loads(fixed)
+        identities = {name: record[name] for name in (
+            "clientNamespace", "createRequest", "operation", "beginRequest", "bindRequest", "publishRequest",
+            "getRequest", "prepareRepairRequest", "pin", "acquireRequest", "releaseRequest", "planId")}
+        self.assertFalse(list(run.glob("state-*.json")))
+        # Only resume admission permits this shape, never success/release evidence.
+        for check in (lambda: mod.journal(run), lambda: mod.published(run, info),
+                      lambda: mod.verify_read(run, info), lambda: mod.released(run),
+                      lambda: self.runner().release(run)):
+            with self.assertRaisesRegex(mod.CheckError, "No observation"):
+                check()
+        with self.assertRaisesRegex(mod.CheckError, "No observation"):
+            self.runner("record-only-no-observation").invoke(run, "resume")
+        self.assertEqual((run / "record.json").read_bytes(), fixed)
+        self.assertFalse(list(run.glob("state-*.json")))
+        # Exercise main's real resume dispatch as well as invoke's before/after
+        # checks. The child is still the explicit Windows fake, never native 3FS.
+        resumed = self.runner()
+        with patch.object(mod.sys, "platform", "linux"), \
+             patch.object(mod.sys, "argv", ["experiment-runner.py", "--root", str(self.root),
+                                             "resume", "--run-dir", str(run), "--sample", "multi"]), \
+             patch.object(mod, "Runner", return_value=resumed):
+            self.assertEqual(mod.main(), 0)
+        self.assertEqual((run / "record.json").read_bytes(), fixed)
+        recovered, state = mod.published(run, info)
+        self.assertEqual({name: recovered[name] for name in identities}, identities)
+        self.assertEqual(state["sequence"], 0)
+        self.assertEqual([p.name for p in run.glob("state-*.json")], ["state-00000000000000000000.json"])
+        self.assertEqual([entry["command"] for entry in self.calls()], ["new-write", "resume", "resume"])
+
+    def test_offline_read_verification_does_not_trust_a_release_label_alone(self):
+        r = self.runner()
+        r.case("offline", "kv112", "central", 1)
+        run = r.runs / "read-offline-kv112-central-one"
+        info = mod.sample_info(self.root, "kv112")
+        self.assertTrue(mod.verify_read(run, info)["remote_released"])
+        state = sorted(run.glob("state-*.json"))[-1]
+        value = json.loads(state.read_text())
+        value["acknowledgedEndpoints"] = 11
+        state.write_text(json.dumps(value))
+        with self.assertRaisesRegex(mod.CheckError, "ACK"):
+            mod.verify_read(run, info)
+
+    def test_stop_request_waits_for_the_owned_child_and_starts_nothing_else(self):
+        r = self.runner("delayed")
+        outcome = []
+        def work():
+            try:
+                r.case("interrupt", "multi", "central", 1)
+            except BaseException as error:
+                outcome.append(error)
+        thread = threading.Thread(target=work)
+        thread.start()
+        deadline = time.monotonic() + 10
+        while not (self.root / "fake-started").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue((self.root / "fake-started").exists())
+        r.request_stop()
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(outcome[0], mod.StopRequested)
+        self.assertTrue((self.root / "fake-exited").exists())
+        self.assertIsNone(r.child)
+        self.assertEqual(len(self.calls()), 1)
+        summary = r.summary("interrupted_after_child_exit")
+        self.assertTrue(summary["all_started_cli_processes_exited"])
+        self.assertFalse(summary["commands"][0]["remote_release_proven_by_exit"])
+
+    def test_malformed_json_numbers_and_sequence_gaps_are_rejected(self):
+        path = self.root / "bad.json"
+        for text in ('{"x":1,"x":2}', '{"x":-1}', '{"x":1.5}', '{"x":NaN}'):
+            path.write_text(text)
+            with self.assertRaises(mod.CheckError):
+                mod.load_json(path)
+        r = self.runner()
+        r.case("gap", "kv112", "central", 1)
+        run = r.runs / "repair-gap-kv112-central-one"
+        (run / "state-00000000000000000001.json").rename(run / "state-00000000000000000003.json")
+        with self.assertRaisesRegex(mod.CheckError, "gapped"):
+            mod.journal(run)
+
+
+if __name__ == "__main__":
+    unittest.main()
