@@ -4,6 +4,9 @@
 
 namespace hf3fs::storage {
 class EcScopeControlExecutor;
+namespace ec_target_discovery_detail {
+class Codec;
+}
 namespace ec_scope_control_detail {
 class Codec;
 }
@@ -25,6 +28,7 @@ class EcScopeControlKey final {
 
  private:
   friend class ec_scope_control_detail::Codec;
+  friend class ec_target_discovery_detail::Codec;
   explicit EcScopeControlKey(std::unique_ptr<EcCapabilityKey> key)
       : key_(std::move(key)) {}
   std::unique_ptr<EcCapabilityKey> key_;

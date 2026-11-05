@@ -90,6 +90,9 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<EcReadBlockResultV2> readEcBlockV2Controlled(EcReadBlockV2Req, EcRequestControl) override;
   CoTryTask<EcFragmentReceipt> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) override;
 
+  CoTryTask<EcTargetDiscoveryObservation> getEcTargetIdentityControlled(EcTargetDiscoveryRequest,
+                                                                        std::shared_ptr<const EcScopeControlKey>,
+                                                                        EcRequestControl) override;
   CoTryTask<EcScopeControlAck> revokeEcScope(const EcScopeControlRequest &) override;
   CoTryTask<EcScopeControlAck> queryEcScopeDrain(const EcScopeControlRequest &) override;
 

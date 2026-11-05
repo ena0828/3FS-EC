@@ -77,6 +77,7 @@ Result<Void> StorageOperator::init(uint32_t numberOfDisks) {
 
 Result<Void> StorageOperator::stopAndJoin() {
   if (ecHelpers_) ecHelpers_->stopAndJoin();
+  if (ecDiscovery_) ecDiscovery_->stopAndJoin();
   if (ecScopeControl_) ecScopeControl_->stopAndJoin();
   storageReadAvgBytes.reset();
   updateWorker_.stopAndJoin();

@@ -16,9 +16,11 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
+#include "client/ec/EcStripeClient.h"
 #include "client/meta/MetaClient.h"
 #include "common/net/Client.h"
 #include "common/net/Server.h"
@@ -136,9 +138,13 @@ struct ControlFailure {
   Uuid scope = Uuid::zero();
   bool fail = false;
   size_t actualRevokes = 0;
+  Uuid observedRepair = Uuid::zero();
+  std::array<size_t, 12> actualPartialReconciles{};
+  std::array<uint16_t, 10> actualHelperBlocks{};
 };
 // Only replaces a real, already durable control response with an error. It
 // cannot fabricate a positive ACK, and does not skip the actual revoke.
+// Stage/helper overrides only observe successful real handlers.
 class ControlFailureStorageService : public storage::StorageService {
  public:
   ControlFailureStorageService(storage::StorageOperator &op, ControlFailure &fault)
@@ -152,6 +158,26 @@ class ControlFailureStorageService : public storage::StorageService {
       ++fault_.actualRevokes;
       if (fault_.fail && fault_.scope == req.claims.scopeId)
         co_return makeError(StatusCode::kNotImplemented, "test fault after actual durable revoke");
+    }
+    co_return response;
+  }
+  CoTryTask<storage::EcStageV2Rsp> reconcileEcStageV2(serde::CallContext &ctx,
+                                                      const storage::EcReconcileStageV2Req &req) {
+    auto response = co_await storage::StorageService::reconcileEcStageV2(ctx, req);
+    if (response && response->result && response->result->state == 1 &&
+        response->result->prefixBytes == storage::kEcIntegrityBlockBytes && !response->result->needsReconcile) {
+      std::lock_guard lock(fault_.mutex);
+      if (req.request.operationId == fault_.observedRepair && req.request.identity.shard < 12)
+        ++fault_.actualPartialReconciles[req.request.identity.shard];
+    }
+    co_return response;
+  }
+  CoTryTask<storage::EcHelperHopRsp> executeEcHelper(serde::CallContext &ctx, const storage::EcHelperHopReq &req) {
+    auto response = co_await storage::StorageService::executeEcHelper(ctx, req);
+    if (response && response->result) {
+      std::lock_guard lock(fault_.mutex);
+      if (req.plan.operationId == fault_.observedRepair && req.packet.nextHelper < 10 && req.packet.blockIndex < 16)
+        fault_.actualHelperBlocks[req.packet.nextHelper] |= uint16_t(1u << req.packet.blockIndex);
     }
     co_return response;
   }
@@ -464,6 +490,10 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
                     flat::NodeType::STORAGE,
                     "StorageSerde"));
     fakeMgmtd_ = std::make_shared<hf3fs::test::FakeMgmtdClient>(routing_);
+    // Components::start is intentionally absent in this fixture. Helper
+    // forwarding still needs the server-side routing provider, not only the
+    // client's provider and targetMap snapshot.
+    components_->mgmtdClient.store(std::shared_ptr<hf3fs::client::IMgmtdClientForServer>(fakeMgmtd_));
     mgmtd_ = std::shared_ptr<hf3fs::client::ICommonMgmtdClient>(fakeMgmtd_, fakeMgmtd_->asCommon());
     storageClientConfig_.set_implementation_type(storage::client::StorageClient::ImplementationType::RPC);
     storageClientConfig_.retry().set_max_wait_time(20_s);
@@ -854,6 +884,60 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     ASSERT_NO_FATAL_FAILURE(startMetaClient(metaClientId_));
     RecordProperty("coordinator_recovery",
                    "destroyed/reconstructed MetaOperator and TCP service; same real FDB and Storage");
+  }
+  void reopenStorageKeepingMeta() {
+    // The caller first joins every manager task and awaits every direct RPC.
+    // Meta/FDB and both real clients remain live but issue no requests here.
+    // No target, scope registry or Engine lease is retained across reset.
+    ASSERT_TRUE(storageInitialized_);
+    ASSERT_NE(storageServer_, nullptr);
+    storageServer_->stopAndJoin();
+    storageServer_.reset();
+    ASSERT_OK(components_->storageOperator.stopAndJoin());
+    storageInitialized_ = false;
+    {
+      auto map = components_->targetMap.release();
+      ASSERT_NE(map, nullptr);
+      for (const auto &[id, target] : map->getTargets()) {
+        if (target.storageTarget) ASSERT_OK(target.storageTarget->release());
+      }
+    }
+    ASSERT_OK(components_->storageTargets.globalFileStore().clear(loader_));
+    components_.reset();
+
+    // AtomicallyTargetMap::release consumes its old map. Reconstruct the
+    // owning Components rather than attempting to reuse that released map.
+    components_ = std::make_unique<storage::Components>(storageConfig_);
+    components_->appInfo.nodeId = storageNode_;
+    ASSERT_OK(components_->storageTargets.load(loader_));
+    components_->mgmtdClient.store(std::shared_ptr<hf3fs::client::IMgmtdClientForServer>(fakeMgmtd_));
+    ASSERT_OK(components_->targetMap.updateRouting(fakeMgmtd_->getRoutingInfo()));
+    ASSERT_OK(components_->storageOperator.init(1));
+    storageInitialized_ = true;
+    routing_ = std::make_shared<flat::RoutingInfo>(*routing_);
+    ASSERT_NO_FATAL_FAILURE(
+        startServer(storageServerConfig_,
+                    storageServer_,
+                    std::make_unique<ControlFailureStorageService>(components_->storageOperator, controlFault_),
+                    storageNode_,
+                    flat::NodeType::STORAGE,
+                    "StorageSerde"));
+    routing_->routingInfoVersion = flat::RoutingInfoVersion(routing_->routingInfoVersion.toUnderType() + 1);
+    fakeMgmtd_->setRoutingInfo(routing_);
+    ASSERT_OK(components_->targetMap.updateRouting(fakeMgmtd_->getRoutingInfo()));
+    for (size_t i = 0; i != 12; ++i) {
+      const auto &fixed = metaConfig_.ec_targets(i);
+      auto loaded = components_->targetMap.getByTargetId(storage::TargetId(fixed.target()));
+      ASSERT_OK(loaded);
+      auto state = (*loaded)->storageTarget->ecScopeState();
+      ASSERT_OK(state);
+      Uuid engine = Uuid::zero(), incarnation = Uuid::zero();
+      std::copy(state->second.engine.begin(), state->second.engine.end(), std::begin(engine.data));
+      std::copy(state->second.incarnation.begin(), state->second.incarnation.end(), std::begin(incarnation.data));
+      ASSERT_EQ(engine.toHexString(), fixed.engine_uuid());
+      ASSERT_EQ(incarnation.toHexString(), fixed.target_incarnation());
+    }
+    RecordProperty("storage_recovery", "normal close/reopen of actual Rust Engine and TCP service; same Meta/FDB");
   }
   template <typename F>
   void alterInode(const EcObjectRef &object, F change) {
@@ -1419,6 +1503,378 @@ TEST_F(TestEcV2NativeHelperPlan, KeyFileAliasesAreRejectedAtCoordinatorInitializ
   EcV2Coordinator helperAlias(metaConfig_, mgmtd_, storageClient_);
   ASSERT_ERROR(helperAlias.checkEnabled(), StatusCode::kInvalidConfig);
   metaConfig_.set_ec_v2_helper_key_file(originalHelper);
+}
+
+TEST_F(TestEcV2NativeLifecycle, StripeManagerOwnsWriteAndReadsThroughTwoMissingRoutes) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor pool(4);
+  // Fixture owns this client until after the manager's explicit close/join.
+  auto borrowedMeta = std::shared_ptr<meta::client::MetaClient>(metaClient_.get(), [](auto *) {});
+  auto connected =
+      blockingWait(EcStripeClient::connect(borrowedMeta, storageClient_, mgmtd_, user_, metaClientId_.uuid, pool, {}));
+  ASSERT_OK(connected);
+  auto manager = *connected;
+  SCOPE_EXIT { blockingWait(manager->close()); };
+  auto control = [] { return EcStripeControl{std::chrono::steady_clock::now() + std::chrono::seconds(120), {}}; };
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "stripe-manager");
+  create.shardBytes = 65543;  // two integrity blocks, with a seven-byte final block
+  auto created = blockingWait(manager->createFile(create, control()));
+  ASSERT_OK(created);
+  EcStripeWrite write;
+  write.object = created->object;
+  write.ids = {Uuid::random(), Uuid::random(), Uuid::random(), Uuid::random(), Uuid::random(), Uuid::random()};
+  write.logicalData = bytes(10 * create.shardBytes - 37, 101);
+  replyDrop_.arm(write.ids.operation);
+  {
+    // Starting is synchronous: dropping an un-awaited waiter does not drop
+    // input/codeword or cancel the real managed Meta/Storage operation.
+    auto abandoned = manager->write(write, control());
+  }
+  auto query = request<GetEcOperationV2Req>();
+  query.object = write.object.object;
+  query.operation = write.ids.operation;
+  bool published = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto observed = blockingWait(metaClient_->getEcOperationV2(query));
+    if (observed && observed->record.state == EcOperationState::Published) {
+      published = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  ASSERT_TRUE(published);
+  blockingWait(manager->close());
+  EXPECT_EQ(manager->snapshot().activeOperations, 0);
+  EXPECT_EQ(manager->snapshot().reservedApplicationBytes, 0);
+  ASSERT_TRUE(replyDrop_.snapshot().committed);
+  connected =
+      blockingWait(EcStripeClient::connect(borrowedMeta, storageClient_, mgmtd_, user_, metaClientId_.uuid, pool, {}));
+  ASSERT_OK(connected);
+  manager = *connected;
+  auto replayed = blockingWait(manager->write(write, control()));
+  ASSERT_TRUE(replayed.published()) << (replayed.failure ? replayed.failure->describe() : "not published");
+  for (size_t missing : {size_t{0}, size_t{1}, size_t{2}}) {
+    auto routes = std::make_shared<flat::RoutingInfo>(*routing_);
+    for (size_t i = 0; i != missing; ++i) routes->targets.erase(storage::TargetId{2000 + i});
+    routes->routingInfoVersion = flat::RoutingInfoVersion{30 + missing};
+    fakeMgmtd_->setRoutingInfo(routes);
+    EcStripePinIds pin{write.object.object, 0, Uuid::random(), Uuid::random(), Uuid::random()};
+    auto session = manager->startRead(pin, control());
+    ASSERT_OK(session);
+    auto output = blockingWait(session->takeReady());
+    ASSERT_OK(output);
+    EXPECT_EQ(output->logicalData, write.logicalData);
+    blockingWait(session->waitLocalCleanup());
+    EXPECT_EQ(manager->snapshot().activeOperations, 0);
+    EXPECT_EQ(manager->snapshot().reservedApplicationBytes, output->logicalData.capacity());
+    // Restore routing before the all-endpoint remote drain, which deliberately
+    // requires all twelve actual instances rather than a ten-shard quorum.
+    fakeMgmtd_->setRoutingInfo(routing_);
+    auto released = blockingWait(manager->release(*session, control()));
+    ASSERT_OK(released);
+    EXPECT_EQ(released->drain.state, EcV2DrainState::ReadReleased);
+    EXPECT_EQ(released->drain.acknowledgedEndpoints, released->drain.expectedEndpoints);
+    output = makeError(StatusCode::kInterrupted);
+    EXPECT_EQ(manager->snapshot().reservedApplicationBytes, 0);
+  }
+  auto changed = write;
+  changed.logicalData[0] ^= 1;
+  auto mismatch = blockingWait(manager->write(std::move(changed), control()));
+  ASSERT_TRUE(mismatch.failure);
+  EXPECT_EQ(mismatch.failure->code(), StatusCode::kTokenMismatch);
+  RecordProperty("stripe_manager_logical_bytes", std::to_string(write.logicalData.size()));
+  RecordProperty("stripe_manager_shard_bytes", std::to_string(create.shardBytes));
+  RecordProperty("stripe_manager_blocks_per_shard", "2");
+  RecordProperty("actual_missing_route_candidates", "0,1,2; all decoded through real Storage TCP");
+}
+
+TEST_F(TestEcV2NativeHelperPlan, StripeManagerRunsAllExplicitRepairStrategiesThroughMetaIssuedPlan) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor pool(4);
+  auto borrowedMeta = std::shared_ptr<meta::client::MetaClient>(metaClient_.get(), [](auto *) {});
+  auto connected =
+      blockingWait(EcStripeClient::connect(borrowedMeta, storageClient_, mgmtd_, user_, metaClientId_.uuid, pool, {}));
+  ASSERT_OK(connected);
+  auto manager = *connected;
+  SCOPE_EXIT { blockingWait(manager->close()); };
+  auto control = [] { return EcStripeControl{std::chrono::steady_clock::now() + std::chrono::seconds(120), {}}; };
+  auto ids = [] {
+    return EcStripeMutationIds{Uuid::random(),
+                               Uuid::random(),
+                               Uuid::random(),
+                               Uuid::random(),
+                               Uuid::random(),
+                               Uuid::random()};
+  };
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "stripe-manager-three-modes");
+  create.shardBytes = 65543;
+  auto created = blockingWait(manager->createFile(create, control()));
+  ASSERT_OK(created);
+  EcStripeWrite write;
+  write.object = created->object;
+  write.ids = ids();
+  write.logicalData = bytes(10 * create.shardBytes - 37, 131);
+  auto written = blockingWait(manager->write(write, control()));
+  ASSERT_TRUE(written.published()) << (written.failure ? written.failure->describe() : "not published");
+  auto object = written.observation->object;
+  auto revision = written.observation->record.candidate.revision;
+  const std::array<EcRepairMode, 3> modes{EcRepairMode::CentralSerial,
+                                          EcRepairMode::ClientPipeline,
+                                          EcRepairMode::HelperChain};
+  const std::array<uint16_t, 3> masks{1, 6, 24};
+  for (size_t round = 0; round != modes.size(); ++round) {
+    EcStripeRepair repair;
+    repair.object = object;
+    repair.expectedRevision = revision;
+    repair.ids = ids();
+    repair.baseRead = {object.object, 0, Uuid::random(), Uuid::random(), Uuid::random()};
+    repair.planId = Uuid::random();
+    repair.replacementMask = masks[round];
+    repair.blockWindow = 2;
+    repair.mode = modes[round];
+    size_t source = 0;
+    for (uint16_t i = 0; i != 12 && source != 10; ++i)
+      if (!(repair.replacementMask & (1u << i))) repair.sources[source++] = i;
+    auto repaired = blockingWait(manager->repair(repair, control()));
+    ASSERT_TRUE(repaired.published()) << (repaired.failure ? repaired.failure->describe() : "not published");
+    EXPECT_EQ(repaired.observation->record.candidate.generation, written.observation->record.candidate.generation);
+    object = repaired.observation->object;
+    revision = repaired.observation->record.candidate.revision;
+    EcStripePinIds pin{object.object, 0, Uuid::random(), Uuid::random(), Uuid::random()};
+    auto read = manager->startRead(pin, control());
+    ASSERT_OK(read);
+    auto output = blockingWait(read->takeReady());
+    ASSERT_OK(output);
+    EXPECT_EQ(output->logicalData, write.logicalData);
+    EXPECT_EQ(output->pinned.manifest.revision, revision);
+    blockingWait(read->waitLocalCleanup());
+    auto readReleased = blockingWait(manager->release(*read, control()));
+    ASSERT_OK(readReleased);
+    EXPECT_EQ(readReleased->drain.state, EcV2DrainState::ReadReleased);
+    auto baseReleased = blockingWait(manager->release(repair.baseRead, control()));
+    ASSERT_OK(baseReleased);
+    EXPECT_EQ(baseReleased->drain.state, EcV2DrainState::ReadReleased);
+    // Resume after the auxiliary base pin has already been released: Get of
+    // the same durable operation must recover Published before another Acquire.
+    auto replay = blockingWait(manager->repair(repair, control()));
+    ASSERT_TRUE(replay.published()) << (replay.failure ? replay.failure->describe() : "not published");
+    EXPECT_EQ(replay.observation->record.candidate.revision, revision);
+    RecordProperty(fmt::format("native_strategy_{}", round), static_cast<int>(modes[round]));
+  }
+  blockingWait(manager->close());
+  EXPECT_EQ(manager->snapshot().activeOperations, 0);
+  EXPECT_EQ(manager->snapshot().reservedApplicationBytes, 0);
+  RecordProperty("trusted_plan_issuance", "real Meta37 with independent helper signing key");
+  RecordProperty("physical_failure_domains", "one process/disk; not a multi-node benchmark");
+}
+
+TEST_F(TestEcV2NativeHelperPlan, PartialRepairSurvivesStorageReopenAndPublishesThroughOriginalMetaPlan) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor executor(4);
+  auto borrowedMeta = std::shared_ptr<meta::client::MetaClient>(metaClient_.get(), [](auto *) {});
+  auto connected = blockingWait(
+      EcStripeClient::connect(borrowedMeta, storageClient_, mgmtd_, user_, metaClientId_.uuid, executor, {}));
+  ASSERT_OK(connected);
+  auto manager = *connected;
+  SCOPE_EXIT {
+    if (manager) blockingWait(manager->close());
+  };
+  auto managerControl = [] {
+    return EcStripeControl{std::chrono::steady_clock::now() + std::chrono::seconds(120), {}};
+  };
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "partial-repair-storage-reopen");
+  create.shardBytes = storage::kEcIntegrityBlockBytes + 7;
+  auto created = blockingWait(manager->createFile(create, managerControl()));
+  ASSERT_OK(created);
+  EcStripeWrite write;
+  write.object = created->object;
+  write.ids = {Uuid::random(), Uuid::random(), Uuid::random(), Uuid::random(), Uuid::random(), Uuid::random()};
+  write.logicalData = bytes(10 * create.shardBytes - 37, 197);
+  auto written = blockingWait(manager->write(write, managerControl()));
+  ASSERT_TRUE(written.published()) << (written.failure ? written.failure->describe() : "not published");
+  ASSERT_TRUE(written.observation);
+  const auto baseObject = written.observation->object;
+
+  // Freeze real Meta intent/descriptor/plan records before creating a partial
+  // stage. Only the first block bytes come from the known original input;
+  // the subsequent recovery reads healthy fragments through actual TCP RPCs.
+  auto acquire = readRequest(baseObject.object);
+  auto base = blockingWait(metaClient_->acquireEcReadV2(acquire));
+  ASSERT_OK(base);
+  Mutation replacement;
+  constexpr uint16_t mask = (1u << 0) | (1u << 11);
+  ASSERT_NO_FATAL_FAILURE(prepareRepairMetadata(replacement, *base, mask));
+  auto planReq = planRequest(replacement);
+  planReq.maxBlocksInFlight = 1;
+  auto issued = blockingWait(metaClient_->prepareEcRepairV2(planReq));
+  ASSERT_OK(issued);
+  ASSERT_TRUE(issued->helpers);
+  ASSERT_TRUE(issued->mutation.allocations);
+  auto originalPlan = storage::EcRepairPlan::create(issued->plan);
+  ASSERT_OK(originalPlan);
+  ASSERT_EQ((*originalPlan)->blockCount(), 2);
+  ASSERT_EQ((*originalPlan)->input().targetCount, 2);
+  const auto planDigest = (*originalPlan)->digest();
+  const auto fixedCandidate = issued->mutation.record.candidate;
+  auto originalShards = storage::EcCodec::encode(write.logicalData, create.shardBytes);
+  ASSERT_OK(originalShards);
+  for (const auto shard : {uint16_t{0}, uint16_t{11}}) {
+    ASSERT_TRUE(issued->mutation.grants[shard]);
+    storage::EcBeginStageV2Req begin;
+    begin.request = access((*issued->mutation.allocations)[shard]);
+    begin.grant = *issued->mutation.grants[shard];
+    ASSERT_OK(blockingWait(storageClient_->beginEcStageV2Controlled(begin, control())));
+    storage::EcAppendStageV2Req append;
+    append.request = begin.request;
+    append.grant = begin.grant;
+    append.blockIndex = 0;
+    append.payload.data = (*originalShards)[shard].substr(0, storage::kEcIntegrityBlockBytes);
+    auto progress = blockingWait(storageClient_->appendEcStageV2Controlled(std::move(append), control()));
+    ASSERT_OK(progress);
+    ASSERT_EQ(progress->state, 1);
+    ASSERT_EQ(progress->prefixBytes, storage::kEcIntegrityBlockBytes);
+    ASSERT_FALSE(progress->needsReconcile);
+  }
+
+  // No detached waiter, manager operation, or direct RPC remains in flight.
+  // The authenticated Meta endpoint and FDB database are intentionally kept.
+  blockingWait(manager->close());
+  EXPECT_EQ(manager->snapshot().activeOperations, 0);
+  EXPECT_EQ(manager->snapshot().reservedApplicationBytes, 0);
+  manager.reset();
+  const auto *sameMeta = meta_.get();
+  const auto *sameMetaServer = metaServer_.get();
+  const auto *sameFdb = kv_.get();
+  ASSERT_NO_FATAL_FAILURE(reopenStorageKeepingMeta());
+  EXPECT_EQ(meta_.get(), sameMeta);
+  EXPECT_EQ(metaServer_.get(), sameMetaServer);
+  EXPECT_EQ(kv_.get(), sameFdb);
+
+  for (const auto shard : {uint16_t{0}, uint16_t{11}}) {
+    storage::EcQueryStageV2Req query;
+    query.request = access((*issued->mutation.allocations)[shard]);
+    query.grant = *issued->mutation.grants[shard];
+    auto restored = blockingWait(storageClient_->queryEcStageV2Controlled(std::move(query), control()));
+    ASSERT_OK(restored);
+    ASSERT_EQ(restored->state, 1);
+    ASSERT_EQ(restored->prefixBytes, storage::kEcIntegrityBlockBytes);
+    ASSERT_TRUE(restored->needsReconcile);
+  }
+  auto renewed = blockingWait(metaClient_->prepareEcRepairV2(planReq));
+  ASSERT_OK(renewed);
+  ASSERT_EQ(renewed->mutation.record.state, EcOperationState::Preparing);
+  ASSERT_FALSE(renewed->mutation.drain);
+  auto restoredPlan = storage::EcRepairPlan::create(renewed->plan);
+  ASSERT_OK(restoredPlan);
+  EXPECT_EQ((*restoredPlan)->digest(), planDigest);
+  EXPECT_EQ(renewed->plan.planId, planReq.planId);
+  EXPECT_EQ(renewed->plan.operationId, replacement.begin.operation);
+  for (size_t i = 0; i != 12; ++i) {
+    EXPECT_TRUE(
+        serde::equals(renewed->mutation.record.candidate.fragments[i].identity, fixedCandidate.fragments[i].identity));
+    EXPECT_EQ(renewed->mutation.record.candidate.fragments[i].operation, fixedCandidate.fragments[i].operation);
+  }
+
+  connected = blockingWait(
+      EcStripeClient::connect(borrowedMeta, storageClient_, mgmtd_, user_, metaClientId_.uuid, executor, {}));
+  ASSERT_OK(connected);
+  manager = *connected;
+  EcStripeRepair resume;
+  resume.object = baseObject;
+  resume.expectedRevision = base->manifest.revision;
+  resume.ids = {replacement.begin.operation,
+                replacement.begin.uuid,
+                replacement.bind.uuid,
+                replacement.publish.uuid,
+                Uuid::random(),
+                planReq.uuid};
+  resume.baseRead = {baseObject.object, acquire.stripe, acquire.pin, acquire.uuid, Uuid::random()};
+  resume.planId = planReq.planId;
+  resume.replacementMask = mask;
+  resume.blockWindow = planReq.maxBlocksInFlight;
+  resume.mode = EcRepairMode::HelperChain;
+  std::copy(planReq.sourceOrder.begin(), planReq.sourceOrder.end(), resume.sources.begin());
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    controlFault_.observedRepair = replacement.begin.operation;
+    controlFault_.actualPartialReconciles.fill(0);
+    controlFault_.actualHelperBlocks.fill(0);
+  }
+  // This path must reconcile the actual restored partial stages, use the
+  // original Meta37 plan, complete the authenticated helper chain, and then
+  // execute Meta's full verification/revoke/ACK/publication sequence.
+  auto repaired = blockingWait(manager->repair(resume, managerControl()));
+  ASSERT_TRUE(repaired.published()) << (repaired.failure ? repaired.failure->describe() : "not published");
+  ASSERT_TRUE(repaired.observation);
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    EXPECT_GE(controlFault_.actualPartialReconciles[0], 1u);
+    EXPECT_GE(controlFault_.actualPartialReconciles[11], 1u);
+    for (const auto blocks : controlFault_.actualHelperBlocks) EXPECT_EQ(blocks, 3u);
+  }
+  EXPECT_EQ(repaired.operation, replacement.begin.operation);
+  EXPECT_EQ(repaired.observation->record.candidate.generation, base->manifest.generation);
+  EXPECT_EQ(repaired.observation->record.candidate.revision, fixedCandidate.revision);
+  for (size_t i = 0; i != 12; ++i) {
+    EXPECT_TRUE(serde::equals(repaired.observation->record.candidate.fragments[i].identity,
+                              fixedCandidate.fragments[i].identity));
+    EXPECT_EQ(repaired.observation->record.candidate.fragments[i].operation, fixedCandidate.fragments[i].operation);
+  }
+  ASSERT_TRUE(repaired.observation->drain);
+  EXPECT_EQ(repaired.observation->drain->state, EcV2DrainState::Published);
+  ASSERT_GT(repaired.observation->drain->expectedEndpoints, 0);
+  EXPECT_EQ(repaired.observation->drain->acknowledgedEndpoints, repaired.observation->drain->expectedEndpoints);
+  {
+    // The public response exposes progress only. Read and verify the complete
+    // persisted evidence through the same real FDB instance after publication.
+    auto txn = kv_->createReadWriteTransaction();
+    auto record = blockingWait(EcV2DrainCatalog::get(*txn,
+                                                     baseObject.object,
+                                                     storage::EcGrantScope::WriteOperation,
+                                                     replacement.begin.operation,
+                                                     manager->owner()));
+    ASSERT_OK(record);
+    ASSERT_TRUE(*record);
+    EXPECT_EQ((**record).state, EcV2DrainState::Published);
+    ASSERT_EQ((**record).identity.endpoints.count, repaired.observation->drain->expectedEndpoints);
+    auto key = storage::EcScopeControlKey::loadFile(controlKeyPath_.string());
+    ASSERT_OK(key);
+    for (size_t i = 0; i != (**record).identity.endpoints.count; ++i) {
+      ASSERT_TRUE((**record).observations[i]);
+      const auto &observed = *(**record).observations[i];
+      ASSERT_OK(EcVerifiedDrainAck::verify(**key, **record, i, observed.request, observed.ack));
+    }
+  }
+
+  EcStripePinIds finalPin{baseObject.object, 0, Uuid::random(), Uuid::random(), Uuid::random()};
+  auto read = manager->startRead(finalPin, managerControl());
+  ASSERT_OK(read);
+  {
+    auto output = blockingWait(read->takeReady());
+    ASSERT_OK(output);
+    EXPECT_EQ(output->logicalData, write.logicalData);
+    EXPECT_EQ(output->pinned.manifest.revision, fixedCandidate.revision);
+    EXPECT_EQ(output->contentSha256, base->contentSha256);
+  }
+  blockingWait(read->waitLocalCleanup());
+  auto finalReleased = blockingWait(manager->release(*read, managerControl()));
+  ASSERT_OK(finalReleased);
+  EXPECT_EQ(finalReleased->drain.state, EcV2DrainState::ReadReleased);
+  ASSERT_NO_FATAL_FAILURE(checkPin(baseObject.object, acquire.pin, false));
+  auto baseReleased = blockingWait(manager->release(resume.baseRead, managerControl()));
+  ASSERT_OK(baseReleased);
+  EXPECT_EQ(baseReleased->drain.state, EcV2DrainState::ReadReleased);
+  ASSERT_NO_FATAL_FAILURE(checkPin(baseObject.object, acquire.pin, true));
+  blockingWait(manager->close());
+  EXPECT_EQ(manager->snapshot().activeOperations, 0);
+  EXPECT_EQ(manager->snapshot().reservedApplicationBytes, 0);
+  RecordProperty("recovered_stage_prefix_bytes", std::to_string(storage::kEcIntegrityBlockBytes));
+  RecordProperty("recovered_replacement_shards", "0,11");
+  RecordProperty("recovery_boundary", "normal Storage Engine reopen, same live Meta/FDB; no power-loss claim");
 }
 
 }  // namespace

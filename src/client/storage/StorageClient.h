@@ -19,6 +19,7 @@
 #include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
+#include "fbs/storage/EcTargetDiscovery.h"
 
 namespace hf3fs::storage::client {
 
@@ -378,6 +379,7 @@ class StorageClient : public folly::MoveOnly {
     executeEcHelper,
     revokeEcScope,
     queryEcScopeDrain,
+    getEcTargetIdentity,
   };
 
   class RetryConfig : public hf3fs::ConfigBase<RetryConfig> {
@@ -657,6 +659,12 @@ class StorageClient : public folly::MoveOnly {
 
   // Transport returns an untrusted ACK until Meta verifies its control MAC,
   // exact request binding and Drained state against the persisted endpoint set.
+  // Administrator-only discovery: retain the explicit control-role key until
+  // the finite TCP request and observation verification have both completed.
+  virtual CoTryTask<EcTargetDiscoveryObservation>
+  getEcTargetIdentityControlled(EcTargetDiscoveryRequest, std::shared_ptr<const EcScopeControlKey>, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented);
+  }
   virtual CoTryTask<EcScopeControlAck> revokeEcScope(const EcScopeControlRequest &) {
     co_return makeError(StatusCode::kNotImplemented, "EC scope control requires the RPC storage client");
   }

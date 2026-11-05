@@ -16,6 +16,7 @@ SERVICES = (
     "storage_main", "mgmtd_main", "meta_main", "admin_cli",
     "hf3fs_fuse_main", "monitor_collector_main",
 )
+NATIVE_V2_SERVICES = ("storage_main", "mgmtd_main", "meta_main", "admin_cli", "ec_stripe_cli")
 GLIBC_NAMES = {
     "libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1",
     "libresolv.so.2", "libutil.so.1", "libanl.so.1", "libBrokenLocale.so.1",
@@ -33,6 +34,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--native-v2", action="store_true", help="Package the native V2 TCP profile including ec_stripe_cli, without FUSE")
     parser.add_argument("--ec-example", type=Path, help="Optional compiled POSIX EC example and its runtime libraries")
     args = parser.parse_args()
     if sys.platform != "linux":
@@ -40,6 +42,11 @@ def main():
     build, output = args.build.resolve(), args.output.resolve()
     if not (output / "cluster.json").is_file():
         parser.error("--output must be a bundle already prepared by cluster/generate.py")
+    bundle_manifest = json.loads((output / "cluster.json").read_text())
+    is_native_v2 = bundle_manifest.get("profile") == "native-v2-local-1-storage-12-targets"
+    if args.native_v2 != is_native_v2:
+        parser.error("--native-v2 must match the prepared bundle profile")
+    services = NATIVE_V2_SERVICES if args.native_v2 else SERVICES
     for directory in (output / "bin", output / "lib", output / "provenance"):
         if directory.is_symlink() or not directory.resolve().is_relative_to(output):
             parser.error(f"Refusing a redirected bundle directory: {directory}")
@@ -67,7 +74,7 @@ def main():
                             "size_bytes": source.stat().st_size, "kind": kind,
                             "reused": destination.exists()}
 
-    binaries = [(name, build / "bin" / name, "service") for name in SERVICES]
+    binaries = [(name, build / "bin" / name, "service") for name in services]
     if args.ec_example:
         binaries.append(("ec_posix_pipeline", args.ec_example.resolve(strict=True), "example"))
     for name, binary, kind in binaries:
@@ -117,7 +124,7 @@ def main():
                 "ld_library_path_during_inspection": environment["LD_LIBRARY_PATH"],
                 "scope": "ELF DT_NEEDED closure; runtime dlopen providers remain guest dependencies"}
     (record / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(json.dumps({"services": len(SERVICES), "ec_example": bool(args.ec_example),
+    print(json.dumps({"services": len(services), "ec_example": bool(args.ec_example),
                       "payload_files": len(copies), "manifest": str(record / "manifest.json")}))
 
 

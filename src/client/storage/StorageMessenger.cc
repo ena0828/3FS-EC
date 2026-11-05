@@ -315,6 +315,19 @@ CoTryTask<GetAllChunkMetadataRsp> StorageMessenger::getAllChunkMetadata(const hf
       timestamp);
 }
 
+CoTryTask<EcTargetDiscoveryRsp> StorageMessenger::getEcTargetIdentity(const net::Address &address,
+                                                                      const EcTargetDiscoveryRequest &request,
+                                                                      const net::UserRequestOptions *options,
+                                                                      serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcTargetDiscoveryRequest,
+                                        EcTargetDiscoveryRsp,
+                                        StorageSerde<>::getEcTargetIdentity<serde::ClientContext>>(client_,
+                                                                                                   address,
+                                                                                                   request,
+                                                                                                   options,
+                                                                                                   timestamp);
+}
+
 CoTryTask<EcScopeControlRsp> StorageMessenger::revokeEcScope(const net::Address &address,
                                                              const EcScopeControlRequest &request,
                                                              const net::UserRequestOptions *options,

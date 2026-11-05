@@ -115,6 +115,11 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.authorizedReconcileEcFragment(req);
   }
 
+  CoTryTask<EcTargetDiscoveryRsp> getEcTargetIdentity(serde::CallContext &ctx, const EcTargetDiscoveryRequest &req) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.getEcTargetIdentity(req);
+  }
+
   CoTryTask<EcScopeControlRsp> revokeEcScope(serde::CallContext &ctx, const EcScopeControlRequest &req) {
     reportDefaultQueueLatency(ctx);
     return storageOperator_.revokeEcScope(req);

@@ -24,6 +24,7 @@
 #include "storage/aio/AioReadWorker.h"
 #include "storage/ec_helper/EcHelperRuntime.h"
 #include "storage/ec_scope/EcScopeControlExecutor.h"
+#include "storage/ec_scope/EcTargetDiscoveryExecutor.h"
 #include "storage/service/BufferPool.h"
 #include "storage/service/ReliableForwarding.h"
 #include "storage/service/ReliableUpdate.h"
@@ -117,6 +118,7 @@ class StorageOperator {
   CoTryTask<EcHelperHopRsp> executeEcHelper(const EcHelperHopReq &request);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const EcScopeControlRequest &req);
   CoTryTask<EcScopeControlRsp> queryEcScopeDrain(const EcScopeControlRequest &req);
+  CoTryTask<EcTargetDiscoveryRsp> getEcTargetIdentity(const EcTargetDiscoveryRequest &req);
 
   CoTryTask<EcReadBlockV2Rsp> readEcBlockV2(const EcReadBlockV2Req &request);
   CoTryTask<EcStageV2Rsp> beginEcStageV2(const EcBeginStageV2Req &request);
@@ -191,6 +193,7 @@ class StorageOperator {
   Result<Void> initEcScopeControl();
   CoTryTask<EcScopeControlRsp> controlEcScope(const EcScopeControlRequest &, EcScopeControlAction);
   std::unique_ptr<EcScopeControlExecutor> ecScopeControl_;
+  std::unique_ptr<EcTargetDiscoveryExecutor> ecDiscovery_;
 
   using EcStageExecution = std::pair<EcStageResult, EcScopeTargetIdentity>;
   template <typename Request>

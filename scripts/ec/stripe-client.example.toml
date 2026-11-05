@@ -1,0 +1,35 @@
+# ec_stripe_cli uses actual TCP endpoints registered by a V2-enabled cluster.
+# This file does not create targets, users, capabilities or signing keys.
+cluster_id = "REPLACE_WITH_REAL_CLUSTER_ID"
+worker_threads = 4
+max_operations = 2
+max_application_bytes = 67108864
+write_fragments = 2
+read_blocks = 2
+deadline_seconds = 300
+
+[user_info]
+# Use the real UserStore UID/GID for this token, not an assumed OS identity.
+uid = 1000
+gid = 1000
+token_file = "/absolute/path/to/existing-user-token"
+
+[mgmtd_client]
+mgmtd_server_addresses = ["TCP://127.0.0.1:12501"]
+network_type = "TCP"
+accept_incomplete_routing_info_during_mgmtd_bootstrapping = false
+
+[meta_client]
+network_type = "TCP"
+
+[meta_client.retry_default]
+rpc_timeout = "5s"
+retry_total_time = "1min"
+
+[storage_client.traffic_control.read]
+max_concurrent_requests = 16
+max_concurrent_requests_per_server = 16
+
+[storage_client.traffic_control.write]
+max_concurrent_requests = 4
+max_concurrent_requests_per_server = 4

@@ -18,10 +18,12 @@ Result<Void> StorageOperator::initEcScopeControl() {
   }
   CHECK_RESULT(key, EcScopeControlKey::loadFile(controlPath));
   auto shared = std::shared_ptr<const EcScopeControlKey>(std::move(key));
-  CHECK_RESULT(
-      executor,
-      EcScopeControlExecutor::create(std::move(shared), authority, components_.appInfo.nodeId, ecAuthorizationNow_));
+  CHECK_RESULT(executor,
+               EcScopeControlExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_));
+  CHECK_RESULT(discovery,
+               EcTargetDiscoveryExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_));
   ecScopeControl_ = std::move(executor);
+  ecDiscovery_ = std::move(discovery);
   return Void{};
 }
 CoTryTask<EcScopeControlRsp> StorageOperator::controlEcScope(const EcScopeControlRequest &request,

@@ -14,6 +14,7 @@
 #include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
+#include "fbs/storage/EcTargetDiscovery.h"
 
 namespace hf3fs::storage::client {
 
@@ -108,6 +109,10 @@ class StorageMessenger {
                                                           const net::UserRequestOptions *options = nullptr,
                                                           serde::Timestamp *timestamp = nullptr);
 
+  CoTryTask<EcTargetDiscoveryRsp> getEcTargetIdentity(const net::Address &address,
+                                                      const EcTargetDiscoveryRequest &request,
+                                                      const net::UserRequestOptions *options = nullptr,
+                                                      serde::Timestamp *timestamp = nullptr);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const net::Address &address,
                                              const EcScopeControlRequest &request,
                                              const net::UserRequestOptions *options = nullptr,

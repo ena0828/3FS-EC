@@ -3260,6 +3260,64 @@ CoTryTask<ChunkMetaVector> StorageClientImpl::getAllChunkMetadata(const ChainId 
   co_return response->chunkMetaVec;
 }
 
+CoTryTask<EcTargetDiscoveryObservation> StorageClientImpl::getEcTargetIdentityControlled(
+    EcTargetDiscoveryRequest request,
+    std::shared_ptr<const EcScopeControlKey> key,
+    EcRequestControl control) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  if (!key) co_return makeError(StatusCode::kAuthenticationFail, "discovery requires an administrator control key");
+  const auto wall = [] {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  };
+  const auto check = [&]() -> Result<Void> {
+    if (std::chrono::steady_clock::now() >= control.deadline) return makeError(StorageClientCode::kTimeout);
+    if (control.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
+    return Void{};
+  };
+  CO_RETURN_ON_ERROR(check());
+  if (control.deadline - std::chrono::steady_clock::now() > std::chrono::seconds(kEcTargetDiscoveryMaxTtlSeconds) ||
+      control.transport != EcRequestControl::TransportPolicy::TcpOnly)
+    co_return makeError(StatusCode::kInvalidArg, "discovery requires TCP and a deadline within 60 seconds");
+  CO_RETURN_ON_ERROR(
+      verifyEcTargetDiscovery(*key, request, request.claims.clusterAuthority, request.claims.nodeId, wall()));
+  if (!ecControlConcurrency_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy);
+  auto release = folly::makeGuard([this] { ecControlConcurrency_.signal(); });
+  auto routing = getCurrentRoutingInfo();
+  if (!routing || !routing->raw()) co_return makeError(StorageClientCode::kRoutingError);
+  auto node = getNodeInfo(routing, request.claims.nodeId);
+  CO_RETURN_ON_ERROR(node);
+  if (node->app.nodeId != request.claims.nodeId || node->type != flat::NodeType::STORAGE)
+    co_return makeError(StorageClientCode::kRoutingVersionMismatch);
+  CO_RETURN_ON_ERROR(check());
+  const auto remaining = control.deadline - std::chrono::steady_clock::now();
+  if (remaining <= std::chrono::steady_clock::duration::zero()) co_return makeError(StorageClientCode::kTimeout);
+  const DebugOptions debug;
+  ClientRequestContext
+      context(MethodType::getEcTargetIdentity, flat::UserInfo(), debug, config_, 1, 0, Duration(remaining));
+  // No asynchronous task is detached. Once dispatched, the native Waiter owns
+  // its finite timer and the coroutine retains request/key until it returns.
+  auto response = co_await callMessengerMethod<EcTargetDiscoveryRequest,
+                                               EcTargetDiscoveryRsp,
+                                               &StorageMessenger::getEcTargetIdentity>(messenger_,
+                                                                                       context,
+                                                                                       *node,
+                                                                                       request,
+                                                                                       0,
+                                                                                       nullptr,
+                                                                                       true,
+                                                                                       true);
+  if (!response) {
+    if (response.error().code() == RPCCode::kTimeout)
+      co_return makeError(response.error().convert(StorageClientCode::kTimeout));
+    co_return makeError(response.error());
+  }
+  CO_RETURN_ON_ERROR(response->result);
+  CO_RETURN_ON_ERROR(check());
+  CO_RETURN_ON_ERROR(verifyEcTargetDiscoveryObservation(*key, *response->result, request, wall()));
+  co_return std::move(*response->result);
+}
+
 CoTryTask<EcScopeControlAck> StorageClientImpl::controlEcScope(const EcScopeControlRequest &request,
                                                                EcScopeControlAction action) {
   if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
