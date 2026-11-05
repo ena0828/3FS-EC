@@ -61,6 +61,7 @@ Result<Void> StorageOperator::init(uint32_t numberOfDisks) {
   RETURN_ON_ERROR(components_.loadEcCapabilityKey());
   RETURN_ON_ERROR(initEcScopeControl());
   RETURN_ON_ERROR(initEcHelpers());
+  RETURN_ON_ERROR(initEcGc());
   storageReadAvgBytes.setLambda([&] {
     auto totalReadBytes = totalReadBytes_.exchange(0);
     auto totalReadIOs = totalReadIOs_.exchange(0);
@@ -76,6 +77,7 @@ Result<Void> StorageOperator::init(uint32_t numberOfDisks) {
 }
 
 Result<Void> StorageOperator::stopAndJoin() {
+  if (ecGc_) RETURN_ON_ERROR(ecGc_->stopAndJoin());
   if (ecHelpers_) ecHelpers_->stopAndJoin();
   if (ecDiscovery_) ecDiscovery_->stopAndJoin();
   if (ecScopeControl_) ecScopeControl_->stopAndJoin();

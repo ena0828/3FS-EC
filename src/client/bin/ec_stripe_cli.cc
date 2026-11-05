@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "client/ec/EcAllocationExport.h"
 #include "client/ec/EcStripeRunRecord.h"
 #include "client/meta/MetaClient.h"
 #include "client/mgmtd/MgmtdClientForAdmin.h"
@@ -58,6 +59,7 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(cluster_id, "");
   CONFIG_ITEM(run_dir, "");
   CONFIG_ITEM(source_run, "");
+  CONFIG_ITEM(allocation_output, "");
   CONFIG_ITEM(input_file, "");
   CONFIG_ITEM(remote_path, "");
   CONFIG_ITEM(shard_bytes, uint32_t{0});
@@ -127,7 +129,7 @@ Result<std::string> tokenFile(const std::string &path) {
 Result<std::unique_ptr<EcStripeRunJournal>> journal(const Config &config,
                                                     std::string_view command,
                                                     std::string_view executable) {
-  if (command == "resume" || command == "release" || command == "inspect") {
+  if (command == "resume" || command == "release" || command == "inspect" || command == "export-allocations") {
     CHECK_RESULT(value, EcStripeRunJournal::resume(config.run_dir()));
     const auto &record = value->record();
     if ((!config.cluster_id().empty() && config.cluster_id() != record.cluster) ||
@@ -350,6 +352,8 @@ int execute(int argc, char **argv) {
   if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
     std::cout << "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/new-run new-write|new-read|new-repair\n"
                  "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/run resume|release|inspect\n"
+                 "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/published-run "
+                 "--config.allocation_output=/absolute/new.json export-allocations\n"
                  "new-write: --config.input_file=... --config.remote_path=/... --config.shard_bytes=...\n"
                  "new-read: --config.source_run=/absolute/published-run\n"
                  "new-repair: source_run plus --config.strategy=central|pipeline|helper, replacement_mask, optional "
@@ -423,12 +427,16 @@ int execute(int argc, char **argv) {
     return 2;
   }
   const ClientId namespaceId(record.record().clientNamespace);
-  auto dataClient = storage::client::StorageClient::create(ClientId::random(), config.storage_client(), *mgmtdClient);
-  if (!dataClient) {
+  std::shared_ptr<storage::client::StorageClient> dataClient;
+  if (command != "export-allocations")
+    dataClient = storage::client::StorageClient::create(ClientId::random(), config.storage_client(), *mgmtdClient);
+  if (command != "export-allocations" && !dataClient) {
     std::cerr << "cannot start StorageClient\n";
     return 2;
   }
-  SCOPE_EXIT { dataClient->stop(); };
+  SCOPE_EXIT {
+    if (dataClient) dataClient->stop();
+  };
   // A fresh transport process reuses the persisted namespace, not a new UUID.
   auto metadata = std::make_shared<meta::client::MetaClient>(
       namespaceId,
@@ -439,6 +447,22 @@ int execute(int argc, char **argv) {
       dataClient,
       false);
   SCOPE_EXIT { metadata->stop(); };
+  if (command == "export-allocations") {
+    const EcStripeControl control{std::chrono::steady_clock::now() + std::chrono::seconds(config.deadline_seconds()),
+                                  {}};
+    auto exported = blockingWait(exportEcAllocations(
+        metadata,
+        record,
+        flat::UserInfo{flat::Uid(config.user_info().uid()), flat::Gid(config.user_info().gid()), std::move(*token)},
+        config.allocation_output(),
+        control));
+    if (!exported) {
+      std::cerr << exported.error().describe() << '\n';
+      return 1;
+    }
+    fmt::print("Allocation metadata archived at {}; this is not GC authorization.\n", config.allocation_output());
+    return 0;
+  }
   folly::CPUThreadPoolExecutor executor(config.worker_threads());
   EcStripeClient::Limits limits;
   limits.maxOperations = config.max_operations();

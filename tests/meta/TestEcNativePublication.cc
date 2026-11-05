@@ -120,6 +120,7 @@ struct ReadResponseGate {
   struct State {
     uint16_t arrived = 0;
     uint16_t authenticationFailures = 0;
+    std::array<uint16_t, 12> resultCodes{};
     bool released = false;
     bool timedOut = false;
   };
@@ -137,12 +138,13 @@ struct ReadResponseGate {
     std::lock_guard lock(mutex);
     return state;
   }
-  CoTask<void> afterRead(Uuid scope, uint16_t shard, bool authenticationFailed) {
+  CoTask<void> afterRead(Uuid scope, uint16_t shard, uint16_t resultCode) {
     {
       std::lock_guard lock(mutex);
       if (armed.is_nil() || scope != armed || shard >= 12) co_return;
       state.arrived |= uint16_t(1u << shard);
-      if (authenticationFailed) state.authenticationFailures |= uint16_t(1u << shard);
+      state.resultCodes[shard] = resultCode;
+      if (resultCode == StatusCode::kAuthenticationFail) state.authenticationFailures |= uint16_t(1u << shard);
     }
     while (true) {
       {
@@ -175,13 +177,13 @@ class GatedReadStorageService : public storage::StorageService {
   CoTryTask<storage::EcReadRsp> authorizedReadEcFragment(serde::CallContext &ctx,
                                                          const storage::EcAuthorizedReadReq &req) {
     auto response = co_await storage::StorageService::authorizedReadEcFragment(ctx, req);
-    bool authenticationFailed = false;
-    if (!response) {
-      authenticationFailed = response.error().code() == StatusCode::kAuthenticationFail;
-    } else if (!response->result) {
-      authenticationFailed = response->result.error().code() == StatusCode::kAuthenticationFail;
-    }
-    co_await gate_.afterRead(req.grant.claims.scopeId, req.request.identity.shard, authenticationFailed);
+    // Record the actual service result before the response barrier. Numeric
+    // codes distinguish admission, authorization and disk errors without
+    // writing a capability, request body or payload into the test evidence.
+    const uint16_t resultCode = !response           ? response.error().code()
+                                : !response->result ? response->result.error().code()
+                                                    : 0;
+    co_await gate_.afterRead(req.grant.claims.scopeId, req.request.identity.shard, resultCode);
     co_return response;
   }
 
@@ -204,6 +206,7 @@ class TestEcNativePublication : public hf3fs::testing::SetupFDB {
  protected:
   static constexpr uint32_t kShardBytes = 4096;
   virtual uint32_t ecAdmissionLimit() const { return 2; }
+  virtual uint32_t ecUpdateQueueSize() const { return 8; }
   struct Mutation {
     std::string logical;
     storage::EcCodec::Shards shards;
@@ -437,7 +440,7 @@ class TestEcNativePublication : public hf3fs::testing::SetupFDB {
     storage.set_max_concurrent_ec_requests(ecAdmissionLimit());
     storage.write_worker().set_num_threads(2);
     storage.write_worker().set_bg_num_threads(1);
-    storage.write_worker().set_queue_size(8);
+    storage.write_worker().set_queue_size(ecUpdateQueueSize());
     storage.event_trace_log().set_enabled(false);
     storage.event_trace_log().set_trace_file_dir(traces_.path());
     storageConfig_.aio_read_worker().set_num_threads(1);
@@ -849,6 +852,14 @@ class TestEcNativePublication : public hf3fs::testing::SetupFDB {
       const auto gate = readGate_.snapshot();
       EXPECT_EQ(gate.arrived & 0x7ff, 0x7ff);
       EXPECT_EQ(gate.authenticationFailures, badMac ? 1u : 0u);
+      std::string serviceCodes;
+      for (size_t index = 0; index != gate.resultCodes.size(); ++index) {
+        if (!(gate.arrived & (1u << index))) continue;
+        const auto expectedCode = badMac && index == 0 ? StatusCode::kAuthenticationFail : 0;
+        EXPECT_EQ(gate.resultCodes[index], expectedCode) << "actual service result, shard " << index;
+        serviceCodes += fmt::format("{}{}:{}", serviceCodes.empty() ? "" : ",", index, gate.resultCodes[index]);
+      }
+      RecordProperty(badMac ? "selector_bad_mac_service_codes" : "selector_valid_service_codes", serviceCodes);
       EXPECT_FALSE(gate.timedOut);
       EXPECT_FALSE(gate.released);
       EXPECT_FALSE(handle.localCleanupComplete());
@@ -1241,11 +1252,13 @@ TEST_F(TestEcNativePublication, RepairsOneAndTwoAllocationsFromTenActualHealthyR
   RecordProperty("physical_fragment_deletion", "false");
 }
 
-// Raise only this fixture's explicit service admission limit. The existing
-// publication/repair fixtures preserve their two-request bound.
+// This fixture launches eleven requests together and may add the twelfth.
+// Non-waiting EC queues must fit that declared burst even before workers run.
+// Other fixtures retain their two-request admission and eight-entry queue.
 class TestEcNativeReadSelector : public TestEcNativePublication {
  protected:
   uint32_t ecAdmissionLimit() const override { return 12; }
+  uint32_t ecUpdateQueueSize() const override { return 12; }
 };
 
 TEST_F(TestEcNativeReadSelector, QuorumPrecedesTcpCleanupAndRejectsBadGrant) {

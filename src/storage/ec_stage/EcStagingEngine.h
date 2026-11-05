@@ -5,6 +5,7 @@
 #include <string>
 
 #include "common/utils/Path.h"
+#include "fbs/storage/EcGcControl.h"
 #include "fbs/storage/EcIntegrity.h"
 #include "storage/ec_scope/EcScope.h"
 
@@ -51,6 +52,16 @@ class EcStagingEngine {
       const Path &path,
       bool create,
       chunk_engine::RawEcStageLimits limits = chunk_engine::RawEcStageLimits{4096, 64, 8});
+  // Explicit, local format-3 opener. The directory must already have exact
+  // format-3 blockers; this neither upgrades format 2 nor authorizes collection.
+  // It owns the same Rust facade used by execute(), not a second Engine.
+  static Result<std::shared_ptr<EcStagingEngine>> openExactGc(
+      const Path &path,
+      bool create,
+      chunk_engine::RawEcStageLimits limits = chunk_engine::RawEcStageLimits{4096, 64, 8});
+  // Actual persisted namespace format, independent of data protocol 2 and
+  // Meta object mode 3. No inference from target configuration or request.
+  Result<uint16_t> actualDiskFormat() const;
   Result<std::shared_ptr<EcScope>> scope() const;
   Result<EcStageResult> execute(const EcStageRequest &request) const;
   Result<uint64_t> committedSize(ChainId chain) const;
@@ -59,6 +70,10 @@ class EcStagingEngine {
   Result<Void> setAllowToAllocate(bool allow) const;
 
  private:
+  friend class StorageTarget;
+  // Only the loaded target adapter supplies its actual chain. The key is
+  // constructed here from that chain and the authenticated fragment identity.
+  Result<EcGcLedgerReceipt> executeGc(const VerifiedEcGcRequest &, ChainId actualChain) const;
   explicit EcStagingEngine(rust::Box<chunk_engine::EcStageHandle> handle)
       : handle_(std::move(handle)) {}
   rust::Box<chunk_engine::EcStageHandle> handle_;

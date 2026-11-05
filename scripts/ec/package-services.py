@@ -34,7 +34,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--native-v2", action="store_true", help="Package the native V2 TCP profile including ec_stripe_cli, without FUSE")
+    native_profile = parser.add_mutually_exclusive_group()
+    native_profile.add_argument("--native-v2", action="store_true", help="Package the native V2 TCP profile including ec_stripe_cli, without FUSE")
+    native_profile.add_argument("--native-gc", action="store_true", help="Package the explicitly prepared native GC profile using the same five services")
     parser.add_argument("--ec-example", type=Path, help="Optional compiled POSIX EC example and its runtime libraries")
     args = parser.parse_args()
     if sys.platform != "linux":
@@ -44,9 +46,10 @@ def main():
         parser.error("--output must be a bundle already prepared by cluster/generate.py")
     bundle_manifest = json.loads((output / "cluster.json").read_text())
     is_native_v2 = bundle_manifest.get("profile") == "native-v2-local-1-storage-12-targets"
-    if args.native_v2 != is_native_v2:
-        parser.error("--native-v2 must match the prepared bundle profile")
-    services = NATIVE_V2_SERVICES if args.native_v2 else SERVICES
+    is_native_gc = bundle_manifest.get("profile") == "native-gc-local-1-storage-12-targets"
+    if args.native_v2 != is_native_v2 or args.native_gc != is_native_gc:
+        parser.error("--native-v2/--native-gc must match the prepared bundle profile")
+    services = NATIVE_V2_SERVICES if args.native_v2 or args.native_gc else SERVICES
     for directory in (output / "bin", output / "lib", output / "provenance"):
         if directory.is_symlink() or not directory.resolve().is_relative_to(output):
             parser.error(f"Refusing a redirected bundle directory: {directory}")

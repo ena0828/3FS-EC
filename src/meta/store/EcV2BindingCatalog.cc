@@ -4,6 +4,7 @@
 #include <set>
 
 #include "common/kv/KeyPrefix.h"
+#include "meta/store/EcV2GcCatalog.h"
 
 namespace hf3fs::meta::server {
 namespace {
@@ -190,10 +191,11 @@ CoTryTask<std::optional<EcV2ObjectMode>> EcV2BindingCatalog::getObjectMode(Tx &t
   CO_RETURN_ON_ERROR(checkObject(object));
   auto mode = co_await load<EcV2ObjectMode>(txn, objectKey(KeyPrefix::EcV2ObjectMode, object.incarnation));
   CO_RETURN_ON_ERROR(mode);
-  if (*mode && ((**mode).mode != 2 || (**mode).object != object || (**mode).creator.client.is_nil() ||
-                (**mode).createRequest.is_nil())) {
+  if (*mode && (((**mode).mode != 2 && (**mode).mode != kEcGcTrackedObjectMode) || (**mode).object != object ||
+                (**mode).creator.client.is_nil() || (**mode).createRequest.is_nil())) {
     co_return makeError(StatusCode::kDataCorruption, "invalid or mismatched immutable V2 object mode");
   }
+  if (*mode) CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::validateEnrollment(txn, **mode));
   co_return mode;
 }
 
@@ -215,6 +217,25 @@ CoTryTask<EcObjectRecord> EcV2BindingCatalog::createV2Object(Tx &txn,
                                                              bool allowColocated,
                                                              const EcOwner &creator,
                                                              const Uuid &createRequest) {
+  co_return co_await createObjectWithMode(txn, object, shardBytes, allowColocated, creator, createRequest, false);
+}
+
+CoTryTask<EcObjectRecord> EcV2BindingCatalog::createTrackedV2Object(Tx &txn,
+                                                                    const EcObjectRef &object,
+                                                                    uint32_t shardBytes,
+                                                                    bool allowColocated,
+                                                                    const EcOwner &creator,
+                                                                    const Uuid &createRequest) {
+  co_return co_await createObjectWithMode(txn, object, shardBytes, allowColocated, creator, createRequest, true);
+}
+
+CoTryTask<EcObjectRecord> EcV2BindingCatalog::createObjectWithMode(Tx &txn,
+                                                                   const EcObjectRef &object,
+                                                                   uint32_t shardBytes,
+                                                                   bool allowColocated,
+                                                                   const EcOwner &creator,
+                                                                   const Uuid &createRequest,
+                                                                   bool tracked) {
   if (creator.client.is_nil() || createRequest.is_nil())
     co_return makeError(StatusCode::kInvalidArg, "V2 creation requires permanent owner/request identity");
   auto mode = co_await getObjectMode(txn, object);
@@ -234,9 +255,11 @@ CoTryTask<EcObjectRecord> EcV2BindingCatalog::createV2Object(Tx &txn,
   auto created = co_await EcCatalog::createObject(txn, object, shardBytes, allowColocated, creator, createRequest);
   CO_RETURN_ON_ERROR(created);
   EcV2ObjectMode value;
+  value.mode = tracked ? kEcGcTrackedObjectMode : 2;
   value.object = object;
   value.creator = creator;
   value.createRequest = createRequest;
+  if (tracked) CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::enrollBirth(txn, value));
   CO_RETURN_ON_ERROR(co_await store(txn, objectKey(KeyPrefix::EcV2ObjectMode, object.incarnation), value));
   co_return created;
 }
@@ -266,6 +289,11 @@ CoTryTask<EcV2OperationBinding> EcV2BindingCatalog::bindPreparing(Tx &txn,
   if (op->state != EcOperationState::Preparing)
     co_return makeError(StatusCode::kTokenStale, "only Preparing operations may bind V2 writes");
   if (!same(*op, expected)) co_return makeError(StatusCode::kTokenMismatch, "V2 bind differs from fixed Begin result");
+  CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::requireProtectedScope(txn,
+                                                                   object,
+                                                                   storage::EcGrantScope::WriteOperation,
+                                                                   expected.intent.operation,
+                                                                   authenticatedOwner));
   auto file = co_await EcCatalog::getObject(txn, object);
   CO_RETURN_ON_ERROR(file);
   CO_RETURN_ON_ERROR(validReservation(*op, *file));
@@ -408,9 +436,11 @@ CoTryTask<EcV2PinnedRead> EcV2BindingCatalog::acquireRead(Tx &txn,
   CO_RETURN_ON_ERROR(previous);
   if (*previous) {
     if (!same(**previous, next)) co_return makeError(StatusCode::kDataCorruption, "V2 pin endpoint snapshot changed");
+    CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::protectRead(txn, **previous));
     co_return EcV2PinnedRead{*manifest, **previous};
   }
   CO_RETURN_ON_ERROR(co_await store(txn, key, next));
+  CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::protectRead(txn, next));
   co_return EcV2PinnedRead{*manifest, next};
 }
 

@@ -1,10 +1,73 @@
 #include "ConfigManager.h"
 
+#include <new>
+
 #include "common/utils/ConfigBase.h"
 #include "common/utils/RenderConfig.h"
 #include "common/utils/StringUtils.h"
 
 namespace hf3fs::app {
+namespace {
+// ConfigBase accepts internal section aliases such as "groups#1". Such a
+// section can be inactive and disappear from toToml(), so matching the final
+// values alone is not enough. Require every supplied structured path to exist
+// in the canonical effective representation after strict typed parsing.
+Result<Void> canonicalConfigShape(const toml::node &supplied, const toml::node &canonical) {
+  // Typed parsing can construct an integer from bool/float or narrow a large
+  // integer. Such lossy aliases must not be acknowledged as unchanged values.
+  if (supplied.type() != canonical.type()) return makeError(StatusCode::kConfigInvalidType);
+  if (const auto *table = supplied.as_table()) {
+    const auto *expected = canonical.as_table();
+    if (!expected) return makeError(StatusCode::kConfigInvalidType);
+    for (const auto &[key, value] : *table) {
+      const auto *field = expected->get(key.str());
+      if (!field) return makeError(StatusCode::kConfigRedundantKey, "noncanonical configuration section");
+      RETURN_ON_ERROR(canonicalConfigShape(value, *field));
+    }
+  } else if (const auto *array = supplied.as_array()) {
+    const auto *expected = canonical.as_array();
+    if (!expected || array->size() != expected->size()) return makeError(StatusCode::kConfigInvalidType);
+    for (size_t i = 0; i != array->size(); ++i) RETURN_ON_ERROR(canonicalConfigShape((*array)[i], (*expected)[i]));
+  } else if (supplied.is_integer() && supplied.as_integer()->get() != canonical.as_integer()->get()) {
+    return makeError(StatusCode::kConfigInvalidValue);
+  } else if (supplied.is_floating_point() &&
+             supplied.as_floating_point()->get() != canonical.as_floating_point()->get()) {
+    return makeError(StatusCode::kConfigInvalidValue);
+  } else if (supplied.is_boolean() && supplied.as_boolean()->get() != canonical.as_boolean()->get()) {
+    return makeError(StatusCode::kConfigInvalidValue);
+  }
+  return Void{};
+}
+}  // namespace
+
+Result<Void> ConfigManager::checkEquivalentConfig(const String &configContent,
+                                                  const config::IConfig &cfg,
+                                                  const flat::AppInfo *appInfo) const {
+  try {
+    auto rendered = hf3fs::renderConfig(configContent, appInfo);
+    RETURN_ON_ERROR(rendered);
+    const auto supplied = toml::parse(std::string_view(*rendered));
+    auto expected = cfg.defaultPtr();
+    // Partial updates on failure affect only this disposable object. Never
+    // apply to cfg and roll back: callbacks could already have changed runtime.
+    RETURN_ON_ERROR(expected->update(supplied, /*isHotUpdate=*/false));
+    // Use the normal startup parser's validation. validate() additionally walks
+    // inactive array capacity, whose default slots need not be runnable configs.
+    const auto canonical = expected->toToml();
+    RETURN_ON_ERROR(canonicalConfigShape(supplied, canonical));
+    // Full typed TOML retains active CONFIG_OBJ_ARRAY lengths. diffWith() and
+    // IConfig::operator== currently omit those separate length fields.
+    if (cfg.toToml() != canonical)
+      return makeError(StatusCode::kCannotPushConfig, "remote configuration differs from pinned local values");
+    return Void{};
+  } catch (const toml::parse_error &) {
+    return makeError(StatusCode::kConfigParseError);
+  } catch (const std::bad_alloc &) {
+    return makeError(StatusCode::kNotEnoughMemory);
+  } catch (const std::exception &) {
+    return makeError(StatusCode::kConfigUpdateFailed);
+  }
+}
 
 #define RETURN_AND_RECORD_CONFIG_UPDATE(ret, desc)                                        \
   Result<Void> _r = (ret);                                                                \

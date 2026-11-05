@@ -66,6 +66,10 @@ class DummyMetaServiceStub : public IMetaServiceStub {
   NOT_IMPLEMENTED_FUNC(acquireEcReadV2, AcquireEcReadV2Req, AcquireEcReadV2Rsp);
   NOT_IMPLEMENTED_FUNC(releaseEcReadV2, ReleaseEcReadV2Req, ReleaseEcReadV2Rsp);
   NOT_IMPLEMENTED_FUNC(prepareEcRepairV2, PrepareEcRepairV2Req, PrepareEcRepairV2Rsp);
+  NOT_IMPLEMENTED_FUNC(collectEcFragmentV2, CollectEcFragmentV2Req, EcGcAdminRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
+  NOT_IMPLEMENTED_FUNC(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
 
   virtual CoTryTask<AuthRsp> authenticate(const AuthReq &req) { co_return AuthRsp{req.user}; }
   CoTryTask<AuthRsp> authenticate(const AuthReq &req, const net::UserRequestOptions &, serde::Timestamp *) override {
@@ -170,6 +174,10 @@ class MetaServiceStub<hf3fs::stubs::StubMockContext<IMetaServiceStub>> : public 
   FORWARD_RPC_FUNC(acquireEcReadV2, AcquireEcReadV2Req, AcquireEcReadV2Rsp);
   FORWARD_RPC_FUNC(releaseEcReadV2, ReleaseEcReadV2Req, ReleaseEcReadV2Rsp);
   FORWARD_RPC_FUNC(prepareEcRepairV2, PrepareEcRepairV2Req, PrepareEcRepairV2Rsp);
+  FORWARD_RPC_FUNC(collectEcFragmentV2, CollectEcFragmentV2Req, EcGcAdminRsp);
+  FORWARD_RPC_FUNC(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
+  FORWARD_RPC_FUNC(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
+  FORWARD_RPC_FUNC(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
 
 #undef FORWARD_RPC_FUNC
 

@@ -154,7 +154,7 @@ Result<Void> Components::stopAndJoin(CPUExecutorGroup &executor) {
   LOG_COMMAND(INFO, "Stop dumpWorker", dumpWorker.stopAndJoin());
   LOG_COMMAND(INFO, "Stop checkWorker", checkWorker.stopAndJoin());
   LOG_COMMAND(INFO, "Stop resyncWorker", resyncWorker.stopAndJoin());
-  LOG_COMMAND(INFO, "Stop storageOperator", storageOperator.stopAndJoin());
+  RETURN_ON_ERROR_LOG_WRAPPED(INFO, "Stop storageOperator", storageOperator.stopAndJoin());
   LOG_COMMAND(INFO, "Stop reliableForwarding", reliableForwarding.stopAndJoin());
   LOG_COMMAND(INFO, "Stop messenger", messenger.stopAndJoin());
   targetMap.setUpdateCallback([](auto) {});

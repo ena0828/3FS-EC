@@ -315,6 +315,18 @@ CoTryTask<GetAllChunkMetadataRsp> StorageMessenger::getAllChunkMetadata(const hf
       timestamp);
 }
 
+CoTryTask<EcGcRsp> StorageMessenger::exchangeEcGc(const net::Address &address,
+                                                  const EcGcRequest &request,
+                                                  const net::UserRequestOptions *options,
+                                                  serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcGcRequest, EcGcRsp, StorageSerde<>::exchangeEcGc<serde::ClientContext>>(
+      client_,
+      address,
+      request,
+      options,
+      timestamp);
+}
+
 CoTryTask<EcTargetDiscoveryRsp> StorageMessenger::getEcTargetIdentity(const net::Address &address,
                                                                       const EcTargetDiscoveryRequest &request,
                                                                       const net::UserRequestOptions *options,
@@ -326,6 +338,19 @@ CoTryTask<EcTargetDiscoveryRsp> StorageMessenger::getEcTargetIdentity(const net:
                                                                                                    request,
                                                                                                    options,
                                                                                                    timestamp);
+}
+
+CoTryTask<EcGcDiscoveryRsp> StorageMessenger::getEcGcCapability(const net::Address &address,
+                                                                const EcGcDiscoveryRequest &request,
+                                                                const net::UserRequestOptions *options,
+                                                                serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcGcDiscoveryRequest,
+                                        EcGcDiscoveryRsp,
+                                        StorageSerde<>::getEcGcCapability<serde::ClientContext>>(client_,
+                                                                                                 address,
+                                                                                                 request,
+                                                                                                 options,
+                                                                                                 timestamp);
 }
 
 CoTryTask<EcScopeControlRsp> StorageMessenger::revokeEcScope(const net::Address &address,

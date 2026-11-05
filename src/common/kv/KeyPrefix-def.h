@@ -39,6 +39,13 @@ DEFINE_PREFIX(EcV2Drain,        "ECVD")
 DEFINE_PREFIX(EcV2Issuance,     "ECVI")
 DEFINE_PREFIX(EcV2PublishedContent, "ECVC")
 DEFINE_PREFIX(EcV2RepairPlan,    "ECRP")
+DEFINE_PREFIX(EcGcEnrollment,   "ECGE")
+DEFINE_PREFIX(EcGcAllocation,   "ECGA")
+DEFINE_PREFIX(EcGcScope,        "ECGS")
+DEFINE_PREFIX(EcGcMembership,   "ECGP")
+DEFINE_PREFIX(EcGcClaim,        "ECGC")
+DEFINE_PREFIX(EcGcCompletion,   "ECGD")
+DEFINE_PREFIX(EcRevisionRetirement, "ECRT")
 // clang-format on
 
 #undef DEFINE_PREFIX

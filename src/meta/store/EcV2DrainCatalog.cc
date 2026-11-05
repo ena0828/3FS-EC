@@ -2,6 +2,7 @@
 
 #include <limits>
 
+#include "meta/store/EcV2GcCatalog.h"
 #include "meta/store/EcV2LifecycleUtils.h"
 
 namespace hf3fs::meta::server {
@@ -305,7 +306,10 @@ CoTryTask<EcPinRecord> EcV2DrainCatalog::finishRead(Transaction &txn,
   auto historical = co_await EcCatalog::getManifest(txn, object, original->stripe, original->revision);
   CO_RETURN_ON_ERROR(historical);
   if (historical->manifest.generation != record->identity.generation) co_return makeError(StatusCode::kDataCorruption);
-  if (original->released) co_return original;
+  if (original->released) {
+    CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::finishScope(txn, object, Kind::ReadPin, pin, owner, key));
+    co_return original;
+  }
   auto snapshot = co_await EcV2BindingCatalog::getPinSnapshot(txn, object, pin, owner);
   CO_RETURN_ON_ERROR(snapshot);
   if (snapshot->endpointSetDigest != record->identity.endpoints.digest)
@@ -313,6 +317,7 @@ CoTryTask<EcPinRecord> EcV2DrainCatalog::finishRead(Transaction &txn,
   CO_RETURN_ON_ERROR(co_await EcCatalog::releaseRead(txn, object, pin));
   record->state = EcV2DrainState::ReadReleased;
   CO_RETURN_ON_ERROR(co_await save(txn, drainKey(object, Kind::ReadPin, pin), *record));
+  CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::finishScope(txn, object, Kind::ReadPin, pin, owner, key));
   co_return co_await EcCatalog::getPin(txn, object, pin);
 }
 
@@ -334,6 +339,7 @@ CoTryTask<EcOperationRecord> EcV2DrainCatalog::finishCancel(Transaction &txn,
     const auto expected =
         record->state == EcV2DrainState::Published ? EcOperationState::Published : EcOperationState::Aborted;
     if (current->state != expected) co_return makeError(StatusCode::kDataCorruption);
+    CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::finishScope(txn, object, Kind::WriteOperation, operation, owner, key));
     co_return current;
   }
   if (current->state != EcOperationState::Preparing)
@@ -342,6 +348,7 @@ CoTryTask<EcOperationRecord> EcV2DrainCatalog::finishCancel(Transaction &txn,
   CO_RETURN_ON_ERROR(cancelled);
   record->state = EcV2DrainState::Aborted;
   CO_RETURN_ON_ERROR(co_await save(txn, drainKey(object, Kind::WriteOperation, operation), *record));
+  CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::finishScope(txn, object, Kind::WriteOperation, operation, owner, key));
   co_return cancelled;
 }
 
@@ -376,6 +383,7 @@ CoTryTask<EcOperationRecord> EcV2DrainCatalog::finishPublish(Transaction &txn,
   CO_RETURN_ON_ERROR(published);
   record->state = EcV2DrainState::Published;
   CO_RETURN_ON_ERROR(co_await save(txn, drainKey(object, Kind::WriteOperation, operation), *record));
+  CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::finishScope(txn, object, Kind::WriteOperation, operation, owner, key));
   co_return published;
 }
 }  // namespace hf3fs::meta::server

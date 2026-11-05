@@ -53,7 +53,9 @@ Result<Void> StorageOperator::initEcHelpers() {
     if (error || same) return makeError(StatusCode::kInvalidConfig, "helper key must be a distinct explicit file");
   }
   CHECK_RESULT(key, EcHelperKey::loadFile(helperPath));
+  const auto loadedIdentity = key->fileIdentity();
   CHECK_RESULT(runtime, EcHelperRuntime::create(components_.config.forward_client(), std::move(key)));
+  ecHelperKeyFileIdentity_ = loadedIdentity;
   ecHelpers_ = std::move(runtime);
   return Void{};
 }

@@ -57,6 +57,10 @@ class IMetaServiceStub {
   IMETA_STUB_METHOD(acquireEcReadV2, AcquireEcReadV2Req, AcquireEcReadV2Rsp);
   IMETA_STUB_METHOD(releaseEcReadV2, ReleaseEcReadV2Req, ReleaseEcReadV2Rsp);
   IMETA_STUB_METHOD(prepareEcRepairV2, PrepareEcRepairV2Req, PrepareEcRepairV2Rsp);
+  IMETA_STUB_METHOD(collectEcFragmentV2, CollectEcFragmentV2Req, EcGcAdminRsp);
+  IMETA_STUB_METHOD(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
+  IMETA_STUB_METHOD(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
+  IMETA_STUB_METHOD(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
 
 #undef IMETA_STUB_METHOD
 };

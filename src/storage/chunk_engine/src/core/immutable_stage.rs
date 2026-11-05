@@ -4,7 +4,14 @@
 //! compaction, or delete operations. Admission/authentication belongs to the
 //! enclosing Storage service; opening this local component is not authorization.
 
+use crate::ec_scope::EcStagingFormat;
 use crate::*;
+#[path = "immutable_gc.rs"]
+mod immutable_gc;
+use immutable_gc::StageGcPending;
+pub(crate) use immutable_gc::{
+    EcStageGcReceipt, IMMUTABLE_GC_ROOT_MARKER, IMMUTABLE_GC_V1_BLOCKER,
+};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
@@ -135,6 +142,7 @@ struct StageSlot {
     record: Option<StageRecord>,
     chunk: Option<ChunkArc>,
     unknown: bool,
+    gc_pending: Option<StageGcPending>,
 }
 
 #[derive(Default)]
@@ -145,6 +153,7 @@ struct StageRegistry {
 
 struct StageInner {
     engine: Engine,
+    format: EcStagingFormat,
     registry: Mutex<StageRegistry>,
     scopes: Arc<crate::ec_scope::EcScopeRegistry>,
     limits: ImmutableStageLimits,
@@ -164,6 +173,7 @@ enum StageWritePoint {
     Progress,
     Seal,
     Abort,
+    ExactGc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +244,15 @@ impl ImmutableStagingEngine {
     fn open_with_hook(
         config: &EngineConfig,
         limits: ImmutableStageLimits,
+        hook: impl FnMut(StageOpenPoint, &Engine) -> ImmutableStageResult<()>,
+    ) -> ImmutableStageResult<Self> {
+        Self::open_format_with_hook(config, limits, EcStagingFormat::V2, hook)
+    }
+
+    fn open_format_with_hook(
+        config: &EngineConfig,
+        limits: ImmutableStageLimits,
+        format: EcStagingFormat,
         mut hook: impl FnMut(StageOpenPoint, &Engine) -> ImmutableStageResult<()>,
     ) -> ImmutableStageResult<Self> {
         if config.prefix_len >= IMMUTABLE_STAGE_MAX_KEY_BYTES
@@ -247,7 +266,7 @@ impl ImmutableStagingEngine {
         {
             return Err(ImmutableStageError::Invalid("invalid staging limits"));
         }
-        Self::check_root(config)?;
+        Self::check_root_format(config, format)?;
         // Existing engine namespaces may resume a valid empty database under
         // the exclusive preflight token, but must never recreate a lost DB.
         let engine_config = EngineConfig {
@@ -255,7 +274,10 @@ impl ImmutableStagingEngine {
             create: config.create && !config.path.exists(),
             prefix_len: config.prefix_len,
         };
-        let engine = Engine::open_staging(&engine_config)?;
+        let engine = match format {
+            EcStagingFormat::V2 => Engine::open_staging(&engine_config)?,
+            EcStagingFormat::ExactGc => Engine::open_staging_gc(&engine_config)?,
+        };
         hook(StageOpenPoint::AfterEngineOpen, &engine)?;
         // Identity bootstrapping shares this exact MetaStore and must complete
         // before returning any data/admission interface to the caller.
@@ -263,7 +285,7 @@ impl ImmutableStagingEngine {
             ImmutableStageError::OutcomeUnknown(format!("EC scope bootstrap: {error}"))
         })?;
         scopes
-            .confirm_staging_identity(config.prefix_len)
+            .confirm_staging_format(config.prefix_len, format)
             .map_err(|error| {
                 ImmutableStageError::OutcomeUnknown(format!(
                     "EC staging identity confirmation: {error}"
@@ -348,6 +370,7 @@ impl ImmutableStagingEngine {
                             record: Some(record),
                             chunk,
                             unknown: true,
+                            gc_pending: None,
                         })),
                     );
                 }
@@ -382,8 +405,12 @@ impl ImmutableStagingEngine {
                 "stage reservation cardinality mismatch",
             ));
         }
+        if format == EcStagingFormat::ExactGc {
+            Self::validate_gc_ledger_on_open(&engine, &scopes)?;
+        }
         Ok(Self(Arc::new(StageInner {
             engine,
+            format,
             registry: Mutex::new(registry),
             scopes,
             limits,
@@ -394,6 +421,13 @@ impl ImmutableStagingEngine {
     }
 
     fn check_root(config: &EngineConfig) -> ImmutableStageResult<()> {
+        Self::check_root_format(config, EcStagingFormat::V2)
+    }
+
+    fn check_root_format(
+        config: &EngineConfig,
+        format: EcStagingFormat,
+    ) -> ImmutableStageResult<()> {
         if config.path.file_name().and_then(|name| name.to_str())
             != Some(IMMUTABLE_STAGE_ENGINE_DIRECTORY)
         {
@@ -425,8 +459,12 @@ impl ImmutableStagingEngine {
                 ));
             }
         }
-        Self::check_marker(&parent.join("engine"), IMMUTABLE_STAGE_ROOT_MARKER)?;
-        Self::check_marker(&parent.join("engine-ec-v1"), IMMUTABLE_STAGE_V1_BLOCKER)?;
+        let (root_marker, v1_blocker) = match format {
+            EcStagingFormat::V2 => (IMMUTABLE_STAGE_ROOT_MARKER, IMMUTABLE_STAGE_V1_BLOCKER),
+            EcStagingFormat::ExactGc => (IMMUTABLE_GC_ROOT_MARKER, IMMUTABLE_GC_V1_BLOCKER),
+        };
+        Self::check_marker(&parent.join("engine"), root_marker)?;
+        Self::check_marker(&parent.join("engine-ec-v1"), v1_blocker)?;
         std::fs::File::open(parent)
             .and_then(|dir| dir.sync_all())
             .map_err(Self::io_error)?;
@@ -537,7 +575,10 @@ impl ImmutableStagingEngine {
             }
             let guard = slot.try_lock().ok()?;
             let record = guard.record.as_ref()?;
-            if guard.chunk.is_none() && record.state != ImmutableStageState::Active {
+            if guard.chunk.is_none()
+                && guard.gc_pending.is_none()
+                && record.state != ImmutableStageState::Active
+            {
                 Some(key.clone())
             } else {
                 None
@@ -584,6 +625,7 @@ impl ImmutableStagingEngine {
             record: Some(record),
             chunk: None,
             unknown: true,
+            gc_pending: None,
         }));
         registry.slots.insert(key.into(), slot.clone());
         Ok(Some(slot))
@@ -597,6 +639,11 @@ impl ImmutableStagingEngine {
         slot: &'a StageSlot,
         stage_id: &[u8; 16],
     ) -> ImmutableStageResult<&'a StageRecord> {
+        if slot.gc_pending.is_some() {
+            return Err(ImmutableStageError::OutcomeUnknown(
+                "exact GC confirmation pending".into(),
+            ));
+        }
         let record = slot.record.as_ref().ok_or_else(|| {
             ImmutableStageError::OutcomeUnknown("initial reservation is still in progress".into())
         })?;
@@ -724,6 +771,7 @@ impl ImmutableStagingEngine {
                     record: None,
                     chunk: None,
                     unknown: true,
+                    gc_pending: None,
                 }));
                 registry.slots.insert(key.into(), slot.clone());
                 registry.active += 1;

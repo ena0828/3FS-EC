@@ -5,6 +5,7 @@
 #include <folly/Utility.h>
 #include <folly/experimental/coro/Task.h>
 #include <folly/fibers/Semaphore.h>
+#include <type_traits>
 
 namespace hf3fs {
 
@@ -67,6 +68,31 @@ class BoundedQueue {
       return false;
     }
     queue_.writeIfNotFull(std::forward<U>(item));
+    dequeueSemaphore_.signal();
+    return true;
+  }
+
+  // EC uses non-waiting admission. Commit is published after the actual
+  // write and before this producer's consumer signal. Tokens are not bound to
+  // items: another producer may signal first. The submitting owner must retain
+  // the item until this call returns. Old co_enqueue semantics are unchanged.
+  template <typename U, typename Commit>
+  bool try_enqueueWithCommit(U &&item, Commit &&commit) {
+    static_assert(std::is_nothrow_constructible_v<T, U &&>);
+    static_assert(std::is_nothrow_invocable_v<Commit &>);
+    if (!enqueueSemaphore_.try_wait()) return false;
+    bool written = false;
+    try {
+      written = queue_.writeIfNotFull(std::forward<U>(item));
+    } catch (...) {
+      enqueueSemaphore_.signal();
+      throw;
+    }
+    if (!written) {
+      enqueueSemaphore_.signal();
+      return false;
+    }
+    commit();
     dequeueSemaphore_.signal();
     return true;
   }

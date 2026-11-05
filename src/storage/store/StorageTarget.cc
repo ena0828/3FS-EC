@@ -95,6 +95,22 @@ Result<Path> physicalConfigPath(const Path &path) {
   return ecConfig;
 }
 
+Result<Void> validateEcFacadeMode(const PhysicalConfig &config,
+                                  const chunk_engine::Engine *legacy,
+                                  const std::shared_ptr<EcStagingEngine> &staging) {
+  if (config.ec_staging_v2 != (staging != nullptr) || (staging && legacy) ||
+      (config.ec_staging_v2 && !config.ec_only) || (config.ec_exact_gc && (!config.ec_only || !config.ec_staging_v2))) {
+    return makeError(StorageCode::kStorageInitFailed, "target physical mode differs from its engine facade");
+  }
+  if (staging) {
+    CHECK_RESULT(format, staging->actualDiskFormat());
+    if (format != (config.ec_exact_gc ? 3 : 2)) {
+      return makeError(StorageCode::kStorageInitFailed, "target GC format differs from actual staging engine");
+    }
+  }
+  return Void{};
+}
+
 Result<std::string> getDeviceUUID(const Path &path) {
   struct stat st;
   int ret = ::stat(path.c_str(), &st);
@@ -148,10 +164,7 @@ StorageTarget::~StorageTarget() {
 }
 
 Result<Void> StorageTarget::create(const PhysicalConfig &config) {
-  if (config.ec_staging_v2 != (staging_ != nullptr) || (staging_ && engine_) ||
-      (config.ec_staging_v2 && !config.ec_only)) {
-    return makeError(StorageCode::kStorageInitFailed, "target staging mode differs from its engine facade");
-  }
+  RETURN_ON_ERROR(validateEcFacadeMode(config, engine_, staging_));
   if (config.ec_only && (!config.only_chunk_engine || config.chain_id == 0)) {
     return makeError(StorageCode::kStorageInitFailed, "EC target requires ChunkEngine and a nonzero fixed chain id");
   }
@@ -166,6 +179,7 @@ Result<Void> StorageTarget::create(const PhysicalConfig &config) {
     }
     RETURN_AND_LOG_ON_ERROR(load(config.path));
     if (targetConfig_.ec_only != config.ec_only || targetConfig_.ec_staging_v2 != config.ec_staging_v2 ||
+        targetConfig_.ec_exact_gc != config.ec_exact_gc ||
         (config.ec_only && targetConfig_.chain_id != config.chain_id)) {
       return makeError(StorageCode::kStorageInitFailed,
                        "existing target mode or EC chain differs; conversion is forbidden");
@@ -255,8 +269,8 @@ Result<PhysicalConfig> StorageTarget::readPhysicalConfig(const Path &path) {
   PhysicalConfig config;
   RETURN_AND_LOG_ON_ERROR(serde::fromTomlFile(config, configPath));
   const bool hasEcConfig = configPath.filename() == kEcPhysicalConfigFileName;
-  if ((config.ec_staging_v2 && !config.ec_only) || config.ec_only != hasEcConfig ||
-      (hasEcConfig && (!config.only_chunk_engine || config.chain_id == 0))) {
+  if ((config.ec_staging_v2 && !config.ec_only) || (config.ec_exact_gc && (!config.ec_only || !config.ec_staging_v2)) ||
+      config.ec_only != hasEcConfig || (hasEcConfig && (!config.only_chunk_engine || config.chain_id == 0))) {
     return makeError(StorageCode::kStorageInitFailed, "EC target files and physical mode disagree");
   }
   if (path != config.path) {
@@ -269,10 +283,7 @@ Result<PhysicalConfig> StorageTarget::readPhysicalConfig(const Path &path) {
 
 Result<Void> StorageTarget::load(const Path &path) {
   CHECK_RESULT(config, readPhysicalConfig(path));
-  if (config.ec_staging_v2 != (staging_ != nullptr) || (staging_ && engine_) ||
-      (config.ec_staging_v2 && !config.ec_only)) {
-    return makeError(StorageCode::kStorageInitFailed, "restored target staging mode differs from its engine facade");
-  }
+  RETURN_ON_ERROR(validateEcFacadeMode(config, engine_, staging_));
   targetConfig_ = std::move(config);
 
   auto getDeviceUUIDResult = getDeviceUUID(path);

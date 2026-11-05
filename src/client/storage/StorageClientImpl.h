@@ -93,6 +93,10 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<EcTargetDiscoveryObservation> getEcTargetIdentityControlled(EcTargetDiscoveryRequest,
                                                                         std::shared_ptr<const EcScopeControlKey>,
                                                                         EcRequestControl) override;
+  CoTryTask<EcGcDiscoveryObservation> getEcGcCapabilityControlled(EcGcDiscoveryRequest,
+                                                                  std::shared_ptr<const EcGcKey>,
+                                                                  EcRequestControl) override;
+  CoTryTask<EcGcAck> exchangeEcGcControlled(EcGcRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) override;
   CoTryTask<EcScopeControlAck> revokeEcScope(const EcScopeControlRequest &) override;
   CoTryTask<EcScopeControlAck> queryEcScopeDrain(const EcScopeControlRequest &) override;
 
@@ -173,6 +177,7 @@ class StorageClientImpl : public StorageClient {
  private:
   CoTryTask<EcScopeControlAck> controlEcScope(const EcScopeControlRequest &, EcScopeControlAction);
   hf3fs::Semaphore ecControlConcurrency_{16, 16};
+  hf3fs::Semaphore ecGcConcurrency_{16, 16};
   hf3fs::Semaphore ecHelperConcurrency_{64, 64};
 
  private:

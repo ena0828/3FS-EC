@@ -74,6 +74,33 @@ fn validate(value: &ffi::RawEcStageBinding) -> ImmutableStageResult<()> {
     Ok(())
 }
 
+fn stable_stage_spec(
+    binding: &ffi::RawEcStageBinding,
+    writer: &[u8; 16],
+) -> ImmutableStageResult<ImmutableStageSpec> {
+    validate(binding)?;
+    if writer == &[0; 16] {
+        return Err(ImmutableStageError::Invalid("zero writer namespace"));
+    }
+    let spec = ImmutableStageSpec {
+        stage_id: binding.operation,
+        length: binding.length,
+        checksum: binding.checksum,
+        chain_ver: 0,
+        last_request_id: u64::from_be_bytes(binding.operation[..8].try_into().unwrap()),
+        last_client_low: u64::from_be_bytes(writer[..8].try_into().unwrap()),
+        last_client_high: u64::from_be_bytes(writer[8..].try_into().unwrap()),
+        etag: binding.operation.to_vec(),
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
+// Small module wiring; keeps handle.engine private to this bridge hierarchy.
+#[path = "ec_stage_gc_bridge.rs"]
+mod gc;
+pub(crate) use gc::*;
+
 fn bound<'a>(
     handle: &'a EcStageHandle,
     key: &[u8],
@@ -168,22 +195,7 @@ pub(crate) fn stage_begin(
     writer: &[u8; 16],
 ) -> ffi::RawEcStageResult {
     state_result(boundary(true, || {
-        validate(binding)?;
-        if writer == &[0; 16] {
-            return Err(ImmutableStageError::Invalid("zero writer namespace"));
-        }
-        // Stable metadata derives exclusively from signed original identities.
-        // CRAQ routing versions and per-RPC tags must not alter retries.
-        let spec = ImmutableStageSpec {
-            stage_id: binding.operation,
-            length: binding.length,
-            checksum: binding.checksum,
-            chain_ver: 0,
-            last_request_id: u64::from_be_bytes(binding.operation[..8].try_into().unwrap()),
-            last_client_low: u64::from_be_bytes(writer[..8].try_into().unwrap()),
-            last_client_high: u64::from_be_bytes(writer[8..].try_into().unwrap()),
-            etag: binding.operation.to_vec(),
-        };
+        let spec = stable_stage_spec(binding, writer)?;
         engine(handle)?.begin(key, &spec)
     }))
 }

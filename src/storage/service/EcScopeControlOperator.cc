@@ -22,6 +22,7 @@ Result<Void> StorageOperator::initEcScopeControl() {
                EcScopeControlExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_));
   CHECK_RESULT(discovery,
                EcTargetDiscoveryExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_));
+  ecControlKeyFileIdentity_ = shared->fileIdentity();
   ecScopeControl_ = std::move(executor);
   ecDiscovery_ = std::move(discovery);
   return Void{};

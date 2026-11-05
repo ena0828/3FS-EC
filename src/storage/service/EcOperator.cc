@@ -186,19 +186,26 @@ CoTryTask<EcCreateRsp> StorageOperator::createEcFragmentImpl(const EcCreateReq &
     rsp.result = makeError(route.error());
     co_return rsp;
   }
-  EcCreateJob job(EcLegacyV1Admission{}, req, target->storageTarget, validateRoute);
-  co_await updateWorker_.enqueue(&job);
-  // The disk worker borrows both job and request. Always drain it, even if the
-  // RPC peer timed out; timeout is not evidence that no fragment was committed.
-  co_await job.complete();
-  rsp.result = std::move(job.result());
-  if (rsp.result) {
-    route = validateRoute();
-    if (!route) {
-      rsp.result = makeError(
-          StorageCode::kEcSealOutcomeUnknown,
-          fmt::format("fragment committed but final access validation failed: {}; retain allocation", route.error()));
+  try {
+    EcCreateJob job(EcLegacyV1Admission{}, req, target->storageTarget, validateRoute);
+    co_await updateWorker_.enqueue(&job);
+    // The disk worker borrows both job and request. Always drain it, even if the
+    // RPC peer timed out; timeout is not evidence that no fragment was committed.
+    co_await job.complete();
+    rsp.result = job.waitFailed() ? decltype(rsp.result)(makeError(StorageCode::kEcSealOutcomeUnknown))
+                                  : std::move(job.result());
+    if (rsp.result) {
+      route = validateRoute();
+      if (!route) {
+        rsp.result = makeError(
+            StorageCode::kEcSealOutcomeUnknown,
+            fmt::format("fragment committed but final access validation failed: {}; retain allocation", route.error()));
+      }
     }
+  } catch (...) {
+    // Job destruction retains any queued request until real worker completion.
+    // No receipt is returned when the await/response construction was lost.
+    rsp.result = makeError(StorageCode::kEcSealOutcomeUnknown);
   }
   record.report(rsp.result.hasValue());
   co_return rsp;
@@ -233,13 +240,20 @@ CoTryTask<EcReadRsp> StorageOperator::readEcFragmentImpl(const EcReadReq &req, E
     RETURN_ON_ERROR(authorization());
     return validateEcTarget(target, false);
   };
-  EcReadJob job(EcLegacyV1Admission{}, req, target->storageTarget, validateRoute);
-  co_await updateWorker_.enqueue(&job);
-  co_await job.complete();
-  rsp.result = std::move(job.result());
-  if (rsp.result) {
-    auto route = validateRoute();
-    if (!route) rsp.result = makeError(route.error());
+  try {
+    EcReadJob job(EcLegacyV1Admission{}, req, target->storageTarget, validateRoute);
+    co_await updateWorker_.enqueue(&job);
+    co_await job.complete();
+    rsp.result =
+        job.waitFailed() ? decltype(rsp.result)(makeError(StatusCode::kNotEnoughMemory)) : std::move(job.result());
+    if (rsp.result) {
+      auto route = validateRoute();
+      if (!route) rsp.result = makeError(route.error());
+    }
+  } catch (...) {
+    // Job destruction retains any queued request until real worker completion.
+    // No receipt is returned when the await/response construction was lost.
+    rsp.result = makeError(StatusCode::kNotEnoughMemory);
   }
   record.report(rsp.result.hasValue());
   co_return rsp;
@@ -290,17 +304,25 @@ CoTryTask<EcReconcileRsp> StorageOperator::reconcileEcFragmentImpl(const EcRecon
     rsp.result = makeError(route.error());
     co_return rsp;
   }
-  EcReconcileJob job(EcLegacyV1Admission{}, req, target->storageTarget, validateRoute);
-  co_await updateWorker_.enqueue(&job);
-  co_await job.complete();
-  rsp.result = std::move(job.result());
-  if (rsp.result) {
-    route = validateRoute();
-    if (!route) {
-      rsp.result = makeError(
-          StorageCode::kEcSealOutcomeUnknown,
-          fmt::format("fragment reconciled but final access validation failed: {}; retain allocation", route.error()));
+  try {
+    EcReconcileJob job(EcLegacyV1Admission{}, req, target->storageTarget, validateRoute);
+    co_await updateWorker_.enqueue(&job);
+    co_await job.complete();
+    rsp.result = job.waitFailed() ? decltype(rsp.result)(makeError(StorageCode::kEcSealOutcomeUnknown))
+                                  : std::move(job.result());
+    if (rsp.result) {
+      route = validateRoute();
+      if (!route) {
+        rsp.result =
+            makeError(StorageCode::kEcSealOutcomeUnknown,
+                      fmt::format("fragment reconciled but final access validation failed: {}; retain allocation",
+                                  route.error()));
+      }
     }
+  } catch (...) {
+    // Job destruction retains any queued request until real worker completion.
+    // No receipt is returned when the await/response construction was lost.
+    rsp.result = makeError(StorageCode::kEcSealOutcomeUnknown);
   }
   record.report(rsp.result.hasValue());
   co_return rsp;

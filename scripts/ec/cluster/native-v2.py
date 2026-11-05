@@ -19,7 +19,9 @@ import threading
 import time
 import tomllib
 
-from native_v2_config import PROFILE, SERVICES, json_text, pool_from_observations, prepare, replace_private, to_toml, write_new
+from native_v2_config import (PROFILES, SERVICES, gc_inventory_from_observations, gc_settings, json_text,
+                              key_roles, pool_from_observations, prepare, profile_config_problems,
+                              replace_private, to_toml, write_new)
 
 
 def inherited_runner():
@@ -36,9 +38,10 @@ def load_manifest(root):
     if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
         raise RuntimeError("Task root must belong to the supervisor UID with mode 0700")
     data = json.loads((root / "cluster.json").read_text(encoding="utf-8"))
-    if data.get("schema") != 1 or data.get("profile") != PROFILE or data.get("root") != str(root) or \
+    if data.get("schema") != 1 or data.get("profile") not in PROFILES.values() or data.get("root") != str(root) or \
             data.get("storage_count") != 1 or data.get("logical_target_count") != 12:
-        raise RuntimeError("Not the matching one-process V2 task bundle")
+        raise RuntimeError("Not a matching one-process native task bundle")
+    gc_settings(data)
     for directory in ("config", "secrets", "client", "state", "logs", "scripts", "data", "bin", "lib"):
         path = root / directory
         if path.is_symlink() or not path.is_dir():
@@ -67,8 +70,10 @@ def doctor(root, check_ports=True):
                 problems.append(f"{name} version must be {manifest['fdb_version']}")
     if not (root / "lib/libfdb_c.so").is_file():
         problems.append("missing lib/libfdb_c.so")
+    configs = {}
     for path in list((root / "config").glob("*.toml")) + list((root / "client").glob("*.toml")):
-        tomllib.loads(path.read_text(encoding="utf-8"))
+        configs[path.name] = tomllib.loads(path.read_text(encoding="utf-8"))
+    problems.extend(profile_config_problems(manifest, configs))
     # This flag exits before IB, FDB or server initialization. The three
     # launchers have fixed top-level objects. Do not treat the full default
     # dump as a schema: unset optional nested fields (e.g. network_type) are
@@ -95,8 +100,8 @@ def doctor(root, check_ports=True):
                 problems.append(f"unknown native launcher keys in {path.name}: {', '.join(unknown)}")
         except (OSError, subprocess.TimeoutExpired, tomllib.TOMLDecodeError) as error:
             problems.append(f"cannot inspect launcher sections for {path.name}: {type(error).__name__}")
-    inodes = set()
-    for role in ("data", "control", "helper"):
+    inodes, key_material = set(), set()
+    for role in key_roles(manifest):
         path = root / "secrets" / f"{role}.key"
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size != 32:
@@ -107,6 +112,11 @@ def doctor(root, check_ports=True):
         if identity in inodes:
             problems.append("different signing roles share a physical key file")
         inodes.add(identity)
+        if gc_settings(manifest) and stat.S_ISREG(info.st_mode) and info.st_size == 32:
+            value = path.read_bytes()
+            if value in key_material:
+                problems.append("GC profile signing roles must have independent key bytes")
+            key_material.add(value)
     filesystem = subprocess.run(["findmnt", "-n", "-o", "FSTYPE", "-T", str(root)], text=True,
                                 capture_output=True, timeout=10)
     observations["filesystem"] = filesystem.stdout.strip()
@@ -133,7 +143,7 @@ def doctor(root, check_ports=True):
                     probe.bind(("127.0.0.1", port))
                 except OSError:
                     problems.append(f"TCP port {port} is occupied; existing listeners are not stopped")
-    return {"profile": PROFILE, "status": "ready" if not problems else "needs_attention",
+    return {"profile": manifest["profile"], "status": "ready" if not problems else "needs_attention",
             "problems": problems, "observations": observations, "services_started": False,
             "validation": "configuration/resources only; native service behavior remains to be tested"}
 
@@ -155,6 +165,7 @@ class NativeCluster(inherited_runner()):
     def status(self):
         with self.status_lock:
             return {"schema": 1, "run": self.run_id, "stage": self.stage, "root": str(self.root),
+                    "profile": self.manifest["profile"],
                     "processes": [{"name": name, "pid": proc.pid, "exit_code": proc.poll()}
                                   for name, proc in self.processes],
                     "logical_targets": 12, "storage_processes": 1,
@@ -310,9 +321,29 @@ class NativeCluster(inherited_runner()):
             write_new(stored, json_text(pool))
         elif json.loads(stored.read_text()) != pool:
             raise RuntimeError("Persistent Engine/target identity changed; refusing to replace historical allocations or Meta pool")
+        gc = gc_settings(self.manifest)
+        if gc:
+            self.stage = "authenticated-gc-capability-discovery"
+            observed_gc = []
+            for endpoint in self.manifest["endpoints"]:
+                output = self.run_dir / f"gc-instance-{endpoint['target']}.json"
+                self.admin(["discover-ec-gc-target", "--node-id", str(endpoint["node"]),
+                    "--chain-id", str(endpoint["chain"]), "--target-id", str(endpoint["target"]),
+                    "--authority", gc["authority"], "--gc-key-id", gc["key_id"],
+                    "--gc-key-file", self.root / "secrets/gc.key", "--output", output],
+                    f"discover-gc-{endpoint['target']}.log")
+                observed_gc.append(json.loads(output.read_text(encoding="utf-8")))
+            inventory = gc_inventory_from_observations(self.manifest, pool, observed_gc, int(time.time()))
+            gc_stored = self.root / "state/gc-physical-pool.json"
+            if self.mode == "initialize":
+                write_new(gc_stored, json_text(inventory))
+            elif json.loads(gc_stored.read_text(encoding="utf-8")) != inventory:
+                raise RuntimeError("Persistent GC instance/format changed; historical inventory is not replaced")
         meta_path = self.config / "meta_main.toml"
         meta = tomllib.loads(meta_path.read_text())
         meta["server"]["meta"].update(enable_ec_v2=True, ec_targets=pool)
+        if gc:
+            meta["server"]["meta"].update(enable_ec_exact_gc=True, enable_ec_revision_retirement=True)
         replace_private(meta_path, to_toml(meta))
         self.admin(["set-config", "-t", "META", "-f", meta_path, "--desc", "verified native-v2 physical pool"],
                    "set-meta-v2-config.log")
@@ -334,7 +365,8 @@ class NativeCluster(inherited_runner()):
             if self.sampler.is_alive():
                 raise RuntimeError("Startup sampler did not finish; refusing measurement-ready state")
         write_new(self.run_dir / "ready.json", json_text(self.status()))
-        print(f"READY: 1 Storage process, 12 logical V2 targets; client config {self.root / 'client/stripe-client.toml'}", flush=True)
+        print(f"READY: {self.manifest['profile']}; 1 Storage process, 12 logical targets; "
+              f"client config {self.root / 'client/stripe-client.toml'}", flush=True)
         print("Services are ready; write/read/repair experiments have not been run.", flush=True)
 
     def finish(self):
@@ -373,6 +405,8 @@ def main():
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[3])
     parser.add_argument("--port-base", type=int, default=13500)
+    parser.add_argument("--profile", choices=tuple(PROFILES),
+                        help="prepare only: v2 (default), or gc on a fresh root; never an in-place upgrade")
     parser.add_argument("--mode", choices=["initialize", "resume"], default="resume")
     args = parser.parse_args()
     if sys.platform != "linux":
@@ -380,8 +414,10 @@ def main():
     os.umask(0o077)
     root = args.root.absolute()
     if args.command == "prepare":
-        prepare(root, args.source, args.port_base)
+        prepare(root, args.source, args.port_base, args.profile or "v2")
         return 0
+    if args.profile is not None:
+        parser.error("--profile is prepare-only; start/resume uses the immutable prepared profile")
     load_manifest(root)
     if args.command == "doctor":
         report = doctor(root)

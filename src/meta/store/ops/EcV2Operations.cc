@@ -122,12 +122,12 @@ class CreateEcFileV2Op : public Operation<CreateEcFileRsp> {
     EcObjectRef ref;
     ref.inode = inode.id;
     ref.incarnation = incarnation_;
-    auto object = co_await EcV2BindingCatalog::createV2Object(txn,
-                                                              ref,
-                                                              req_.shardBytes,
-                                                              config().ec_allow_colocated_test_targets(),
-                                                              ownerOf(req_),
-                                                              req_.uuid);
+    auto object = co_await EcV2BindingCatalog::createTrackedV2Object(txn,
+                                                                     ref,
+                                                                     req_.shardBytes,
+                                                                     config().ec_allow_colocated_test_targets(),
+                                                                     ownerOf(req_),
+                                                                     req_.uuid);
     CO_RETURN_ON_ERROR(object);
     CO_RETURN_ON_ERROR(co_await inode.store(txn));
     CO_RETURN_ON_ERROR(co_await newEntry.store(txn));

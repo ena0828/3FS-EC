@@ -169,7 +169,9 @@ MetaOperator::MetaOperator(const Config &cfg,
                                              sessionManager_,
                                              gcManager_)),
       ecCoordinator_(std::make_unique<EcCoordinator>(cfg, mgmtdClient, storageClient)),
-      ecV2Coordinator_(std::make_unique<EcV2Coordinator>(cfg, mgmtdClient, storageClient)) {
+      ecV2Coordinator_(std::make_unique<EcV2Coordinator>(cfg, mgmtdClient, storageClient)),
+      ecGcAdmin_(
+          std::make_unique<EcGcAdminCoordinator>(cfg, kvEngine, storageClient, *ecCoordinator_, *ecV2Coordinator_)) {
   sessionManager_->setCloseFunc(
       [&](const auto &req) -> CoTryTask<void> { co_return (co_await close(req)).then([](auto &) { return Void{}; }); });
 }
@@ -178,6 +180,7 @@ CoTryTask<void> MetaOperator::init(std::optional<Layout> layout) {
   XLOGF(INFO, "MetaOperator::init");
   if (config_.enable_ec_catalog()) CO_RETURN_ON_ERROR(ecCoordinator_->checkEnabled());
   if (config_.enable_ec_v2()) CO_RETURN_ON_ERROR(ecV2Coordinator_->checkEnabled());
+  if (config_.enable_ec_exact_gc()) CO_RETURN_ON_ERROR(ecGcAdmin_->checkEnabled());
   if (layout.has_value()) {
     CO_RETURN_ON_ERROR(co_await runOp(&MetaStore::initFs, *layout));
   }
@@ -236,6 +239,7 @@ void MetaOperator::start(CPUExecutorGroup &exec) {
 
 void MetaOperator::beforeStop() {
   XLOGF(INFO, "MetaOperator::beforeStop");
+  ecGcAdmin_->close();
   stop_ = true;
   if (distributor_) {
     distributor_->stopAndJoin(true);

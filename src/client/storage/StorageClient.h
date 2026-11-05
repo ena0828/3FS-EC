@@ -16,6 +16,8 @@
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcGcDiscovery.h"
+#include "fbs/storage/EcGcRpc.h"
 #include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
@@ -380,6 +382,8 @@ class StorageClient : public folly::MoveOnly {
     revokeEcScope,
     queryEcScopeDrain,
     getEcTargetIdentity,
+    exchangeEcGc,
+    getEcGcCapability,
   };
 
   class RetryConfig : public hf3fs::ConfigBase<RetryConfig> {
@@ -664,6 +668,15 @@ class StorageClient : public folly::MoveOnly {
   virtual CoTryTask<EcTargetDiscoveryObservation>
   getEcTargetIdentityControlled(EcTargetDiscoveryRequest, std::shared_ptr<const EcScopeControlKey>, EcRequestControl) {
     co_return makeError(StatusCode::kNotImplemented);
+  }
+  // Independent G-role capability observation; no claim or deletion authority.
+  virtual CoTryTask<EcGcDiscoveryObservation> getEcGcCapabilityControlled(EcGcDiscoveryRequest,
+                                                                          std::shared_ptr<const EcGcKey>,
+                                                                          EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented);
+  }
+  virtual CoTryTask<EcGcAck> exchangeEcGcControlled(EcGcRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "GC requires native RPC28 transport");
   }
   virtual CoTryTask<EcScopeControlAck> revokeEcScope(const EcScopeControlRequest &) {
     co_return makeError(StatusCode::kNotImplemented, "EC scope control requires the RPC storage client");

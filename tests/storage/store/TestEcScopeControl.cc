@@ -1,8 +1,14 @@
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <folly/ScopeGuard.h>
 #include <folly/experimental/coro/BlockingWait.h>
 #include <fstream>
 #include <functional>
+#include <future>
+#include <stdexcept>
 #include <sys/stat.h>
+#include <thread>
 #include <type_traits>
 
 #include "fbs/storage/EcScopeControl.h"
@@ -11,6 +17,16 @@
 #include "tests/GtestHelpers.h"
 
 namespace hf3fs::storage {
+class EcControlExecutorTestAccess {
+ public:
+  static CoTryTask<EcScopeControlAck> execute(EcScopeControlExecutor &executor,
+                                              EcScopeControlAction action,
+                                              EcScopeControlRequest request,
+                                              std::shared_ptr<StorageTarget> target,
+                                              void (*beforeAwait)()) {
+    return executor.executeImpl(action, std::move(request), std::move(target), beforeAwait);
+  }
+};
 namespace {
 constexpr uint64_t issued = 1700000000;
 Uuid uuid(uint8_t first) {
@@ -473,6 +489,98 @@ TEST(TestEcScopeControl, LegacyTargetCannotIssueDrainedEvenIfLocalScopeWasInitia
   ASSERT_OK(control);
   ASSERT_ERROR(folly::coro::blockingWait((*control)->execute(original.action, *request, (*target)->storageTarget)),
                StorageCode::kTargetStateInvalid);
+}
+
+thread_local bool controlTestCaller = false;
+thread_local std::promise<void> *controlWaitInjection = nullptr;
+void throwControlAwaitBadAlloc() {
+  controlWaitInjection->set_value();
+  throw std::bad_alloc();
+}
+void throwControlAwaitError() {
+  controlWaitInjection->set_value();
+  throw std::runtime_error("test await construction");
+}
+
+TEST_F(TestEcScopeControlExecutor, PostEnqueueExceptionRetainsBorrowAndUnknownUntilRealRevokeCompletes) {
+  using namespace std::chrono_literals;
+  for (bool badAlloc : {true, false}) {
+    auto intent = original;
+    intent.scopeId.data[0] ^= badAlloc ? 3 : 7;
+    auto request = signEcScopeControl(*key, intent, issued);
+    ASSERT_OK(request);
+    std::promise<void> entered, resume, injected;
+    auto resumed = resume.get_future().share();
+    std::atomic<bool> blocked{false};
+    auto isolated = EcScopeControlExecutor::create(key, intent.clusterAuthority, intent.nodeId, [&] {
+      if (!controlTestCaller && !blocked.exchange(true)) {
+        entered.set_value();
+        resumed.wait();
+      }
+      return issued + 1;
+    });
+    ASSERT_OK(isolated);
+    auto pending = std::async(std::launch::async, [&] {
+      controlTestCaller = true;
+      controlWaitInjection = &injected;
+      SCOPE_EXIT { controlWaitInjection = nullptr; };
+      return folly::coro::blockingWait(
+          EcControlExecutorTestAccess::execute(**isolated,
+                                               EcScopeControlAction::Revoke,
+                                               *request,
+                                               target,
+                                               badAlloc ? throwControlAwaitBadAlloc : throwControlAwaitError));
+    });
+    auto unblock = folly::makeGuard([&] { resume.set_value(); });
+    ASSERT_EQ(entered.get_future().wait_for(5s), std::future_status::ready);
+    ASSERT_EQ(injected.get_future().wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(pending.wait_for(20ms), std::future_status::timeout);
+    std::promise<void> stopStarted;
+    auto stopper = std::async(std::launch::async, [&] {
+      stopStarted.set_value();
+      (*isolated)->stopAndJoin();
+    });
+    stopStarted.get_future().wait();
+    EXPECT_EQ(stopper.wait_for(20ms), std::future_status::timeout);
+    resume.set_value();
+    unblock.dismiss();
+    auto result = pending.get();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), StorageCode::kEcSealOutcomeUnknown);
+    stopper.get();
+    // Observe the actual durable deny through a normal separately-owned query;
+    // the failed await must not be mistaken for "Revoke never executed".
+    intent.action = EcScopeControlAction::Query;
+    intent.nonce.data[0] ^= 1;
+    auto query = signEcScopeControl(*key, intent, issued);
+    ASSERT_OK(query);
+    auto ack = execute(*query, EcScopeControlAction::Query);
+    ASSERT_OK(ack);
+    ASSERT_OK(verifyEcScopeControlAck(*key, *ack, *query));
+    EXPECT_EQ(ack->claims.state, EcScopeControlState::Drained);
+    EXPECT_TRUE(ack->claims.durable);
+  }
+}
+
+TEST_F(TestEcScopeControlExecutor, WorkerReentryIsRejectedBeforeQueueBorrow) {
+  auto request = signEcScopeControl(*key, original, issued);
+  ASSERT_OK(request);
+  const auto caller = std::this_thread::get_id();
+  EcScopeControlExecutor *raw = nullptr;
+  std::atomic<bool> rejected{false};
+  auto isolated = EcScopeControlExecutor::create(key, original.clusterAuthority, original.nodeId, [&] {
+    if (std::this_thread::get_id() != caller) {
+      auto nested = folly::coro::blockingWait(raw->execute(EcScopeControlAction::Revoke, *request, target));
+      rejected = !nested && nested.error().code() == StatusCode::kInvalidArg;
+    }
+    return issued + 1;
+  });
+  ASSERT_OK(isolated);
+  raw = isolated->get();
+  auto ack = folly::coro::blockingWait((*isolated)->execute(EcScopeControlAction::Revoke, *request, target));
+  ASSERT_OK(ack);
+  ASSERT_OK(verifyEcScopeControlAck(*key, *ack, *request));
+  EXPECT_TRUE(rejected);
 }
 }  // namespace
 }  // namespace hf3fs::storage

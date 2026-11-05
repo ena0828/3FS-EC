@@ -718,6 +718,30 @@ pub mod ffi {
         revision: u64,
         needs_reconcile: bool,
     }
+    // Process-local exact-GC ABI; these fields do not grant authorization.
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcStageGcClaim {
+        claim_id: [u8; 16],
+        claim_digest: [u8; 32],
+        eligibility_digest: [u8; 32],
+        target: RawEcScopeTarget,
+        binding: RawEcStageBinding,
+        writer: [u8; 16],
+    }
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcStageGcReceipt {
+        claim_id: [u8; 16],
+        ledger_sha256: [u8; 32],
+        terminal_revision: u64,
+    }
+    struct RawEcStageGcResult {
+        status: RawEcScopeStatus,
+        receipt: RawEcStageGcReceipt,
+    }
+    struct RawEcStageFormatResult {
+        status: RawEcScopeStatus,
+        disk_format: u16,
+    }
     struct RawEcStageOpenResult {
         status: RawEcScopeStatus,
         handle: Box<EcStageHandle>,
@@ -750,6 +774,24 @@ pub mod ffi {
             prefix_len: u32,
             limits: &RawEcStageLimits,
         ) -> RawEcStageOpenResult;
+        // Reuse the existing EcStageHandle type; do not declare it again.
+        fn stage_open_gc(
+            path: &str,
+            create: bool,
+            prefix_len: u32,
+            limits: &RawEcStageLimits,
+        ) -> RawEcStageOpenResult;
+        fn stage_gc_collect(
+            handle: &EcStageHandle,
+            key: &[u8],
+            claim: &RawEcStageGcClaim,
+        ) -> RawEcStageGcResult;
+        fn stage_gc_query(
+            handle: &EcStageHandle,
+            key: &[u8],
+            claim: &RawEcStageGcClaim,
+        ) -> RawEcStageGcResult;
+        fn stage_actual_disk_format(handle: &EcStageHandle) -> RawEcStageFormatResult;
         fn stage_scope_open(handle: &EcStageHandle) -> RawEcScopeOpenResult;
         fn stage_begin(
             handle: &EcStageHandle,

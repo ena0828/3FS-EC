@@ -79,6 +79,20 @@ EcV2Coordinator::EcV2Coordinator(const Config &config,
     helperKey_ = std::shared_ptr<const storage::EcHelperKey>(std::move(*helper));
   }
 }
+Result<std::vector<storage::EcKeyFileIdentity>> EcV2Coordinator::loadedKeyFileIdentities() const {
+  RETURN_ON_ERROR(checkEnabled());
+  std::vector<storage::EcKeyFileIdentity> result;
+  const auto append = [&](const auto &key) -> Result<Void> {
+    if (!key || !key->fileIdentity())
+      return makeError(StatusCode::kInvalidConfig, "enabled EC role has no loaded-file identity");
+    result.push_back(*key->fileIdentity());
+    return Void{};
+  };
+  RETURN_ON_ERROR(append(dataKey_));
+  RETURN_ON_ERROR(append(controlKey_));
+  if (helperKey_) RETURN_ON_ERROR(append(helperKey_));
+  return result;
+}
 Result<Void> EcV2Coordinator::checkEnabled() const {
   if (!config_.enable_ec_v2() || !config_.enable_ec_catalog())
     return makeError(StatusCode::kNotImplemented, "native V2 EC is disabled");

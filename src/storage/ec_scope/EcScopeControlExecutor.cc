@@ -7,6 +7,7 @@
 
 namespace hf3fs::storage {
 namespace {
+thread_local const EcScopeControlExecutor *currentControlWorker = nullptr;
 template <size_t N>
 std::array<uint8_t, N> bytes(const Uuid &id) {
   static_assert(N == 16);
@@ -32,11 +33,15 @@ EcScopeRevocation revokeBinding(const EcScopeControlClaims &claims) {
 }  // namespace
 
 struct EcScopeControlExecutor::Job {
+  struct Completion {
+    folly::coro::Baton ready;
+    std::atomic<bool> finished{false};
+  };
   EcScopeControlAction action;
   EcScopeControlRequest request;
   std::shared_ptr<StorageTarget> target;
   Result<EcScopeControlAck> result{makeError(StorageClientCode::kNotInitialized)};
-  folly::coro::Baton complete{};
+  std::shared_ptr<Completion> completion = std::make_shared<Completion>();
   bool submitted = false;
   bool observedCompletion = false;
   ~Job() {
@@ -78,6 +83,15 @@ void EcScopeControlExecutor::stopAndJoin() {
 CoTryTask<EcScopeControlAck> EcScopeControlExecutor::execute(EcScopeControlAction action,
                                                              EcScopeControlRequest request,
                                                              std::shared_ptr<StorageTarget> target) {
+  return executeImpl(action, std::move(request), std::move(target), nullptr);
+}
+CoTryTask<EcScopeControlAck> EcScopeControlExecutor::executeImpl(EcScopeControlAction action,
+                                                                 EcScopeControlRequest request,
+                                                                 std::shared_ptr<StorageTarget> target,
+                                                                 void (*beforeAwait)()) {
+  if (currentControlWorker == this) {
+    co_return makeError(StatusCode::kInvalidArg, "control worker cannot admit a reentrant request");
+  }
   auto session = sessions_->acquire();
   if (!session) co_return makeError(session.error());
   if (!budget_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy, "EC control admission limit reached");
@@ -93,8 +107,20 @@ CoTryTask<EcScopeControlAck> EcScopeControlExecutor::execute(EcScopeControlActio
   // The independent control budget and queue both have capacity 64.
   if (!queue_.try_enqueue(&job)) co_return makeError(StorageClientCode::kResourceBusy, "EC control queue is full");
   job.submitted = true;
-  co_await job.complete;
+  bool waitFailed = false;
+  try {
+    if (beforeAwait) beforeAwait();
+    co_await job.completion->ready;
+  } catch (...) {
+    // A ViaIfAsync allocation failure is not permission to abandon borrowed
+    // work. Revoke may already be durable; retain the request for exact Query.
+    while (!job.completion->finished.load(std::memory_order_acquire)) {
+      job.completion->finished.wait(false, std::memory_order_acquire);
+    }
+    waitFailed = true;
+  }
   job.observedCompletion = true;
+  if (waitFailed) co_return makeError(StorageCode::kEcSealOutcomeUnknown);
   co_return std::move(job.result);
 }
 Result<EcScopeControlAck> EcScopeControlExecutor::process(const Job &job) {
@@ -131,13 +157,20 @@ Result<EcScopeControlAck> EcScopeControlExecutor::process(const Job &job) {
                                                       now);
 }
 void EcScopeControlExecutor::run() {
+  currentControlWorker = this;
+  SCOPE_EXIT { currentControlWorker = nullptr; };
   while (auto *job = queue_.dequeue()) {
+    auto completion = job->completion;
     try {
       job->result = process(*job);
     } catch (...) {
-      job->result = makeError(StorageCode::kChunkMetadataGetError, "EC control observation failed; no ACK issued");
+      job->result = makeError(StorageCode::kEcSealOutcomeUnknown);
     }
-    job->complete.post();
+    // No Job access after release publication. Inline or fallback waiters may
+    // destroy it; this independent shared owner keeps the Baton alive.
+    completion->finished.store(true, std::memory_order_release);
+    completion->finished.notify_all();
+    completion->ready.post();
   }
 }
 }  // namespace hf3fs::storage

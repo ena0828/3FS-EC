@@ -29,6 +29,8 @@ class PhysicalConfig {
   SERDE_STRUCT_FIELD(only_chunk_engine, false);
   SERDE_STRUCT_FIELD(ec_only, false);
   SERDE_STRUCT_FIELD(ec_staging_v2, false);
+  // Explicit disk format 3; absence preserves the existing format-2 meaning.
+  SERDE_STRUCT_FIELD(ec_exact_gc, false);
 
  public:
   Path kvPath() const {

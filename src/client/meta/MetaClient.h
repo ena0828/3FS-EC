@@ -122,6 +122,10 @@ class MetaClient {
   CoTryTask<AcquireEcReadV2Rsp> acquireEcReadV2(AcquireEcReadV2Req req);
   CoTryTask<ReleaseEcReadV2Rsp> releaseEcReadV2(ReleaseEcReadV2Req req);
   CoTryTask<PrepareEcRepairV2Rsp> prepareEcRepairV2(PrepareEcRepairV2Req req);
+  CoTryTask<EcGcAdminRsp> collectEcFragmentV2(CollectEcFragmentV2Req req);
+  CoTryTask<EcGcAdminRsp> queryEcFragmentGcV2(QueryEcFragmentGcV2Req req);
+  CoTryTask<EcRevisionRetirementRsp> retireEcRevisionV2(RetireEcRevisionV2Req req);
+  CoTryTask<EcRevisionRetirementRsp> queryEcRevisionRetirementV2(QueryEcRevisionRetirementV2Req req);
 
   CoTryTask<Inode> stat(const UserInfo &userInfo,
                         InodeId inodeId,

@@ -75,5 +75,38 @@ TEST(TestBoundedQueue, Normal) {
   }
 }
 
+TEST(TestBoundedQueue, NonwaitingCommitOnlyForAcceptedItems) {
+  struct Item {
+    int value;
+    bool *committed;
+  };
+  BoundedQueue<Item> queue(1);
+  bool first = false;
+  bool second = false;
+  unsigned commits = 0;
+  EXPECT_TRUE(queue.try_enqueueWithCommit(Item{1, &first}, [&]() noexcept {
+    first = true;
+    ++commits;
+  }));
+  EXPECT_FALSE(queue.try_enqueueWithCommit(Item{2, &second}, [&]() noexcept {
+    second = true;
+    ++commits;
+  }));
+  EXPECT_EQ(commits, 1);
+  EXPECT_FALSE(second);
+  auto one = queue.dequeue();
+  EXPECT_EQ(one.value, 1);
+  EXPECT_TRUE(*one.committed);
+  EXPECT_TRUE(queue.try_enqueueWithCommit(Item{2, &second}, [&]() noexcept {
+    second = true;
+    ++commits;
+  }));
+  auto two = queue.dequeue();
+  EXPECT_EQ(two.value, 2);
+  EXPECT_TRUE(*two.committed);
+  EXPECT_EQ(commits, 2);
+  EXPECT_TRUE(queue.empty());
+}
+
 }  // namespace
 }  // namespace hf3fs::test

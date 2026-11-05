@@ -76,6 +76,15 @@ struct Config : ConfigBase<Config> {
   // Native EC remains opt-in while storage capability enforcement is integrated.
   CONFIG_ITEM(enable_ec_catalog, false);
   CONFIG_ITEM(enable_ec_v2, false);
+  // Explicit root-only, exact-allocation GC. No scan, TTL or automatic retire.
+  CONFIG_ITEM(enable_ec_exact_gc, false);
+  CONFIG_ITEM(enable_ec_revision_retirement, false);
+  CONFIG_ITEM(ec_gc_key_file, Path{});
+  CONFIG_ITEM(ec_gc_key_id, std::string{});
+  CONFIG_ITEM(ec_gc_authority, std::string{});
+  CONFIG_ITEM(ec_gc_request_ttl_seconds, uint64_t{60});
+  CONFIG_ITEM(ec_gc_timeout, 60_s);
+  CONFIG_ITEM(ec_gc_max_concurrent, uint32_t{8});
   CONFIG_ITEM(ec_v2_helper_key_file, Path{});
   CONFIG_ITEM(ec_v2_helper_grant_ttl_seconds, uint64_t{300});
   CONFIG_ITEM(ec_v2_control_key_file, Path{});

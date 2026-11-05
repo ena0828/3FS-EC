@@ -78,9 +78,14 @@ Result<Void> createEcRootMarker(const Path &marker, std::string_view bytes = kEc
 // the old executable understanding any new target or engine format field.
 // V2 opens only through the owned staging facade, which restores all
 // persistent reservations before exposing any data or admission operation.
-Result<Path> prepareEngineRoot(const Path &root, bool ecOnly, bool stagingV2 = false) {
+Result<Path> prepareEngineRoot(const Path &root, bool ecOnly, bool stagingV2 = false, bool exactGc = false) {
   constexpr std::string_view v2Marker = "3FS_EC_ENGINE_ROOT_V2\n";
-  constexpr std::string_view v1BlockerBytes = "3FS_EC_ENGINE_V1_BLOCKED_BY_V2\n";
+  constexpr std::string_view v3Marker = "3FS_EC_ENGINE_ROOT_V3_GC\n";
+  const std::string_view v1BlockerBytes =
+      exactGc ? "3FS_EC_ENGINE_V1_BLOCKED_BY_V3_GC\n" : "3FS_EC_ENGINE_V1_BLOCKED_BY_V2\n";
+  if (exactGc && (!ecOnly || !stagingV2)) {
+    return makeError(StorageCode::kStorageInitFailed, "exact GC format requires EC-only staging mode");
+  }
   if (stagingV2 && !ecOnly) {
     return makeError(StorageCode::kStorageInitFailed, "staging requires an EC-only process");
   }
@@ -88,7 +93,7 @@ Result<Path> prepareEngineRoot(const Path &root, bool ecOnly, bool stagingV2 = f
   const auto v1Blocker = root / "engine-ec-v1";
   const auto v2Engine = root / "engine-ec-v2";
   const auto ecEngine = stagingV2 ? v2Engine : root / kEcEngineDirectoryName;
-  const std::string_view expectedMarker = stagingV2 ? v2Marker : kEcEngineRootMarker;
+  const std::string_view expectedMarker = exactGc ? v3Marker : stagingV2 ? v2Marker : kEcEngineRootMarker;
   if (ecOnly) {
     if (!boost::filesystem::is_directory(root) || boost::filesystem::is_symlink(root)) {
       return makeError(StorageCode::kStorageInitFailed, "EC target root must be a real directory");
@@ -136,7 +141,7 @@ Result<Path> prepareEngineRoot(const Path &root, bool ecOnly, bool stagingV2 = f
                          "EC root contains an unexpected entry or has lost its engine");
       }
       CHECK_RESULT(config, StorageTarget::readPhysicalConfig(path));
-      if (!config.ec_only || config.ec_staging_v2 != stagingV2 ||
+      if (!config.ec_only || config.ec_staging_v2 != stagingV2 || config.ec_exact_gc != exactGc ||
           path.filename().string() != std::to_string(config.target_id)) {
         return makeError(StorageCode::kStorageInitFailed, "EC root contains a legacy or mismatched target");
       }
@@ -170,6 +175,9 @@ using namespace std::chrono_literals;
 StorageTargets::~StorageTargets() { void(); }
 
 Result<Void> StorageTargets::init(CPUExecutorGroup &executor) {
+  if (config_.ec_exact_gc() && (!config_.ec_only() || !config_.ec_staging_v2())) {
+    return makeError(StorageCode::kStorageInitFailed, "exact GC format requires EC-only staging mode");
+  }
   auto diskInfoResult = SysResource::scanDiskInfo();
   RETURN_AND_LOG_ON_ERROR(diskInfoResult);
   std::unordered_map<uint32_t, std::string> deviceIdToManufacturer;
@@ -197,12 +205,20 @@ Result<Void> StorageTargets::init(CPUExecutorGroup &executor) {
   std::vector<folly::coro::TaskWithExecutor<Result<rust::Box<chunk_engine::Engine>>>> tasks;
   std::vector<Path> enginePaths;
   for (auto &path : targetPaths_) {
-    CHECK_RESULT(enginePath, prepareEngineRoot(path, config_.ec_only(), config_.ec_staging_v2()));
+    CHECK_RESULT(enginePath,
+                 prepareEngineRoot(path, config_.ec_only(), config_.ec_staging_v2(), config_.ec_exact_gc()));
     enginePaths.push_back(std::move(enginePath));
   }
   if (config_.ec_staging_v2()) {
     for (const auto &path : enginePaths) {
-      CHECK_RESULT(engine, EcStagingEngine::open(path, !boost::filesystem::exists(path)));
+      const bool create = !boost::filesystem::exists(path);
+      CHECK_RESULT(
+          engine,
+          config_.ec_exact_gc() ? EcStagingEngine::openExactGc(path, create) : EcStagingEngine::open(path, create));
+      CHECK_RESULT(format, engine->actualDiskFormat());
+      if (format != (config_.ec_exact_gc() ? 3 : 2)) {
+        return makeError(StorageCode::kStorageInitFailed, "opened staging format differs from process mode");
+      }
       stagingEngines_.push_back(std::move(engine));
     }
     return Void{};
@@ -313,6 +329,9 @@ Result<Void> StorageTargets::create(const CreateConfig &createConfig) {
 }
 
 Result<Void> StorageTargets::create(const CreateTargetReq &req, bool ecOnly) {
+  if (config_.ec_exact_gc() && (!config_.ec_only() || !config_.ec_staging_v2())) {
+    return makeError(StorageCode::kStorageInitFailed, "exact GC format requires EC-only staging mode");
+  }
   if (ecOnly != config_.ec_only()) {
     return makeError(StorageCode::kStorageInitFailed, "target mode must match the dedicated process mode");
   }
@@ -323,6 +342,15 @@ Result<Void> StorageTargets::create(const CreateTargetReq &req, bool ecOnly) {
     auto msg = fmt::format("disk index exceed {} >= {}", req.diskIndex, config_.target_paths().size());
     XLOG(ERR, msg);
     return makeError(StorageCode::kStorageInitFailed, std::move(msg));
+  }
+  if (config_.ec_staging_v2()) {
+    if (req.diskIndex >= stagingEngines_.size() || !stagingEngines_[req.diskIndex]) {
+      return makeError(StorageCode::kStorageInitFailed, "staging engine has not been initialized");
+    }
+    CHECK_RESULT(format, stagingEngines_[req.diskIndex]->actualDiskFormat());
+    if (format != (config_.ec_exact_gc() ? 3 : 2)) {
+      return makeError(StorageCode::kStorageInitFailed, "target creation differs from actual staging format");
+    }
   }
   if (req.chainId == ChainId{}) {
     auto msg = fmt::format("target {} without chain id", req.targetId);
@@ -382,6 +410,16 @@ Result<Void> StorageTargets::create(const CreateTargetReq &req, bool ecOnly) {
         XLOG(ERR, msg);
         return makeError(StorageCode::kStorageInitFailed, std::move(msg));
       }
+      if (ecOnly) {
+        // An in-memory idempotent replay must not bypass persistent mode
+        // checks. This reads config only and never converts or reopens a target.
+        CHECK_RESULT(physical, StorageTarget::readPhysicalConfig(targetPath));
+        if (!physical.ec_only || physical.ec_staging_v2 != config_.ec_staging_v2() ||
+            physical.ec_exact_gc != config_.ec_exact_gc() || physical.chain_id != req.chainId.toUnderType() ||
+            physical.target_id != req.targetId.toUnderType()) {
+          return makeError(StorageCode::kStorageInitFailed, "existing EC target physical mode or identity differs");
+        }
+      }
       XLOGF(INFO, "target {} is already existing, return succ", req.targetId);
       return Void{};
     } else {
@@ -410,6 +448,7 @@ Result<Void> StorageTargets::create(const CreateTargetReq &req, bool ecOnly) {
   targetConfig.only_chunk_engine = req.onlyChunkEngine;
   targetConfig.ec_only = ecOnly;
   targetConfig.ec_staging_v2 = config_.ec_staging_v2();
+  targetConfig.ec_exact_gc = config_.ec_exact_gc();
   if (config_.ec_staging_v2()) {
     CHECK_RESULT(scope, stagingEngines_[req.diskIndex]->scope());
     // Reserve the stable target identity before publishing physical config.
@@ -471,7 +510,8 @@ Result<Void> StorageTargets::loadTarget(const Path &targetPath) {
 
   auto diskIndex = pathToDiskIndex_[diskPath];
   CHECK_RESULT(physical, StorageTarget::readPhysicalConfig(targetPath));
-  if (physical.ec_only != config_.ec_only() || physical.ec_staging_v2 != config_.ec_staging_v2()) {
+  if (physical.ec_only != config_.ec_only() || physical.ec_staging_v2 != config_.ec_staging_v2() ||
+      physical.ec_exact_gc != config_.ec_exact_gc()) {
     return makeError(StorageCode::kStorageInitFailed, "restored target mode differs from the process mode");
   }
   auto storageTarget =

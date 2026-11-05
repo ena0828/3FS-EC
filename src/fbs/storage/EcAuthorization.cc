@@ -224,7 +224,14 @@ Result<std::unique_ptr<EcCapabilityKey>> EcCapabilityKey::loadFile(const std::fi
     }
     // The 33rd-byte read must reach EOF. The temporary is cleansed after the
     // key copies its 32 bytes, including exceptions and all earlier returns.
-    return std::make_unique<EcCapabilityKey>(std::span<const uint8_t, 32>(bytes.value.data(), 32));
+    auto key = std::make_unique<EcCapabilityKey>(std::span<const uint8_t, 32>(bytes.value.data(), 32));
+    static_assert(sizeof(metadata.st_dev) <= sizeof(uint64_t));
+    static_assert(sizeof(metadata.st_ino) <= sizeof(uint64_t));
+    // Preserve the identity from the validated fd, even if its pathname
+    // is replaced before another role is loaded. Never stat(path) here.
+    key->fileIdentity_ =
+        EcKeyFileIdentity{static_cast<uint64_t>(metadata.st_dev), static_cast<uint64_t>(metadata.st_ino)};
+    return key;
   } catch (const std::bad_alloc &) {
     return makeError(StatusCode::kNotEnoughMemory);
   }

@@ -2,6 +2,8 @@
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/experimental/coro/WithCancellation.h>
+#include <new>
+#include <type_traits>
 #include <variant>
 
 #include "common/utils/BoundedQueue.h"
@@ -33,77 +35,17 @@ class UpdateWorker {
   void stopAndJoin();
   Result<std::shared_ptr<EcWorkerSession>> acquireEcSession() { return ecSessions_->acquire(); }
 
-  CoTask<void> enqueue(EcAdmissionJob *job) {
-    job->claimSubmission();
-    if (!job->sessionMatches(ecSessions_)) {
-      job->reject(Status(StatusCode::kInvalidArg, "EC admission session belongs to another worker"));
-      co_return;
-    }
-    assert(job->target()->diskIndex() < queueVec_.size());
-    // Once claimed, this borrowed job must either enqueue and complete or
-    // remain owned. Semaphore::co_wait is cancellation-aware, unlike Baton.
-    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
-                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
-  }
-
-  CoTask<void> enqueue(EcStageJob *job) {
-    job->claimSubmission();
-    if (!job->sessionMatches(ecSessions_)) {
-      job->setResult(makeError(StatusCode::kInvalidArg, "stage session belongs to another worker"));
-      co_return;
-    }
-    auto valid = job->validateSubmission();
-    if (!valid) {
-      job->setResult(makeError(valid.error()));
-      co_return;
-    }
-    assert(job->target()->diskIndex() < queueVec_.size());
-    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
-                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
-  }
+  // EC admission is deliberately non-waiting. Full queues reject before any
+  // worker owns the job; callers retain the same operation identity on retry.
+  CoTask<void> enqueue(EcAdmissionJob *job) { return enqueueEc(job); }
+  CoTask<void> enqueue(EcStageJob *job) { return enqueueEc(job); }
+  CoTask<void> enqueue(EcCreateJob *job) { return enqueueEc(job); }
+  CoTask<void> enqueue(EcReadJob *job) { return enqueueEc(job); }
+  CoTask<void> enqueue(EcReconcileJob *job) { return enqueueEc(job); }
 
   CoTask<void> enqueue(UpdateJob *job) {
     assert(job->target()->diskIndex() < queueVec_.size());
     co_await queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job});
-  }
-
-  CoTask<void> enqueue(EcCreateJob *job) {
-    job->claimSubmission();
-    if (!job->sessionMatches(ecSessions_)) {
-      job->setResult(makeError(StatusCode::kInvalidArg, "scoped EC session belongs to another worker"));
-      co_return;
-    }
-    assert(job->target()->diskIndex() < queueVec_.size());
-    // Once claimed, this borrowed job must either enqueue and complete or
-    // remain owned. Semaphore::co_wait is cancellation-aware, unlike Baton.
-    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
-                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
-  }
-
-  CoTask<void> enqueue(EcReadJob *job) {
-    job->claimSubmission();
-    if (!job->sessionMatches(ecSessions_)) {
-      job->setResult(makeError(StatusCode::kInvalidArg, "scoped EC session belongs to another worker"));
-      co_return;
-    }
-    assert(job->target()->diskIndex() < queueVec_.size());
-    // Once claimed, this borrowed job must either enqueue and complete or
-    // remain owned. Semaphore::co_wait is cancellation-aware, unlike Baton.
-    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
-                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
-  }
-
-  CoTask<void> enqueue(EcReconcileJob *job) {
-    job->claimSubmission();
-    if (!job->sessionMatches(ecSessions_)) {
-      job->setResult(makeError(StatusCode::kInvalidArg, "scoped EC session belongs to another worker"));
-      co_return;
-    }
-    assert(job->target()->diskIndex() < queueVec_.size());
-    // Once claimed, this borrowed job must either enqueue and complete or
-    // remain owned. Semaphore::co_wait is cancellation-aware, unlike Baton.
-    co_await folly::coro::co_withCancellation(folly::CancellationToken{},
-                                              queueVec_[job->target()->diskIndex()]->co_enqueue(QueueItem{job}));
   }
 
  protected:
@@ -118,6 +60,51 @@ class UpdateWorker {
   void run(Queue &queue);
 
  private:
+  bool isCurrentWorkerThread() const noexcept;
+  template <typename Job>
+  static void rejectBeforeQueue(Job *job, uint16_t code) {
+    if constexpr (std::is_same_v<Job, EcAdmissionJob>) {
+      job->reject(Status(code));
+    } else {
+      job->setResult(makeError(code));
+    }
+  }
+  template <typename Job>
+  CoTask<void> enqueueEc(Job *job) {
+    // Must precede every rejection: a duplicate submission never completes or
+    // wakes the original request as a side effect of its validation failure.
+    job->claimSubmission();
+    try {
+      if (isCurrentWorkerThread() || !job->sessionMatches(ecSessions_) || !job->target() ||
+          job->target()->diskIndex() >= queueVec_.size()) {
+        rejectBeforeQueue(job, StatusCode::kInvalidArg);
+        co_return;
+      }
+      if constexpr (std::is_same_v<Job, EcStageJob>) {
+        auto valid = job->validateSubmission();
+        if (!valid) {
+          job->setResult(makeError(std::move(valid.error())));
+          co_return;
+        }
+      }
+      auto &queue = *queueVec_[job->target()->diskIndex()];
+      if (!queue.try_enqueueWithCommit(QueueItem{job}, [job]() noexcept { job->commitQueued(); })) {
+        rejectBeforeQueue(job, StorageClientCode::kResourceBusy);
+      }
+    } catch (const std::bad_alloc &) {
+      if (job->queued()) {
+        job->awaitSubmittedAfterFailure();
+      } else {
+        rejectBeforeQueue(job, StatusCode::kNotEnoughMemory);
+      }
+    } catch (...) {
+      if (job->queued()) {
+        job->awaitSubmittedAfterFailure();
+      } else {
+        rejectBeforeQueue(job, StorageCode::kChunkMetadataGetError);
+      }
+    }
+  }
   ConstructLog<"storage::UpdateWorker"> constructLog_;
   const Config &config_;
   std::vector<std::unique_ptr<Queue>> queueVec_;

@@ -34,6 +34,12 @@ class EcCoordinator {
                 std::shared_ptr<storage::client::StorageClient> storage);
 
   Result<Void> checkEnabled() const;
+  // Identity captured by the fd that loaded this still-owned data key.
+  Result<storage::EcKeyFileIdentity> loadedDataKeyFileIdentity() const {
+    if (!key_ || !key_->fileIdentity())
+      return makeError(StatusCode::kInvalidConfig, "EC data key has no loaded-file identity");
+    return *key_->fileIdentity();
+  }
   Result<std::array<EcPlacement, 12>> placements() const;
   Result<storage::VersionedChainId> route(const EcPlacement &) const;
   Result<Void> validatePlacements(const EcOperationRecord &) const;

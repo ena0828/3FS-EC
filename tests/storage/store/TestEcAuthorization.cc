@@ -344,13 +344,15 @@ TEST(TestEcAuthorization, SecretHasNoDefaultCopyOrFormatterAndClearsItsStorage) 
   static_assert(!std::is_move_constructible_v<EcCapabilityKey>);
   static_assert(!serde::SerdeType<EcCapabilityKey>);
   static_assert(!fmt::is_formattable<EcCapabilityKey>::value);
-  static_assert(sizeof(EcCapabilityKey) == 32);
-  alignas(EcCapabilityKey) uint8_t storage[sizeof(EcCapabilityKey)];
+  alignas(EcCapabilityKey) uint8_t storage[sizeof(EcCapabilityKey)]{};
   auto bytes = keyBytes();
   auto *key = new (storage) EcCapabilityKey(bytes);
-  ASSERT_TRUE(std::equal(std::begin(storage), std::end(storage), bytes.begin()));
+  // The object now also holds non-secret file identity. Locate the
+  // secret bytes without assuming a fixed object size or field offset.
+  const auto secret = std::search(std::begin(storage), std::end(storage), bytes.begin(), bytes.end());
+  ASSERT_NE(secret, std::end(storage));
   key->~EcCapabilityKey();
-  ASSERT_TRUE(std::all_of(std::begin(storage), std::end(storage), [](auto byte) { return byte == 0; }));
+  ASSERT_TRUE(std::all_of(secret, secret + bytes.size(), [](auto byte) { return byte == 0; }));
 }
 
 TEST(TestEcAuthorization, KeyFileLoadsExactRawOwnerOnlyKeyAndRejectsLengthOrZero) {

@@ -71,14 +71,22 @@ impl Engine {
                 "V2 engine requires immutable staging entry point".into(),
             ));
         }
-        Self::open_with_mode(config, false)
+        Self::open_with_mode(config, None)
     }
 
     pub(crate) fn open_staging(config: &EngineConfig) -> Result<Self> {
-        Self::open_with_mode(config, true)
+        Self::open_with_mode(config, Some(crate::ec_scope::EcStagingFormat::V2))
     }
 
-    fn open_with_mode(config: &EngineConfig, immutable_staging: bool) -> Result<Self> {
+    pub(crate) fn open_staging_gc(config: &EngineConfig) -> Result<Self> {
+        Self::open_with_mode(config, Some(crate::ec_scope::EcStagingFormat::ExactGc))
+    }
+
+    fn open_with_mode(
+        config: &EngineConfig,
+        staging_format: Option<crate::ec_scope::EcStagingFormat>,
+    ) -> Result<Self> {
+        let immutable_staging = staging_format.is_some();
         // Capture the pre-existing ancestor before RocksDB's create_dir_all
         // creates missing engine/metadata parents. Do not recursively walk
         // arbitrary directories: only this explicitly configured path chain.
@@ -114,8 +122,12 @@ impl Engine {
         let ec_scope_create = config.create && !meta_config.rocksdb.path.exists();
         let (mut meta_store, staging_provision) = if immutable_staging {
             let (store, provision) = MetaStore::open_with_validation(&meta_config, |raw| {
-                let provision = crate::ec_scope::preflight_staging(raw, config.prefix_len)
-                    .map_err(|error| Error::MetaError(format!("staging preflight: {error}")))?;
+                let provision = crate::ec_scope::preflight_staging_format(
+                    raw,
+                    config.prefix_len,
+                    staging_format.unwrap(),
+                )
+                .map_err(|error| Error::MetaError(format!("staging preflight: {error}")))?;
                 if provision.is_empty() {
                     validate_empty_immutable_stage_paths(&config.path)?;
                 }

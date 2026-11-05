@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 
 #include "fbs/storage/EcIntegrity.h"
@@ -51,6 +52,14 @@ std::array<uint8_t, kEcGrantCanonicalBytes> encodeClaims(const EcGrantClaims &cl
 Result<EcGrantClaims> decodeClaims(std::string_view bytes);
 }  // namespace ec_authorization_detail
 
+// Non-secret identity captured by fstat on the same fd that supplied the key.
+// It is not a later path lookup and does not prove distinct secret bytes.
+struct EcKeyFileIdentity {
+  uint64_t device = 0;
+  uint64_t inode = 0;
+  bool operator==(const EcKeyFileIdentity &) const = default;
+};
+
 // Explicitly supplied secret, with no Serde, stream or formatter interface.
 // The caller owns entropy and must clear any source buffer it retains. This
 // class clears its own copy; it does not claim locked memory or dump protection.
@@ -66,10 +75,14 @@ class EcCapabilityKey final {
   EcCapabilityKey &operator=(const EcCapabilityKey &) = delete;
   EcCapabilityKey(EcCapabilityKey &&) = delete;
   EcCapabilityKey &operator=(EcCapabilityKey &&) = delete;
+  // Raw-memory keys have no file identity. Callers requiring role-file
+  // separation must reject absence instead of consulting the current path.
+  const std::optional<EcKeyFileIdentity> &fileIdentity() const noexcept { return fileIdentity_; }
 
  private:
   friend struct ec_authorization_detail::Access;
   std::array<uint8_t, 32> bytes_;
+  std::optional<EcKeyFileIdentity> fileIdentity_;
 };
 
 // Binary Serde is the transport format. Readable Serde and fmt are deliberately

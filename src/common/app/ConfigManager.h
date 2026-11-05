@@ -15,6 +15,12 @@ struct AppInfo;
 
 namespace hf3fs::app {
 struct ConfigManager {
+  // Parse only into an isolated default instance. Success acknowledges that
+  // the effective configuration already matches; it never updates cfg.
+  Result<Void> checkEquivalentConfig(const String &configContent,
+                                     const config::IConfig &cfg,
+                                     const flat::AppInfo *appInfo) const;
+
   void updateConfigRecord(Status status, String desc);
   void updateConfigContent(config::IConfig &cfg,
                            const flat::AppInfo *appInfo,

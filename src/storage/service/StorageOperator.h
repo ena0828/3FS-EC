@@ -20,8 +20,11 @@
 #include "common/utils/Semaphore.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcGcDiscovery.h"
+#include "fbs/storage/EcGcRpc.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "storage/aio/AioReadWorker.h"
+#include "storage/ec_gc/EcGcExecutor.h"
 #include "storage/ec_helper/EcHelperRuntime.h"
 #include "storage/ec_scope/EcScopeControlExecutor.h"
 #include "storage/ec_scope/EcTargetDiscoveryExecutor.h"
@@ -54,6 +57,10 @@ class StorageOperator {
     CONFIG_ITEM(ec_capability_key_file, Path{});
     CONFIG_ITEM(enable_ec_helpers, false);
     CONFIG_ITEM(ec_helper_key_file, Path{});
+    CONFIG_ITEM(enable_ec_gc, false);
+    CONFIG_ITEM(ec_gc_key_file, Path{});
+    CONFIG_ITEM(ec_gc_key_id, std::string{});
+    CONFIG_ITEM(ec_gc_authority, std::string{});
     CONFIG_ITEM(enable_ec_scope_control, false);
     CONFIG_ITEM(ec_scope_control_key_file, Path{});
     CONFIG_ITEM(ec_scope_control_authority, std::string{});
@@ -118,7 +125,9 @@ class StorageOperator {
   CoTryTask<EcHelperHopRsp> executeEcHelper(const EcHelperHopReq &request);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const EcScopeControlRequest &req);
   CoTryTask<EcScopeControlRsp> queryEcScopeDrain(const EcScopeControlRequest &req);
+  CoTryTask<EcGcRsp> exchangeEcGc(const EcGcRequest &request);
   CoTryTask<EcTargetDiscoveryRsp> getEcTargetIdentity(const EcTargetDiscoveryRequest &req);
+  CoTryTask<EcGcDiscoveryRsp> getEcGcCapability(const EcGcDiscoveryRequest &request);
 
   CoTryTask<EcReadBlockV2Rsp> readEcBlockV2(const EcReadBlockV2Req &request);
   CoTryTask<EcStageV2Rsp> beginEcStageV2(const EcBeginStageV2Req &request);
@@ -189,6 +198,11 @@ class StorageOperator {
   Result<Void> initEcHelpers();
   CoTryTask<EcHelperHopResult> executeEcHelperOwned(EcHelperHopReq, std::chrono::steady_clock::time_point receivedAt);
   std::unique_ptr<EcHelperRuntime> ecHelpers_;
+
+  Result<Void> initEcGc();
+  std::unique_ptr<EcGcExecutor> ecGc_;
+  std::optional<EcKeyFileIdentity> ecControlKeyFileIdentity_;
+  std::optional<EcKeyFileIdentity> ecHelperKeyFileIdentity_;
 
   Result<Void> initEcScopeControl();
   CoTryTask<EcScopeControlRsp> controlEcScope(const EcScopeControlRequest &, EcScopeControlAction);

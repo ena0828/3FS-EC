@@ -29,6 +29,15 @@ class EcV2BindingCatalog {
                                                   bool allowColocated,
                                                   const EcOwner &creator,
                                                   const Uuid &createRequest);
+  // Fresh public V2 files use mode 3 and enroll protection history atomically.
+  // Existing mode-2 objects are returned unchanged on an exact create retry.
+  // createV2Object above deliberately remains the low-level mode-2 constructor.
+  static CoTryTask<EcObjectRecord> createTrackedV2Object(Transaction &,
+                                                         const EcObjectRef &,
+                                                         uint32_t shardBytes,
+                                                         bool allowColocated,
+                                                         const EcOwner &,
+                                                         const Uuid &createRequest);
   static CoTryTask<std::optional<EcV2ObjectMode>> getObjectMode(Transaction &, const EcObjectRef &);
   static CoTryTask<EcV2ObjectMode> requireV2Mode(Transaction &, const EcObjectRef &);
   static CoTryTask<EcV2OperationBinding> bindPreparing(Transaction &,
@@ -49,5 +58,9 @@ class EcV2BindingCatalog {
                                                    const EcObjectRef &,
                                                    const Uuid &pin,
                                                    const EcOwner &authenticatedOwner);
+
+ private:
+  static CoTryTask<EcObjectRecord>
+  createObjectWithMode(Transaction &, const EcObjectRef &, uint32_t, bool, const EcOwner &, const Uuid &, bool tracked);
 };
 }  // namespace hf3fs::meta::server

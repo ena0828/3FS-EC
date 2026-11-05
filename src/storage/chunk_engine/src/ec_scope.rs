@@ -23,6 +23,20 @@ const STAGING_FORMAT_PREFIX: u8 = 15;
 const STAGING_FORMAT_RECORD_BYTES: usize = 32;
 const STAGING_FORMAT_VERSION: u16 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EcStagingFormat {
+    V2,
+    ExactGc,
+}
+impl EcStagingFormat {
+    fn version(self) -> u16 {
+        match self {
+            Self::V2 => STAGING_FORMAT_VERSION,
+            Self::ExactGc => 3,
+        }
+    }
+}
+
 pub type EcIdentity = [u8; 16];
 pub type EcScopeResult<T> = std::result::Result<T, EcScopeError>;
 
@@ -139,6 +153,7 @@ pub(crate) struct EcStagingProvision {
     empty: bool,
     identity: EcIdentity,
     prefix_len: u32,
+    format: EcStagingFormat,
 }
 
 impl EcStagingProvision {
@@ -156,18 +171,28 @@ pub(crate) fn preflight_staging(
     raw: &RocksDB,
     prefix_len: usize,
 ) -> EcScopeResult<EcStagingProvision> {
+    preflight_staging_format(raw, prefix_len, EcStagingFormat::V2)
+}
+
+pub(crate) fn preflight_staging_format(
+    raw: &RocksDB,
+    prefix_len: usize,
+    format: EcStagingFormat,
+) -> EcScopeResult<EcStagingProvision> {
     let prefix_len = u32::try_from(prefix_len)
         .map_err(|_| EcScopeError::Invalid("staging prefix length exceeds u32"))?;
     let identity = inspect_staging(
         |key| exact_raw_get(raw, key),
         raw.new_iterator(),
         prefix_len,
+        format,
     )?;
     Ok(EcStagingProvision {
         empty: identity.is_none(),
         // Keep one candidate through unknown-commit retries within this open.
         identity: identity.unwrap_or_else(new_identity),
         prefix_len,
+        format,
     })
 }
 
@@ -193,6 +218,7 @@ fn joint_provision_staging_with(
         |key| exact_get(store, key),
         store.iterator(),
         provision.prefix_len,
+        provision.format,
     )?;
     match actual {
         Some(identity) if identity == provision.identity => {}
@@ -203,7 +229,11 @@ fn joint_provision_staging_with(
             batch.put([ENGINE_PREFIX], encode_engine(provision.identity));
             batch.put(
                 [STAGING_FORMAT_PREFIX],
-                encode_staging_format(provision.identity, provision.prefix_len),
+                encode_staging_format_mode(
+                    provision.identity,
+                    provision.prefix_len,
+                    provision.format,
+                ),
             );
             batch.put(
                 MetaKey::used_size_prefix_len_key(),
@@ -222,6 +252,7 @@ fn inspect_staging(
     mut get: impl FnMut(&[u8]) -> EcScopeResult<Option<Vec<u8>>>,
     mut iterator: RocksDBIterator<'_>,
     prefix_len: u32,
+    expected_format: EcStagingFormat,
 ) -> EcScopeResult<Option<EcIdentity>> {
     let identity = get(&[ENGINE_PREFIX])?;
     let format = get(&[STAGING_FORMAT_PREFIX])?;
@@ -257,7 +288,7 @@ fn inspect_staging(
         }
         (Some(identity), Some(format)) => {
             let identity = decode_engine(&identity)?;
-            decode_staging_format(&format, identity, prefix_len)?;
+            decode_staging_format_mode(&format, identity, prefix_len, expected_format)?;
             let prefix = get(&[MetaKey::USED_SIZE_PREFIX_LEN_KEY])?;
             if !matches!(prefix.as_deref(), Some(bytes) if bytes == prefix_len.to_le_bytes())
                 && !(prefix_len == 0 && prefix.is_none())
@@ -425,12 +456,21 @@ impl EcScopeRegistry {
     }
 
     pub(crate) fn confirm_staging_identity(&self, prefix_len: usize) -> EcScopeResult<()> {
+        self.confirm_staging_format(prefix_len, EcStagingFormat::V2)
+    }
+
+    pub(crate) fn confirm_staging_format(
+        &self,
+        prefix_len: usize,
+        format: EcStagingFormat,
+    ) -> EcScopeResult<()> {
         let prefix_len = u32::try_from(prefix_len)
             .map_err(|_| EcScopeError::Invalid("staging prefix length exceeds u32"))?;
         let actual = inspect_staging(
             |key| exact_get(&self.store, key),
             self.store.iterator(),
             prefix_len,
+            format,
         )?;
         if actual != Some(self.identity) {
             return Err(EcScopeError::IdentityMismatch);
@@ -1001,21 +1041,38 @@ fn decode_engine(bytes: &[u8]) -> EcScopeResult<EcIdentity> {
 }
 
 fn encode_staging_format(identity: EcIdentity, prefix_len: u32) -> Vec<u8> {
+    encode_staging_format_mode(identity, prefix_len, EcStagingFormat::V2)
+}
+
+fn encode_staging_format_mode(
+    identity: EcIdentity,
+    prefix_len: u32,
+    format: EcStagingFormat,
+) -> Vec<u8> {
     let mut bytes = record(b"ECSF");
     bytes.extend_from_slice(&identity);
     bytes.extend_from_slice(&prefix_len.to_be_bytes());
-    bytes.extend_from_slice(&STAGING_FORMAT_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&format.version().to_be_bytes());
     checksum(bytes)
 }
 
 fn decode_staging_format(bytes: &[u8], identity: EcIdentity, prefix_len: u32) -> EcScopeResult<()> {
+    decode_staging_format_mode(bytes, identity, prefix_len, EcStagingFormat::V2)
+}
+
+fn decode_staging_format_mode(
+    bytes: &[u8],
+    identity: EcIdentity,
+    prefix_len: u32,
+    format: EcStagingFormat,
+) -> EcScopeResult<()> {
     let mut reader = Reader(checked_record(bytes, b"ECSF", STAGING_FORMAT_RECORD_BYTES)?);
     let recorded_identity: EcIdentity = reader.take()?;
     let recorded_prefix = u32::from_be_bytes(reader.take()?);
     let recorded_version = u16::from_be_bytes(reader.take()?);
     if recorded_identity != identity
         || recorded_prefix != prefix_len
-        || recorded_version != STAGING_FORMAT_VERSION
+        || recorded_version != format.version()
     {
         return Err(EcScopeError::Corrupt(
             "staging format and engine identity disagree",

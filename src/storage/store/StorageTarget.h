@@ -19,6 +19,8 @@
 
 namespace hf3fs::storage {
 
+class EcGcExecutor;
+
 class StorageTarget : public enable_shared_from_this<StorageTarget> {
  protected:
   StorageTarget(const ChunkStore::Config &config,
@@ -198,6 +200,9 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   bool ecOnly() const { return targetConfig_.ec_only; }
 
  private:
+  friend class EcGcExecutor;
+  Result<EcGcLocalTarget> gcLocalTarget(NodeId actualLocalNode) const;
+  Result<EcGcLedgerReceipt> executeGc(const VerifiedEcGcRequest &, NodeId actualLocalNode) const;
   const Config &config_;
   std::shared_ptr<bool> alive_ = std::make_shared<bool>();
   uint32_t diskIndex_;

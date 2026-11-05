@@ -2,6 +2,7 @@
 #include <folly/experimental/coro/Sleep.h>
 
 #include "client/mgmtd/MgmtdClient.h"
+#include "common/app/ConfigManager.h"
 #include "fbs/mgmtd/NodeConversion.h"
 #include "tests/GtestHelpers.h"
 #include "tests/stubs/DummyMgmtdServiceStub.h"
@@ -608,6 +609,79 @@ TEST_F(MgmtdClientTest, testSetGetConfigViaInvoke) {
       CO_ASSERT_OK(res);
       CO_ASSERT_TRUE(!res->has_value());
     }
+  }());
+}
+
+TEST_F(MgmtdClientTest, EquivalentPinnedConfigurationAdvancesHeartbeatVersionButMismatchDoesNot) {
+  struct LocalConfig : ConfigBase<LocalConfig> {
+    CONFIG_ITEM(value, 7);
+  } local;
+  struct PinnedFactory : stubs::IStubFactory<mgmtd::IMgmtdServiceStub> {
+    flat::ConfigInfo latest = flat::ConfigInfo::create(flat::ConfigVersion(1), "value = 7", "same local values");
+    std::vector<flat::ConfigVersion> versions;
+    size_t payloads = 0;
+    std::unique_ptr<mgmtd::IMgmtdServiceStub> create(net::Address) override {
+      auto stub = std::make_unique<mgmtd::DummyMgmtdServiceStub>();
+      stub->set_getPrimaryMgmtdFunc([](const mgmtd::GetPrimaryMgmtdReq &) {
+            return mgmtd::GetPrimaryMgmtdRsp::create(makePrimary(flat::NodeId(1), ada));
+          })
+          .set_heartbeatFunc([this](const mgmtd::HeartbeatReq &req) -> Result<mgmtd::HeartbeatRsp> {
+            versions.push_back(req.info.configVersion);
+            mgmtd::HeartbeatRsp rsp;
+            if (req.info.configVersion < latest.configVersion) {
+              rsp.config = latest;
+              ++payloads;
+            }
+            return rsp;
+          });
+      return stub;
+    }
+  };
+  auto factory = std::make_unique<PinnedFactory>();
+  auto *observed = factory.get();
+  MgmtdClient::Config config;
+  config.set_mgmtd_server_addresses({ada});
+  config.set_enable_auto_refresh(false);
+  config.set_enable_auto_heartbeat(false);
+  config.set_enable_auto_extend_client_session(false);
+  MgmtdClient client("pinned-config-test", std::move(factory), config);
+  flat::AppInfo info;
+  info.nodeId = flat::NodeId(100);
+  client.setAppInfoForHeartbeat(info);
+  client.updateHeartbeatPayload(flat::MetaHeartbeatInfo{});
+  app::ConfigManager manager;
+  size_t callbacks = 0, checks = 0;
+  auto guard = local.addCallbackGuard([&] { ++callbacks; });
+  const auto before = local.toString();
+  client.setServerConfigListener([&](const String &content, const String &) {
+    ++checks;
+    return manager.checkEquivalentConfig(content, local, &info);
+  });
+  folly::coro::blockingWait([&]() -> CoTask<void> {
+    CO_START_CLIENT(client);
+    CO_ASSERT_OK(co_await client.heartbeat());
+    auto acknowledged = co_await client.heartbeat();
+    CO_ASSERT_OK(acknowledged);
+    CO_ASSERT_FALSE(acknowledged->config);
+    CO_ASSERT_EQ(observed->versions.back(), flat::ConfigVersion(1));
+    CO_ASSERT_EQ(observed->payloads, 1);
+    CO_ASSERT_EQ(checks, 1);
+    observed->latest = flat::ConfigInfo::create(flat::ConfigVersion(2), "value = 9", "different local values");
+    CO_ASSERT_OK(co_await client.heartbeat());
+    CO_ASSERT_OK(co_await client.heartbeat());
+    CO_ASSERT_EQ(observed->versions.back(), flat::ConfigVersion(1));
+    CO_ASSERT_EQ(observed->payloads, 3);
+    observed->latest =
+        flat::ConfigInfo::create(flat::ConfigVersion(3), "value=7 # equivalent", "restored local values");
+    CO_ASSERT_OK(co_await client.heartbeat());
+    auto stable = co_await client.heartbeat();
+    CO_ASSERT_OK(stable);
+    CO_ASSERT_FALSE(stable->config);
+    CO_ASSERT_EQ(observed->versions.back(), flat::ConfigVersion(3));
+    CO_ASSERT_EQ(observed->payloads, 4);
+    CO_ASSERT_EQ(checks, 4);
+    CO_ASSERT_EQ(local.toString(), before);
+    CO_ASSERT_EQ(callbacks, 0);
   }());
 }
 

@@ -30,7 +30,13 @@ class EcScopeControlExecutor final {
   void stopAndJoin();
 
  private:
+  friend class EcControlExecutorTestAccess;
   struct Job;
+  // Private deterministic throw seam; public calls always use nullptr.
+  CoTryTask<EcScopeControlAck> executeImpl(EcScopeControlAction,
+                                           EcScopeControlRequest,
+                                           std::shared_ptr<StorageTarget>,
+                                           void (*beforeAwait)());
   EcScopeControlExecutor(std::shared_ptr<const EcScopeControlKey> key, Uuid authority, NodeId node, Clock clock);
   Result<EcScopeControlAck> process(const Job &job);
   void run();

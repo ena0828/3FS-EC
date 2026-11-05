@@ -19,9 +19,9 @@ import time
 import xml.etree.ElementTree as ET
 
 
-STORAGE_FILTER = "TestEcProtocol.*:TestEcTarget.*:TestEcIntegrity.*:TestEcCodec.*:TestEcAuthorization.*:TestEcScopeBridge.*:TestEcScopeLoadBudget.*:TestEcStagingBridge.*:TestEcAuthorizationV2.*:TestEcScopeControl.*:TestEcScopeControlExecutor.*:TestEcRepairPlan.*:TestEcHelperAuthorization.*:TestEcTargetDiscovery.*:TestEcDiskMaintenance.*"
-SERVICE_FILTER = "TestEcService.*:TestEcServiceWithoutEngine.*:TestEcAuthorizedService.*:TestEcAuthorizedNoKeyService.*:TestEcCapabilityComponents.*:TestEcScopeControlService.*:TestEcStageService.*:TestEcNativeRepairService.*:TestEcTargetDiscoveryService.*:TestEcTargetDiscoveryDisabled.*"
-CLIENT_FILTER = "TestEcStripeRead.*:TestEcBlockRead.*:TestEcRepairPipeline.*:TestFakeMgmtdRoutingListeners.*:TestEcStripeClient.*:TestEcStripeRunRecord.*:TestEcStripeFragmentRecovery.*:TestEcStripeCompletion.*"
+STORAGE_FILTER = "TestEcProtocol.*:TestEcTarget.*:TestEcIntegrity.*:TestEcCodec.*:TestEcAuthorization.*:TestEcScopeBridge.*:TestEcScopeLoadBudget.*:TestEcStagingBridge.*:TestEcAuthorizationV2.*:TestEcScopeControl.*:TestEcScopeControlExecutor.*:TestEcRepairPlan.*:TestEcHelperAuthorization.*:TestEcTargetDiscovery.*:TestEcDiskMaintenance.*:TestEcGcControl.*:TestEcGcExecutor.*:TestEcGcTargetFormat.*:TestEcKeyFileIdentity.*:TestEcGcDiscovery.*:TestEcGcDiscoveryRuntime.*:TestEcGcDiscoveryFormat2.*"
+SERVICE_FILTER = "TestEcService.*:TestEcServiceWithoutEngine.*:TestEcAuthorizedService.*:TestEcAuthorizedNoKeyService.*:TestEcCapabilityComponents.*:TestEcScopeControlService.*:TestEcStageService.*:TestEcNativeRepairService.*:TestEcTargetDiscoveryService.*:TestEcTargetDiscoveryDisabled.*:TestEcGcDiscoveryDisabled.*:TestEcGcDiscoveryService.*"
+CLIENT_FILTER = "TestEcStripeRead.*:TestEcBlockRead.*:TestEcRepairPipeline.*:TestFakeMgmtdRoutingListeners.*:TestEcStripeClient.*:TestEcStripeRunRecord.*:TestEcStripeFragmentRecovery.*:TestEcStripeCompletion.*:TestEcGcCommands.*:TestEcRevisionRetirementCommands.*:TestEcAllocationExport.*"
 LEGACY_FILTER = "TestChunkEngine.ReadWrite:TestStorageTarget.ReadWrite:TestStorageTarget.Uncommitted"
 # TestChunkEngine.ReadWrite retains default 4 MiB/64 MiB buffers and 32 AIO
 # workers: (4 * 4 + 64) * 32 = 2560 MiB of repeated ring registration accounting.

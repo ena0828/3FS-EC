@@ -843,6 +843,63 @@ struct PrepareEcRepairV2Rsp : RspBase {
   SERDE_STRUCT_FIELD(helpers, (std::optional<std::array<storage::EcHelperCapability, 10>>{}));
 };
 
+// Root-only GC accepts identities, never a caller endpoint, claim certificate,
+// receipt, eligibility flag or allocator position. Success is committed G2.
+struct EcGcAdminReq : ReqBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(identity, storage::EcFragmentIdentity{});
+  SERDE_STRUCT_FIELD(claimId, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    RETURN_ON_ERROR(identity.validate());
+    if (claimId.is_nil() || object.incarnation.is_nil() || object.inode.isTreeRoot() ||
+        object.inode > InodeId::normalMax() || identity.object != object.incarnation || identity.shard >= 12)
+      return INVALID("invalid exact GC identity");
+    return VALID;
+  }
+};
+struct CollectEcFragmentV2Req : EcGcAdminReq {};
+struct QueryEcFragmentGcV2Req : EcGcAdminReq {};
+// Permanent proof remains in ECGD; the response does not export G bearer data.
+struct EcGcAdminRsp : RspBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(identity, storage::EcFragmentIdentity{});
+  SERDE_STRUCT_FIELD(claimId, Uuid::zero());
+  SERDE_STRUCT_FIELD(claimDigest, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(ledgerSha256, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(terminalRevision, uint64_t{});
+};
+
+// An explicit administrative metadata operation. The same client namespace
+// and request UUID bind one exact historical revision permanently.
+struct EcRevisionRetirementReq : ReqBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(stripe, uint64_t{});
+  SERDE_STRUCT_FIELD(revision, uint64_t{});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (client.uuid.is_nil() || object.incarnation.is_nil() || object.inode.isTreeRoot() ||
+        object.inode > InodeId::normalMax() || !revision)
+      return INVALID("invalid fixed EC revision retirement identity");
+    return VALID;
+  }
+};
+struct RetireEcRevisionV2Req : EcRevisionRetirementReq {};
+struct QueryEcRevisionRetirementV2Req : EcRevisionRetirementReq {};
+struct EcRevisionRetirementRsp : RspBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(stripe, uint64_t{});
+  SERDE_STRUCT_FIELD(revision, uint64_t{});
+  SERDE_STRUCT_FIELD(generation, uint64_t{});
+  SERDE_STRUCT_FIELD(clientNamespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(referencesReleased, false);
+};
+
 // testRpc
 struct TestRpcReq : ReqBase {
   SERDE_STRUCT_FIELD(path, PathAt());
@@ -903,6 +960,11 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(acquireEcReadV2, 35, AcquireEcReadV2Req, AcquireEcReadV2Rsp);
   META_SERVICE_METHOD(releaseEcReadV2, 36, ReleaseEcReadV2Req, ReleaseEcReadV2Rsp);
   META_SERVICE_METHOD(prepareEcRepairV2, 37, PrepareEcRepairV2Req, PrepareEcRepairV2Rsp);
+  META_SERVICE_METHOD(collectEcFragmentV2, 38, CollectEcFragmentV2Req, EcGcAdminRsp);
+  META_SERVICE_METHOD(queryEcFragmentGcV2, 39, QueryEcFragmentGcV2Req, EcGcAdminRsp);
+
+  META_SERVICE_METHOD(retireEcRevisionV2, 40, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
+  META_SERVICE_METHOD(queryEcRevisionRetirementV2, 41, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
 

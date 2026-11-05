@@ -8,6 +8,7 @@
 #include <optional>
 
 #include "storage/ec_stage/EcStagingEngine.h"
+#include "storage/update/EcJobCompletion.h"
 #include "storage/update/EcWorkerSession.h"
 
 namespace hf3fs::storage {
@@ -30,12 +31,8 @@ class EcStageJob {
         session_(std::move(session)) {}
   EcStageJob(const EcStageJob &) = delete;
   EcStageJob &operator=(const EcStageJob &) = delete;
-  ~EcStageJob() {
-    if (submitted_.load() && !completed_.load()) std::terminate();
-  }
-  void claimSubmission() {
-    if (submitted_.exchange(true)) std::terminate();
-  }
+  ~EcStageJob() { completion_.retainUntilFinished(); }
+  void claimSubmission() { completion_.claim(); }
   const auto &target() const { return target_; }
   const auto &request() const { return request_; }
   bool sessionMatches(const std::shared_ptr<EcWorkerSessions> &sessions) const {
@@ -53,11 +50,14 @@ class EcStageJob {
   void execute();
   void setResult(Result<EcStageResult> result) {
     result_ = std::move(result);
-    baton_.post();
+    completion_.finish();
   }
-  CoTask<void> complete() const {
-    co_await baton_;
-    completed_.store(true, std::memory_order_release);
+  CoTask<void> complete() const { return completion_.observe(); }
+  void commitQueued() noexcept { completion_.commitQueued(); }
+  bool queued() const noexcept { return completion_.queued(); }
+  void awaitSubmittedAfterFailure() noexcept {
+    completion_.failedWait();
+    completion_.waitFinished();
   }
   Result<EcStageResult> takeResult();
 
@@ -68,9 +68,7 @@ class EcStageJob {
   std::optional<EcScopeTicket> ticket_;
   std::shared_ptr<EcWorkerSession> session_;
   Result<EcStageResult> result_{makeError(StorageClientCode::kNotInitialized)};
-  std::atomic<bool> submitted_{false};
-  mutable std::atomic<bool> completed_{false};
+  EcJobCompletion completion_;
   bool consumed_ = false;
-  folly::coro::Baton baton_;
 };
 }  // namespace hf3fs::storage

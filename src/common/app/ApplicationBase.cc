@@ -119,11 +119,16 @@ Result<Void> ApplicationBase::updateConfig(const String &configContent, const St
     RETURN_AND_RECORD_CONFIG_UPDATE(makeError(StatusCode::kNoApplication), configDesc);
   }
   if (!globalApp->configPushable()) {
-    XLOGF(WARN,
-          "Update config ignored: this app declares that its config is not hotupdatable. desc: {}\nConfig content:\n{}",
-          configDesc,
-          configContent);
-    RETURN_AND_RECORD_CONFIG_UPDATE(makeError(StatusCode::kCannotPushConfig), configDesc);
+    auto res = getConfigManager().checkEquivalentConfig(configContent, *globalApp->getConfig(), globalApp->info());
+    if (res) {
+      XLOGF(INFO,
+            "Pinned local config already matches remote version; acknowledged without update. desc: {}",
+            configDesc);
+    } else {
+      XLOGF(WARN, "Pinned local config rejected remote version. desc: {}. status: {}", configDesc, res.error().code());
+    }
+    // Version acknowledgement only: no hot update, callback or persistConfig.
+    RETURN_AND_RECORD_CONFIG_UPDATE(std::move(res), configDesc);
   }
   auto res = getConfigManager().updateConfig(configContent, configDesc, *globalApp->getConfig(), globalApp->info());
   if (res) {

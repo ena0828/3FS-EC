@@ -22,22 +22,23 @@ void EcAdmissionJob::execute() {
       return scope_->tryAdmit(binding_);
     }();
   } catch (const std::exception &) {
-    result_ = makeError(StorageCode::kChunkMetadataGetError, "EC admission worker failed");
+    result_ = makeError(StorageCode::kChunkMetadataGetError);
   } catch (...) {
-    result_ = makeError(StorageCode::kChunkMetadataGetError, "EC admission worker failed");
+    result_ = makeError(StorageCode::kChunkMetadataGetError);
   }
-  baton_.post();
+  completion_.finish();
 }
 void EcAdmissionJob::reject(Status status) {
   result_ = makeError(std::move(status));
-  baton_.post();
+  completion_.finish();
 }
 Result<EcScopeTicket> EcAdmissionJob::takeTicket() {
-  if (!observedCompletion_.load(std::memory_order_acquire) || consumed_) {
+  if (!completion_.observed() || consumed_) {
     return makeError(StorageClientCode::kResourceBusy, "EC admission is incomplete or already consumed");
   }
   consumed_ = true;
   session_.reset();
+  if (completion_.waitFailed()) return makeError(StatusCode::kNotEnoughMemory);
   return std::move(result_);
 }
 }  // namespace hf3fs::storage

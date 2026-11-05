@@ -95,46 +95,54 @@ CoTryTask<StorageOperator::EcStageExecution> StorageOperator::executeEcStageV2(c
     if (!current) return makeError(current.error());
     return Void{};
   };
-  EcAdmissionJob admission(scopeBinding(*verified, identity),
-                           scope->first,
-                           *session,
-                           target->storageTarget,
-                           validateAccess,
-                           [&]() {
-                             return loadBudget.remaining(EcScopeLoadBudget::Clock::now(),
-                                                         verified->claims().expiresAtSeconds,
-                                                         ecAuthorizationNow_());
-                           });
-  // Both admission and data work are drained under an explicit empty token.
-  // Network timeout never ends ownership of a submitted borrowed job.
-  co_await folly::coro::co_withCancellation(folly::CancellationToken{}, updateWorker_.enqueue(&admission));
-  co_await folly::coro::co_withCancellation(folly::CancellationToken{}, admission.complete());
-  auto ticket = admission.takeTicket();
-  CO_RETURN_ON_ERROR(ticket);
-  CO_RETURN_ON_ERROR(validateAccess());
-  EcStageRequest input;
-  input.operation = operation;
-  input.identity = request.identity;
-  input.vChainId = request.vChainId;
-  input.targetId = request.targetId;
-  input.operationId = request.operationId;
-  input.integrity = request.integrity;
-  if constexpr (std::is_same_v<Request, EcBeginStageV2Req>) {
-    auto derived = deriveEcStageSpecV2(*verified);
-    CO_RETURN_ON_ERROR(derived);
-    input.writerNamespace = verified->claims().clientNamespace;
+  try {
+    EcAdmissionJob admission(scopeBinding(*verified, identity),
+                             scope->first,
+                             *session,
+                             target->storageTarget,
+                             validateAccess,
+                             [&]() {
+                               return loadBudget.remaining(EcScopeLoadBudget::Clock::now(),
+                                                           verified->claims().expiresAtSeconds,
+                                                           ecAuthorizationNow_());
+                             });
+    // Submitted work is drained under an explicit empty token; queue-full work
+    // is completed as ResourceBusy before any disk worker takes ownership.
+    // Network timeout never ends ownership of a submitted borrowed job.
+    co_await folly::coro::co_withCancellation(folly::CancellationToken{}, updateWorker_.enqueue(&admission));
+    co_await folly::coro::co_withCancellation(folly::CancellationToken{}, admission.complete());
+    auto ticket = admission.takeTicket();
+    CO_RETURN_ON_ERROR(ticket);
+    CO_RETURN_ON_ERROR(validateAccess());
+    EcStageRequest input;
+    input.operation = operation;
+    input.identity = request.identity;
+    input.vChainId = request.vChainId;
+    input.targetId = request.targetId;
+    input.operationId = request.operationId;
+    input.integrity = request.integrity;
+    if constexpr (std::is_same_v<Request, EcBeginStageV2Req>) {
+      auto derived = deriveEcStageSpecV2(*verified);
+      CO_RETURN_ON_ERROR(derived);
+      input.writerNamespace = verified->claims().clientNamespace;
+    }
+    if constexpr (std::is_same_v<Request, EcReadBlockV2Req> || std::is_same_v<Request, EcAppendStageV2Req>) {
+      // verifyEcRequestV2 rejected blockIndex >= the fixed sixteen-slot bound.
+      input.blockIndex = static_cast<uint8_t>(wire.blockIndex);
+    }
+    if constexpr (std::is_same_v<Request, EcAppendStageV2Req>) input.payload = wire.payload.data;
+    EcStageJob job(std::move(*ticket), *session, std::move(input), target->storageTarget, validateAccess);
+    co_await folly::coro::co_withCancellation(folly::CancellationToken{}, updateWorker_.enqueue(&job));
+    co_await folly::coro::co_withCancellation(folly::CancellationToken{}, job.complete());
+    auto result = job.takeResult();
+    CO_RETURN_ON_ERROR(result);
+    co_return EcStageExecution{std::move(*result), identity};
+  } catch (...) {
+    // Borrowed jobs retain their owning frame, ticket and payload until the
+    // actual worker completes, even if creating complete() itself throws.
+    const bool durable = operation != EcStageOperation::ReadBlock && operation != EcStageOperation::Query;
+    co_return makeError(durable ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kNotEnoughMemory);
   }
-  if constexpr (std::is_same_v<Request, EcReadBlockV2Req> || std::is_same_v<Request, EcAppendStageV2Req>) {
-    // verifyEcRequestV2 rejected blockIndex >= the fixed sixteen-slot bound.
-    input.blockIndex = static_cast<uint8_t>(wire.blockIndex);
-  }
-  if constexpr (std::is_same_v<Request, EcAppendStageV2Req>) input.payload = wire.payload.data;
-  EcStageJob job(std::move(*ticket), *session, std::move(input), target->storageTarget, validateAccess);
-  co_await folly::coro::co_withCancellation(folly::CancellationToken{}, updateWorker_.enqueue(&job));
-  co_await folly::coro::co_withCancellation(folly::CancellationToken{}, job.complete());
-  auto result = job.takeResult();
-  CO_RETURN_ON_ERROR(result);
-  co_return EcStageExecution{std::move(*result), identity};
 }
 
 CoTryTask<EcReadBlockV2Rsp> StorageOperator::readEcBlockV2(const EcReadBlockV2Req &request) {

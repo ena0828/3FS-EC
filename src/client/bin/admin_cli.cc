@@ -5,6 +5,7 @@
 #include <folly/logging/xlog.h>
 #include <iostream>
 
+#include "client/cli/admin/AdminClientIdentity.h"
 #include "client/cli/admin/AdminEnv.h"
 #include "client/cli/admin/registerAdminCommands.h"
 #include "client/cli/common/Utils.h"
@@ -43,6 +44,8 @@ class Config : public ConfigBase<Config> {
   CONFIG_OBJ(client, net::Client::Config);
   CONFIG_OBJ(ib_devices, net::IBDevice::Config);
   CONFIG_ITEM(cluster_id, "");
+  // Optional stable retry namespace; empty preserves ordinary random clients.
+  CONFIG_ITEM(client_uuid, "");
   CONFIG_OBJ(user_info, UserConfig);
   CONFIG_ITEM(log, "DBG:normal; normal=file:path=cli.log,async=true,sync_level=ERR", ConfigCheckers::checkNotEmpty);
   CONFIG_ITEM(num_timeout_ms, 1000L);
@@ -99,7 +102,12 @@ int main(int argc, char **argv) {
   std::shared_ptr<MetaClient> metaClient;
   std::shared_ptr<StorageClient> storageClient;
   std::shared_ptr<CoreClient> coreClient;
-  auto clientId = ClientId::random();
+  auto selectedClientId = makeAdminClientId(config.client_uuid());
+  if (!selectedClientId) {
+    fmt::print(stderr, "Invalid client_uuid: {}\n", selectedClientId.error().describe());
+    return 1;
+  }
+  auto clientId = *selectedClientId;
 
   auto ensureIbInited = [&] {
     [[maybe_unused]] static bool inited = [&] {

@@ -1,6 +1,12 @@
 #include "storage/update/UpdateWorker.h"
 
+#include <folly/ScopeGuard.h>
+
 namespace hf3fs::storage {
+namespace {
+thread_local const UpdateWorker *currentEcUpdateWorker = nullptr;
+}
+bool UpdateWorker::isCurrentWorkerThread() const noexcept { return currentEcUpdateWorker == this; }
 
 Result<Void> UpdateWorker::start(uint32_t numberOfDisks) {
   if (config_.num_threads() < numberOfDisks) {
@@ -35,6 +41,8 @@ void UpdateWorker::stopAndJoin() {
 }
 
 void UpdateWorker::run(Queue &queue) {
+  currentEcUpdateWorker = this;
+  SCOPE_EXIT { currentEcUpdateWorker = nullptr; };
   while (true) {
     auto job = queue.dequeue();
     if (UNLIKELY(std::holds_alternative<std::monostate>(job))) {
@@ -63,18 +71,9 @@ void UpdateWorker::run(Queue &queue) {
           return;
         }
         ecJob->setResult((ecJob->target().get()->*operation)(ecJob->request()));
-      } catch (const std::exception &error) {
-        ecJob->setResult(makeError(
-            durableOperation ? StorageCode::kEcSealOutcomeUnknown : StorageCode::kChunkMetadataGetError,
-            fmt::format("{}: {}",
-                        durableOperation ? "EC durable worker operation failed; retain allocation and reconcile outcome"
-                                         : "EC read worker failed",
-                        error.what())));
       } catch (...) {
         ecJob->setResult(
-            makeError(durableOperation ? StorageCode::kEcSealOutcomeUnknown : StorageCode::kChunkMetadataGetError,
-                      durableOperation ? "EC durable worker operation failed; retain allocation and reconcile outcome"
-                                       : "EC read worker failed"));
+            makeError(durableOperation ? StorageCode::kEcSealOutcomeUnknown : StorageCode::kChunkMetadataGetError));
       }
     };
     if (auto *create = std::get_if<EcCreateJob *>(&job)) {

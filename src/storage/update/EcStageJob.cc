@@ -33,15 +33,13 @@ void EcStageJob::execute() {
     }
     setResult(target_->executeEcStage(request_));
   } catch (const std::exception &) {
-    setResult(makeError(request_.durable() ? StorageCode::kEcSealOutcomeUnknown : StorageCode::kChunkMetadataGetError,
-                        "stage worker failed; retain allocation and reconcile any durable operation"));
+    setResult(makeError(request_.durable() ? StorageCode::kEcSealOutcomeUnknown : StorageCode::kChunkMetadataGetError));
   } catch (...) {
-    setResult(makeError(request_.durable() ? StorageCode::kEcSealOutcomeUnknown : StorageCode::kChunkMetadataGetError,
-                        "stage worker failed; retain allocation and reconcile any durable operation"));
+    setResult(makeError(request_.durable() ? StorageCode::kEcSealOutcomeUnknown : StorageCode::kChunkMetadataGetError));
   }
 }
 Result<EcStageResult> EcStageJob::takeResult() {
-  if (!completed_.load(std::memory_order_acquire) || consumed_) {
+  if (!completion_.observed() || consumed_) {
     return makeError(StorageClientCode::kResourceBusy, "stage job result is incomplete or already consumed");
   }
   consumed_ = true;
@@ -50,6 +48,9 @@ Result<EcStageResult> EcStageJob::takeResult() {
     session_.reset();
   });
   auto output = std::move(result_);
+  if (completion_.waitFailed()) {
+    return makeError(request_.durable() ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kNotEnoughMemory);
+  }
   const auto access = [&]() -> Result<Void> {
     try {
       auto result = validateRoute();

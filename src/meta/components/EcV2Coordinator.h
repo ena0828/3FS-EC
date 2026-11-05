@@ -22,6 +22,8 @@ class EcV2Coordinator {
   Result<storage::VersionedChainId> route(const EcV2PhysicalEndpoint &) const;
   const Uuid &authority() const { return authority_; }
   const storage::EcScopeControlKey &controlKey() const { return *controlKey_; }
+  std::shared_ptr<const storage::EcScopeControlKey> sharedControlKey() const { return controlKey_; }
+  Result<std::vector<storage::EcKeyFileIdentity>> loadedKeyFileIdentities() const;
 
   // Caller must first commit checkIssuanceOpen in the same transaction that
   // checked owner/ACL and loaded these fixed records. Late delivery after T0

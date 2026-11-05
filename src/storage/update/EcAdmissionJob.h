@@ -8,6 +8,7 @@
 
 #include "common/utils/Coroutine.h"
 #include "storage/ec_scope/EcScope.h"
+#include "storage/update/EcJobCompletion.h"
 #include "storage/update/EcWorkerSession.h"
 
 namespace hf3fs::storage {
@@ -31,21 +32,20 @@ class EcAdmissionJob {
         waitBudget_(std::move(waitBudget)) {}
   EcAdmissionJob(const EcAdmissionJob &) = delete;
   EcAdmissionJob &operator=(const EcAdmissionJob &) = delete;
-  ~EcAdmissionJob() {
-    if (submitted_.load() && !observedCompletion_.load()) std::terminate();
-  }
-  void claimSubmission() {
-    if (submitted_.exchange(true)) std::terminate();
-  }
+  ~EcAdmissionJob() { completion_.retainUntilFinished(); }
+  void claimSubmission() { completion_.claim(); }
   const auto &target() const { return target_; }
   bool sessionMatches(const std::shared_ptr<EcWorkerSessions> &sessions) const {
     return session_ && session_->belongsTo(sessions);
   }
   void execute();
   void reject(Status status);
-  CoTask<void> complete() const {
-    co_await baton_;
-    observedCompletion_.store(true, std::memory_order_release);
+  CoTask<void> complete() const { return completion_.observe(); }
+  void commitQueued() noexcept { completion_.commitQueued(); }
+  bool queued() const noexcept { return completion_.queued(); }
+  void awaitSubmittedAfterFailure() noexcept {
+    completion_.failedWait();
+    completion_.waitFinished();
   }
   Result<EcScopeTicket> takeTicket();
 
@@ -57,9 +57,8 @@ class EcAdmissionJob {
   std::function<Result<Void>()> validate_;
   std::function<Result<uint32_t>()> waitBudget_;
   Result<EcScopeTicket> result_{makeError(StorageClientCode::kNotInitialized)};
-  std::atomic<bool> submitted_{false};
-  mutable std::atomic<bool> observedCompletion_{false};
+  friend class EcJobCompletionTestAccess;
+  EcJobCompletion completion_;
   bool consumed_ = false;
-  folly::coro::Baton baton_;
 };
 }  // namespace hf3fs::storage

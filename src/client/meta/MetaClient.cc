@@ -541,6 +541,34 @@ CoTryTask<PrepareEcRepairV2Rsp> MetaClient::prepareEcRepairV2(PrepareEcRepairV2R
   if (req.uuid.is_nil()) req.uuid = Uuid::random();
   co_return co_await retry(&IMetaServiceStub::prepareEcRepairV2, req);
 }
+CoTryTask<EcGcAdminRsp> MetaClient::collectEcFragmentV2(CollectEcFragmentV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  // Surface this exchange's outcome. Generic retry can otherwise replace an
+  // earlier irreversible 4085 with a later ordinary error. Recovery is an
+  // explicit call with the same permanent claimId, usually Query first.
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::collectEcFragmentV2, req, std::move(once));
+}
+CoTryTask<EcGcAdminRsp> MetaClient::queryEcFragmentGcV2(QueryEcFragmentGcV2Req req) {
+  if (req.uuid.is_nil()) req.uuid = Uuid::random();
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcFragmentGcV2, req, std::move(once));
+}
+CoTryTask<EcRevisionRetirementRsp> MetaClient::retireEcRevisionV2(RetireEcRevisionV2Req req) {
+  // The caller persists this identity before dispatch; never create a new UUID.
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "retirement request UUID is required");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::retireEcRevisionV2, req, std::move(once));
+}
+CoTryTask<EcRevisionRetirementRsp> MetaClient::queryEcRevisionRetirementV2(QueryEcRevisionRetirementV2Req req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "original retirement UUID is required");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcRevisionRetirementV2, req, std::move(once));
+}
 CoTryTask<ReleaseEcReadV2Rsp> MetaClient::releaseEcReadV2(ReleaseEcReadV2Req req) {
   if (req.uuid.is_nil()) req.uuid = Uuid::random();
   co_return co_await retry(&IMetaServiceStub::releaseEcReadV2, req);

@@ -11,6 +11,8 @@
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcGcDiscovery.h"
+#include "fbs/storage/EcGcRpc.h"
 #include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
@@ -109,10 +111,19 @@ class StorageMessenger {
                                                           const net::UserRequestOptions *options = nullptr,
                                                           serde::Timestamp *timestamp = nullptr);
 
+  CoTryTask<EcGcRsp> exchangeEcGc(const net::Address &address,
+                                  const EcGcRequest &request,
+                                  const net::UserRequestOptions *options = nullptr,
+                                  serde::Timestamp *timestamp = nullptr);
   CoTryTask<EcTargetDiscoveryRsp> getEcTargetIdentity(const net::Address &address,
                                                       const EcTargetDiscoveryRequest &request,
                                                       const net::UserRequestOptions *options = nullptr,
                                                       serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcGcDiscoveryRsp> getEcGcCapability(const net::Address &address,
+                                                const EcGcDiscoveryRequest &request,
+                                                const net::UserRequestOptions *options = nullptr,
+                                                serde::Timestamp *timestamp = nullptr);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const net::Address &address,
                                              const EcScopeControlRequest &request,
                                              const net::UserRequestOptions *options = nullptr,

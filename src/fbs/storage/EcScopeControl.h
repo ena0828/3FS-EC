@@ -25,6 +25,7 @@ class EcScopeControlKey final {
   static Result<std::unique_ptr<EcScopeControlKey>> loadFile(const std::filesystem::path &path);
   EcScopeControlKey(const EcScopeControlKey &) = delete;
   EcScopeControlKey &operator=(const EcScopeControlKey &) = delete;
+  const std::optional<EcKeyFileIdentity> &fileIdentity() const noexcept { return key_->fileIdentity(); }
 
  private:
   friend class ec_scope_control_detail::Codec;

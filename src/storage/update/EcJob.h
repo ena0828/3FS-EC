@@ -11,6 +11,7 @@
 
 #include "fbs/storage/Ec.h"
 #include "storage/ec_scope/EcScope.h"
+#include "storage/update/EcJobCompletion.h"
 #include "storage/update/EcWorkerSession.h"
 
 namespace hf3fs::storage {
@@ -47,13 +48,13 @@ class EcJob {
   EcJob(const EcJob &) = delete;
   EcJob &operator=(const EcJob &) = delete;
   ~EcJob() {
-    // Destroying a borrowed queued frame is a programming-contract violation.
-    // Never silently drop the count and advertise drain while the worker owns it.
-    if (scoped_ && submitted_.load() && !completed_.load()) std::terminate();
+    // Allocation can fail creating complete() at its call site. Retain the
+    // request, target and optional ticket until the real owner is finished.
+    completion_.retainUntilFinished();
   }
   void claimSubmission() {
     // A second completion must not wake the first, still-running operation.
-    if (submitted_.exchange(true)) std::terminate();
+    completion_.claim();
   }
 
   const auto &request() const { return request_; }
@@ -79,19 +80,23 @@ class EcJob {
     RETURN_ON_ERROR(ticket_->checkExecution());
     return checkEcJobTarget(*target_, *ticket_, request_.vChainId.chainId, request_.targetId, request_.identity.object);
   }
-  CoTask<void> complete() const {
-    co_await baton_;
-    completed_.store(true, std::memory_order_release);
+  CoTask<void> complete() const { return completion_.observe(); }
+  void commitQueued() noexcept { completion_.commitQueued(); }
+  bool queued() const noexcept { return completion_.queued(); }
+  bool waitFailed() const noexcept { return completion_.waitFailed(); }
+  void awaitSubmittedAfterFailure() noexcept {
+    completion_.failedWait();
+    completion_.waitFinished();
   }
   void setResult(Result<Response> result) {
     result_ = std::move(result);
-    baton_.post();
+    completion_.finish();
   }
   // Only call after complete(). This keeps the owning response, route/expiry
   // postcheck and final ticket release in one operation. Failure before disk
   // completion never drops a ticket. Retrying takeResult is rejected.
   Result<Response> takeResult() {
-    if (!completed_.load(std::memory_order_acquire) || consumed_) {
+    if (!completion_.observed() || consumed_) {
       return makeError(StorageClientCode::kResourceBusy, "EC result is incomplete or already consumed");
     }
     consumed_ = true;
@@ -100,6 +105,10 @@ class EcJob {
       session_.reset();
     });
     auto output = std::move(result_);
+    if (completion_.waitFailed()) {
+      return makeError(std::is_same_v<Request, EcReadReq> ? StatusCode::kNotEnoughMemory
+                                                          : StorageCode::kEcSealOutcomeUnknown);
+    }
     auto access = validateRoute();
     if (access) access = validateAdmission();
     if (!access && output) {
@@ -120,11 +129,10 @@ class EcJob {
   std::optional<EcScopeTicket> ticket_;
   std::shared_ptr<EcWorkerSession> session_;
   Result<Response> result_{makeError(StorageClientCode::kNotInitialized)};
-  std::atomic<bool> submitted_{false};
+  friend class EcJobCompletionTestAccess;
+  EcJobCompletion completion_;
   const bool scoped_ = false;
-  mutable std::atomic<bool> completed_{false};
   bool consumed_ = false;
-  folly::coro::Baton baton_;
 };
 using EcCreateJob = EcJob<EcCreateReq, EcFragmentReceipt>;
 using EcReadJob = EcJob<EcReadReq, EcReadResult>;

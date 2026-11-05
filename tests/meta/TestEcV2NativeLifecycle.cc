@@ -22,15 +22,20 @@
 
 #include "client/ec/EcStripeClient.h"
 #include "client/meta/MetaClient.h"
+#include "common/kv/KeyPrefix.h"
 #include "common/net/Client.h"
 #include "common/net/Server.h"
+#include "common/utils/SerDeser.h"
 #include "core/user/UserStore.h"
 #include "fbs/meta/EcRequestDigest.h"
 #include "fbs/storage/EcAuthorizedV2.h"
 #include "fbs/storage/EcStageValidationV2.h"
 #include "fdb/FDBKVEngine.h"
+#include "meta/components/NativeEcGcTransport.h"
 #include "meta/service/MetaSerdeService.h"
 #include "meta/store/EcCatalog.h"
+#include "meta/store/EcRevisionRetirementCatalog.h"
+#include "meta/store/EcV2GcCatalog.h"
 #include "meta/store/EcV2PublishedCatalog.h"
 #include "meta/store/Inode.h"
 #include "storage/ec_codec/EcCodec.h"
@@ -76,6 +81,9 @@ struct PublishReplyDrop {
   mutable std::mutex mutex;
   Uuid armed = Uuid::zero();
   State state;
+  Uuid retirementArmed = Uuid::zero();
+  size_t retirementCalls = 0;
+  std::optional<EcRevisionRetirementRsp> retirementCommitted;
 };
 
 // The real operator has returned from its FDB commit before this one-shot
@@ -124,6 +132,26 @@ class DropPublishMetaService : public MetaSerdeService {
     co_return response;
   }
 
+  CoTryTask<EcRevisionRetirementRsp> retireEcRevisionV2(serde::CallContext &ctx, const RetireEcRevisionV2Req &req) {
+    {
+      std::lock_guard lock(fault_.mutex);
+      ++fault_.retirementCalls;
+    }
+    auto response = co_await MetaSerdeService::retireEcRevisionV2(ctx, req);
+    bool drop = false;
+    if (response) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.retirementArmed == req.uuid) {
+        fault_.retirementArmed = Uuid::zero();
+        fault_.retirementCommitted = *response;
+        drop = true;
+      }
+    }
+    // Real FDB retirement committed before this one-shot lost RPC response.
+    if (drop) ctx.transport()->invalidate(false);
+    co_return response;
+  }
+
  protected:
   friend struct ::hf3fs::refl::Helper;
   template <class U = DropPublishMetaService>
@@ -141,6 +169,10 @@ struct ControlFailure {
   Uuid observedRepair = Uuid::zero();
   std::array<size_t, 12> actualPartialReconciles{};
   std::array<uint16_t, 10> actualHelperBlocks{};
+  Uuid dropGcCollectReply = Uuid::zero();
+  size_t actualGcCollects = 0;
+  size_t actualGcQueries = 0;
+  std::optional<storage::EcGcAck> observedGcCollect;
 };
 // Only replaces a real, already durable control response with an error. It
 // cannot fabricate a positive ACK, and does not skip the actual revoke.
@@ -159,6 +191,27 @@ class ControlFailureStorageService : public storage::StorageService {
       if (fault_.fail && fault_.scope == req.claims.scopeId)
         co_return makeError(StatusCode::kNotImplemented, "test fault after actual durable revoke");
     }
+    co_return response;
+  }
+  CoTryTask<storage::EcGcRsp> exchangeEcGc(serde::CallContext &ctx, const storage::EcGcRequest &req) {
+    auto response = co_await storage::StorageService::exchangeEcGc(ctx, req);
+    bool drop = false;
+    if (response && response->result) {
+      std::lock_guard lock(fault_.mutex);
+      if (req.claims.action == storage::EcGcAction::Collect) {
+        ++fault_.actualGcCollects;
+        fault_.observedGcCollect = *response->result;
+        if (fault_.dropGcCollectReply == req.claims.certificate.claimId) {
+          fault_.dropGcCollectReply = Uuid::zero();
+          drop = true;
+        }
+      } else {
+        ++fault_.actualGcQueries;
+      }
+    }
+    // Same connection-loss seam as Publish above: the real authenticated
+    // handler and Rust/WAL confirmation finish before the reply is lost.
+    if (drop) ctx.transport()->invalidate(false);
     co_return response;
   }
   CoTryTask<storage::EcStageV2Rsp> reconcileEcStageV2(serde::CallContext &ctx,
@@ -202,6 +255,8 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   static constexpr uint32_t kShardBytes = 4096;
   virtual uint32_t ecAdmissionLimit() const { return 2; }
   virtual bool enableHelperIssuance() const { return false; }
+  virtual bool enableExactGc() const { return false; }
+  virtual bool enableMetaGcAdmin() const { return false; }
   struct Mutation {
     std::string logical;
     storage::EcCodec::Shards shards;
@@ -382,6 +437,15 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     control.close();
     ASSERT_TRUE(control.good());
     ASSERT_EQ(::chmod(controlKeyPath_.c_str(), 0600), 0);
+    if (enableExactGc()) {
+      gcKeyPath_ = traces_.path() / "native-gc.key";
+      std::ofstream gc(gcKeyPath_.string(), std::ios::binary | std::ios::trunc);
+      const std::string gcMaterial(32, 'G');
+      gc.write(gcMaterial.data(), gcMaterial.size());
+      gc.close();
+      ASSERT_TRUE(gc.good());
+      ASSERT_EQ(::chmod(gcKeyPath_.c_str(), 0600), 0);
+    }
     if (enableHelperIssuance()) {
       helperKeyPath_ = traces_.path() / "native-helper.key";
       std::ofstream helper(helperKeyPath_.string(), std::ios::binary | std::ios::trunc);
@@ -441,6 +505,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     storageConfig_.targets().set_target_paths({data_.path()});
     storageConfig_.targets().set_ec_only(true);
     storageConfig_.targets().set_ec_staging_v2(true);
+    storageConfig_.targets().set_ec_exact_gc(enableExactGc());
     storageConfig_.targets().set_allow_disk_without_uuid(true);
     storageConfig_.targets().set_collect_all_fds(false);
     auto &storage = storageConfig_.storage();
@@ -450,6 +515,12 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     storage.set_enable_ec_scope_control(true);
     storage.set_ec_scope_control_key_file(controlKeyPath_);
     storage.set_ec_scope_control_authority(authority_.toHexString());
+    if (enableExactGc()) {
+      storage.set_enable_ec_gc(true);
+      storage.set_ec_gc_key_file(gcKeyPath_);
+      storage.set_ec_gc_key_id(gcKeyId_.toHexString());
+      storage.set_ec_gc_authority(authority_.toHexString());
+    }
     if (enableHelperIssuance()) {
       storage.set_enable_ec_helpers(true);
       storage.set_ec_helper_key_file(helperKeyPath_);
@@ -544,6 +615,12 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   void startMeta() {
     metaConfig_.set_enable_ec_catalog(true);
     metaConfig_.set_enable_ec_v2(true);
+    if (enableMetaGcAdmin()) {
+      metaConfig_.set_enable_ec_exact_gc(true);
+      metaConfig_.set_ec_gc_key_file(gcKeyPath_);
+      metaConfig_.set_ec_gc_key_id(gcKeyId_.toHexString());
+      metaConfig_.set_ec_gc_authority(authority_.toHexString());
+    }
     if (enableHelperIssuance()) metaConfig_.set_ec_v2_helper_key_file(helperKeyPath_);
     metaConfig_.set_ec_v2_control_key_file(controlKeyPath_);
     metaConfig_.set_ec_v2_control_authority(authority_.toHexString());
@@ -984,6 +1061,8 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   ControlFailure controlFault_;
   Path controlKeyPath_;
   Path helperKeyPath_;
+  Path gcKeyPath_;
+  const Uuid gcKeyId_ = Uuid::random();
   const Uuid authority_ = Uuid::random();
   net::Server::Config metaServerConfig_;
   std::unique_ptr<net::Server> metaServer_;
@@ -997,6 +1076,49 @@ class TestEcV2NativeHelperPlan : public TestEcV2NativeLifecycle {
  protected:
   bool enableHelperIssuance() const override { return true; }
 };
+
+TEST_F(TestEcV2NativeLifecycle, PublicCreateTracksNewObjectsAndLegacyCreateReplayDoesNotUpgrade) {
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "gc-tracked-birth");
+  create.shardBytes = kShardBytes;
+  auto created = blockingWait(metaClient_->createEcFileV2(create));
+  ASSERT_OK(created);
+  const auto object = created->object.object;
+  auto txn = kv_->createReadWriteTransaction();
+  auto mode = blockingWait(EcV2BindingCatalog::requireV2Mode(*txn, object));
+  ASSERT_OK(mode);
+  EXPECT_EQ(mode->mode, kEcGcTrackedObjectMode);
+  ASSERT_OK(blockingWait(EcV2GcCatalog::validateEnrollment(*txn, *mode)));
+  txn.reset();
+  ASSERT_OK(blockingWait(metaClient_->createEcFileV2(create)));
+
+  // Build a pre-tracking on-disk fixture before any mutation/issuance exists.
+  // This raw test-only rewrite is not an offered downgrade/migration API.
+  // The permanent Create result and its UUID are identical to the old format.
+  txn = kv_->createReadWriteTransaction();
+  mode = blockingWait(EcV2BindingCatalog::requireV2Mode(*txn, object));
+  ASSERT_OK(mode);
+  mode->mode = 2;
+  std::string modeKey(kv::toStr(kv::KeyPrefix::EcV2ObjectMode));
+  modeKey.append(object.incarnation.asStringView());
+  const auto bytes = serde::serialize(*mode);
+  ASSERT_OK(blockingWait(txn->set(modeKey, bytes)));
+  std::string birthKey(kv::toStr(kv::KeyPrefix::EcGcEnrollment));
+  birthKey.append(object.incarnation.asStringView());
+  ASSERT_OK(blockingWait(txn->clear(birthKey)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  txn.reset();
+  auto replay = blockingWait(metaClient_->createEcFileV2(create));
+  ASSERT_OK(replay);
+  EXPECT_EQ(replay->object.object, object);
+  txn = kv_->createReadWriteTransaction();
+  mode = blockingWait(EcV2BindingCatalog::requireV2Mode(*txn, object));
+  ASSERT_OK(mode);
+  EXPECT_EQ(mode->mode, 2);
+  auto enrollment = blockingWait(txn->get(birthKey));
+  ASSERT_OK(enrollment);
+  EXPECT_FALSE(*enrollment);
+}
 
 TEST_F(TestEcV2NativeLifecycle, PublicationReplayModeGuardsAndReleaseAfterAclRevocation) {
   auto create = request<CreateEcFileV2Req>();
@@ -1235,6 +1357,45 @@ TEST_F(TestEcV2NativeLifecycle, SingleAndDoubleRepairReuseDescriptorsAndPreserve
     }
   }
   txn.reset();
+  // Metadata-only GC eligibility follows real Publish/Release TCP calls.
+  // No Storage deletion is invoked, and current/shared shards stay readable.
+  auto gcKey = storage::EcScopeControlKey::loadFile(std::filesystem::path(controlKeyPath_.string()));
+  ASSERT_OK(gcKey);
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_ERROR(blockingWait(EcCatalog::retireRevision(*txn, object, 0, history.front().manifest.revision)),
+               StatusCode::kTokenStale);
+  txn.reset();
+  for (size_t old = 0; old + 1 < history.size(); ++old) {
+    auto release = request<ReleaseEcReadV2Req>();
+    release.object = object;
+    release.pin = history[old].snapshot.pin;
+    auto released = blockingWait(metaClient_->releaseEcReadV2(release));
+    ASSERT_OK(released);
+    EXPECT_EQ(released->drain.state, EcV2DrainState::ReadReleased);
+    txn = kv_->createReadWriteTransaction();
+    ASSERT_OK(blockingWait(EcCatalog::retireRevision(*txn, object, 0, history[old].manifest.revision)));
+    ASSERT_OK(blockingWait(txn->commit()));
+    txn.reset();
+  }
+  const auto claimId = Uuid::random();
+  txn = kv_->createReadWriteTransaction();
+  auto gcClaim = blockingWait(
+      EcV2GcCatalog::claim(*txn, object, history.front().manifest.fragments[0].identity, claimId, **gcKey));
+  ASSERT_OK(gcClaim);
+  EXPECT_EQ(gcClaim->allocation.fragment.operation, original.begin.operation);
+  EXPECT_EQ(gcClaim->allocation.fragment.integrity, history.front().manifest.fragments[0].integrity);
+  EXPECT_EQ(gcClaim->registeredScopes, gcClaim->releasedScopes);
+  ASSERT_OK(blockingWait(txn->commit()));
+  txn.reset();
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_ERROR(
+      blockingWait(
+          EcV2GcCatalog::claim(*txn, object, history.back().manifest.fragments[11].identity, Uuid::random(), **gcKey)),
+      StatusCode::kTokenStale);
+  txn.reset();
+  auto stillReadable = readOne(history.back(), 11);
+  ASSERT_OK(stillReadable);
+  EXPECT_EQ(stillReadable->payload.data, original.shards[11]);
   auto forgedRepair = request<BeginEcMutationV2Req>();
   forgedRepair.object = object;
   forgedRepair.operation = Uuid::random();
@@ -1916,6 +2077,861 @@ TEST_F(TestEcV2NativeHelperPlan, PartialRepairSurvivesStorageReopenAndPublishesT
   RecordProperty("recovered_stage_prefix_bytes", std::to_string(storage::kEcIntegrityBlockBytes));
   RecordProperty("recovered_replacement_shards", "0,11");
   RecordProperty("recovery_boundary", "normal Storage Engine reopen, same live Meta/FDB; no power-loss claim");
+}
+
+class TestEcV2NativeExactGc : public TestEcV2NativeLifecycle {
+ protected:
+  bool enableExactGc() const override { return true; }
+
+  void makeGc(std::shared_ptr<const storage::EcGcKey> &key,
+              std::shared_ptr<NativeEcGcTransport> &transport,
+              std::unique_ptr<EcGcCoordinator> &coordinator,
+              const EcV2AllocationBindings &allocations) {
+    auto data = storage::EcCapabilityKey::loadFile(std::filesystem::path(keyPath_.string()));
+    auto control = storage::EcScopeControlKey::loadFile(std::filesystem::path(controlKeyPath_.string()));
+    ASSERT_OK(data);
+    ASSERT_OK(control);
+    ASSERT_TRUE((*data)->fileIdentity());
+    ASSERT_TRUE((*control)->fileIdentity());
+    const auto &dataIdentity = *(*data)->fileIdentity();
+    const auto &controlIdentity = *(*control)->fileIdentity();
+    const std::array<storage::EcGcRoleFileIdentity, 2> roles{
+        {{dataIdentity.device, dataIdentity.inode}, {controlIdentity.device, controlIdentity.inode}}};
+    auto loaded = storage::EcGcKey::loadFile(std::filesystem::path(gcKeyPath_.string()), gcKeyId_, roles);
+    ASSERT_OK(loaded);
+    key = std::shared_ptr<const storage::EcGcKey>(std::move(*loaded));
+    auto native = NativeEcGcTransport::create(storageClient_, key);
+    ASSERT_OK(native);
+    transport = *native;
+    EcGcCoordinator::Config config;
+    config.authority = authority_;
+    // This is explicit fixture inventory, not a discovery inference. Storage
+    // opened exact format3 before any request; every instance came from real
+    // Meta reservations and is rechecked by the actual executor.
+    for (const auto &allocation : allocations)
+      config.targets.push_back({allocation.endpoint().controlEndpoint(), 2, 3, 1, true});
+    auto built = EcGcCoordinator::create(config, kv_, key, transport);
+    ASSERT_OK(built);
+    coordinator = std::move(*built);
+  }
+
+  Result<storage::EcStageResult> observeStage(const EcV2AllocationBinding &allocation,
+                                              storage::EcStageOperation operation) {
+    CHECK_RESULT(found, components_->targetMap.getByTargetId(allocation.fragment.placement.target));
+    storage::EcStageRequest request;
+    request.operation = operation;
+    request.identity = allocation.fragment.identity;
+    request.operationId = allocation.fragment.operation;
+    request.writerNamespace = allocation.writer.client;
+    request.targetId = allocation.fragment.placement.target;
+    request.vChainId = {allocation.fragment.placement.chain, storage::ChainVer{1}};
+    request.integrity = allocation.fragment.integrity;
+    // Read-only local observation bypasses revoked network read credentials;
+    // no delete, receipt fabrication or stage mutation occurs here.
+    return found->storageTarget->executeEcStage(request);
+  }
+
+  // MetaStore add_mut/remove_mut account pos.chunk_size(), not payload bytes.
+  // This fixture's 4096-byte shards use CHUNK_SIZE_SMALL (64 KiB), defined in
+  // chunk_engine/src/types/constants.rs and selected by Allocators::select_by_size.
+  static constexpr uint64_t kCommittedAllocationClassBytes = 64 * 1024;
+  static_assert(kShardBytes > 0 && kShardBytes <= kCommittedAllocationClassBytes);
+
+  Result<uint64_t> committedAllocationClassBytes(const EcV2AllocationBinding &allocation) {
+    CHECK_RESULT(found, components_->targetMap.getByTargetId(allocation.fragment.placement.target));
+    return found->storageTarget->usedSize();
+  }
+
+  void verifySealedSurvivors(const EcV2AllocationBindings &allocations,
+                             const storage::EcCodec::Shards &expected,
+                             uint16_t omittedMask = 0) {
+    for (size_t shard = 0; shard != allocations.size(); ++shard) {
+      if (omittedMask & (uint16_t{1} << shard)) continue;
+      const auto &allocation = allocations[shard];
+      // These fixed 4 KiB shards fit in one actual ReadBlock response.
+      ASSERT_EQ(allocation.fragment.integrity.wholeLength, kShardBytes);
+      auto state = observeStage(allocation, storage::EcStageOperation::Query);
+      ASSERT_OK(state);
+      ASSERT_TRUE(state->state);
+      ASSERT_EQ(state->state->state, 2);
+      auto read = observeStage(allocation, storage::EcStageOperation::ReadBlock);
+      ASSERT_OK(read);
+      ASSERT_EQ(read->data, expected[shard]);
+    }
+  }
+
+  void verifyFormatMarker() {
+    std::ifstream input((data_.path() / "engine").string(), std::ios::binary);
+    ASSERT_TRUE(input.is_open());
+    const std::string marker((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    ASSERT_EQ(marker, "3FS_EC_ENGINE_ROOT_V3_GC\n");
+  }
+
+  void verifyCurrent(const AcquireEcReadV2Rsp &pin, const Mutation &original) {
+    storage::EcCodec::Shards actual;
+    std::array<storage::EcCodecShardView, 12> views;
+    for (size_t i = 0; i != 12; ++i) {
+      auto block = readOne(pin, i);
+      ASSERT_OK(block);
+      actual[i] = std::move(block->payload.data);
+      ASSERT_EQ(actual[i], original.shards[i]);
+      views[i] = {static_cast<uint16_t>(i), actual[i]};
+    }
+    ASSERT_OK(storage::EcCodec::verify(views, pin.manifest.logicalLength, kShardBytes));
+    std::array<std::string_view, 10> logical;
+    std::string joined;
+    for (size_t i = 0; i != 10; ++i) {
+      logical[i] = actual[i];
+      joined += actual[i];
+    }
+    joined.resize(pin.manifest.logicalLength);
+    ASSERT_EQ(joined, original.logical);
+    auto sha = computeEcLogicalSha256(logical, pin.manifest.logicalLength);
+    ASSERT_OK(sha);
+    ASSERT_EQ(*sha, original.begin.contentSha256);
+    ASSERT_EQ(*sha, pin.contentSha256);
+  }
+
+  void verifyDrain(const EcObjectRef &object,
+                   storage::EcGrantScope kind,
+                   const Uuid &scope,
+                   const EcV2DrainProgress &progress,
+                   EcV2DrainState expected) {
+    ASSERT_EQ(progress.state, expected);
+    ASSERT_GT(progress.expectedEndpoints, 0);
+    ASSERT_EQ(progress.acknowledgedEndpoints, progress.expectedEndpoints);
+    auto key = storage::EcScopeControlKey::loadFile(std::filesystem::path(controlKeyPath_.string()));
+    ASSERT_OK(key);
+    auto txn = kv_->createReadWriteTransaction();
+    auto record =
+        blockingWait(EcV2DrainCatalog::get(*txn, object, kind, scope, EcOwner{user_.uid, metaClientId_.uuid}));
+    ASSERT_OK(record);
+    ASSERT_TRUE(*record);
+    ASSERT_EQ((**record).state, expected);
+    ASSERT_EQ((**record).identity.endpoints.count, progress.expectedEndpoints);
+    for (size_t i = 0; i != (**record).identity.endpoints.count; ++i) {
+      ASSERT_TRUE((**record).observations[i]);
+      const auto &observed = *(**record).observations[i];
+      ASSERT_OK(EcVerifiedDrainAck::verify(**key, **record, i, observed.request, observed.ack));
+    }
+  }
+};
+
+TEST_F(TestEcV2NativeExactGc, RealQualificationLostCollectReplyAndReopenQueryCommitPermanentCompletion) {
+  ASSERT_NO_FATAL_FAILURE(verifyFormatMarker());
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "exact-gc-fdb-native");
+  create.shardBytes = kShardBytes;
+  auto created = blockingWait(metaClient_->createEcFileV2(create));
+  ASSERT_OK(created);
+  const auto object = created->object.object;
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto mode = blockingWait(EcV2BindingCatalog::requireV2Mode(*txn, object));
+    ASSERT_OK(mode);
+    ASSERT_EQ(mode->mode, kEcGcTrackedObjectMode);
+    ASSERT_OK(blockingWait(EcV2GcCatalog::validateEnrollment(*txn, *mode)));
+  }
+  Mutation original;
+  ASSERT_NO_FATAL_FAILURE(prepare(original, object, 0, 211));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(original));
+  auto initial = blockingWait(metaClient_->publishEcMutationV2(original.publish));
+  ASSERT_OK(initial);
+  ASSERT_TRUE(initial->drain);
+  ASSERT_NO_FATAL_FAILURE(verifyDrain(object,
+                                      storage::EcGrantScope::WriteOperation,
+                                      original.begin.operation,
+                                      *initial->drain,
+                                      EcV2DrainState::Published));
+  auto oldPin = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(oldPin);
+  Mutation replacement;
+  ASSERT_NO_FATAL_FAILURE(repair(replacement, *oldPin, uint16_t{1}));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(replacement));
+  auto published = blockingWait(metaClient_->publishEcMutationV2(replacement.publish));
+  ASSERT_OK(published);
+  ASSERT_TRUE(published->drain);
+  ASSERT_NO_FATAL_FAILURE(verifyDrain(object,
+                                      storage::EcGrantScope::WriteOperation,
+                                      replacement.begin.operation,
+                                      *published->drain,
+                                      EcV2DrainState::Published));
+  auto current = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(current);
+  ASSERT_NO_FATAL_FAILURE(verifyCurrent(*current, original));
+  ASSERT_TRUE(original.reservation.allocations);
+  const auto oldAllocation = (*original.reservation.allocations)[0];
+  const auto oldIdentity = oldAllocation.fragment.identity;
+  ASSERT_NE(current->manifest.fragments[0].identity.allocation, oldIdentity.allocation);
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    ASSERT_ERROR(blockingWait(EcCatalog::retireRevision(*txn, object, 0, oldPin->manifest.revision)),
+                 StatusCode::kTokenStale);
+  }
+  // Both read sessions complete the actual authenticated all-endpoint T0/T1/T2
+  // path. The current-head rejection below must not depend only on a live pin.
+  for (const auto *pin : {&*oldPin, &*current}) {
+    auto release = request<ReleaseEcReadV2Req>();
+    release.object = object;
+    release.pin = pin->snapshot.pin;
+    auto released = blockingWait(metaClient_->releaseEcReadV2(release));
+    ASSERT_OK(released);
+    ASSERT_NO_FATAL_FAILURE(verifyDrain(object,
+                                        storage::EcGrantScope::ReadPin,
+                                        release.pin,
+                                        released->drain,
+                                        EcV2DrainState::ReadReleased));
+    ASSERT_NO_FATAL_FAILURE(checkPin(object, release.pin, true));
+  }
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    ASSERT_OK(blockingWait(EcCatalog::retireRevision(*txn, object, 0, oldPin->manifest.revision)));
+    ASSERT_OK(blockingWait(txn->commit()));
+  }
+  auto controlKey = storage::EcScopeControlKey::loadFile(std::filesystem::path(controlKeyPath_.string()));
+  ASSERT_OK(controlKey);
+  const Uuid claimId = Uuid::random();
+  EcGcClaim committedClaim;
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto refs = blockingWait(EcCatalog::getFragmentRef(*txn, oldIdentity));
+    ASSERT_OK(refs);
+    ASSERT_EQ(refs->references, 0);
+    ASSERT_TRUE(refs->owner.is_nil());
+    ASSERT_TRUE(refs->gcCandidate);
+    auto protection = blockingWait(EcV2GcCatalog::getAllocation(*txn, object, oldIdentity));
+    ASSERT_OK(protection);
+    ASSERT_EQ(protection->active, 0);
+    ASSERT_EQ(protection->registered, protection->released);
+    // Real G0 invokes all immutable reference, birth, membership, T2 and ACK
+    // validation against this same private FoundationDB; no raw ledger writes.
+    auto qualified = blockingWait(EcV2GcCatalog::claim(*txn, object, oldIdentity, claimId, **controlKey));
+    ASSERT_OK(qualified);
+    committedClaim = *qualified;
+    ASSERT_TRUE(serde::equals(committedClaim.allocation, oldAllocation));
+    ASSERT_EQ(committedClaim.registeredScopes, committedClaim.releasedScopes);
+    ASSERT_OK(blockingWait(txn->commit()));
+  }
+  // G0 is committed and its transaction destroyed before any G request exists.
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto durable = blockingWait(EcV2GcCatalog::getClaim(*txn, object, oldIdentity));
+    ASSERT_OK(durable);
+    ASSERT_TRUE(*durable);
+    ASSERT_TRUE(serde::equals(**durable, committedClaim));
+    ASSERT_ERROR(blockingWait(EcCatalog::retireRevision(*txn, object, 0, current->manifest.revision)),
+                 StatusCode::kTokenStale);
+  }
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    ASSERT_ERROR(
+        blockingWait(
+            EcV2GcCatalog::claim(*txn, object, current->manifest.fragments[0].identity, Uuid::random(), **controlKey)),
+        StatusCode::kTokenStale);
+  }
+  auto physicalBefore = observeStage(oldAllocation, storage::EcStageOperation::Query);
+  ASSERT_OK(physicalBefore);
+  ASSERT_TRUE(physicalBefore->state);
+  ASSERT_EQ(physicalBefore->state->state, 2);  // Actual Sealed record.
+  auto oldRead = observeStage(oldAllocation, storage::EcStageOperation::ReadBlock);
+  ASSERT_OK(oldRead);
+  ASSERT_EQ(oldRead->data, original.shards[0]);
+  auto beforeBytes = committedAllocationClassBytes(oldAllocation);
+  ASSERT_OK(beforeBytes);
+  ASSERT_EQ(oldAllocation.fragment.integrity.wholeLength, kShardBytes);
+  ASSERT_GE(*beforeBytes, kCommittedAllocationClassBytes);
+  std::shared_ptr<const storage::EcGcKey> gcKey;
+  std::shared_ptr<NativeEcGcTransport> transport;
+  std::unique_ptr<EcGcCoordinator> gc;
+  ASSERT_NO_FATAL_FAILURE(makeGc(gcKey, transport, gc, *original.reservation.allocations));
+  ASSERT_ERROR(blockingWait(gc->query(object, oldIdentity, claimId, control())), StorageCode::kChunkMetadataNotFound);
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    controlFault_.dropGcCollectReply = claimId;
+  }
+  ASSERT_ERROR(blockingWait(gc->collect(object, oldIdentity, claimId, control())), StorageCode::kEcSealOutcomeUnknown);
+  storage::EcGcAck actualLostAck;
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    ASSERT_EQ(controlFault_.actualGcCollects, 1);
+    ASSERT_TRUE(controlFault_.observedGcCollect);
+    actualLostAck = *controlFault_.observedGcCollect;
+    ASSERT_TRUE(controlFault_.dropGcCollectReply.is_nil());
+  }
+  auto absent = blockingWait(gc->getCompletion(object, oldIdentity, claimId));
+  ASSERT_OK(absent);
+  ASSERT_FALSE(*absent);
+  auto physicalAfter = observeStage(oldAllocation, storage::EcStageOperation::Query);
+  ASSERT_OK(physicalAfter);
+  ASSERT_TRUE(physicalAfter->state);
+  ASSERT_EQ(physicalAfter->state->state, 3);  // Actual permanent Aborted stage + GC ledger.
+  ASSERT_FALSE(observeStage(oldAllocation, storage::EcStageOperation::ReadBlock));
+  auto afterBytes = committedAllocationClassBytes(oldAllocation);
+  ASSERT_OK(afterBytes);
+  ASSERT_EQ(*afterBytes, *beforeBytes - kCommittedAllocationClassBytes);
+  ASSERT_TRUE(replacement.reservation.allocations);
+  // The new shard 0 and the eleven shared allocations must remain Sealed and
+  // byte-identical; the accounting correction cannot hide another deletion.
+  for (size_t shard = 1; shard != 12; ++shard)
+    ASSERT_TRUE(
+        serde::equals((*replacement.reservation.allocations)[shard], (*original.reservation.allocations)[shard]));
+  ASSERT_NO_FATAL_FAILURE(verifySealedSurvivors(*replacement.reservation.allocations, original.shards));
+  gc.reset();
+  transport.reset();
+  gcKey.reset();
+  const auto *sameFdb = kv_.get();
+  const auto *sameMeta = meta_.get();
+  // No target/Engine leases, in-flight RPCs or synthetic storage state survive
+  // this normal close/reopen. The helper verifies all twelve durable instances.
+  ASSERT_NO_FATAL_FAILURE(reopenStorageKeepingMeta());
+  ASSERT_EQ(kv_.get(), sameFdb);
+  ASSERT_EQ(meta_.get(), sameMeta);
+  ASSERT_NO_FATAL_FAILURE(verifyFormatMarker());
+  ASSERT_NO_FATAL_FAILURE(makeGc(gcKey, transport, gc, *original.reservation.allocations));
+  auto completed = blockingWait(gc->query(object, oldIdentity, claimId, control()));
+  ASSERT_OK(completed);
+  ASSERT_EQ(completed->request.claims.action, storage::EcGcAction::Query);
+  ASSERT_OK(storage::ec_gc_control_detail::Codec::verifyAck(*gcKey, completed->ack, completed->request));
+  ASSERT_EQ(completed->ack.claims.ledgerSha256, actualLostAck.claims.ledgerSha256);
+  ASSERT_EQ(completed->ack.claims.terminalRevision, actualLostAck.claims.terminalRevision);
+  ASSERT_NE(completed->ack.claims.bootNonce, actualLostAck.claims.bootNonce);
+  ASSERT_EQ(completed->ack.claims.endpoint.engineUuid, oldAllocation.engineUuid);
+  ASSERT_EQ(completed->ack.claims.endpoint.targetIncarnation, oldAllocation.targetIncarnation);
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    ASSERT_EQ(controlFault_.actualGcQueries, 1);
+  }
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto saved = blockingWait(EcGcCompletionCatalog::get(*txn, object, oldIdentity, claimId, *gcKey, authority_));
+    ASSERT_OK(saved);
+    ASSERT_TRUE(*saved);
+    // Binary Serde includes the opaque request and ACK signatures.
+    ASSERT_TRUE(serde::serialize(**saved) == serde::serialize(*completed));
+    auto replayClaim = blockingWait(EcV2GcCatalog::claim(*txn, object, oldIdentity, claimId, **controlKey));
+    ASSERT_OK(replayClaim);
+    ASSERT_TRUE(serde::equals(*replayClaim, committedClaim));
+    ASSERT_OK(blockingWait(txn->commit()));
+  }
+  auto replay = blockingWait(gc->collect(object, oldIdentity, claimId, control()));
+  ASSERT_OK(replay);
+  ASSERT_TRUE(serde::serialize(*replay) == serde::serialize(*completed));
+  auto finalBytes = committedAllocationClassBytes(oldAllocation);
+  ASSERT_OK(finalBytes);
+  ASSERT_EQ(*finalBytes, *afterBytes);
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    ASSERT_EQ(controlFault_.actualGcCollects, 1);  // G2 replay does not delete twice.
+    ASSERT_EQ(controlFault_.actualGcQueries, 1);
+  }
+  auto finalPin = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(finalPin);
+  ASSERT_EQ(finalPin->manifest.revision, current->manifest.revision);
+  ASSERT_NO_FATAL_FAILURE(verifyCurrent(*finalPin, original));
+  auto finalRelease = request<ReleaseEcReadV2Req>();
+  finalRelease.object = object;
+  finalRelease.pin = finalPin->snapshot.pin;
+  auto released = blockingWait(metaClient_->releaseEcReadV2(finalRelease));
+  ASSERT_OK(released);
+  ASSERT_EQ(released->drain.state, EcV2DrainState::ReadReleased);
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    ASSERT_ERROR(
+        blockingWait(
+            EcV2GcCatalog::claim(*txn, object, finalPin->manifest.fragments[0].identity, Uuid::random(), **controlKey)),
+        StatusCode::kTokenStale);
+  }
+  RecordProperty("gc_qualification", "actual FDB birth/protection/T2/retire/claim, independent G0 commit");
+  RecordProperty("gc_transport", "actual native RPC28; reply dropped only after actual Rust/WAL confirmation");
+  RecordProperty("gc_recovery", "normal same-format3 Storage reopen; actual Query ACK then permanent FDB G2");
+  RecordProperty("gc_limit", "one Engine/failure domain; no process-kill, power-loss or throughput claim");
+}
+
+// Unlike the earlier internal coordinator test, these cases use the production
+// Meta38/39 methods. G0, capability discovery29, RPC28 and G2 are service-owned.
+class TestEcV2NativeGcAdmin : public TestEcV2NativeExactGc {
+ protected:
+  bool enableMetaGcAdmin() const override { return true; }
+  Result<UserInfo> rootUser() {
+    auto txn = kv_->createReadWriteTransaction();
+    core::UserStore store;
+    auto root = blockingWait(store.getUser(*txn, flat::Uid{0}));
+    RETURN_ON_ERROR(root);
+    if (!*root) return makeError(StatusCode::kAuthenticationFail);
+    return UserInfo{(**root).uid, (**root).gid, (**root).token};
+  }
+  Result<std::shared_ptr<const storage::EcGcKey>> verificationKey() {
+    auto data = storage::EcCapabilityKey::loadFile(keyPath_.string());
+    auto control = storage::EcScopeControlKey::loadFile(controlKeyPath_.string());
+    RETURN_ON_ERROR(data);
+    RETURN_ON_ERROR(control);
+    if (!(*data)->fileIdentity() || !(*control)->fileIdentity()) return makeError(StatusCode::kInvalidConfig);
+    const auto &d = *(*data)->fileIdentity();
+    const auto &c = *(*control)->fileIdentity();
+    const std::array<storage::EcGcRoleFileIdentity, 2> roles{{{d.device, d.inode}, {c.device, c.inode}}};
+    auto key = storage::EcGcKey::loadFile(gcKeyPath_.string(), gcKeyId_, roles);
+    RETURN_ON_ERROR(key);
+    return std::shared_ptr<const storage::EcGcKey>(std::move(*key));
+  }
+};
+
+TEST_F(TestEcV2NativeGcAdmin, RootServiceCommitsEligibilityDiscoversDeletesAndRecoversTheSameClaim) {
+  // Overall GC may exceed the independent <=60s discovery request budget.
+  metaConfig_.set_ec_gc_timeout(120_s);
+  auto root = rootUser();
+  ASSERT_OK(root);
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "admin-gc-native");
+  create.shardBytes = kShardBytes;
+  auto created = blockingWait(metaClient_->createEcFileV2(create));
+  ASSERT_OK(created);
+  const auto object = created->object.object;
+  Mutation original;
+  ASSERT_NO_FATAL_FAILURE(prepare(original, object, 0, 221));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(original));
+  auto published = blockingWait(metaClient_->publishEcMutationV2(original.publish));
+  ASSERT_OK(published);
+  auto current = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(current);
+  auto currentRelease = request<ReleaseEcReadV2Req>();
+  currentRelease.object = object;
+  currentRelease.pin = current->snapshot.pin;
+  ASSERT_OK(blockingWait(metaClient_->releaseEcReadV2(currentRelease)));
+  auto head = request<CollectEcFragmentV2Req>();
+  head.user = *root;
+  head.object = object;
+  head.identity = current->manifest.fragments[0].identity;
+  head.claimId = Uuid::random();
+  ASSERT_ERROR(blockingWait(metaClient_->collectEcFragmentV2(head)), StatusCode::kTokenStale);
+
+  Mutation abandoned;
+  ASSERT_NO_FATAL_FAILURE(prepare(abandoned, object, current->manifest.revision, 229));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(abandoned));
+  auto cancel = request<CancelEcMutationV2Req>();
+  cancel.object = object;
+  cancel.operation = abandoned.begin.operation;
+  auto cancelled = blockingWait(metaClient_->cancelEcMutationV2(cancel));
+  ASSERT_OK(cancelled);
+  ASSERT_TRUE(cancelled->drain);
+  ASSERT_NO_FATAL_FAILURE(verifyDrain(object,
+                                      storage::EcGrantScope::WriteOperation,
+                                      cancel.operation,
+                                      *cancelled->drain,
+                                      EcV2DrainState::Aborted));
+  ASSERT_TRUE(abandoned.reservation.allocations);
+  const auto &allocation = (*abandoned.reservation.allocations)[0];
+  auto collect = request<CollectEcFragmentV2Req>();
+  collect.object = object;
+  collect.identity = allocation.fragment.identity;
+  collect.claimId = Uuid::random();
+  // A real ordinary token and a forged effective root UID both fail before G0.
+  ASSERT_ERROR(blockingWait(metaClient_->collectEcFragmentV2(collect)), MetaCode::kNoPermission);
+  collect.user.uid = flat::Uid{0};
+  ASSERT_ERROR(blockingWait(metaClient_->collectEcFragmentV2(collect)), StatusCode::kAuthenticationFail);
+  collect.user = *root;
+  auto query = request<QueryEcFragmentGcV2Req>();
+  static_cast<EcGcAdminReq &>(query) = collect;
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcFragmentGcV2(query)), StatusCode::kTokenStale);
+  metaConfig_.set_readonly(true);
+  ASSERT_ERROR(blockingWait(metaClient_->collectEcFragmentV2(collect)), StatusCode::kReadOnlyMode);
+  metaConfig_.set_readonly(false);
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto absent = blockingWait(EcV2GcCatalog::getClaim(*txn, object, collect.identity));
+    ASSERT_OK(absent);
+    ASSERT_FALSE(*absent);
+  }
+  auto before = committedAllocationClassBytes(allocation);
+  ASSERT_OK(before);
+  ASSERT_EQ(allocation.fragment.integrity.wholeLength, kShardBytes);
+  ASSERT_GE(*before, kCommittedAllocationClassBytes);
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    controlFault_.dropGcCollectReply = collect.claimId;
+  }
+  auto lost = blockingWait(metaClient_->collectEcFragmentV2(collect));
+  ASSERT_ERROR(lost, StorageCode::kEcSealOutcomeUnknown);
+  auto key = verificationKey();
+  ASSERT_OK(key);
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto committed = blockingWait(EcV2GcCatalog::getClaim(*txn, object, collect.identity));
+    ASSERT_OK(committed);
+    ASSERT_TRUE(*committed);
+    ASSERT_EQ((**committed).claimId, collect.claimId);
+    ASSERT_TRUE(serde::equals((**committed).allocation, allocation));
+    auto completion =
+        blockingWait(EcGcCompletionCatalog::get(*txn, object, collect.identity, collect.claimId, **key, authority_));
+    ASSERT_OK(completion);
+    ASSERT_FALSE(*completion);
+  }
+  auto physical = observeStage(allocation, storage::EcStageOperation::Query);
+  ASSERT_OK(physical);
+  ASSERT_TRUE(physical->state);
+  ASSERT_EQ(physical->state->state, 3);
+  auto after = committedAllocationClassBytes(allocation);
+  ASSERT_OK(after);
+  ASSERT_EQ(*after, *before - kCommittedAllocationClassBytes);
+  ASSERT_TRUE(original.reservation.allocations);
+  ASSERT_NO_FATAL_FAILURE(verifySealedSurvivors(*original.reservation.allocations, original.shards));
+  ASSERT_NO_FATAL_FAILURE(verifySealedSurvivors(*abandoned.reservation.allocations, abandoned.shards, uint16_t{1}));
+  // A reconstructed production Meta runtime loads its own real G authority.
+  ASSERT_NO_FATAL_FAILURE(restartCoordinator());
+  metaConfig_.set_readonly(true);
+  storageConfig_.storage().set_read_only(true);
+  auto completed = blockingWait(metaClient_->queryEcFragmentGcV2(query));
+  ASSERT_OK(completed);
+  ASSERT_EQ(completed->claimId, collect.claimId);
+  ASSERT_GT(completed->terminalRevision, 0);
+  ASSERT_NE(completed->ledgerSha256, storage::EcSha256{});
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto record =
+        blockingWait(EcGcCompletionCatalog::get(*txn, object, collect.identity, collect.claimId, **key, authority_));
+    ASSERT_OK(record);
+    ASSERT_TRUE(*record);
+    ASSERT_EQ((**record).ack.claims.ledgerSha256, completed->ledgerSha256);
+    ASSERT_EQ((**record).request.claims.action, storage::EcGcAction::Query);
+  }
+  metaConfig_.set_readonly(false);
+  storageConfig_.storage().set_read_only(false);
+  // Remove the actual Storage route: permanent authenticated ECGD replay does
+  // not require a fresh discovery exchange or a new physical delete.
+  auto unavailable = std::make_shared<flat::RoutingInfo>(*routing_);
+  unavailable->nodes.erase(storageNode_);
+  unavailable->routingInfoVersion = flat::RoutingInfoVersion{100};
+  fakeMgmtd_->setRoutingInfo(unavailable);
+  auto replay = blockingWait(metaClient_->collectEcFragmentV2(collect));
+  fakeMgmtd_->setRoutingInfo(routing_);
+  ASSERT_OK(replay);
+  ASSERT_TRUE(serde::equals(*replay, *completed));
+  auto changed = collect;
+  changed.claimId = Uuid::random();
+  ASSERT_ERROR(blockingWait(metaClient_->collectEcFragmentV2(changed)), StatusCode::kTokenMismatch);
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    ASSERT_EQ(controlFault_.actualGcCollects, 1);
+    ASSERT_EQ(controlFault_.actualGcQueries, 1);
+  }
+  auto final = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(final);
+  ASSERT_EQ(final->manifest.revision, current->manifest.revision);
+  ASSERT_NO_FATAL_FAILURE(verifyCurrent(*final, original));
+  auto release = request<ReleaseEcReadV2Req>();
+  release.object = object;
+  release.pin = final->snapshot.pin;
+  ASSERT_OK(blockingWait(metaClient_->releaseEcReadV2(release)));
+  RecordProperty("gc_entry", "actual authenticated Meta38/39, FDB G0, signed discovery29, native28, FDB G2");
+  RecordProperty("gc_scope", "explicit bound cancelled allocation; no scan, migration, retire or current-head removal");
+}
+
+TEST_F(TestEcV2NativeGcAdmin, LoadedFileRoleAliasesAndAuthenticationDisableFailClosed) {
+  const auto original = metaConfig_.ec_gc_key_file();
+  const Path alias = traces_.path() / "gc-role-alias.key";
+  ASSERT_EQ(::link(keyPath_.c_str(), alias.c_str()), 0);
+  metaConfig_.set_ec_gc_key_file(alias);
+  EcCoordinator data(metaConfig_, mgmtd_, storageClient_);
+  EcV2Coordinator v2(metaConfig_, mgmtd_, storageClient_);
+  EcGcAdminCoordinator invalid(metaConfig_, kv_, storageClient_, data, v2);
+  ASSERT_ERROR(invalid.checkEnabled(), StatusCode::kInvalidConfig);
+  metaConfig_.set_ec_gc_key_file(original);
+  auto root = rootUser();
+  ASSERT_OK(root);
+  auto req = request<QueryEcFragmentGcV2Req>();
+  req.user = *root;
+  req.object = {InodeId{12345}, Uuid::random()};
+  req.identity.object = req.object.incarnation;
+  req.identity.generation = 1;
+  req.identity.allocation = Uuid::random();
+  req.claimId = Uuid::random();
+  metaConfig_.set_authenticate(false);
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcFragmentGcV2(req)), StatusCode::kAuthenticationFail);
+  metaConfig_.set_authenticate(true);
+}
+
+TEST_F(TestEcV2NativeLifecycle, ExactGcAdminIsDisabledByDefault) {
+  auto req = request<CollectEcFragmentV2Req>();
+  req.object = {InodeId{12345}, Uuid::random()};
+  req.identity.object = req.object.incarnation;
+  req.identity.generation = 1;
+  req.identity.allocation = Uuid::random();
+  req.claimId = Uuid::random();
+  ASSERT_FALSE(metaConfig_.enable_ec_exact_gc());
+  ASSERT_ERROR(blockingWait(metaClient_->collectEcFragmentV2(req)), StatusCode::kNotImplemented);
+  auto query = request<QueryEcFragmentGcV2Req>();
+  static_cast<EcGcAdminReq &>(query) = req;
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcFragmentGcV2(query)), StatusCode::kNotImplemented);
+}
+
+class TestEcV2NativeRetirement : public TestEcV2NativeGcAdmin {
+ protected:
+  void SetUp() override {
+    TestEcV2NativeGcAdmin::SetUp();
+    if (HasFatalFailure()) return;
+    metaConfig_.set_enable_ec_revision_retirement(true);
+  }
+  void replaceClientIdentity(const ClientId &identity) {
+    metaClient_->stop();
+    metaClient_.reset();
+    metaNet_->stopAndJoin();
+    metaNet_.reset();
+    ASSERT_NO_FATAL_FAILURE(startMetaClient(identity));
+  }
+  RetireEcRevisionV2Req retirement(const EcObjectRef &object, uint64_t revision, const UserInfo &user) {
+    auto req = request<RetireEcRevisionV2Req>();
+    req.user = user;
+    req.object = object;
+    req.revision = revision;
+    return req;
+  }
+  QueryEcRevisionRetirementV2Req query(const RetireEcRevisionV2Req &retire) {
+    QueryEcRevisionRetirementV2Req req;
+    static_cast<EcRevisionRetirementReq &>(req) = retire;
+    return req;
+  }
+};
+
+TEST_F(TestEcV2NativeRetirement, PinBlocksRetirementThenLostReplyReplaysWithoutReleasingSharedFragments) {
+  auto root = rootUser();
+  ASSERT_OK(root);
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "retirement-native");
+  create.shardBytes = kShardBytes;
+  auto created = blockingWait(metaClient_->createEcFileV2(create));
+  ASSERT_OK(created);
+  const auto object = created->object.object;
+  Mutation original;
+  ASSERT_NO_FATAL_FAILURE(prepare(original, object, 0, 241));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(original));
+  ASSERT_OK(blockingWait(metaClient_->publishEcMutationV2(original.publish)));
+  auto oldPin = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(oldPin);
+  Mutation replacement;
+  ASSERT_NO_FATAL_FAILURE(repair(replacement, *oldPin, uint16_t{1}));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(replacement));
+  ASSERT_OK(blockingWait(metaClient_->publishEcMutationV2(replacement.publish)));
+  auto retire = retirement(object, oldPin->manifest.revision, *root);
+  ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(retire)), StatusCode::kTokenStale);
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRevisionRetirementV2(query(retire))), StatusCode::kKVStoreNotFound);
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto shared = blockingWait(EcCatalog::getFragmentRef(*txn, oldPin->manifest.fragments[1].identity));
+    ASSERT_OK(shared);
+    ASSERT_EQ(shared->references, 2);
+  }
+  auto release = request<ReleaseEcReadV2Req>();
+  release.object = object;
+  release.pin = oldPin->snapshot.pin;
+  auto released = blockingWait(metaClient_->releaseEcReadV2(release));
+  ASSERT_OK(released);
+  ASSERT_NO_FATAL_FAILURE(
+      verifyDrain(object, storage::EcGrantScope::ReadPin, release.pin, released->drain, EcV2DrainState::ReadReleased));
+  size_t callsBefore = 0;
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    replyDrop_.retirementArmed = retire.uuid;
+    callsBefore = replyDrop_.retirementCalls;
+  }
+  auto lost = blockingWait(metaClient_->retireEcRevisionV2(retire));
+  ASSERT_TRUE(lost.hasError());
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    ASSERT_EQ(replyDrop_.retirementCalls, callsBefore + 1);
+    ASSERT_TRUE(replyDrop_.retirementCommitted);
+    ASSERT_TRUE(replyDrop_.retirementCommitted->referencesReleased);
+  }
+  ASSERT_NO_FATAL_FAILURE(restartCoordinator());
+  metaConfig_.set_readonly(true);
+  auto observed = blockingWait(metaClient_->queryEcRevisionRetirementV2(query(retire)));
+  ASSERT_OK(observed);
+  ASSERT_EQ(observed->object, object);
+  ASSERT_EQ(observed->revision, retire.revision);
+  ASSERT_EQ(observed->requestId, retire.uuid);
+  ASSERT_EQ(observed->clientNamespace, metaClientId_.uuid);
+  ASSERT_TRUE(observed->referencesReleased);
+  ASSERT_NO_FATAL_FAILURE(reconstructMetaClient());
+  auto reconstructed = blockingWait(metaClient_->queryEcRevisionRetirementV2(query(retire)));
+  ASSERT_OK(reconstructed);
+  ASSERT_TRUE(serde::equals(*observed, *reconstructed));
+  ASSERT_NO_FATAL_FAILURE(replaceClientIdentity(ClientId::random()));
+  // retry overwrites the supplied req.client with the actual client identity.
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRevisionRetirementV2(query(retire))), StatusCode::kKVStoreNotFound);
+  ASSERT_NO_FATAL_FAILURE(replaceClientIdentity(metaClientId_));
+  ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(retire)), StatusCode::kReadOnlyMode);
+  metaConfig_.set_readonly(false);
+  auto replay = blockingWait(metaClient_->retireEcRevisionV2(retire));
+  ASSERT_OK(replay);
+  ASSERT_TRUE(serde::equals(*observed, *replay));
+  for (int field = 0; field != 4; ++field) {
+    auto changed = retire;
+    if (field == 0) ++changed.stripe;
+    if (field == 1) ++changed.revision;
+    if (field == 2) changed.object.incarnation = Uuid::random();
+    if (field == 3) changed.object.inode = InodeId(object.inode.u64() + 1);
+    ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(changed)), StatusCode::kTokenMismatch);
+    ASSERT_ERROR(blockingWait(metaClient_->queryEcRevisionRetirementV2(query(changed))), StatusCode::kTokenMismatch);
+  }
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto replaced = blockingWait(EcCatalog::getFragmentRef(*txn, oldPin->manifest.fragments[0].identity));
+    auto shared = blockingWait(EcCatalog::getFragmentRef(*txn, oldPin->manifest.fragments[1].identity));
+    ASSERT_OK(replaced);
+    ASSERT_OK(shared);
+    ASSERT_EQ(replaced->references, 0);
+    ASSERT_TRUE(replaced->gcCandidate);
+    ASSERT_EQ(shared->references, 1);
+    ASSERT_FALSE(shared->gcCandidate);
+  }
+  auto current = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(current);
+  ASSERT_NO_FATAL_FAILURE(verifyCurrent(*current, original));
+  auto currentRelease = request<ReleaseEcReadV2Req>();
+  currentRelease.object = object;
+  currentRelease.pin = current->snapshot.pin;
+  ASSERT_OK(blockingWait(metaClient_->releaseEcReadV2(currentRelease)));
+  ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(retirement(object, current->manifest.revision, *root))),
+               StatusCode::kTokenStale);
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    ASSERT_EQ(controlFault_.actualGcCollects, 0);
+    ASSERT_EQ(controlFault_.actualGcQueries, 0);
+  }
+  RecordProperty("retirement_path", "actual authenticated Meta40/41, FDB reference transaction, lost RPC reply");
+  RecordProperty("retirement_limit", "metadata references only; no physical deletion or automatic scanner");
+}
+
+TEST_F(TestEcV2NativeRetirement, ActualCommittedButUnknownAcknowledgementCanBeQueriedWithoutDoubleDecrement) {
+  auto root = rootUser();
+  ASSERT_OK(root);
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "retirement-unknown-fdb");
+  create.shardBytes = kShardBytes;
+  auto created = blockingWait(metaClient_->createEcFileV2(create));
+  ASSERT_OK(created);
+  const auto object = created->object.object;
+  Mutation original;
+  ASSERT_NO_FATAL_FAILURE(prepare(original, object, 0, 243));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(original));
+  ASSERT_OK(blockingWait(metaClient_->publishEcMutationV2(original.publish)));
+  auto old = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(old);
+  Mutation replacement;
+  ASSERT_NO_FATAL_FAILURE(prepare(replacement, object, old->manifest.revision, 247));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(replacement));
+  ASSERT_OK(blockingWait(metaClient_->publishEcMutationV2(replacement.publish)));
+  auto release = request<ReleaseEcReadV2Req>();
+  release.object = object;
+  release.pin = old->snapshot.pin;
+  ASSERT_OK(blockingWait(metaClient_->releaseEcReadV2(release)));
+  auto req = retirement(object, old->manifest.revision, *root);
+  auto unknown = [&]() -> CoTryTask<Void> {
+    auto txn = kv_->createReadWriteTransaction();
+    CO_RETURN_ON_ERROR(co_await EcRevisionRetirementCatalog::retire(*txn, req));
+    CO_RETURN_ON_ERROR(co_await txn->commit());
+    // Actual FDB commit succeeds; model losing just its acknowledgement.
+    // This is not a FoundationDB server/network fault-injection claim.
+    co_return makeError(TransactionCode::kMaybeCommitted, "lost ACK after actual FDB retirement commit");
+  };
+  ASSERT_ERROR(blockingWait(unknown()), TransactionCode::kMaybeCommitted);
+  auto observed = blockingWait(metaClient_->queryEcRevisionRetirementV2(query(req)));
+  ASSERT_OK(observed);
+  auto replay = blockingWait(metaClient_->retireEcRevisionV2(req));
+  ASSERT_OK(replay);
+  ASSERT_TRUE(serde::equals(*observed, *replay));
+  for (const auto &fragment : old->manifest.fragments) {
+    auto txn = kv_->createReadWriteTransaction();
+    auto ref = blockingWait(EcCatalog::getFragmentRef(*txn, fragment.identity));
+    ASSERT_OK(ref);
+    ASSERT_EQ(ref->references, 0);
+    ASSERT_TRUE(ref->gcCandidate);
+  }
+}
+
+TEST_F(TestEcV2NativeRetirement, AuthenticationModeAndDefaultGateCannotBeBypassed) {
+  auto root = rootUser();
+  ASSERT_OK(root);
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "retirement-auth");
+  create.shardBytes = kShardBytes;
+  auto created = blockingWait(metaClient_->createEcFileV2(create));
+  ASSERT_OK(created);
+  auto req = retirement(created->object.object, 1, user_);
+  ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(req)), MetaCode::kNoPermission);
+  req.user.uid = flat::Uid{0};
+  ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(req)), StatusCode::kAuthenticationFail);
+  req.user = *root;
+  metaConfig_.set_authenticate(false);
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRevisionRetirementV2(query(req))), StatusCode::kAuthenticationFail);
+  metaConfig_.set_authenticate(true);
+  metaConfig_.set_enable_ec_revision_retirement(false);
+  ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(req)), StatusCode::kNotImplemented);
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRevisionRetirementV2(query(req))), StatusCode::kNotImplemented);
+  metaConfig_.set_enable_ec_revision_retirement(true);
+  const EcObjectRef legacy{InodeId{500123}, Uuid::random()};
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    ASSERT_OK(blockingWait(EcV2BindingCatalog::createV2Object(*txn,
+                                                              legacy,
+                                                              kShardBytes,
+                                                              true,
+                                                              EcOwner{user_.uid, metaClientId_.uuid},
+                                                              Uuid::random())));
+    ASSERT_OK(blockingWait(txn->commit()));
+  }
+  auto legacyReq = retirement(legacy, 1, *root);
+  ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(legacyReq)), StatusCode::kNotImplemented);
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRevisionRetirementV2(query(legacyReq))), StatusCode::kNotImplemented);
+  auto empty = req;
+  empty.uuid = Uuid::zero();
+  ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(empty)), StatusCode::kInvalidArg);
+  ASSERT_FALSE(Config{}.enable_ec_revision_retirement());
+}
+
+TEST_F(TestEcV2NativeRetirement, MissingOrMismatchedBirthEnrollmentNeverCreatesCompletion) {
+  auto root = rootUser();
+  ASSERT_OK(root);
+  auto create = request<CreateEcFileV2Req>();
+  create.path = PathAt(parent_, "retirement-enrollment");
+  create.shardBytes = kShardBytes;
+  auto created = blockingWait(metaClient_->createEcFileV2(create));
+  ASSERT_OK(created);
+  auto req = retirement(created->object.object, 1, *root);
+  std::string enrollmentKey(kv::toStr(kv::KeyPrefix::EcGcEnrollment));
+  enrollmentKey.append(req.object.incarnation.asStringView());
+  const auto completedKey = Serializer::serRawArgs(kv::KeyPrefix::EcRevisionRetirement, req.uuid, req.client.uuid);
+  String original;
+  EcGcEnrollment enrollment;
+  {
+    auto txn = kv_->createReadWriteTransaction();
+    auto bytes = blockingWait(txn->get(enrollmentKey));
+    ASSERT_OK(bytes);
+    ASSERT_TRUE(*bytes);
+    original = **bytes;
+    ASSERT_OK(serde::deserialize(enrollment, original));
+  }
+  for (int corrupt = 0; corrupt != 2; ++corrupt) {
+    {
+      auto txn = kv_->createReadWriteTransaction();
+      if (corrupt == 0) {
+        ASSERT_OK(blockingWait(txn->clear(enrollmentKey)));
+      } else {
+        auto forged = enrollment;
+        forged.createRequest = Uuid::random();
+        ASSERT_OK(blockingWait(txn->set(enrollmentKey, serde::serialize(forged))));
+      }
+      ASSERT_OK(blockingWait(txn->commit()));
+    }
+    ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(req)), StatusCode::kDataCorruption);
+    ASSERT_ERROR(blockingWait(metaClient_->queryEcRevisionRetirementV2(query(req))), StatusCode::kDataCorruption);
+    {
+      auto txn = kv_->createReadWriteTransaction();
+      auto complete = blockingWait(txn->get(completedKey));
+      ASSERT_OK(complete);
+      ASSERT_FALSE(*complete);
+      ASSERT_OK(blockingWait(txn->set(enrollmentKey, original)));
+      ASSERT_OK(blockingWait(txn->commit()));
+    }
+  }
 }
 
 }  // namespace

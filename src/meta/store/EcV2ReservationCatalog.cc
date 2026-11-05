@@ -3,6 +3,7 @@
 #include <limits>
 
 #include "fbs/meta/EcRequestDigest.h"
+#include "meta/store/EcV2GcCatalog.h"
 #include "meta/store/EcV2LifecycleUtils.h"
 
 namespace hf3fs::meta::server {
@@ -142,9 +143,11 @@ CoTryTask<EcV2Reservation> EcV2ReservationCatalog::reserve(Transaction &txn,
   if (*existing) {
     if (!same(**existing, next))
       co_return makeError(StatusCode::kTokenMismatch, "V2 physical reservation cannot change");
+    CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::protectOperation(txn, **existing));
     co_return **existing;
   }
   CO_RETURN_ON_ERROR(co_await save(txn, key, next));
+  CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::protectOperation(txn, next));
   co_return next;
 }
 
@@ -169,6 +172,7 @@ CoTryTask<Void> EcV2ReservationCatalog::checkIssuanceOpen(Transaction &txn,
   auto closed = co_await load<EcV2DrainRecord>(txn, drainKey(object, kind, scope));
   CO_RETURN_ON_ERROR(closed);
   if (*closed) co_return makeError(StatusCode::kTokenStale, "V2 scope issuance is permanently closed");
+  CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::requireProtectedScope(txn, object, kind, scope, owner));
   auto sequence = co_await readIssuanceSequence(txn, object, kind, scope);
   CO_RETURN_ON_ERROR(sequence);
   if (*sequence == std::numeric_limits<uint64_t>::max())

@@ -4,6 +4,8 @@
 #include "fbs/storage/Common.h"
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
+#include "fbs/storage/EcGcDiscovery.h"
+#include "fbs/storage/EcGcRpc.h"
 #include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
@@ -36,6 +38,8 @@ SERDE_SERVICE(StorageSerde, 3) {
   SERDE_SERVICE_METHOD(revokeEcScope, 25, EcScopeControlRequest, EcScopeControlRsp);
   SERDE_SERVICE_METHOD(queryEcScopeDrain, 26, EcScopeControlRequest, EcScopeControlRsp);
   SERDE_SERVICE_METHOD(getEcTargetIdentity, 27, EcTargetDiscoveryRequest, EcTargetDiscoveryRsp);
+  SERDE_SERVICE_METHOD(exchangeEcGc, 28, EcGcRequest, EcGcRsp);
+  SERDE_SERVICE_METHOD(getEcGcCapability, 29, EcGcDiscoveryRequest, EcGcDiscoveryRsp);
   SERDE_SERVICE_METHOD(readEcBlockV2, 40, EcReadBlockV2Req, EcReadBlockV2Rsp);
   SERDE_SERVICE_METHOD(beginEcStageV2, 41, EcBeginStageV2Req, EcStageV2Rsp);
   SERDE_SERVICE_METHOD(appendEcStageV2, 42, EcAppendStageV2Req, EcStageV2Rsp);

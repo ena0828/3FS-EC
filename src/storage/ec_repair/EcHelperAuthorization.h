@@ -10,6 +10,7 @@ class EcHelperKey final {
   static Result<std::unique_ptr<EcHelperKey>> loadFile(const std::filesystem::path &path);
   EcHelperKey(const EcHelperKey &) = delete;
   EcHelperKey &operator=(const EcHelperKey &) = delete;
+  const std::optional<EcKeyFileIdentity> &fileIdentity() const noexcept { return key_->fileIdentity(); }
 
  private:
   friend struct ec_helper_detail::Access;

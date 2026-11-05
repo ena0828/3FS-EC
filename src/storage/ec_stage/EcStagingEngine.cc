@@ -61,6 +61,27 @@ Result<std::shared_ptr<EcStagingEngine>> EcStagingEngine::open(const Path &path,
   RETURN_ON_ERROR(check(result.status));
   return std::shared_ptr<EcStagingEngine>(new EcStagingEngine(std::move(result.handle)));
 }
+Result<std::shared_ptr<EcStagingEngine>> EcStagingEngine::openExactGc(const Path &path,
+                                                                      bool create,
+                                                                      chunk_engine::RawEcStageLimits limits) {
+  const auto text = path.string();
+  auto result = chunk_engine::stage_open_gc(text, create, sizeof(ChainId), limits);
+  RETURN_ON_ERROR(check(result.status));
+  auto format = chunk_engine::stage_actual_disk_format(*result.handle);
+  RETURN_ON_ERROR(check(format.status));
+  if (format.disk_format != 3) {
+    return makeError(StatusCode::kFoundBug, "exact GC opener returned another disk format");
+  }
+  return std::shared_ptr<EcStagingEngine>(new EcStagingEngine(std::move(result.handle)));
+}
+Result<uint16_t> EcStagingEngine::actualDiskFormat() const {
+  auto result = chunk_engine::stage_actual_disk_format(*handle_);
+  RETURN_ON_ERROR(check(result.status));
+  if (result.disk_format != 2 && result.disk_format != 3) {
+    return makeError(StatusCode::kFoundBug, "stage bridge returned unknown disk format");
+  }
+  return result.disk_format;
+}
 Result<std::shared_ptr<EcScope>> EcStagingEngine::scope() const {
   return EcScope::fromResult(chunk_engine::stage_scope_open(*handle_));
 }
@@ -150,5 +171,54 @@ Result<EcStageResult> EcStagingEngine::execute(const EcStageRequest &request) co
     }
   }
   return makeError(StatusCode::kInvalidArg, "unknown stage operation");
+}
+Result<EcGcLedgerReceipt> EcStagingEngine::executeGc(const VerifiedEcGcRequest &verified, ChainId actualChain) const {
+  const auto &certificate = verified.certificate();
+  if (actualChain != certificate.endpoint.chainId) {
+    return makeError(StorageCode::kTargetStateInvalid, "GC actual chain differs from certificate");
+  }
+  CHECK_RESULT(format, actualDiskFormat());
+  if (format != 3) return makeError(StorageCode::kTargetStateInvalid, "GC requires disk format 3");
+  CHECK_RESULT(id, certificate.fragment.chunkId());
+  // Native ChainId prefix, exactly as execute()/stage_begin. Neither caller
+  // supplied bytes nor a route table can replace the signed fragment identity.
+  std::string key(reinterpret_cast<const char *>(&actualChain), sizeof(actualChain));
+  key.append(id.data());
+  chunk_engine::RawEcStageGcClaim claim{};
+  std::copy(std::begin(certificate.claimId.data), std::end(certificate.claimId.data), claim.claim_id.begin());
+  claim.claim_digest = verified.claimDigest();
+  claim.eligibility_digest = certificate.eligibilityDigest;
+  std::copy(std::begin(certificate.endpoint.engineUuid.data),
+            std::end(certificate.endpoint.engineUuid.data),
+            claim.target.engine.begin());
+  std::copy(std::begin(certificate.endpoint.targetIncarnation.data),
+            std::end(certificate.endpoint.targetIncarnation.data),
+            claim.target.incarnation.begin());
+  claim.target.chain = actualChain.toUnderType();
+  claim.target.target = certificate.endpoint.targetId.toUnderType();
+  std::copy(std::begin(certificate.fragmentOperation.data),
+            std::end(certificate.fragmentOperation.data),
+            claim.binding.operation.begin());
+  claim.binding.length = certificate.integrity.wholeLength;
+  claim.binding.checksum = certificate.integrity.wholeCrc32c;
+  std::copy(std::begin(certificate.writerClient.data), std::end(certificate.writerClient.data), claim.writer.begin());
+  // Both primitives use the same opaque handle. Query never invokes Collect,
+  // and its successful receipt includes the Rust terminal/WAL confirmation.
+  auto result = verified.action() == EcGcAction::Collect ? chunk_engine::stage_gc_collect(*handle_, bytes(key), claim)
+                                                         : chunk_engine::stage_gc_query(*handle_, bytes(key), claim);
+  if (result.status.error_code)
+    return makeError(result.status.error_code, std::string(result.status.error.data(), result.status.error.size()));
+  if (!result.status.error.empty()) return makeError(StorageCode::kEcSealOutcomeUnknown);
+  if (result.receipt.claim_id != claim.claim_id || result.receipt.terminal_revision < 2 ||
+      std::all_of(result.receipt.ledger_sha256.begin(), result.receipt.ledger_sha256.end(), [](uint8_t byte) {
+        return byte == 0;
+      })) {
+    return makeError(StorageCode::kEcSealOutcomeUnknown, "GC bridge returned an invalid confirmation");
+  }
+  EcGcLedgerReceipt receipt;
+  std::copy(result.receipt.claim_id.begin(), result.receipt.claim_id.end(), std::begin(receipt.claimId.data));
+  receipt.ledgerSha256 = result.receipt.ledger_sha256;
+  receipt.terminalRevision = result.receipt.terminal_revision;
+  return receipt;
 }
 }  // namespace hf3fs::storage

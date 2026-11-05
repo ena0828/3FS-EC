@@ -20,7 +20,20 @@
 #include "tests/GtestHelpers.h"
 
 namespace hf3fs::storage {
+class EcJobCompletionTestAccess {
+ public:
+  template <typename Job>
+  static void failBeforeAwait(Job &job, void (*callback)()) {
+    job.completion_.beforeAwait_ = callback;
+  }
+};
 namespace {
+thread_local std::promise<void> *waitFailureEntered = nullptr;
+void throwWaitAllocation() {
+  if (waitFailureEntered) waitFailureEntered->set_value();
+  throw std::bad_alloc();
+}
+
 using namespace std::chrono_literals;
 static_assert(!std::is_copy_constructible_v<EcScopeTicket>);
 static_assert(std::is_nothrow_move_constructible_v<EcScopeTicket>);
@@ -468,7 +481,7 @@ TEST_F(TestEcScopeBridge, ReadPinCannotAuthorizeDurableQueueOperation) {
   EXPECT_TRUE(denied->drained);
 }
 
-TEST_F(TestEcScopeBridge, CancellationWhileQueueIsFullRetainsAdmissionUntilRealCompletion) {
+TEST_F(TestEcScopeBridge, FullQueueRejectsBeforeSubmissionAndPreservesExistingWork) {
   ASSERT_OK(store->createEcFragment(create));
   WorkerBarrier barrier;
   auto entered = barrier.entered.get_future();
@@ -485,43 +498,88 @@ TEST_F(TestEcScopeBridge, CancellationWhileQueueIsFullRetainsAdmissionUntilRealC
     barrier.release();
     folly::coro::blockingWait(queued.complete());
   };
-  // One worker is blocked and the queue of capacity one is already full.
   auto ticket = admit(binding());
   auto session = worker->acquireEcSession();
   ASSERT_OK(ticket);
   ASSERT_OK(session);
   EcReadJob third(std::move(*ticket), *session, read, store, valid);
   folly::CancellationSource cancellation;
-  std::promise<void> started;
-  std::promise<void> enqueued;
-  auto enqueuedFuture = enqueued.get_future();
-  std::atomic<bool> enqueueFailed{false};
-  std::thread caller([&] {
-    started.set_value();
-    try {
-      folly::coro::blockingWait(folly::coro::co_withCancellation(cancellation.getToken(), worker->enqueue(&third)));
-    } catch (...) {
-      enqueueFailed.store(true);
-    }
-    enqueued.set_value();
+  cancellation.requestCancellation();
+  // No coroutine semaphore wait is registered: capacity one is already full.
+  folly::coro::blockingWait(folly::coro::co_withCancellation(cancellation.getToken(), worker->enqueue(&third)));
+  folly::coro::blockingWait(third.complete());
+  EXPECT_FALSE(third.queued());
+  EXPECT_TRUE(blocker.queued());
+  EXPECT_TRUE(queued.queued());
+  ASSERT_ERROR(third.takeResult(), StorageClientCode::kResourceBusy);
+  auto denied = scope->revoke(revokeRequest(binding()));
+  ASSERT_OK(denied);
+  EXPECT_TRUE(denied->drained);  // Rejected job has relinquished its ticket.
+  barrier.release();
+  folly::coro::blockingWait(blocker.complete());
+  folly::coro::blockingWait(queued.complete());
+  ASSERT_OK(blocker.result());
+  ASSERT_OK(queued.result());
+}
+
+TEST_F(TestEcScopeBridge, AdmissionAwaitFailureStillJoinsTheActualWorker) {
+  WorkerBarrier barrier;
+  auto entered = barrier.entered.get_future();
+  auto session = worker->acquireEcSession();
+  ASSERT_OK(session);
+  const auto value = binding();
+  auto job = std::make_unique<EcAdmissionJob>(value, scope, *session, store, [&] { return barrier.wait(); });
+  EcJobCompletionTestAccess::failBeforeAwait(*job, throwWaitAllocation);
+  folly::coro::blockingWait(worker->enqueue(job.get()));
+  SCOPE_EXIT { barrier.release(); };
+  ASSERT_TRUE(job->queued());
+  ASSERT_EQ(entered.wait_for(5s), std::future_status::ready);
+  std::promise<void> injected;
+  auto injectedFuture = injected.get_future();
+  std::promise<void> returned;
+  auto returnedFuture = returned.get_future();
+  std::thread waiter([&] {
+    waitFailureEntered = &injected;
+    folly::coro::blockingWait(job->complete());
+    waitFailureEntered = nullptr;
+    returned.set_value();
   });
   SCOPE_EXIT {
     barrier.release();
-    caller.join();
-    if (!enqueueFailed.load()) folly::coro::blockingWait(third.complete());
+    waiter.join();
   };
-  started.get_future().wait();
-  cancellation.requestCancellation();
-  EXPECT_EQ(enqueuedFuture.wait_for(20ms), std::future_status::timeout);
-  EXPECT_FALSE(enqueueFailed.load());
-  expectPending(revokeRequest(binding()), 1);
+  ASSERT_EQ(injectedFuture.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(returnedFuture.wait_for(20ms), std::future_status::timeout);
   barrier.release();
-  ASSERT_EQ(enqueuedFuture.wait_for(5s), std::future_status::ready);
-  ASSERT_FALSE(enqueueFailed.load());
-  folly::coro::blockingWait(third.complete());
-  expectPending(revokeRequest(binding()), 1);
-  ASSERT_ERROR(third.takeResult(), StatusCode::kTokenStale);
-  expectDrained(revokeRequest(binding()));
+  ASSERT_EQ(returnedFuture.wait_for(5s), std::future_status::ready);
+  ASSERT_ERROR(job->takeTicket(), StatusCode::kNotEnoughMemory);
+  expectPending(revokeRequest(value), 1);
+  job.reset();
+  expectDrained(revokeRequest(value));
+}
+
+TEST_F(TestEcScopeBridge, NestedSubmissionFromOwningWorkerRejectsBeforeQueueCommit) {
+  ASSERT_OK(store->createEcFragment(create));
+  std::atomic<bool> tested{false};
+  std::atomic<uint16_t> nestedCode{0};
+  std::atomic<bool> nestedQueued{true};
+  EcReadJob outer(EcLegacyV1Admission{}, read, store, [&]() -> Result<Void> {
+    if (!tested.exchange(true)) {
+      EcReadJob nested(EcLegacyV1Admission{}, read, store, valid);
+      folly::coro::blockingWait(worker->enqueue(&nested));
+      folly::coro::blockingWait(nested.complete());
+      nestedQueued.store(nested.queued());
+      auto result = nested.takeResult();
+      nestedCode.store(result ? 0 : result.error().code());
+    }
+    return Void{};
+  });
+  folly::coro::blockingWait(worker->enqueue(&outer));
+  folly::coro::blockingWait(outer.complete());
+  ASSERT_OK(outer.result());
+  EXPECT_TRUE(tested.load());
+  EXPECT_FALSE(nestedQueued.load());
+  EXPECT_EQ(nestedCode.load(), StatusCode::kInvalidArg);
 }
 
 TEST_F(TestEcScopeBridge, DuplicateSubmissionToDifferentWorkerFailsBeforePostingAnotherResult) {

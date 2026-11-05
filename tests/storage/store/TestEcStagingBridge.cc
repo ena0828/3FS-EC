@@ -5,6 +5,7 @@
 #include <folly/ScopeGuard.h>
 #include <folly/experimental/coro/BlockingWait.h>
 #include <future>
+#include <new>
 #include <stdexcept>
 #include <thread>
 
@@ -330,7 +331,7 @@ TEST_F(TestEcStagingBridge, SealTicketRemainsLiveThroughFinalRevocationCheck) {
   EXPECT_EQ(observed->state->state, 2);
 }
 
-TEST_F(TestEcStagingBridge, FullStageQueueCancellationWaitsForRealCompletion) {
+TEST_F(TestEcStagingBridge, FullStageQueueRejectsBeforeMutationAndPreservesEarlierTickets) {
   ASSERT_NO_FATAL_FAILURE(writeAll());
   ASSERT_OK(run(op(EcStageOperation::Seal)));
   const auto value = binding(true);
@@ -367,44 +368,19 @@ TEST_F(TestEcStagingBridge, FullStageQueueCancellationWaitsForRealCompletion) {
   auto third = make([] { return Result<Void>{Void{}}; });
   ASSERT_TRUE(third);
   folly::CancellationSource cancellation;
-  std::promise<void> started;
-  std::promise<void> enqueued;
-  auto done = enqueued.get_future();
-  std::atomic<bool> failed{false};
-  std::thread caller([&] {
-    started.set_value();
-    try {
-      folly::coro::blockingWait(
-          folly::coro::co_withCancellation(cancellation.getToken(), worker->enqueue(third.get())));
-    } catch (...) {
-      failed.store(true);
-    }
-    enqueued.set_value();
-  });
-  SCOPE_EXIT {
-    barrier.release();
-    caller.join();
-    if (!failed.load()) {
-      folly::coro::blockingWait(third->complete());
-      (void)third->takeResult();
-    }
-  };
-  started.get_future().wait();
   cancellation.requestCancellation();
-  EXPECT_EQ(done.wait_for(20ms), std::future_status::timeout);
-  EXPECT_FALSE(failed.load());
+  folly::coro::blockingWait(folly::coro::co_withCancellation(cancellation.getToken(), worker->enqueue(third.get())));
+  folly::coro::blockingWait(third->complete());
+  EXPECT_FALSE(third->queued());
+  ASSERT_ERROR(third->takeResult(), StorageClientCode::kResourceBusy);
   EcScopeRevocation revoke{};
   revoke.binding = value;
   revoke.id.fill(44);
   revoke.endpoint_set_digest.fill(45);
   auto pending = scope->revoke(revoke);
   ASSERT_OK(pending);
-  EXPECT_EQ(pending->inflight, 3);
+  EXPECT_EQ(pending->inflight, 2);  // Only the already submitted jobs remain.
   barrier.release();
-  ASSERT_EQ(done.wait_for(5s), std::future_status::ready);
-  ASSERT_FALSE(failed.load());
-  folly::coro::blockingWait(third->complete());
-  ASSERT_ERROR(third->takeResult(), StatusCode::kTokenStale);
   folly::coro::blockingWait(first->complete());
   folly::coro::blockingWait(second->complete());
   (void)first->takeResult();
@@ -412,6 +388,64 @@ TEST_F(TestEcStagingBridge, FullStageQueueCancellationWaitsForRealCompletion) {
   auto drained = scope->drainStatus(revoke);
   ASSERT_OK(drained);
   EXPECT_TRUE(drained->drained);
+}
+
+TEST_F(TestEcStagingBridge, ExceptionBeforeCreatingCompletionTaskRetainsSealUntilRealFinish) {
+  ASSERT_NO_FATAL_FAILURE(writeAll());
+  const auto value = binding();
+  ASSERT_OK(scope->prepare(value));
+  auto ticket = scope->tryAdmit(value);
+  auto session = worker->acquireEcSession();
+  ASSERT_OK(ticket);
+  ASSERT_OK(session);
+  StageBarrier barrier;
+  auto entered = barrier.entered.get_future();
+  std::promise<void> unwinding;
+  auto unwindingFuture = unwinding.get_future();
+  std::promise<void> caught;
+  auto caughtFuture = caught.get_future();
+  std::atomic<bool> wasQueued{false};
+  std::atomic<bool> unexpected{false};
+  std::thread caller([&] {
+    try {
+      EcStageJob job(std::move(*ticket), std::move(*session), op(EcStageOperation::Seal), store, [&] {
+        return barrier.wait();
+      });
+      folly::coro::blockingWait(worker->enqueue(&job));
+      wasQueued.store(job.queued());
+      unwinding.set_value();
+      // Deterministic simulation of failure constructing complete()'s Task.
+      // No global allocator is changed, and no real resource exhaustion claimed.
+      throw std::bad_alloc();
+    } catch (const std::bad_alloc &) {
+      caught.set_value();
+    } catch (...) {
+      unexpected.store(true);
+      caught.set_value();
+    }
+  });
+  SCOPE_EXIT {
+    barrier.release();
+    caller.join();
+  };
+  ASSERT_EQ(entered.wait_for(5s), std::future_status::ready);
+  ASSERT_EQ(unwindingFuture.wait_for(5s), std::future_status::ready);
+  EXPECT_TRUE(wasQueued.load());
+  EXPECT_EQ(caughtFuture.wait_for(20ms), std::future_status::timeout);
+  barrier.release();
+  ASSERT_EQ(caughtFuture.wait_for(5s), std::future_status::ready);
+  EXPECT_FALSE(unexpected.load());
+  auto observed = store->executeEcStage(op(EcStageOperation::Query));
+  ASSERT_OK(observed);
+  ASSERT_TRUE(observed->state);
+  EXPECT_EQ(observed->state->state, 2);  // Seal actually completed, despite the lost waiter.
+  EcScopeRevocation revoke{};
+  revoke.binding = value;
+  revoke.id.fill(46);
+  revoke.endpoint_set_digest.fill(47);
+  auto drained = scope->revoke(revoke);
+  ASSERT_OK(drained);
+  EXPECT_TRUE(drained->drained);  // Destructor released the original ticket only after Seal.
 }
 
 }  // namespace
