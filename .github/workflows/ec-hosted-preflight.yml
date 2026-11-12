@@ -112,3 +112,12 @@ jobs:
           if not ready:
               raise SystemExit("FUSE device access prerequisite was not met; no mount or dependency installation attempted.")
           PY
+
+      - name: Check portable acceptance commands on Linux
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          python3 -B scripts/ec/cluster/test-file-cli-acceptance.py -v
+          python3 -B scripts/ec/cluster/test-experiment-menu.py -v
+          python3 -B scripts/ec/cluster/test-prepare-fuse-file.py -v
+          python3 -B scripts/ec/cluster/test-portable-experiments.py -v
