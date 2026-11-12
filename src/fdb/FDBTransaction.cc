@@ -98,6 +98,7 @@ enum class Op {
   Clear,
   ClearRange,
   GetReadVersion,
+  GetApproximateSize,
 };
 
 template <Op op>
@@ -147,6 +148,7 @@ OP_RECORDER_LATENCY(Op::GetRange, "get_range");
 OP_RECORDER_LATENCY(Op::SnapshotGetRange, "snapshot_get_range");
 OP_RECORDER_LATENCY(Op::Commit, "commit");
 OP_RECORDER_LATENCY(Op::GetReadVersion, "get_read_version");
+OP_RECORDER_LATENCY(Op::GetApproximateSize, "get_approximate_size");
 
 monitor::CountRecorder retryConflict("fdb.retry_conflict");
 monitor::CountRecorder retryOther("fdb.retry_other");
@@ -421,6 +423,14 @@ CoTryTask<int64_t> FDBTransaction::getReadVersion() {
   co_return co_await OpWrapper<Op::GetReadVersion>::run([&](Op op) -> CoTryTask<int64_t> {
     auto r = co_await tr_.getReadVersion();
     CHECK_FDB_ERRCODE(Op::GetReadVersion, r.error());
+    co_return r.value();
+  });
+}
+
+CoTryTask<int64_t> FDBTransaction::getApproximateSize() {
+  co_return co_await OpWrapper<Op::GetApproximateSize>::run([&](Op op) -> CoTryTask<int64_t> {
+    auto r = co_await tr_.getApproximateSize();
+    CHECK_FDB_ERRCODE(op, r.error());
     co_return r.value();
   });
 }

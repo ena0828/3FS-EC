@@ -58,6 +58,30 @@ class MetaServiceStub : public IMetaServiceStub {
   META_STUB_METHOD(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
   META_STUB_METHOD(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
   META_STUB_METHOD(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
+  META_STUB_METHOD(describeEcFileV2, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
+  META_STUB_METHOD(acquireEcRangeV2, AcquireEcRangeV2Req, EcRangeRsp);
+  META_STUB_METHOD(queryEcRangeV2, QueryEcRangeV2Req, EcRangeRsp);
+  META_STUB_METHOD(queryEcOwnedMutationV2, QueryEcOwnedMutationV2Req, EcOwnedMutationRsp);
+  META_STUB_METHOD(openEcFileSession, OpenEcFileSessionReq, OpenEcFileSessionRsp);
+  META_STUB_METHOD(beginEcFilePwrite, BeginEcFilePwriteReq, EcFilePwriteRsp);
+  META_STUB_METHOD(queryEcFilePwrite, QueryEcFilePwriteReq, EcFilePwriteRsp);
+  META_STUB_METHOD(advanceEcFilePwrite, AdvanceEcFilePwriteReq, EcFilePwriteRsp);
+  META_STUB_METHOD(closeEcFileSession, CloseEcFileSessionReq, CloseEcFileSessionRsp);
+  META_STUB_METHOD(acquireEcTreeRead, AcquireEcTreeReadReq, EcTreeReadRsp);
+  META_STUB_METHOD(queryEcTreeRead, QueryEcTreeReadReq, EcTreeReadRsp);
+  META_STUB_METHOD(releaseEcTreeRead, ReleaseEcTreeReadReq, EcTreeReadRsp);
+  META_STUB_METHOD(advanceEcTreeReclaim, AdvanceEcTreeReclaimReq, AdvanceEcTreeReclaimRsp);
+  META_STUB_METHOD(beginEcFileTruncate, BeginEcFileTruncateReq, EcFileTruncateRsp);
+  META_STUB_METHOD(queryEcFileTruncate, QueryEcFileTruncateReq, EcFileTruncateRsp);
+  META_STUB_METHOD(advanceEcFileTruncate, AdvanceEcFileTruncateReq, EcFileTruncateRsp);
+  META_STUB_METHOD(closeEcFileTruncateDebt, CloseEcFileTruncateDebtReq, EcFileTruncateRsp);
+  META_STUB_METHOD(beginEcFileAppend, BeginEcFileAppendReq, EcFileAppendRsp);
+  META_STUB_METHOD(queryEcFileAppend, QueryEcFileAppendReq, EcFileAppendRsp);
+  META_STUB_METHOD(syncEcFileSession, SyncEcFileSessionReq, SyncEcFileSessionRsp);
+  META_STUB_METHOD(beginEcFileRepair, BeginEcFileRepairReq, EcFileRepairRsp);
+  META_STUB_METHOD(queryEcFileRepair, QueryEcFileRepairReq, EcFileRepairRsp);
+  META_STUB_METHOD(advanceEcFileRepair, AdvanceEcFileRepairReq, EcFileRepairRsp);
+  META_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 #undef META_STUB_METHOD
 

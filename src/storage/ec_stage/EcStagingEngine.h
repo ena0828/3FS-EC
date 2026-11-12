@@ -68,6 +68,9 @@ class EcStagingEngine {
   Result<chunk_engine::RawUsedSize> physicalUsedSize() const;
   Result<chunk_engine::Metrics> sampleMetrics() const;
   Result<Void> setAllowToAllocate(bool allow) const;
+  // Always inspect status AND report. Successful punch bytes are not statfs
+  // bytes, and failed/unknown physical extents are reported separately.
+  chunk_engine::RawEcStageTrimResult trimEmptyGroups(const chunk_engine::RawEcStageTrimLimits &limits) const;
 
  private:
   friend class StorageTarget;

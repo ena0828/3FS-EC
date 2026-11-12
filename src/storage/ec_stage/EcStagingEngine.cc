@@ -105,6 +105,11 @@ Result<Void> EcStagingEngine::setAllowToAllocate(bool allow) const {
   return check(chunk_engine::stage_set_allow_to_allocate(*handle_, allow));
 }
 
+chunk_engine::RawEcStageTrimResult EcStagingEngine::trimEmptyGroups(
+    const chunk_engine::RawEcStageTrimLimits &limits) const {
+  return chunk_engine::stage_trim_empty_groups(*handle_, limits);
+}
+
 Result<EcStageResult> EcStagingEngine::execute(const EcStageRequest &request) const {
   RETURN_ON_ERROR(request.validate());
   CHECK_RESULT(id, request.identity.chunkId());

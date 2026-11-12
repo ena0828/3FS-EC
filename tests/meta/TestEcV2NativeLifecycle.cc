@@ -13,6 +13,7 @@
 #include <linux/magic.h>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
@@ -20,8 +21,15 @@
 #include <unistd.h>
 #include <vector>
 
+#include "client/ec/EcFileAppendClient.h"
+#include "client/ec/EcFileRepairClient.h"
+#include "client/ec/EcFileRunFactory.h"
+#include "client/ec/EcReadDispatcher.h"
 #include "client/ec/EcStripeClient.h"
+#include "client/ec/EcStripeRecoveryWrite.h"
+#include "client/ec/EcTruncateJournal.h"
 #include "client/meta/MetaClient.h"
+#include "client/storage/EcRmwTransport.h"
 #include "common/kv/KeyPrefix.h"
 #include "common/net/Client.h"
 #include "common/net/Server.h"
@@ -34,16 +42,23 @@
 #include "meta/components/NativeEcGcTransport.h"
 #include "meta/service/MetaSerdeService.h"
 #include "meta/store/EcCatalog.h"
+#include "meta/store/EcFileExecutionCatalog.h"
+#include "meta/store/EcFileTruncateCatalog.h"
+#include "meta/store/EcNamespaceGuard.h"
+#include "meta/store/EcOwnedMutationCatalog.h"
+#include "meta/store/EcRangeCatalog.h"
 #include "meta/store/EcRevisionRetirementCatalog.h"
 #include "meta/store/EcV2GcCatalog.h"
 #include "meta/store/EcV2PublishedCatalog.h"
 #include "meta/store/Inode.h"
+#include "meta/store/detail/EcFileTreeKeys.h"
 #include "storage/ec_codec/EcCodec.h"
 #include "storage/service/Components.h"
 #include "storage/service/StorageService.h"
 #include "tests/GtestHelpers.h"
 #include "tests/fdb/SetupFDB.h"
 #include "tests/lib/UnitTestFabric.h"
+#include "tests/meta/EcNativeTxnObservation.h"
 
 namespace hf3fs::meta::server {
 namespace {
@@ -84,6 +99,20 @@ struct PublishReplyDrop {
   Uuid retirementArmed = Uuid::zero();
   size_t retirementCalls = 0;
   std::optional<EcRevisionRetirementRsp> retirementCommitted;
+  Uuid rangeArmed = Uuid::zero();
+  size_t rangeCalls = 0;
+  std::optional<EcRangeRsp> rangeCommitted;
+  Uuid ownerBeginArmed = Uuid::zero(), ownerQueryArmed = Uuid::zero();
+  size_t ownerBeginCalls = 0, ownerQueryCalls = 0;
+  std::optional<EcV2MutationRsp> ownerBeginCommitted;
+  // File-client recovery seam: lose a bounded number of actual committed
+  // replies, including retries of that same operation. Never fabricate state.
+  Uuid fileBeginDropOperation = Uuid::zero(), filePublishDropOperation = Uuid::zero();
+  Uuid fileTreePublishDropChild = Uuid::zero();
+  size_t fileTreeRepliesDropped = 0;
+  Uuid truncateDropOperation = Uuid::zero();
+  size_t truncateRepliesDropped = 0;
+  size_t fileBeginRepliesToDrop = 0, filePublishRepliesToDrop = 0;
 };
 
 // The real operator has returned from its FDB commit before this one-shot
@@ -93,6 +122,38 @@ class DropPublishMetaService : public MetaSerdeService {
   DropPublishMetaService(MetaOperator &meta, PublishReplyDrop &fault)
       : MetaSerdeService(meta),
         fault_(fault) {}
+
+  CoTryTask<EcFileTruncateRsp> advanceEcFileTruncate(serde::CallContext &ctx, const AdvanceEcFileTruncateReq &req) {
+    auto response = co_await MetaSerdeService::advanceEcFileTruncate(ctx, req);
+    bool drop = false;
+    if (response && response->progress.observed &&
+        response->progress.observed->state == EcFileTruncateState::Published) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.truncateDropOperation == req.intent.operation) {
+        fault_.truncateDropOperation = Uuid::zero();
+        ++fault_.truncateRepliesDropped;
+        drop = true;
+      }
+    }
+    if (drop) ctx.transport()->invalidate(false);
+    co_return response;
+  }
+
+  CoTryTask<EcFilePwriteRsp> advanceEcFilePwrite(serde::CallContext &ctx, const AdvanceEcFilePwriteReq &req) {
+    auto response = co_await MetaSerdeService::advanceEcFilePwrite(ctx, req);
+    bool drop = false;
+    if (response && req.action == EcFileAdvanceAction::Publish && response->progress.child &&
+        response->progress.child->state == EcFileChildState::Published) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.fileTreePublishDropChild == req.child) {
+        fault_.fileTreePublishDropChild = Uuid::zero();
+        ++fault_.fileTreeRepliesDropped;
+        drop = true;
+      }
+    }
+    if (drop) ctx.transport()->invalidate(false);
+    co_return response;
+  }
 
   CoTryTask<EcV2MutationRsp> publishEcMutationV2(serde::CallContext &ctx, const PublishEcMutationV2Req &req) {
     {
@@ -106,6 +167,10 @@ class DropPublishMetaService : public MetaSerdeService {
       if (fault_.armed == req.operation) {
         fault_.armed = Uuid::zero();
         fault_.state.committed = response->record;
+        drop = true;
+      }
+      if (fault_.filePublishDropOperation == req.operation && fault_.filePublishRepliesToDrop) {
+        --fault_.filePublishRepliesToDrop;
         drop = true;
       }
     }
@@ -148,6 +213,65 @@ class DropPublishMetaService : public MetaSerdeService {
       }
     }
     // Real FDB retirement committed before this one-shot lost RPC response.
+    if (drop) ctx.transport()->invalidate(false);
+    co_return response;
+  }
+
+  CoTryTask<EcV2MutationRsp> beginEcMutationV2(serde::CallContext &ctx, const BeginEcMutationV2Req &req) {
+    {
+      std::lock_guard lock(fault_.mutex);
+      ++fault_.ownerBeginCalls;
+    }
+    auto response = co_await MetaSerdeService::beginEcMutationV2(ctx, req);
+    bool drop = false;
+    if (response) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.ownerBeginArmed == req.operation) {
+        fault_.ownerBeginArmed = Uuid::zero();
+        fault_.ownerBeginCommitted = *response;
+        drop = true;
+      }
+      if (fault_.fileBeginDropOperation == req.operation && fault_.fileBeginRepliesToDrop) {
+        --fault_.fileBeginRepliesToDrop;
+        drop = true;
+      }
+    }
+    if (drop) ctx.transport()->invalidate(false);
+    co_return response;
+  }
+  CoTryTask<EcOwnedMutationRsp> queryEcOwnedMutationV2(serde::CallContext &ctx, const QueryEcOwnedMutationV2Req &req) {
+    {
+      std::lock_guard lock(fault_.mutex);
+      ++fault_.ownerQueryCalls;
+    }
+    auto response = co_await MetaSerdeService::queryEcOwnedMutationV2(ctx, req);
+    bool drop = false;
+    if (response) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.ownerQueryArmed == req.uuid) {
+        fault_.ownerQueryArmed = Uuid::zero();
+        drop = true;
+      }
+    }
+    if (drop) ctx.transport()->invalidate(false);
+    co_return response;
+  }
+
+  CoTryTask<EcRangeRsp> acquireEcRangeV2(serde::CallContext &ctx, const AcquireEcRangeV2Req &req) {
+    {
+      std::lock_guard lock(fault_.mutex);
+      ++fault_.rangeCalls;
+    }
+    auto response = co_await MetaSerdeService::acquireEcRangeV2(ctx, req);
+    bool drop = false;
+    if (response) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.rangeArmed == req.uuid) {
+        fault_.rangeArmed = Uuid::zero();
+        fault_.rangeCommitted = *response;
+        drop = true;
+      }
+    }
     if (drop) ctx.transport()->invalidate(false);
     co_return response;
   }
@@ -257,6 +381,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   virtual bool enableHelperIssuance() const { return false; }
   virtual bool enableExactGc() const { return false; }
   virtual bool enableMetaGcAdmin() const { return false; }
+  virtual bool enableFileRmw() const { return false; }
   struct Mutation {
     std::string logical;
     storage::EcCodec::Shards shards;
@@ -301,6 +426,10 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     ASSERT_OK(blockingWait(reset->commit()));
     reset.reset();
     RecordProperty("private_fdb_reset", "user keys [empty, 0xff), before Meta initialization");
+    if (enableFileRmw()) {
+      txnObservation_ = std::make_shared<detail::EcNativeTxnObservation>();
+      kv_ = std::make_shared<detail::EcObservedNativeEngine>(kv_, txnObservation_);
+    }
     ASSERT_NO_FATAL_FAILURE(writeKey());
     ASSERT_NO_FATAL_FAILURE(startStorage());
     RecordProperty("fds_with_engine", std::to_string(openFds()));
@@ -342,6 +471,9 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
       EXPECT_TRUE(cleared) << cleared.error().describe();
       components_.reset();
     }
+    // All service workers have joined before reading the fixed observation
+    // array. This includes callbacks from real worker Bind and verifier RPCs.
+    if (txnObservation_) txnObservation_->report(!HasFatalFailure());
     // Private database ownership and cleanup belong to the runner. Live pins
     // remain live; this fixture does not invent a drain or physical GC proof.
   }
@@ -431,6 +563,15 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     ASSERT_EQ(::stat(keyPath_.c_str(), &st), 0);
     ASSERT_EQ(st.st_mode & 0777, 0600);
     controlKeyPath_ = traces_.path() / "native-control.key";
+    if (enableFileRmw()) {
+      rmwKeyPath_ = traces_.path() / "native-rmw.key";
+      std::ofstream rmw(rmwKeyPath_.string(), std::ios::binary | std::ios::trunc);
+      const std::string material(32, 'R');
+      rmw.write(material.data(), material.size());
+      rmw.close();
+      ASSERT_TRUE(rmw.good());
+      ASSERT_EQ(::chmod(rmwKeyPath_.c_str(), 0600), 0);
+    }
     std::ofstream control(controlKeyPath_.string(), std::ios::binary | std::ios::trunc);
     const std::string material(32, 'C');
     control.write(material.data(), material.size());
@@ -515,6 +656,13 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     storage.set_enable_ec_scope_control(true);
     storage.set_ec_scope_control_key_file(controlKeyPath_);
     storage.set_ec_scope_control_authority(authority_.toHexString());
+    if (enableFileRmw()) {
+      storage.set_enable_ec_rmw(true);
+      storage.set_ec_rmw_key_file(rmwKeyPath_);
+      storage.set_ec_rmw_authority(authority_.toHexString());
+      smallClient(storage.ec_rmw_transport());
+      storage.ec_rmw_client().set_implementation_type(storage::client::StorageClient::ImplementationType::RPC);
+    }
     if (enableExactGc()) {
       storage.set_enable_ec_gc(true);
       storage.set_ec_gc_key_file(gcKeyPath_);
@@ -546,12 +694,18 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     smallClient(storageConfig_.client());
     components_ = std::make_unique<storage::Components>(storageConfig_);
     components_->appInfo.nodeId = storageNode_;
+    if (enableFileRmw()) {
+      routing_ = std::make_shared<flat::RoutingInfo>();
+      routing_->routingInfoVersion = flat::RoutingInfoVersion{1};
+      fakeMgmtd_ = std::make_shared<hf3fs::test::FakeMgmtdClient>(routing_);
+      components_->mgmtdClient.store(std::shared_ptr<hf3fs::client::IMgmtdClientForServer>(fakeMgmtd_));
+    }
     // No Components::start: avoid unrelated allocator, RDMA/AIO, resync and
     // telemetry background workers. The actual EC update worker starts in init.
     ASSERT_OK(components_->storageTargets.load(loader_));
     ASSERT_OK(components_->storageOperator.init(1));
     storageInitialized_ = true;
-    routing_ = std::make_shared<flat::RoutingInfo>();
+    if (!routing_) routing_ = std::make_shared<flat::RoutingInfo>();
     routing_->routingInfoVersion = flat::RoutingInfoVersion{1};
     ASSERT_NO_FATAL_FAILURE(
         startServer(storageServerConfig_,
@@ -560,7 +714,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
                     storageNode_,
                     flat::NodeType::STORAGE,
                     "StorageSerde"));
-    fakeMgmtd_ = std::make_shared<hf3fs::test::FakeMgmtdClient>(routing_);
+    if (!fakeMgmtd_) fakeMgmtd_ = std::make_shared<hf3fs::test::FakeMgmtdClient>(routing_);
     // Components::start is intentionally absent in this fixture. Helper
     // forwarding still needs the server-side routing provider, not only the
     // client's provider and targetMap snapshot.
@@ -615,6 +769,13 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   void startMeta() {
     metaConfig_.set_enable_ec_catalog(true);
     metaConfig_.set_enable_ec_v2(true);
+    if (enableFileRmw()) {
+      metaConfig_.set_enable_ec_rmw(true);
+      metaConfig_.set_ec_rmw_key_file(rmwKeyPath_);
+      metaConfig_.set_enable_ec_file_ranges(true);
+      metaConfig_.set_ec_rmw_authority(authority_.toHexString());
+      smallClient(metaConfig_.ec_rmw_transport());
+    }
     if (enableMetaGcAdmin()) {
       metaConfig_.set_enable_ec_exact_gc(true);
       metaConfig_.set_ec_gc_key_file(gcKeyPath_);
@@ -755,14 +916,21 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     return data;
   }
 
-  void prepare(Mutation &out, const EcObjectRef &object, uint64_t revision, uint32_t seed, bool badParity = false) {
-    out.logical = bytes(10 * kShardBytes - 37, seed);
+  void prepare(Mutation &out,
+               const EcObjectRef &object,
+               uint64_t revision,
+               uint32_t seed,
+               bool badParity = false,
+               uint64_t stripe = 0,
+               size_t logicalLength = 10 * kShardBytes - 37) {
+    out.logical = bytes(logicalLength, seed);
     auto encoded = storage::EcCodec::encode(out.logical, kShardBytes);
     ASSERT_OK(encoded);
     out.shards = std::move(*encoded);
     if (badParity) out.shards[11][17] ^= 0x53;
     out.begin = request<BeginEcMutationV2Req>();
     out.begin.object = object;
+    out.begin.stripe = stripe;
     out.begin.operation = Uuid::random();
     out.begin.expectedEpoch = 1;
     out.begin.expectedRevision = revision;
@@ -1042,6 +1210,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   std::filesystem::path privateCluster_;
   CPUExecutorGroup loader_{1, "EcNativeDisk"};
   std::shared_ptr<kv::IKVEngine> kv_;
+  std::shared_ptr<detail::EcNativeTxnObservation> txnObservation_;
   std::shared_ptr<flat::RoutingInfo> routing_;
   std::shared_ptr<hf3fs::test::FakeMgmtdClient> fakeMgmtd_;
   std::shared_ptr<hf3fs::client::ICommonMgmtdClient> mgmtd_;
@@ -1061,6 +1230,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   ControlFailure controlFault_;
   Path controlKeyPath_;
   Path helperKeyPath_;
+  Path rmwKeyPath_;
   Path gcKeyPath_;
   const Uuid gcKeyId_ = Uuid::random();
   const Uuid authority_ = Uuid::random();
@@ -1076,6 +1246,14 @@ class TestEcV2NativeHelperPlan : public TestEcV2NativeLifecycle {
  protected:
   bool enableHelperIssuance() const override { return true; }
 };
+
+// clang-format off
+// The following fragments require TestEcFileNativeWrite to be defined first.
+#include "EcFileNativeWriteTests.inc"
+#include "EcFileRepairNativeTests.inc"
+#include "EcFileAppendNativeTests.inc"
+#include "EcFileTruncateNativeTests.inc"
+// clang-format on
 
 TEST_F(TestEcV2NativeLifecycle, PublicCreateTracksNewObjectsAndLegacyCreateReplayDoesNotUpgrade) {
   auto create = request<CreateEcFileV2Req>();
@@ -2763,6 +2941,7 @@ TEST_F(TestEcV2NativeRetirement, PinBlocksRetirementThenLostReplyReplaysWithoutR
   ASSERT_OK(replay);
   ASSERT_TRUE(serde::equals(*observed, *replay));
   for (int field = 0; field != 4; ++field) {
+    SCOPED_TRACE(field);
     auto changed = retire;
     if (field == 0) ++changed.stripe;
     if (field == 1) ++changed.revision;
@@ -2933,6 +3112,910 @@ TEST_F(TestEcV2NativeRetirement, MissingOrMismatchedBirthEnrollmentNeverCreatesC
     }
   }
 }
+
+// A delegating observer: every operation, including conflicts and commit,
+// reaches the actual FDB transaction. It supplies no fabricated read or ACK.
+class RangeCountingTransaction : public kv::IReadWriteTransaction {
+ public:
+  explicit RangeCountingTransaction(kv::IReadWriteTransaction &inner)
+      : inner_(inner) {}
+  void setReadVersion(int64_t v) override { inner_.setReadVersion(v); }
+  CoTryTask<std::optional<String>> snapshotGet(std::string_view k) override {
+    co_return co_await inner_.snapshotGet(k);
+  }
+  CoTryTask<std::optional<String>> get(std::string_view k) override { co_return co_await inner_.get(k); }
+  CoTryTask<GetRangeResult> snapshotGetRange(const KeySelector &a, const KeySelector &b, int32_t n) override {
+    co_return co_await inner_.snapshotGetRange(a, b, n);
+  }
+  CoTryTask<GetRangeResult> getRange(const KeySelector &a, const KeySelector &b, int32_t n) override {
+    co_return co_await inner_.getRange(a, b, n);
+  }
+  CoTryTask<void> cancel() override { co_return co_await inner_.cancel(); }
+  void reset() override { inner_.reset(); }
+  CoTryTask<void> addReadConflict(std::string_view k) override { co_return co_await inner_.addReadConflict(k); }
+  CoTryTask<void> addReadConflictRange(std::string_view a, std::string_view b) override {
+    co_return co_await inner_.addReadConflictRange(a, b);
+  }
+  CoTryTask<void> set(std::string_view k, std::string_view v) override {
+    ++sets;
+    setBytes += k.size() + v.size();
+    maximumValue = std::max(maximumValue, v.size());
+    co_return co_await inner_.set(k, v);
+  }
+  CoTryTask<void> clear(std::string_view k) override {
+    ++clears;
+    co_return co_await inner_.clear(k);
+  }
+  CoTryTask<void> setVersionstampedKey(std::string_view k, uint32_t o, std::string_view v) override {
+    co_return co_await inner_.setVersionstampedKey(k, o, v);
+  }
+  CoTryTask<void> setVersionstampedValue(std::string_view k, std::string_view v, uint32_t o) override {
+    co_return co_await inner_.setVersionstampedValue(k, v, o);
+  }
+  CoTryTask<void> commit() override { co_return co_await inner_.commit(); }
+  int64_t getCommittedVersion() override { return inner_.getCommittedVersion(); }
+  size_t sets = 0, clears = 0, setBytes = 0, maximumValue = 0;
+
+ private:
+  kv::IReadWriteTransaction &inner_;
+};
+
+class TestEcV2NativeFileRange : public TestEcV2NativeRetirement {
+ protected:
+  static constexpr uint64_t kStripeBytes = uint64_t{kShardBytes} * 10;
+  void SetUp() override {
+    TestEcV2NativeRetirement::SetUp();
+    if (HasFatalFailure()) return;
+    metaConfig_.set_enable_ec_file_ranges(true);
+  }
+  void createFile(EcObjectRef &object, std::string name) {
+    auto req = request<CreateEcFileV2Req>();
+    req.path = PathAt(parent_, std::move(name));
+    req.shardBytes = kShardBytes;
+    auto result = blockingWait(metaClient_->createEcFileV2(req));
+    ASSERT_OK(result);
+    object = result->object.object;
+  }
+  void appendStripe(const EcObjectRef &object, uint64_t stripe, Mutation &mutation, size_t length = kStripeBytes) {
+    ASSERT_NO_FATAL_FAILURE(prepare(mutation, object, 0, static_cast<uint32_t>(313 + stripe), false, stripe, length));
+    ASSERT_NO_FATAL_FAILURE(writeFragments(mutation));
+    ASSERT_OK(blockingWait(metaClient_->publishEcMutationV2(mutation.publish)));
+  }
+  AcquireEcRangeV2Req range(const EcObjectRef &object, uint64_t offset, uint64_t length) const {
+    auto req = request<AcquireEcRangeV2Req>();
+    req.rangeId = Uuid::random();
+    req.selection.object = object;
+    req.selection.offset = offset;
+    req.selection.length = length;
+    const auto first = offset / kStripeBytes;
+    const auto count = length ? (offset + length - 1) / kStripeBytes - first + 1 : 0;
+    req.selection.pinCount = count;
+    for (size_t i = 0; i < std::min<uint64_t>(count, 8); ++i) {
+      req.selection.pins[i].stripe = first + i;
+      req.selection.pins[i].pin = Uuid::random();
+    }
+    return req;
+  }
+  QueryEcRangeV2Req rangeQuery(const EcRangeReq &source) const {
+    QueryEcRangeV2Req req;
+    static_cast<EcRangeReq &>(req) = source;
+    return req;
+  }
+  void releaseRange(const EcRangeRsp &rsp) {
+    for (size_t i = 0; i != rsp.snapshot.stripeCount; ++i) {
+      auto req = request<ReleaseEcReadV2Req>();
+      req.object = rsp.snapshot.selection.object;
+      req.stripe = rsp.snapshot.stripes[i].snapshot.stripe;
+      req.pin = rsp.snapshot.stripes[i].snapshot.pin;
+      auto released = blockingWait(metaClient_->releaseEcReadV2(req));
+      ASSERT_OK(released);
+      ASSERT_EQ(released->drain.state, EcV2DrainState::ReadReleased);
+    }
+  }
+  void assertNoPin(const AcquireEcRangeV2Req &req) {
+    auto txn = kv_->createReadWriteTransaction();
+    for (size_t i = 0; i != req.selection.pinCount; ++i)
+      ASSERT_ERROR(blockingWait(EcCatalog::getPin(*txn, req.selection.object, req.selection.pins[i].pin)),
+                   StatusCode::kKVStoreNotFound);
+  }
+};
+
+TEST_F(TestEcV2NativeFileRange, DescribeRequiresActualCredentialsGateAclAndTrackedBirth) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "range-describe"));
+  auto req = request<DescribeEcFileV2Req>();
+  req.object = object;
+  auto described = blockingWait(metaClient_->describeEcFileV2(req));
+  ASSERT_OK(described);
+  ASSERT_EQ(described->file.object, object);
+  ASSERT_EQ(described->file.length, 0);
+  ASSERT_EQ(described->file.layout.shardBytes, kShardBytes);
+  ASSERT_EQ(described->file.epoch, 1);
+  req.access = AccessType::WRITE;
+  ASSERT_OK(blockingWait(metaClient_->describeEcFileV2(req)));
+  req.access = static_cast<AccessType>(255);
+  ASSERT_ERROR(blockingWait(metaClient_->describeEcFileV2(req)), StatusCode::kInvalidArg);
+  req.access = AccessType::READ;
+  req.user.uid = flat::Uid{0};
+  ASSERT_ERROR(blockingWait(metaClient_->describeEcFileV2(req)), StatusCode::kAuthenticationFail);
+  req.user = user_;
+  req.user.token.clear();
+  ASSERT_ERROR(blockingWait(metaClient_->describeEcFileV2(req)), StatusCode::kAuthenticationFail);
+  req.user = user_;
+  Config defaults;
+  ASSERT_FALSE(defaults.enable_ec_file_ranges());
+  metaConfig_.set_enable_ec_file_ranges(false);
+  ASSERT_ERROR(blockingWait(metaClient_->describeEcFileV2(req)), StatusCode::kNotImplemented);
+  metaConfig_.set_enable_ec_file_ranges(true);
+  metaConfig_.set_authenticate(false);
+  ASSERT_ERROR(blockingWait(metaClient_->describeEcFileV2(req)), StatusCode::kAuthenticationFail);
+  metaConfig_.set_authenticate(true);
+  auto root = rootUser();
+  ASSERT_OK(root);
+  req.user = *root;
+  req.user.uid = user_.uid;
+  req.user.gid = user_.gid;
+  ASSERT_OK(blockingWait(metaClient_->describeEcFileV2(req)));  // actual root delegation is preserved
+  req.user = user_;
+  auto txn = kv_->createReadWriteTransaction();
+  auto inode = blockingWait(Inode::load(*txn, object.inode));
+  ASSERT_OK(inode);
+  ASSERT_TRUE(*inode);
+  (**inode).acl.perm = Permission{0200};
+  ASSERT_OK(blockingWait((**inode).store(*txn)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_ERROR(blockingWait(metaClient_->describeEcFileV2(req)), MetaCode::kNoPermission);
+  req.access = AccessType::WRITE;
+  ASSERT_OK(blockingWait(metaClient_->describeEcFileV2(req)));
+  EcObjectRef legacy;
+  legacy.inode = InodeId{object.inode.u64() + 1000000};
+  legacy.incarnation = Uuid::random();
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(EcV2BindingCatalog::createV2Object(*txn,
+                                                            legacy,
+                                                            kShardBytes,
+                                                            true,
+                                                            EcOwner{user_.uid, metaClientId_.uuid},
+                                                            Uuid::random())));
+  ASSERT_OK(blockingWait(txn->commit()));
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_ERROR(blockingWait(requireTrackedEcFile(*txn, legacy)), StatusCode::kNotImplemented);
+  std::string enrollment(kv::toStr(kv::KeyPrefix::EcGcEnrollment));
+  enrollment += object.incarnation.asStringView();
+  txn = kv_->createReadWriteTransaction();
+  auto original = blockingWait(txn->get(enrollment));
+  ASSERT_OK(original);
+  ASSERT_TRUE(*original);
+  ASSERT_OK(blockingWait(txn->clear(enrollment)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_ERROR(blockingWait(metaClient_->describeEcFileV2(req)), StatusCode::kDataCorruption);
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(txn->set(enrollment, **original)));
+  ASSERT_OK(blockingWait(txn->commit()));
+}
+
+TEST_F(TestEcV2NativeFileRange, CrossStripeSnapshotPinsHistoricalRevisionsAndConflictsWithPublish) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "range-cross-stripe"));
+  Mutation first, second, tail;
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 0, first));
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 1, second));
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 2, tail, 137));
+  auto req = range(object, kStripeBytes - 31, kStripeBytes + 500);
+  auto acquired = blockingWait(metaClient_->acquireEcRangeV2(req));
+  ASSERT_OK(acquired);
+  ASSERT_EQ(acquired->snapshot.stripeCount, 3);
+  ASSERT_EQ(acquired->snapshot.file.length, 2 * kStripeBytes + 137);
+  ASSERT_EQ(acquired->snapshot.readableLength, kStripeBytes + 168);
+  ASSERT_EQ(acquired->snapshot.stripes[2].logicalLength, 137);
+  for (size_t i = 0; i != 3; ++i) {
+    auto read = readRequest(object);
+    read.stripe = i;
+    read.pin = acquired->snapshot.stripes[i].snapshot.pin;
+    auto pinned = blockingWait(metaClient_->acquireEcReadV2(read));
+    ASSERT_OK(pinned);
+    ASSERT_TRUE(serde::equals(pinned->snapshot, acquired->snapshot.stripes[i].snapshot));
+    ASSERT_EQ(pinned->contentSha256, acquired->snapshot.stripes[i].contentSha256);
+    ASSERT_NO_FATAL_FAILURE(verifyCurrent(*pinned, i == 0 ? first : (i == 1 ? second : tail)));
+  }
+  Mutation replacement;
+  ASSERT_NO_FATAL_FAILURE(
+      prepare(replacement, object, acquired->snapshot.stripes[0].snapshot.revision, 411, false, 0, kStripeBytes));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(replacement));
+  auto competing = range(object, 0, 2 * kStripeBytes);
+  auto txn = kv_->createReadWriteTransaction();
+  auto provisional = blockingWait(EcRangeCatalog::acquire(*txn, competing));
+  ASSERT_OK(provisional);
+  ASSERT_OK(blockingWait(metaClient_->publishEcMutationV2(replacement.publish)));
+  ASSERT_ERROR(blockingWait(txn->commit()), TransactionCode::kConflict);
+  ASSERT_NO_FATAL_FAILURE(assertNoPin(competing));
+  auto replay = blockingWait(metaClient_->acquireEcRangeV2(req));
+  ASSERT_OK(replay);
+  ASSERT_TRUE(serde::equals(*replay, *acquired));
+  auto root = rootUser();
+  ASSERT_OK(root);
+  auto retire = retirement(object, acquired->snapshot.stripes[0].snapshot.revision, *root);
+  ASSERT_ERROR(blockingWait(metaClient_->retireEcRevisionV2(retire)), StatusCode::kTokenStale);
+  ASSERT_NO_FATAL_FAILURE(releaseRange(*acquired));
+  ASSERT_OK(blockingWait(metaClient_->retireEcRevisionV2(retire)));
+  auto query = blockingWait(metaClient_->queryEcRangeV2(rangeQuery(req)));
+  ASSERT_OK(query);
+  for (size_t i = 0; i != 3; ++i) ASSERT_EQ(query->snapshot.stripes[i].state, EcRangePinState::Released);
+}
+
+TEST_F(TestEcV2NativeFileRange, FailureAfterFirstPinRollsBackEveryPinGcCountAndRangeRecord) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "range-atomic-failure"));
+  Mutation first, second;
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 0, first));
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 1, second));
+  auto req = range(object, 0, 2 * kStripeBytes);
+  auto txn = kv_->createReadWriteTransaction();
+  const auto revision = second.reservation.record.candidate.revision;
+  std::string key(kv::toStr(kv::KeyPrefix::EcV2PublishedContent));
+  key += object.incarnation.asStringView();
+  for (uint64_t n : {uint64_t{1}, revision})
+    for (int shift = 56; shift >= 0; shift -= 8) key.push_back(static_cast<char>(n >> shift));
+  auto saved = blockingWait(txn->get(key));
+  ASSERT_OK(saved);
+  ASSERT_TRUE(*saved);
+  auto before = blockingWait(
+      EcV2GcCatalog::getAllocation(*txn, object, first.reservation.record.candidate.fragments[0].identity));
+  ASSERT_OK(before);
+  ASSERT_OK(blockingWait(txn->clear(key)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(req)), StatusCode::kNotImplemented);
+  ASSERT_NO_FATAL_FAILURE(assertNoPin(req));
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRangeV2(rangeQuery(req))), StatusCode::kKVStoreNotFound);
+  txn = kv_->createReadWriteTransaction();
+  auto after = blockingWait(
+      EcV2GcCatalog::getAllocation(*txn, object, first.reservation.record.candidate.fragments[0].identity));
+  ASSERT_OK(after);
+  ASSERT_TRUE(serde::equals(*before, *after));
+  auto manifest = blockingWait(EcCatalog::getManifest(*txn, object, 0, first.reservation.record.candidate.revision));
+  ASSERT_OK(manifest);
+  ASSERT_EQ(manifest->pins, 0);
+  ASSERT_OK(blockingWait(txn->set(key, **saved)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  auto retry = blockingWait(metaClient_->acquireEcRangeV2(req));
+  ASSERT_OK(retry);
+  ASSERT_NO_FATAL_FAILURE(releaseRange(*retry));
+}
+
+TEST_F(TestEcV2NativeFileRange, CompleteBodyOwnerAliasAndPreexistingPinsCannotBeRebound) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "range-identity"));
+  Mutation first;
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 0, first));
+  auto req = range(object, 0, 19);
+  auto result = blockingWait(metaClient_->acquireEcRangeV2(req));
+  ASSERT_OK(result);
+  auto changed = req;
+  changed.selection.length++;
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(changed)), StatusCode::kTokenMismatch);
+  changed = req;
+  changed.selection.pins[0].pin = Uuid::random();
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRangeV2(rangeQuery(changed))), StatusCode::kTokenMismatch);
+  changed = req;
+  changed.uuid = Uuid::random();
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRangeV2(rangeQuery(changed))), StatusCode::kTokenMismatch);
+  changed = req;
+  changed.rangeId = Uuid::random();
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(changed)), StatusCode::kTokenMismatch);
+  auto root = rootUser();
+  ASSERT_OK(root);
+  changed = req;
+  changed.user = *root;
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRangeV2(rangeQuery(changed))), MetaCode::kNoPermission);
+  auto existing = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(existing);
+  auto collision = range(object, 0, 23);
+  collision.selection.pins[0].pin = existing->snapshot.pin;
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(collision)), StatusCode::kTokenDuplicated);
+  collision = range(object, 0, kStripeBytes + 1);
+  collision.selection.pins[1].pin = collision.selection.pins[0].pin;
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(collision)), StatusCode::kInvalidArg);
+  auto release = request<ReleaseEcReadV2Req>();
+  release.object = object;
+  release.pin = existing->snapshot.pin;
+  ASSERT_OK(blockingWait(metaClient_->releaseEcReadV2(release)));
+  ASSERT_NO_FATAL_FAILURE(releaseRange(*result));
+}
+
+TEST_F(TestEcV2NativeFileRange, ClosingReleasedAndRevokedAclRemainObservableWithoutResurrection) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "range-cleanup"));
+  Mutation first;
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 0, first));
+  auto req = range(object, 0, 19);
+  auto result = blockingWait(metaClient_->acquireEcRangeV2(req));
+  ASSERT_OK(result);
+  auto release = request<ReleaseEcReadV2Req>();
+  release.object = object;
+  release.pin = result->snapshot.stripes[0].snapshot.pin;
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    controlFault_.scope = release.pin;
+    controlFault_.fail = true;
+  }
+  auto failed = blockingWait(metaClient_->releaseEcReadV2(release));
+  ASSERT_FALSE(failed);
+  auto closing = blockingWait(metaClient_->queryEcRangeV2(rangeQuery(req)));
+  ASSERT_OK(closing);
+  ASSERT_EQ(closing->snapshot.stripes[0].state, EcRangePinState::Closing);
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(req)), StatusCode::kTokenStale);
+  // Inject one missing ECPN row while preserving real ECVP/Closing/GC state.
+  // A new range must refuse adoption and leave the old closed scope unchanged.
+  std::string pinKey(kv::toStr(kv::KeyPrefix::EcPin));
+  pinKey += object.incarnation.asStringView();
+  pinKey += release.pin.asStringView();
+  auto faultTxn = kv_->createReadWriteTransaction();
+  auto savedPin = blockingWait(faultTxn->get(pinKey));
+  ASSERT_OK(savedPin);
+  ASSERT_TRUE(*savedPin);
+  ASSERT_OK(blockingWait(faultTxn->clear(pinKey)));
+  ASSERT_OK(blockingWait(faultTxn->commit()));
+  auto orphan = range(object, 0, 19);
+  orphan.selection.pins[0].pin = release.pin;
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(orphan)), StatusCode::kTokenDuplicated);
+  faultTxn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(faultTxn->set(pinKey, **savedPin)));
+  ASSERT_OK(blockingWait(faultTxn->commit()));
+  for (const auto prefix :
+       {kv::KeyPrefix::EcV2Pin, kv::KeyPrefix::EcV2Drain, kv::KeyPrefix::EcGcScope, kv::KeyPrefix::EcV2Issuance}) {
+    auto isolated = range(object, 0, 19);
+    std::string side(kv::toStr(prefix));
+    side += object.incarnation.asStringView();
+    if (prefix != kv::KeyPrefix::EcV2Pin) side.push_back(static_cast<char>(storage::EcGrantScope::ReadPin));
+    side += isolated.selection.pins[0].pin.asStringView();
+    auto corrupt = kv_->createReadWriteTransaction();
+    ASSERT_OK(blockingWait(corrupt->set(side, "fixture-only-orphan")));
+    ASSERT_OK(blockingWait(corrupt->commit()));
+    ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(isolated)), StatusCode::kTokenDuplicated);
+    ASSERT_NO_FATAL_FAILURE(assertNoPin(isolated));
+    ASSERT_ERROR(blockingWait(metaClient_->queryEcRangeV2(rangeQuery(isolated))), StatusCode::kKVStoreNotFound);
+    corrupt = kv_->createReadWriteTransaction();
+    ASSERT_OK(blockingWait(corrupt->clear(side)));
+    ASSERT_OK(blockingWait(corrupt->commit()));
+  }
+  auto txn = kv_->createReadWriteTransaction();
+  auto inode = blockingWait(Inode::load(*txn, object.inode));
+  ASSERT_OK(inode);
+  ASSERT_TRUE(*inode);
+  const auto original = **inode;
+  (**inode).acl.perm = Permission{0};
+  ASSERT_OK(blockingWait((**inode).store(*txn)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(req)), MetaCode::kNoPermission);
+  ASSERT_OK(blockingWait(metaClient_->queryEcRangeV2(rangeQuery(req))));
+  {
+    std::lock_guard lock(controlFault_.mutex);
+    controlFault_.fail = false;
+  }
+  ASSERT_OK(blockingWait(metaClient_->releaseEcReadV2(release)));
+  auto released = blockingWait(metaClient_->queryEcRangeV2(rangeQuery(req)));
+  ASSERT_OK(released);
+  ASSERT_EQ(released->snapshot.stripes[0].state, EcRangePinState::Released);
+  txn = kv_->createReadWriteTransaction();
+  auto unlinked = original;
+  unlinked.nlink = 0;
+  ASSERT_OK(blockingWait(unlinked.store(*txn)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  // This fixture-only liveness fault is not an implementation of unlink.
+  ASSERT_OK(blockingWait(metaClient_->queryEcRangeV2(rangeQuery(req))));
+  txn = kv_->createReadWriteTransaction();
+  auto restored = original;
+  ASSERT_OK(blockingWait(restored.store(*txn)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(req)), StatusCode::kTokenStale);
+  auto observeTxn = kv_->createReadWriteTransaction();
+  RangeCountingTransaction observer(*observeTxn);
+  ASSERT_OK(blockingWait(EcRangeCatalog::query(observer, req)));
+  ASSERT_EQ(observer.sets, 0);
+  ASSERT_EQ(observer.clears, 0);
+}
+
+TEST_F(TestEcV2NativeFileRange, LostTcpReplyAndUnknownCommitRecoverWithSameDurableIdentity) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "range-unknown"));
+  Mutation first;
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 0, first));
+  auto req = range(object, 0, 29);
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    replyDrop_.rangeArmed = req.uuid;
+    replyDrop_.rangeCalls = 0;
+  }
+  auto lost = blockingWait(metaClient_->acquireEcRangeV2(req));
+  ASSERT_FALSE(lost);
+  EcRangeRsp committed;
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    ASSERT_EQ(replyDrop_.rangeCalls, 1);
+    ASSERT_TRUE(replyDrop_.rangeCommitted);
+    committed = *replyDrop_.rangeCommitted;
+  }
+  ASSERT_NO_FATAL_FAILURE(reconstructMetaClient());
+  auto query = blockingWait(metaClient_->queryEcRangeV2(rangeQuery(req)));
+  ASSERT_OK(query);
+  ASSERT_TRUE(serde::equals(*query, committed));
+  auto replay = blockingWait(metaClient_->acquireEcRangeV2(req));
+  ASSERT_OK(replay);
+  ASSERT_TRUE(serde::equals(*replay, committed));
+  auto txn = kv_->createReadWriteTransaction();
+  auto manifest =
+      blockingWait(EcCatalog::getManifest(*txn, object, 0, committed.snapshot.stripes[0].snapshot.revision));
+  ASSERT_OK(manifest);
+  ASSERT_EQ(manifest->pins, 1);
+  auto unknownReq = range(object, 0, 31);
+  auto unknown = [&]() -> CoTryTask<Void> {
+    auto transaction = kv_->createReadWriteTransaction();
+    CO_RETURN_ON_ERROR(co_await EcRangeCatalog::acquire(*transaction, unknownReq));
+    CO_RETURN_ON_ERROR(co_await transaction->commit());
+    // Actual commit followed by a modeled lost acknowledgement. This does not
+    // claim an FDB server/network fault injection.
+    co_return makeError(TransactionCode::kMaybeCommitted);
+  };
+  ASSERT_ERROR(blockingWait(unknown()), TransactionCode::kMaybeCommitted);
+  auto recovered = blockingWait(metaClient_->queryEcRangeV2(rangeQuery(unknownReq)));
+  ASSERT_OK(recovered);
+  ASSERT_NO_FATAL_FAILURE(replaceClientIdentity(ClientId::random()));
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRangeV2(rangeQuery(req))), StatusCode::kKVStoreNotFound);
+  ASSERT_NO_FATAL_FAILURE(replaceClientIdentity(metaClientId_));
+  ASSERT_NO_FATAL_FAILURE(releaseRange(committed));
+  ASSERT_NO_FATAL_FAILURE(releaseRange(*recovered));
+}
+
+TEST_F(TestEcV2NativeFileRange, EmptyRangesPersistEofAndUnusedMappingsWithoutCreatingPins) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "range-empty"));
+  auto empty = range(object, 0, 0);
+  auto captured = blockingWait(metaClient_->acquireEcRangeV2(empty));
+  ASSERT_OK(captured);
+  auto beyond = range(object, 2 * kStripeBytes + 1, 8 * kStripeBytes - 1);
+  auto outside = blockingWait(metaClient_->acquireEcRangeV2(beyond));
+  ASSERT_OK(outside);
+  ASSERT_EQ(outside->snapshot.stripeCount, 0);
+  ASSERT_EQ(outside->snapshot.selection.pinCount, 8);
+  ASSERT_NO_FATAL_FAILURE(assertNoPin(beyond));
+  Mutation first;
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 0, first));
+  auto replay = blockingWait(metaClient_->acquireEcRangeV2(empty));
+  ASSERT_OK(replay);
+  ASSERT_EQ(replay->snapshot.file.length, 0);
+  ASSERT_EQ(replay->snapshot.stripeCount, 0);
+  ASSERT_TRUE(serde::equals(*replay, *captured));
+  auto wrong = range(object, 0, 0);
+  wrong.selection.pins[7].pin = Uuid::random();
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(wrong)), StatusCode::kInvalidArg);
+  wrong = range(object, 0, 1);
+  wrong.selection.offset = std::numeric_limits<uint64_t>::max();
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(wrong)), StatusCode::kInvalidArg);
+  wrong = range(object, 0, 1);
+  wrong.selection.length = kEcFileRangeMaxBytes + 1;
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(wrong)), StatusCode::kInvalidArg);
+  wrong = range(object, 0, 8 * kStripeBytes);
+  wrong.selection.offset = 1;
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(wrong)), StatusCode::kInvalidArg);
+  wrong = range(object, 0, 1);
+  wrong.selection.pins[0].stripe = 1;
+  ASSERT_ERROR(blockingWait(metaClient_->acquireEcRangeV2(wrong)), StatusCode::kInvalidArg);
+  auto missing = range(object, 0, 1);
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcRangeV2(rangeQuery(missing))), StatusCode::kKVStoreNotFound);
+  ASSERT_OK(blockingWait(metaClient_->acquireEcRangeV2(missing)));  // missing was not cancellation
+  auto recovered = blockingWait(metaClient_->queryEcRangeV2(rangeQuery(missing)));
+  ASSERT_OK(recovered);
+  ASSERT_NO_FATAL_FAILURE(releaseRange(*recovered));
+}
+
+TEST_F(TestEcV2NativeFileRange, EightStripeActualFdbTransactionAndWireSizeRemainBounded) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "range-eight"));
+  for (size_t i = 0; i != 8; ++i) {
+    Mutation stripe;
+    ASSERT_NO_FATAL_FAILURE(appendStripe(object, i, stripe));
+  }
+  auto req = range(object, 0, 8 * kStripeBytes);
+  auto txn = kv_->createReadWriteTransaction();
+  RangeCountingTransaction counted(*txn);
+  auto result = blockingWait(EcRangeCatalog::acquire(counted, req));
+  ASSERT_OK(result);
+  ASSERT_EQ(result->snapshot.stripeCount, 8);
+  ASSERT_LE(counted.maximumValue, kEcFileRangeMaxRecordBytes);
+  ASSERT_LT(counted.setBytes, 1u << 20);
+  ASSERT_LE(counted.sets, 256);
+  ASSERT_OK(blockingWait(counted.commit()));
+  auto bytes = serde::serialize(result->snapshot);
+  ASSERT_LE(bytes.size(), kEcFileRangeMaxRecordBytes);
+  EcRangeSnapshot decoded;
+  ASSERT_OK(serde::deserialize(decoded, bytes));
+  ASSERT_TRUE(serde::equals(decoded, result->snapshot));
+  auto queryTxn = kv_->createReadWriteTransaction();
+  RangeCountingTransaction queryCounted(*queryTxn);
+  ASSERT_OK(blockingWait(EcRangeCatalog::query(queryCounted, req)));
+  ASSERT_EQ(queryCounted.sets, 0);
+  ASSERT_EQ(queryCounted.clears, 0);
+  // Fixed eight-slot decoder rejects the wire count before decoding elements.
+  auto pins = serde::serialize(req.selection.pins);
+  ASSERT_FALSE(pins.empty());
+  pins[0] = static_cast<char>(9);
+  std::array<EcRangePin, 8> malformed;
+  ASSERT_ERROR(serde::deserialize(malformed, pins), StatusCode::kInvalidFormat);
+  EcRangeSelection maximum;
+  maximum.object = object;
+  maximum.length = kEcFileRangeMaxBytes;
+  maximum.pinCount = 4;
+  for (size_t i = 0; i != 4; ++i) maximum.pins[i] = EcRangePin{uint64_t{i}, Uuid::random()};
+  EcManifestLayoutV1 layout;
+  layout.incarnation = object.incarnation;
+  layout.shardBytes = 1u << 20;
+  ASSERT_OK(maximum.matchesLayout(layout));
+  ASSERT_NO_FATAL_FAILURE(releaseRange(*result));
+}
+
+class TestEcV2NativeOwnedMutation : public TestEcV2NativeFileRange {
+ protected:
+  QueryEcOwnedMutationV2Req ownedQuery(const EcObjectRef &object, const Uuid &operation) {
+    auto req = request<QueryEcOwnedMutationV2Req>();
+    req.object = object;
+    req.operation = operation;
+    return req;
+  }
+  void makeBegin(BeginEcMutationV2Req &req, const EcObjectRef &object) {
+    const auto logical = bytes(kStripeBytes, 701);
+    auto encoded = storage::EcCodec::encode(logical, kShardBytes);
+    ASSERT_OK(encoded);
+    req = request<BeginEcMutationV2Req>();
+    req.object = object;
+    req.operation = Uuid::random();
+    req.expectedEpoch = 1;
+    req.logicalLength = logical.size();
+    std::array<std::string_view, 10> data;
+    for (size_t i = 0; i != 10; ++i) data[i] = (*encoded)[i];
+    auto digest = computeEcLogicalSha256(data, logical.size());
+    ASSERT_OK(digest);
+    req.contentSha256 = *digest;
+    for (size_t i = 0; i != 12; ++i) {
+      auto crc = storage::ChecksumInfo::create(storage::ChecksumType::CRC32C,
+                                               reinterpret_cast<const uint8_t *>((*encoded)[i].data()),
+                                               (*encoded)[i].size());
+      req.fragmentCrc32c[i] = ~crc.value;
+    }
+  }
+  std::string idKey(kv::KeyPrefix prefix, const EcObjectRef &object, const Uuid &id, bool scope = false) {
+    std::string key(kv::toStr(prefix));
+    key += object.incarnation.asStringView();
+    if (scope) key.push_back(static_cast<char>(storage::EcGrantScope::WriteOperation));
+    key += id.asStringView();
+    return key;
+  }
+};
+
+TEST_F(TestEcV2NativeOwnedMutation, RealOwnerCanObserveAfterReadAclRevocationUnlinkAndDeletingWithoutWrites) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "owner-query-acl"));
+  Mutation mutation;
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 0, mutation));
+  auto req = ownedQuery(object, mutation.begin.operation);
+  auto initial = blockingWait(metaClient_->queryEcOwnedMutationV2(req));
+  ASSERT_OK(initial);
+  ASSERT_TRUE(initial->publishedContentConfirmed);
+  ASSERT_EQ(initial->contentSha256, mutation.begin.contentSha256);
+  ASSERT_EQ(initial->requestId, req.uuid);
+  ASSERT_EQ(initial->clientNamespace, metaClientId_.uuid);
+  ASSERT_TRUE(initial->drain);
+  ASSERT_EQ(initial->drain->state, EcV2DrainState::Published);
+  ASSERT_EQ(initial->drain->acknowledgedEndpoints, initial->drain->expectedEndpoints);
+  auto txn = kv_->createReadWriteTransaction();
+  auto inode = blockingWait(Inode::load(*txn, object.inode));
+  ASSERT_OK(inode);
+  ASSERT_TRUE(*inode);
+  const auto originalInode = **inode;
+  (**inode).acl.perm = Permission{0200};
+  ASSERT_OK(blockingWait((**inode).store(*txn)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  auto ordinary = request<GetEcOperationV2Req>();
+  ordinary.object = object;
+  ordinary.operation = req.operation;
+  ASSERT_ERROR(blockingWait(metaClient_->getEcOperationV2(ordinary)), MetaCode::kNoPermission);
+  auto writeOnly = blockingWait(metaClient_->queryEcOwnedMutationV2(req));
+  ASSERT_OK(writeOnly);
+  ASSERT_EQ(serde::serialize(*initial), serde::serialize(*writeOnly));
+  txn = kv_->createReadWriteTransaction();
+  auto removed = originalInode;
+  removed.nlink = 0;
+  removed.acl.perm = Permission{0};
+  ASSERT_OK(blockingWait(removed.store(*txn)));
+  auto catalog = blockingWait(EcCatalog::getObject(*txn, object));
+  ASSERT_OK(catalog);
+  const auto originalObject = *catalog;
+  catalog->deleting = true;
+  ++catalog->epoch;
+  std::string objectKey(kv::toStr(kv::KeyPrefix::EcObject));
+  objectKey += object.incarnation.asStringView();
+  ASSERT_OK(blockingWait(txn->set(objectKey, serde::serialize(*catalog))));
+  ASSERT_OK(blockingWait(txn->commit()));
+  // Fixture-only tombstone simulation; ordinary unlink/truncate remain blocked.
+  metaConfig_.set_readonly(true);
+  const auto savedEngine = metaConfig_.ec_targets(0).engine_uuid();
+  metaConfig_.ec_targets(0).set_engine_uuid("not-a-current-pool");
+  auto retained = blockingWait(metaClient_->queryEcOwnedMutationV2(req));
+  ASSERT_OK(retained);
+  ASSERT_EQ(serde::serialize(*initial), serde::serialize(*retained));
+  metaConfig_.ec_targets(0).set_engine_uuid(savedEngine);
+  metaConfig_.set_readonly(false);
+  auto key = storage::EcScopeControlKey::loadFile(std::filesystem::path(controlKeyPath_.string()));
+  ASSERT_OK(key);
+  auto readTxn = kv_->createReadWriteTransaction();
+  RangeCountingTransaction count(*readTxn);
+  ASSERT_OK(blockingWait(EcOwnedMutationCatalog::query(count, req, **key)));
+  ASSERT_EQ(count.sets, 0);
+  ASSERT_EQ(count.clears, 0);
+  auto root = rootUser();
+  ASSERT_OK(root);
+  auto changed = req;
+  changed.user = *root;
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(changed)), MetaCode::kNoPermission);
+  changed.user.uid = user_.uid;
+  changed.user.gid = user_.gid;
+  ASSERT_OK(blockingWait(metaClient_->queryEcOwnedMutationV2(changed)));  // genuine root delegation
+  changed = req;
+  changed.user.uid = flat::Uid{0};
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(changed)), StatusCode::kAuthenticationFail);
+  ASSERT_NO_FATAL_FAILURE(replaceClientIdentity(ClientId::random()));
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(req)), MetaCode::kNoPermission);
+  ASSERT_NO_FATAL_FAILURE(replaceClientIdentity(metaClientId_));
+  changed = req;
+  changed.uuid = Uuid::zero();
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(changed)), StatusCode::kInvalidArg);
+  metaConfig_.set_enable_ec_file_ranges(false);
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(req)), StatusCode::kNotImplemented);
+  metaConfig_.set_enable_ec_file_ranges(true);
+  txn = kv_->createReadWriteTransaction();
+  auto restored = originalInode;
+  ASSERT_OK(blockingWait(restored.store(*txn)));
+  ASSERT_OK(blockingWait(txn->set(objectKey, serde::serialize(originalObject))));
+  ASSERT_OK(blockingWait(txn->commit()));
+}
+
+TEST_F(TestEcV2NativeOwnedMutation, MissingLostBeginAndLostQueryReplyPreserveIdentityAndObserveAbort) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "owner-query-unknown"));
+  BeginEcMutationV2Req begin;
+  ASSERT_NO_FATAL_FAILURE(makeBegin(begin, object));
+  auto req = ownedQuery(object, begin.operation);
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(req)), StatusCode::kKVStoreNotFound);
+  const auto wait = metaClientConfig_.retry_default().retry_init_wait();
+  metaClientConfig_.retry_default().set_retry_init_wait(0_ms);
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    replyDrop_.ownerBeginArmed = begin.operation;
+    replyDrop_.ownerBeginCalls = 0;
+  }
+  auto lostBegin = blockingWait(metaClient_->beginEcMutationV2(begin));
+  ASSERT_FALSE(lostBegin);
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    ASSERT_EQ(replyDrop_.ownerBeginCalls, 1);
+    ASSERT_TRUE(replyDrop_.ownerBeginCommitted);
+  }
+  metaClientConfig_.retry_default().set_retry_init_wait(wait);
+  ASSERT_NO_FATAL_FAILURE(reconstructMetaClient());
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    replyDrop_.ownerQueryArmed = req.uuid;
+    replyDrop_.ownerQueryCalls = 0;
+  }
+  auto lostQuery = blockingWait(metaClient_->queryEcOwnedMutationV2(req));
+  ASSERT_FALSE(lostQuery);
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    ASSERT_EQ(replyDrop_.ownerQueryCalls, 1);
+  }
+  ASSERT_NO_FATAL_FAILURE(reconstructMetaClient());
+  auto preparing = blockingWait(metaClient_->queryEcOwnedMutationV2(req));
+  ASSERT_OK(preparing);
+  ASSERT_EQ(preparing->record.state, EcOperationState::Preparing);
+  ASSERT_FALSE(preparing->drain);
+  ASSERT_FALSE(preparing->publishedContentConfirmed);
+  ASSERT_EQ(preparing->contentSha256, begin.contentSha256);
+  ASSERT_EQ(preparing->record.intent.operation, begin.operation);
+  ASSERT_EQ(preparing->requestId, req.uuid);
+  // Persist a real T0 through the production catalog, intentionally without
+  // dispatching T1. This is an actual FDB Closing state, not a mocked reply.
+  auto closingTxn = kv_->createReadWriteTransaction();
+  auto closingRecord = blockingWait(EcV2DrainCatalog::startCancel(*closingTxn,
+                                                                  object,
+                                                                  begin.operation,
+                                                                  EcOwner{user_.uid, metaClientId_.uuid},
+                                                                  authority_,
+                                                                  Uuid::random()));
+  ASSERT_OK(closingRecord);
+  ASSERT_OK(blockingWait(closingTxn->commit()));
+  auto closing = blockingWait(metaClient_->queryEcOwnedMutationV2(req));
+  ASSERT_OK(closing);
+  ASSERT_EQ(closing->record.state, EcOperationState::Preparing);
+  ASSERT_TRUE(closing->drain);
+  ASSERT_EQ(closing->drain->state, EcV2DrainState::Closing);
+  ASSERT_EQ(closing->drain->acknowledgedEndpoints, 0);
+  ASSERT_FALSE(closing->publishedContentConfirmed);
+  ASSERT_EQ(closing->requestId, req.uuid);
+  auto cancelled = request<CancelEcMutationV2Req>();
+  cancelled.object = object;
+  cancelled.operation = begin.operation;
+  ASSERT_OK(blockingWait(metaClient_->cancelEcMutationV2(cancelled)));
+  auto terminal = blockingWait(metaClient_->queryEcOwnedMutationV2(req));
+  ASSERT_OK(terminal);
+  ASSERT_EQ(terminal->record.state, EcOperationState::Aborted);
+  ASSERT_FALSE(terminal->publishedContentConfirmed);
+  ASSERT_TRUE(terminal->drain);
+  ASSERT_EQ(terminal->drain->state, EcV2DrainState::Aborted);
+  ASSERT_EQ(terminal->drain->acknowledgedEndpoints, terminal->drain->expectedEndpoints);
+  ASSERT_EQ(terminal->requestId, req.uuid);  // same query identity, newer observation
+}
+
+TEST_F(TestEcV2NativeOwnedMutation, RepairAndRetiredHistoricalPublicationDoNotDependOnTheCurrentHead) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "owner-query-history"));
+  Mutation first;
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 0, first));
+  auto old = blockingWait(metaClient_->acquireEcReadV2(readRequest(object)));
+  ASSERT_OK(old);
+  Mutation repaired;
+  ASSERT_NO_FATAL_FAILURE(repair(repaired, *old, uint16_t{1}));
+  ASSERT_NO_FATAL_FAILURE(writeFragments(repaired));
+  ASSERT_OK(blockingWait(metaClient_->publishEcMutationV2(repaired.publish)));
+  auto release = request<ReleaseEcReadV2Req>();
+  release.object = object;
+  release.pin = old->snapshot.pin;
+  ASSERT_OK(blockingWait(metaClient_->releaseEcReadV2(release)));
+  auto root = rootUser();
+  ASSERT_OK(root);
+  ASSERT_OK(blockingWait(metaClient_->retireEcRevisionV2(retirement(object, old->manifest.revision, *root))));
+  auto historical = blockingWait(metaClient_->queryEcOwnedMutationV2(ownedQuery(object, first.begin.operation)));
+  ASSERT_OK(historical);
+  auto replacement = blockingWait(metaClient_->queryEcOwnedMutationV2(ownedQuery(object, repaired.begin.operation)));
+  ASSERT_OK(replacement);
+  ASSERT_TRUE(historical->publishedContentConfirmed);
+  ASSERT_TRUE(replacement->publishedContentConfirmed);
+  ASSERT_EQ(historical->record.candidate.revision, old->manifest.revision);
+  ASSERT_NE(replacement->record.candidate.revision, historical->record.candidate.revision);
+  ASSERT_EQ(replacement->record.intent.kind, EcMutationKind::Repair);
+  ASSERT_EQ(replacement->record.candidate.fragments[1], historical->record.candidate.fragments[1]);
+  auto txn = kv_->createReadWriteTransaction();
+  auto retired = blockingWait(EcCatalog::getManifest(*txn, object, 0, old->manifest.revision));
+  ASSERT_OK(retired);
+  ASSERT_TRUE(retired->referencesReleased);
+  ASSERT_EQ(retired->pins, 0);
+}
+
+TEST_F(TestEcV2NativeOwnedMutation, MissingBirthTamperedHistoricalProofAndWrongControlKeyFailClosed) {
+  EcObjectRef object;
+  ASSERT_NO_FATAL_FAILURE(createFile(object, "owner-query-proof"));
+  Mutation mutation;
+  ASSERT_NO_FATAL_FAILURE(appendStripe(object, 0, mutation));
+  auto req = ownedQuery(object, mutation.begin.operation);
+  auto txn = kv_->createReadWriteTransaction();
+  std::string enrollment(kv::toStr(kv::KeyPrefix::EcGcEnrollment));
+  enrollment += object.incarnation.asStringView();
+  auto birth = blockingWait(txn->get(enrollment));
+  ASSERT_OK(birth);
+  ASSERT_TRUE(*birth);
+  ASSERT_OK(blockingWait(txn->clear(enrollment)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(req)), StatusCode::kDataCorruption);
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(txn->set(enrollment, **birth)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  const auto key = idKey(kv::KeyPrefix::EcV2Drain, object, req.operation, true);
+  txn = kv_->createReadWriteTransaction();
+  auto saved = blockingWait(txn->get(key));
+  ASSERT_OK(saved);
+  ASSERT_TRUE(*saved);
+  EcV2DrainRecord record;
+  ASSERT_OK(serde::deserialize(record, **saved));
+  ASSERT_TRUE(record.observations[0]);
+  auto incomplete = record;
+  incomplete.observations[0].reset();
+  ASSERT_OK(blockingWait(txn->set(key, serde::serialize(incomplete))));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(req)), StatusCode::kDataCorruption);
+  auto changed = record;
+  ++changed.observations[0]->ack.claims.inflight;
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(txn->set(key, serde::serialize(changed))));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_FALSE(blockingWait(metaClient_->queryEcOwnedMutationV2(req)));
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(txn->set(key, **saved)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  auto wrong = storage::EcScopeControlKey::loadFile(std::filesystem::path(keyPath_.string()));
+  ASSERT_OK(wrong);
+  txn = kv_->createReadWriteTransaction();
+  RangeCountingTransaction readOnly(*txn);
+  ASSERT_FALSE(blockingWait(EcOwnedMutationCatalog::query(readOnly, req, **wrong)));
+  ASSERT_EQ(readOnly.sets, 0);
+  ASSERT_EQ(readOnly.clears, 0);
+  ASSERT_OK(blockingWait(metaClient_->queryEcOwnedMutationV2(req)));
+  std::string content(kv::toStr(kv::KeyPrefix::EcV2PublishedContent));
+  content += object.incarnation.asStringView();
+  for (uint64_t n : {uint64_t{0}, mutation.reservation.record.candidate.revision})
+    for (int shift = 56; shift >= 0; shift -= 8) content.push_back(static_cast<char>(n >> shift));
+  txn = kv_->createReadWriteTransaction();
+  auto provenance = blockingWait(txn->get(content));
+  ASSERT_OK(provenance);
+  ASSERT_TRUE(*provenance);
+  ASSERT_OK(blockingWait(txn->clear(content)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(req)), StatusCode::kDataCorruption);
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(txn->set(content, **provenance)));
+  ASSERT_OK(blockingWait(txn->commit()));
+
+  // A real Preparing+Bound operation retains the original zero-descriptor
+  // candidate. Missing ECVA must not be mistaken for ECVO not yet existing.
+  Mutation preparing;
+  ASSERT_NO_FATAL_FAILURE(prepare(preparing, object, 0, 719, false, 1, kStripeBytes));
+  auto preparingReq = ownedQuery(object, preparing.begin.operation);
+  ASSERT_OK(blockingWait(metaClient_->queryEcOwnedMutationV2(preparingReq)));
+  const auto &allocation = (*preparing.reservation.allocations)[0];
+  auto chunk = allocation.fragment.identity.chunkId();
+  ASSERT_OK(chunk);
+  std::string allocationKey(kv::toStr(kv::KeyPrefix::EcV2Allocation));
+  allocationKey += chunk->data();
+  txn = kv_->createReadWriteTransaction();
+  auto allocationBytes = blockingWait(txn->get(allocationKey));
+  ASSERT_OK(allocationBytes);
+  ASSERT_TRUE(*allocationBytes);
+  ASSERT_OK(blockingWait(txn->clear(allocationKey)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_ERROR(blockingWait(EcV2BindingCatalog::getOperationBinding(*txn,
+                                                                    object,
+                                                                    preparing.begin.operation,
+                                                                    EcOwner{user_.uid, metaClientId_.uuid})),
+               StatusCode::kNotImplemented);
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(preparingReq)), StatusCode::kDataCorruption);
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(txn->set(allocationKey, **allocationBytes)));
+  ASSERT_OK(blockingWait(txn->commit()));
+
+  // Individually valid ECVO can contain an extra endpoint with a recomputed
+  // digest. It must still exactly match the original reservation's set.
+  const auto operationKey = idKey(kv::KeyPrefix::EcV2Operation, object, preparing.begin.operation);
+  txn = kv_->createReadWriteTransaction();
+  auto operationBytes = blockingWait(txn->get(operationKey));
+  ASSERT_OK(operationBytes);
+  ASSERT_TRUE(*operationBytes);
+  EcV2OperationBinding binding;
+  ASSERT_OK(serde::deserialize(binding, **operationBytes));
+  ASSERT_EQ(binding.operationEndpoints.count, 12);
+  auto &set = binding.operationEndpoints;
+  set.endpoints[12] = set.endpoints[0];
+  set.endpoints[12].engineUuid = Uuid::random();
+  set.count = 13;
+  std::array<storage::EcScopeEndpoint, 13> endpoints;
+  for (size_t i = 0; i != endpoints.size(); ++i) endpoints[i] = set.endpoints[i].controlEndpoint();
+  auto extraDigest = storage::computeEcScopeEndpointDigest(endpoints);
+  ASSERT_OK(extraDigest);
+  set.digest = *extraDigest;
+  ASSERT_OK(blockingWait(txn->set(operationKey, serde::serialize(binding))));
+  ASSERT_OK(blockingWait(txn->commit()));
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(EcV2BindingCatalog::getOperationBinding(*txn,
+                                                                 object,
+                                                                 preparing.begin.operation,
+                                                                 EcOwner{user_.uid, metaClientId_.uuid})));
+  ASSERT_ERROR(blockingWait(metaClient_->queryEcOwnedMutationV2(preparingReq)), StatusCode::kDataCorruption);
+  txn = kv_->createReadWriteTransaction();
+  ASSERT_OK(blockingWait(txn->set(operationKey, **operationBytes)));
+  ASSERT_OK(blockingWait(txn->commit()));
+  ASSERT_OK(blockingWait(metaClient_->queryEcOwnedMutationV2(preparingReq)));
+}
+
+#include "EcFileClientNativeTests.inc"
+#include "EcReadDispatcherNativeTests.inc"
+#include "EcRecoveryWriteNativeTests.inc"
 
 }  // namespace
 }  // namespace hf3fs::meta::server

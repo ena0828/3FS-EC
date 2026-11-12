@@ -73,10 +73,22 @@ Result<Void> StorageOperator::init(uint32_t numberOfDisks) {
     return makeError(StorageCode::kStorageInitFailed);
   }
 
-  return updateWorker_.start(numberOfDisks);
+  RETURN_ON_ERROR(updateWorker_.start(numberOfDisks));
+  auto initialized = initEcRmw();
+  if (!initialized) updateWorker_.stopAndJoin();
+  return initialized;
 }
 
 Result<Void> StorageOperator::stopAndJoin() {
+  // Join real RMW jobs/tickets before any client, target or disk worker goes.
+  if (ecRmw_) RETURN_ON_ERROR(ecRmw_->stopAndJoin());
+  if (ecRmwResources_) ecRmwResources_->closeAndWait();
+  if (ecRmwTransport_) ecRmwTransport_->stopAndJoin();
+  if (ecRmwStorage_) ecRmwStorage_->stop();
+  ecRmw_.reset();
+  ecRmwTransport_.reset();
+  ecRmwStorage_.reset();
+  ecRmwMgmtd_.reset();
   if (ecGc_) RETURN_ON_ERROR(ecGc_->stopAndJoin());
   if (ecHelpers_) ecHelpers_->stopAndJoin();
   if (ecDiscovery_) ecDiscovery_->stopAndJoin();

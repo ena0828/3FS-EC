@@ -97,7 +97,7 @@ class Journal {
   Journal(const Journal &) = delete;
   Journal &operator=(const Journal &) = delete;
 
-  static Result<std::unique_ptr<Journal>> create(const Path &path, const Observation &observation) {
+  static Result<std::unique_ptr<Journal>> create(const Path &path, const auto &observation) {
     if (path.empty()) return makeError(StatusCode::kInvalidArg);
     const auto text = serde::toJsonString(observation) + "\n";
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
@@ -119,7 +119,7 @@ class Journal {
     guard.dismiss();
     return Result<std::unique_ptr<Journal>>(std::move(result));
   }
-  Result<Void> append(const Observation &value) { return appendFd(fd_, serde::toJsonString(value) + "\n"); }
+  Result<Void> append(const auto &value) { return appendFd(fd_, serde::toJsonString(value) + "\n"); }
 
  private:
   static Result<Void> appendFd(int fd, std::string_view text) {
@@ -199,9 +199,142 @@ CoTryTask<Dispatcher::OutputTable> handle(IEnv &ienv,
     co_return makeError(invoked ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kIOError);
   }
 }
+
+struct TreeGcCandidate {
+  SERDE_STRUCT_FIELD(stripe_decimal, std::string{});
+  SERDE_STRUCT_FIELD(revision_decimal, std::string{});
+  SERDE_STRUCT_FIELD(generation_decimal, std::string{});
+  SERDE_STRUCT_FIELD(shard, uint16_t{});
+  SERDE_STRUCT_FIELD(allocation, Uuid::zero());
+};
+struct TreeObservation {
+  SERDE_STRUCT_FIELD(schema, uint16_t{1});
+  SERDE_STRUCT_FIELD(action, std::string{"tree_reclaim"});
+  SERDE_STRUCT_FIELD(phase, std::string{"prepared"});
+  SERDE_STRUCT_FIELD(outcome, std::string{"not_confirmed"});
+  SERDE_STRUCT_FIELD(inode_decimal, std::string{});
+  SERDE_STRUCT_FIELD(object_incarnation, Uuid::zero());
+  SERDE_STRUCT_FIELD(client_namespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(request_id, Uuid::zero());
+  SERDE_STRUCT_FIELD(node, Uuid::zero());
+  SERDE_STRUCT_FIELD(next_node, Uuid::zero());
+  SERDE_STRUCT_FIELD(reclaimed, false);
+  // Each string is "stripe:revision" in unsigned decimal. No logical content
+  // or capability is printed; the root administrator already owns this scope.
+  SERDE_STRUCT_FIELD(retire_candidates, std::vector<std::string>{});
+  SERDE_STRUCT_FIELD(gc_candidates, std::vector<TreeGcCandidate>{});
+  SERDE_STRUCT_FIELD(status_code, uint32_t{});
+};
+auto treeParser() {
+  argparse::ArgumentParser p("ec-advance-tree-reclaim");
+  for (const auto *arg :
+       {"--inode", "--object-incarnation", "--node", "--client-namespace", "--request-id", "--output"})
+    p.add_argument(arg).required();
+  return p;
+}
+CoTryTask<Dispatcher::OutputTable> handleTree(IEnv &ienv,
+                                              const argparse::ArgumentParser &p,
+                                              const Dispatcher::Args &args) {
+  ENSURE_USAGE(args.empty());
+  auto &env = dynamic_cast<AdminEnv &>(ienv);
+  if (!env.userInfo.isRoot() || env.userInfo.token.empty()) co_return makeError(StatusCode::kAuthenticationFail);
+  auto inode = unsignedDecimal(p.get<std::string>("--inode"));
+  CO_RETURN_ON_ERROR(inode);
+  auto object = parseAdminNonNilUuid(p.get<std::string>("--object-incarnation"));
+  CO_RETURN_ON_ERROR(object);
+  auto client = parseAdminNonNilUuid(p.get<std::string>("--client-namespace"));
+  CO_RETURN_ON_ERROR(client);
+  auto id = parseAdminNonNilUuid(p.get<std::string>("--request-id"));
+  CO_RETURN_ON_ERROR(id);
+  const auto nodeText = p.get<std::string>("--node");
+  Uuid node{};
+  if (nodeText != "inspect") {
+    auto n = parseAdminNonNilUuid(nodeText);
+    CO_RETURN_ON_ERROR(n);
+    node = *n;
+  }
+  meta::AdvanceEcTreeReclaimReq req;
+  req.user = env.userInfo;
+  req.client.uuid = *client;
+  req.uuid = *id;
+  req.object = {meta::InodeId(*inode), *object};
+  req.node = node;
+  CO_RETURN_ON_ERROR(req.valid());
+  TreeObservation observation;
+  observation.inode_decimal = std::to_string(*inode);
+  observation.object_incarnation = *object;
+  observation.client_namespace = *client;
+  observation.request_id = *id;
+  observation.node = node;
+  if (node.is_nil()) observation.action = "tree_reclaim_inspect";
+  auto journal = Journal::create(Path(p.get<std::string>("--output")), observation);
+  CO_RETURN_ON_ERROR(journal);
+  bool invoked = false;
+  try {
+    auto remote = env.metaClientGetter();
+    if (!remote) co_return makeError(StatusCode::kInvalidConfig);
+    if (remote->clientId().uuid != *client)
+      co_return makeError(StatusCode::kInvalidArg, "actual MetaClient namespace differs from prepared archive");
+    invoked = true;
+    auto result = co_await folly::coro::co_withCancellation({}, remote->advanceEcTreeReclaim(req));
+    if (result && (result->requestId != req.uuid || result->clientNamespace != req.client.uuid ||
+                   result->progress.object != req.object || result->progress.node != node ||
+                   result->progress.reclaimed != !node.is_nil() ||
+                   (!node.is_nil() && (!result->progress.refs || result->progress.refs->object != req.object ||
+                                       result->progress.refs->node != node ||
+                                       result->progress.refs->state != meta::EcTreeRefState::Reclaimed ||
+                                       result->progress.refs->references))))
+      result = makeError(StorageClientCode::kProtocolMismatch);
+    observation.phase = "result";
+    if (result) {
+      observation.outcome = "confirmed";
+      observation.reclaimed = result->progress.reclaimed;
+      observation.next_node = result->progress.next;
+      for (size_t n = 0; n < 16; ++n) {
+        const auto &slot = result->progress.revisions[n];
+        if (slot.kind != meta::EcTreeSlotKind::Data) continue;
+        observation.retire_candidates.push_back(std::to_string(slot.stripe) + ":" + std::to_string(slot.revision));
+        for (size_t shard = 0; shard < 12; ++shard) {
+          const auto &identity = result->progress.identities[n].fragments[shard];
+          if (!identity.validate() || identity.object != req.object.incarnation || identity.stripe != slot.stripe ||
+              identity.generation != slot.generation || identity.shard != shard) {
+            observation.outcome = "not_confirmed";
+            observation.status_code = StorageClientCode::kProtocolMismatch;
+            CO_RETURN_ON_ERROR((*journal)->append(observation));
+            co_return makeError(StorageClientCode::kProtocolMismatch);
+          }
+          TreeGcCandidate candidate;
+          candidate.stripe_decimal = std::to_string(slot.stripe);
+          candidate.revision_decimal = std::to_string(slot.revision);
+          candidate.generation_decimal = std::to_string(identity.generation);
+          candidate.shard = identity.shard;
+          candidate.allocation = identity.allocation;
+          observation.gc_candidates.push_back(std::move(candidate));
+        }
+      }
+    } else {
+      observation.status_code = result.error().code();
+      observation.outcome = (result.error().code() == TransactionCode::kMaybeCommitted ||
+                             result.error().code() == StorageCode::kEcSealOutcomeUnknown)
+                                ? "unknown"
+                                : "not_confirmed";
+    }
+    auto saved = (*journal)->append(observation);
+    if (!saved) co_return makeError(StorageCode::kEcSealOutcomeUnknown);
+    if (!result)
+      co_return makeError(result.error().code(),
+                          "tree reclaim not confirmed; retry exact original IDs and node with a new archive");
+    co_return Dispatcher::OutputTable{{serde::toJsonString(observation)}};
+  } catch (...) {
+    co_return makeError(invoked ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kIOError);
+  }
+}
 }  // namespace
 
 CoTryTask<void> registerEcRevisionRetirementHandlers(Dispatcher &dispatcher) {
+  CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
+      [] { return treeParser(); },
+      [](IEnv &env, const auto &p, const auto &a) { return handleTree(env, p, a); }));
   CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
       [] { return parserFor("ec-retire-revision"); },
       [](IEnv &env, const auto &parser, const auto &args) { return handle(env, parser, args, true); }));

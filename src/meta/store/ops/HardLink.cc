@@ -13,6 +13,7 @@
 #include "common/utils/Result.h"
 #include "common/utils/UtcTime.h"
 #include "fbs/meta/Service.h"
+#include "meta/store/EcFileLifecycleCatalog.h"
 #include "meta/store/MetaStore.h"
 #include "meta/store/Operation.h"
 #include "meta/store/ops/SetAttr.h"
@@ -31,6 +32,13 @@ class HardLinkOp : public Operation<HardLinkRsp> {
     XLOGF(DBG, "HardLinkOp: {}", req_);
 
     CHECK_REQUEST(req_);
+    EcFileTreeTxnBudget ecTxn(txn);
+    auto previous = co_await EcFileLifecycleCatalog::replay(ecTxn, req_);
+    CO_RETURN_ON_ERROR(previous);
+    if (*previous) {
+      if (!config().authenticate() || !config().enable_ec_rmw()) co_return makeError(StatusCode::kNotImplemented);
+      co_return std::move(**previous);
+    }
     // check name valid
     CO_RETURN_ON_ERROR(req_.newPath.validForCreate());
 
@@ -43,6 +51,8 @@ class HardLinkOp : public Operation<HardLinkRsp> {
         XLOGF(CRITICAL, "HardLink already created, dst {}, req {}, uuid {}", entry, req_, req_.uuid);
         auto inode = co_await entry.snapshotLoadInode(txn);
         CO_RETURN_ON_ERROR(inode);
+        if (inode->isFile() && inode->asFile().layout.isErasureCoded())
+          co_return makeError(StatusCode::kTokenMismatch, "EC link replay requires its permanent request record");
         co_return HardLinkRsp(std::move(*inode));
       }
       co_return makeError(MetaCode::kExists, fmt::format("hardlink exists, req {}, uuid {}", req_, entry));
@@ -61,6 +71,14 @@ class HardLinkOp : public Operation<HardLinkRsp> {
       co_return makeError(MetaCode::kNoPermission, fmt::format("FS_IMMUTABLE_FL set on target inode {}", inode.id));
     }
     if (inode.isFile()) {
+      if (inode.asFile().layout.isErasureCoded()) {
+        if (!config().authenticate() || !config().enable_ec_rmw()) co_return makeError(StatusCode::kNotImplemented);
+        co_return co_await EcFileLifecycleCatalog::link(ecTxn,
+                                                        req_,
+                                                        inode.id,
+                                                        resolveResult->getParentId(),
+                                                        req_.newPath.path->filename().native());
+      }
       CO_RETURN_ON_ERROR(inode.asFile().layout.checkReplicated());
     }
 

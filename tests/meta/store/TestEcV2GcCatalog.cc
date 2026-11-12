@@ -10,8 +10,10 @@
 #include "common/kv/mem/MemKVEngine.h"
 #include "fbs/meta/EcRequestDigest.h"
 #include "fdb/FDBKVEngine.h"
+#include "meta/store/EcFileTreeGcGuard.h"
 #include "meta/store/EcV2GcCatalog.h"
 #include "meta/store/EcV2LifecycleUtils.h"
+#include "meta/store/detail/EcFileTreeKeys.h"
 #include "storage/ec_codec/EcCodec.h"
 #include "storage/ec_scope/EcScopeControlExecutor.h"
 #include "storage/store/StorageTargets.h"
@@ -453,6 +455,19 @@ TEST_F(TestEcGcDrainPersistence, ExactClaimRequiresAllAckT2AndSurvivesUnknownCom
     EXPECT_EQ(after->registered, 1);
     EXPECT_EQ(after->released, 1);
     const auto claimId = Uuid::random();
+    // Extra tree-hold invariant at the actual mode-3 G0 entry, including its
+    // private-FDB run. Deliberately injected metadata is not a mode-4 publisher.
+    auto holdKey = ec_tree_detail::allocationKey(kv::KeyPrefix::EcTreeAllocationHold, identity);
+    ASSERT_OK(holdKey);
+    EcTreeAllocationHolds hold;
+    hold.object = f.object;
+    hold.identity = identity;
+    hold.holds = 1;
+    ASSERT_OK(f.run([&](auto &next) { return ec_tree_detail::store(next, *holdKey, hold); }));
+    ASSERT_ERROR(f.run([&](auto &next) { return EcV2GcCatalog::claim(next, f.object, identity, claimId, *key); }),
+                 StatusCode::kTokenStale);
+    hold.holds = 0;
+    ASSERT_OK(f.run([&](auto &next) { return ec_tree_detail::store(next, *holdKey, hold); }));
     txn = f.engine->createReadWriteTransaction();
     auto claimed = blockingWait(EcV2GcCatalog::claim(*txn, f.object, identity, claimId, *key));
     ASSERT_OK(claimed);

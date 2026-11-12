@@ -15,7 +15,49 @@ from generate import put, to_toml, tune
 
 PROFILE = "native-v2-local-1-storage-12-targets"
 GC_PROFILE = "native-gc-local-1-storage-12-targets"
-PROFILES = {"v2": PROFILE, "gc": GC_PROFILE}
+MULTI_PROFILE = "native-v2-local-12-storage-12-targets"
+MULTI_GC_PROFILE = "native-gc-local-12-storage-12-targets"
+PROFILES = {"v2": PROFILE, "gc": GC_PROFILE, "v2-12": MULTI_PROFILE, "gc-12": MULTI_GC_PROFILE}
+
+
+def storage_process_count(manifest):
+    profile = manifest.get("profile")
+    if profile in (PROFILE, GC_PROFILE):
+        return 1
+    if profile in (MULTI_PROFILE, MULTI_GC_PROFILE):
+        return 12
+    raise ValueError("Unknown native process topology")
+
+
+def storage_specs(manifest):
+    count = storage_process_count(manifest)
+    root, port = Path(manifest["root"]), manifest["port_base"]
+    if type(port) is not int or not 1024 <= port <= 65535 - (count + 2):
+        raise ValueError("Native topology requires a valid complete port interval")
+    return [dict(node=10001 + i, name="storage" if count == 1 else f"storage-{10001+i}",
+                 stem="storage_main" if count == 1 else f"storage-{10001+i}", port=port + 3 + i,
+                 data_path=str(root / f"data/storage-{10001+i}")) for i in range(count)]
+
+
+def topology_problems(manifest):
+    count = storage_process_count(manifest)
+    problems = []
+    if type(manifest.get("storage_count")) is not int or manifest["storage_count"] != count or \
+            type(manifest.get("logical_target_count")) is not int or manifest["logical_target_count"] != 12:
+        problems.append("Storage process/target count differs from explicit profile")
+    expected = [dict(node=10001 + (i if count == 12 else 0), chain=910001+i, target=1100001+i) for i in range(12)]
+    actual = manifest.get("endpoints", [])
+    if actual != expected or any(type(e.get(k)) is not int for e in actual for k in ("node", "chain", "target")):
+        problems.append("Endpoint map must be the fixed twelve target/chain identities for this profile")
+    if type(manifest.get("independent_storage_failure_domains")) is not int or manifest["independent_storage_failure_domains"] != 1:
+        problems.append("A local process topology still has one physical machine failure domain")
+    if count == 12 and (type(manifest.get("storage_process_failure_domains")) is not int or
+                        manifest["storage_process_failure_domains"] != 12 or
+                        manifest.get("deployment_scope") != "single_machine_distinct_processes_not_physical_hosts" or
+                        manifest.get("remote_global_storage_config_policy") != "pinned_local_mismatch_rejected_not_version_acked"):
+        problems.append("Twelve-process manifest must explicitly preserve physical/configuration limitations")
+    storage_specs(manifest)
+    return problems
 
 
 def nonzero_uuid(value):
@@ -29,11 +71,11 @@ def nonzero_uuid(value):
 
 def gc_settings(manifest):
     """Validate requested configuration, never infer a live target's format."""
-    if manifest.get("profile") == PROFILE:
+    if manifest.get("profile") in (PROFILE, MULTI_PROFILE):
         if "gc" in manifest:
             raise ValueError("V2 bundle cannot acquire GC settings; prepare a new GC root")
         return None
-    if manifest.get("profile") != GC_PROFILE:
+    if manifest.get("profile") not in (GC_PROFILE, MULTI_GC_PROFILE):
         raise ValueError("Unknown native profile")
     config = manifest.get("gc", {})
     if not isinstance(config, dict):
@@ -42,43 +84,89 @@ def gc_settings(manifest):
         nonzero_uuid(config.get(key))
     if config["authority"] == nonzero_uuid(manifest.get("authority")):
         raise ValueError("G authority must be distinct from the control authority")
-    expected = {"data_protocol": 2, "disk_format": 3, "gc_protocol": 1}
+    expected = {"data_protocol": 2, "disk_format": 3,
+                "gc_protocol": 2 if manifest.get("file_api") is True else 1}
     if any(type(config.get(key)) is not int or config[key] != value for key, value in expected.items()):
-        raise ValueError("GC profile requires data protocol 2, disk format 3, GC protocol 1")
+        raise ValueError("GC profile requires data protocol 2, disk format 3 and its explicitly selected GC protocol")
     return config
 
 
 def key_roles(manifest):
-    return ("data", "control", "helper", "gc") if gc_settings(manifest) else ("data", "control", "helper")
+    roles = ("data", "control", "helper", "gc") if gc_settings(manifest) else ("data", "control", "helper")
+    return roles + ("rmw",) if file_api_enabled(manifest) else roles
+
+
+def file_api_enabled(manifest):
+    enabled = manifest.get("file_api", False)
+    if type(enabled) is not bool:
+        raise ValueError("file_api must be an explicit boolean")
+    if enabled and not gc_settings(manifest):
+        raise ValueError("File API requires a fresh GC profile with staging disk format 3")
+    return enabled
+
+
+def required_services(manifest):
+    return SERVICES + ("ec_file_cli",) if file_api_enabled(manifest) else SERVICES
 
 
 def profile_config_problems(manifest, configs):
     """Fail closed on profile/config drift before opening any target root."""
     gc = gc_settings(manifest)
+    file_api = file_api_enabled(manifest)
     meta = configs["meta_main.toml"]["server"]["meta"]
-    storage = configs["storage_main.toml"]["server"]
-    targets, service = storage["targets"], storage["storage"]
+    count = storage_process_count(manifest)
+    # Preserve the original one-process names and values. Twelve-process roots
+    # use actual per-node paths; no generic STORAGE template can replace them.
+    names = ["storage_main.toml"] if count == 1 else [f"storage-{10001+i}.toml" for i in range(12)]
     problems = []
-    if not gc:
-        if targets.get("ec_exact_gc", False) or service.get("enable_ec_gc", False) or \
-                meta.get("enable_ec_exact_gc", False) or meta.get("enable_ec_revision_retirement", False):
-            problems.append("V2 profile cannot be converted to GC; use a fresh explicitly prepared GC root")
-        return problems
-    storage_flags = [targets.get(key) for key in ("ec_only", "ec_staging_v2", "ec_exact_gc")]
-    storage_flags += [service.get(key) for key in ("enable_ec_fragments", "enable_ec_gc")]
-    if any(value is not True for value in storage_flags):
-        problems.append("GC Storage requires explicit EC-only staging format 3 and enabled GC")
-    expected = {"ec_gc_authority": gc["authority"], "ec_gc_key_id": gc["key_id"],
-                "ec_gc_key_file": str(Path(manifest["root"]) / "secrets/gc.key")}
-    for label, settings in (("Meta", meta), ("Storage", service)):
-        if any(settings.get(key) != value for key, value in expected.items()):
-            problems.append(f"{label} G key/authority configuration differs from prepared identity")
-    # All three gates remain false until fresh C and G observations agree.
-    gates = [meta.get(key) for key in ("enable_ec_v2", "enable_ec_exact_gc", "enable_ec_revision_retirement")]
-    if any(type(value) is not bool for value in gates) or gates[1] != gates[0] or gates[2] != gates[0]:
-        problems.append("Meta V2/GC/retirement gates must be enabled together after discovery")
-    if configs["admin_cli.toml"].get("client_uuid") != gc["client_namespace"]:
-        problems.append("actual administrator client namespace differs from the prepared GC bundle")
+    for name in names:
+        storage = configs[name]["server"]
+        targets, service = storage["targets"], storage["storage"]
+        if service.get("enable_ec_rmw", False) is not file_api:
+            problems.append(f"{name} RMW gate differs from the prepared file API selection")
+        if file_api:
+            expected_rmw = {"ec_rmw_authority": manifest["authority"],
+                            "ec_rmw_key_file": str(Path(manifest["root"]) / "secrets/rmw.key")}
+            for label, settings in (("Meta", meta), (name, service)):
+                if any(settings.get(key) != value for key, value in expected_rmw.items()):
+                    problems.append(f"{label} RMW key/authority differs from prepared identity")
+        if not gc:
+            if targets.get("ec_exact_gc", False) or service.get("enable_ec_gc", False) or \
+                    meta.get("enable_ec_exact_gc", False) or meta.get("enable_ec_revision_retirement", False):
+                problems.append("V2 profile cannot be converted to GC; use a fresh explicitly prepared GC root")
+            continue
+        flags = [targets.get(key) for key in ("ec_only", "ec_staging_v2", "ec_exact_gc")]
+        flags += [service.get(key) for key in ("enable_ec_fragments", "enable_ec_gc")]
+        if any(value is not True for value in flags):
+            problems.append(f"{name} requires explicit EC-only staging format 3 and enabled GC")
+        expected = {"ec_gc_authority": gc["authority"], "ec_gc_key_id": gc["key_id"],
+                    "ec_gc_key_file": str(Path(manifest["root"]) / "secrets/gc.key")}
+        for label, settings in (("Meta", meta), (name, service)):
+            if any(settings.get(key) != value for key, value in expected.items()):
+                problems.append(f"{label} G key/authority configuration differs from prepared identity")
+    if gc:
+        gates = [meta.get(key) for key in ("enable_ec_v2", "enable_ec_exact_gc", "enable_ec_revision_retirement")]
+        if any(type(value) is not bool for value in gates) or gates[1] != gates[0] or gates[2] != gates[0]:
+            problems.append("Meta V2/GC/retirement gates must be enabled together after discovery")
+        if configs["admin_cli.toml"].get("client_uuid") != gc["client_namespace"]:
+            problems.append("actual administrator client namespace differs from the prepared GC bundle")
+    for key in ("enable_ec_rmw", "enable_ec_file_ranges"):
+        expected = bool(file_api and meta.get("enable_ec_v2") is True)
+        if meta.get(key, False) is not expected:
+            problems.append(f"Meta {key} must follow the prepared file API and verified V2 pool")
+    if count == 12:
+        if meta.get("ec_allow_colocated_test_targets") is not False:
+            problems.append("Twelve-process placement requires twelve distinct Storage node IDs")
+        for spec in storage_specs(manifest):
+            config = configs[spec["stem"] + ".toml"]
+            groups = config["server"]["base"]["groups"]
+            app = configs[spec["stem"] + "_app.toml"]
+            if len(groups) != 1 or type(groups[0]["listener"].get("listen_port")) is not int or \
+                    groups[0]["listener"]["listen_port"] != spec["port"] or \
+                    config["server"]["targets"].get("target_paths") != [spec["data_path"]] or \
+                    type(app.get("node_id")) is not int or app["node_id"] != spec["node"] or \
+                    config["common"]["log"]["handlers"][0].get("file_path") != str(Path(manifest["root"])/"logs"/(spec["name"]+".log")):
+                problems.append(f"{spec['name']} port/path/node/log differs from its prepared topology")
     return problems
 
 
@@ -126,13 +214,15 @@ def tcp_only(value):
                 tcp_only(item)
 
 
-def generate_configs(source, root, port_base, authority, cluster_id, *, profile="v2", gc=None):
+def generate_configs(source, root, port_base, authority, cluster_id, *, profile="v2", gc=None, file_api=False):
     """Pure configuration generation, shared by prepare and configuration tests."""
     if profile not in PROFILES:
         raise ValueError("Unknown native profile")
     requested = {"profile": PROFILES[profile], "authority": authority}
     if gc is not None:
         requested["gc"] = gc
+    requested["file_api"] = file_api
+    file_api = file_api_enabled(requested)
     gc = gc_settings(requested)
     root = str(root)
     configs, hashes = {}, {}
@@ -187,6 +277,11 @@ def generate_configs(source, root, port_base, authority, cluster_id, *, profile=
                     ec_gc_key_file=f"{root}/secrets/gc.key", ec_gc_key_id=gc["key_id"],
                     ec_gc_authority=gc["authority"], ec_gc_request_ttl_seconds=60,
                     ec_gc_timeout="60s", ec_gc_max_concurrent=1)
+            if file_api:
+                data["server"]["meta"].update(enable_ec_rmw=False, enable_ec_file_ranges=False,
+                    ec_rmw_key_file=f"{root}/secrets/rmw.key", ec_rmw_authority=authority,
+                    ec_rmw_grant_ttl_seconds=60,
+                    ec_rmw_transport=copy.deepcopy(data["server"]["background_client"]))
             put(data, "server.meta.gc.enable", False)
             put(data, "server.meta.session_manager.enable", False)
         configs[f"{kind}_main.toml"] = data
@@ -234,6 +329,10 @@ def generate_configs(source, root, port_base, authority, cluster_id, *, profile=
         store["targets"]["ec_exact_gc"] = True
         store["storage"].update(enable_ec_gc=True, ec_gc_key_file=f"{root}/secrets/gc.key",
                                 ec_gc_key_id=gc["key_id"], ec_gc_authority=gc["authority"])
+    if file_api:
+        store["storage"].update(enable_ec_rmw=True, ec_rmw_key_file=f"{root}/secrets/rmw.key",
+            ec_rmw_authority=authority, ec_rmw_transport=copy.deepcopy(store["client"]),
+            ec_rmw_client=copy.deepcopy(configs["meta_main.toml"]["server"]["storage_client"]))
     store["targets"]["storage_target"]["force_persist"] = True
     configs["storage_main.toml"] = data
     launcher = load("storage_main_launcher")
@@ -260,10 +359,32 @@ def generate_configs(source, root, port_base, authority, cluster_id, *, profile=
     client["user_info"].update(uid=1000, gid=1000, token_file=f"{root}/client/user.token")
     client["mgmtd_client"]["mgmtd_server_addresses"] = [mgmtd_address]
     configs["stripe-client.toml"] = client
+    if file_api:
+        file_client = {key: copy.deepcopy(client[key]) for key in
+                       ("cluster_id", "worker_threads", "deadline_seconds", "user_info",
+                        "mgmtd_client", "meta_client", "storage_client") if key in client}
+        file_client["client"] = {"force_use_tcp": True}
+        file_client["log"] = f"INFO:normal; normal=file:path={root}/logs/ec-file.log,async=true,sync_level=ERR"
+        configs["file-client.toml"] = file_client
+    if profile in ("v2-12", "gc-12"):
+        storage = configs.pop("storage_main.toml")
+        launcher = configs.pop("storage_main_launcher.toml")
+        configs.pop("storage_main_app.toml")
+        meta = configs["meta_main.toml"]["server"]["meta"]
+        meta["ec_allow_colocated_test_targets"] = False
+        manifest = dict(profile=PROFILES[profile], root=root, port_base=port_base)
+        for spec in storage_specs(manifest):
+            node = copy.deepcopy(storage)
+            node["server"]["base"]["groups"][0]["listener"]["listen_port"] = spec["port"]
+            node["server"]["targets"]["target_paths"] = [spec["data_path"]]
+            node["common"]["log"]["handlers"][0]["file_path"] = f"{root}/logs/{spec['name']}.log"
+            configs[spec["stem"] + ".toml"] = node
+            configs[spec["stem"] + "_launcher.toml"] = copy.deepcopy(launcher)
+            configs[spec["stem"] + "_app.toml"] = {"allow_empty_node_id": False, "node_id": spec["node"]}
     return configs, hashes
 
 
-def prepare(root, source, port_base, profile="v2"):
+def prepare(root, source, port_base, profile="v2", *, file_api=False):
     if os.name != "posix":
         raise RuntimeError("prepare requires the target Linux filesystem and permission semantics")
     original = root.absolute()
@@ -272,35 +393,48 @@ def prepare(root, source, port_base, profile="v2"):
         raise RuntimeError("Use a new absolute, non-symlink task directory named 3fs-ec-native-*")
     if not root.parent.is_dir() or root.exists():
         raise RuntimeError("Parent must exist; the task directory must not exist (no overwrite or adoption)")
-    if not 1024 <= port_base <= 65532:
-        raise RuntimeError("port-base must be in [1024, 65532]")
+    count = storage_process_count({"profile": PROFILES.get(profile)})
+    if type(port_base) is not int or not 1024 <= port_base <= 65535 - (count + 2):
+        raise RuntimeError("port-base leaves insufficient consecutive ports for this profile")
     authority, cluster_id = str(uuid.uuid4()), "ec_native_" + secrets.token_hex(6)
     gc = None
-    if profile == "gc":
+    if profile in ("gc", "gc-12"):
         gc = {"authority": str(uuid.uuid4()), "key_id": str(uuid.uuid4()), "client_namespace": str(uuid.uuid4()),
-              "data_protocol": 2, "disk_format": 3, "gc_protocol": 1}
+              "data_protocol": 2, "disk_format": 3, "gc_protocol": 2 if file_api else 1}
     configs, hashes = generate_configs(source.resolve(strict=True), root, port_base, authority, cluster_id,
-                                       profile=profile, gc=gc)
+                                       profile=profile, gc=gc, file_api=file_api)
     root.mkdir(mode=0o700)
     for name in ("config", "secrets", "client", "state", "logs", "scripts", "data", "bin", "lib", "provenance"):
         (root / name).mkdir(mode=0o700)
-    for role in (("data", "control", "helper", "gc") if gc else ("data", "control", "helper")):
+    if file_api:
+        (root / "client/runs").mkdir(mode=0o700)
+        (root / "client/outputs").mkdir(mode=0o700)
+    roles = ("data", "control", "helper", "gc") if gc else ("data", "control", "helper")
+    for role in (roles + ("rmw",) if file_api else roles):
         write_new(root / "secrets" / f"{role}.key", secrets.token_bytes(32))
     for name, data in configs.items():
-        destination = root / ("client" if name == "stripe-client.toml" else "config") / name
+        destination = root / ("client" if name in ("stripe-client.toml", "file-client.toml") else "config") / name
         write_new(destination, to_toml(data))
     write_new(root / "config/fdb.cluster", f"{cluster_id}:{secrets.token_hex(8)}@127.0.0.1:{port_base}\n")
-    endpoints = [{"node": 10001, "chain": 910001 + i, "target": 1100001 + i} for i in range(12)]
+    endpoints = [{"node": 10001 + (i if count == 12 else 0), "chain": 910001 + i, "target": 1100001 + i} for i in range(12)]
     write_new(root / "config/chains.csv", "ChainId,TargetId\n" + "".join(f"{e['chain']},{e['target']}\n" for e in endpoints))
     write_new(root / "config/chain-table.csv", "ChainId\n" + "".join(f"{e['chain']}\n" for e in endpoints))
     manifest = {"schema": 1, "profile": PROFILES[profile], "root": str(root), "cluster_id": cluster_id,
-        "authority": authority, "port_base": port_base, "storage_count": 1, "logical_target_count": 12,
+        "authority": authority, "port_base": port_base, "storage_count": count, "logical_target_count": 12,
         "independent_storage_failure_domains": 1, "endpoints": endpoints, "source_config_sha256": hashes,
         "fdb_version": "7.3.63", "state": "prepared_not_started", "performance_validated": False}
     if gc:
         manifest["gc"] = gc
+    if file_api:
+        manifest["file_api"] = True
+    if count == 12:
+        manifest["storage_process_failure_domains"] = 12
+        manifest["deployment_scope"] = "single_machine_distinct_processes_not_physical_hosts"
+        manifest["remote_global_storage_config_policy"] = "pinned_local_mismatch_rejected_not_version_acked"
     write_new(root / "cluster.json", json_text(manifest))
-    for name in ("generate.py", "run-cluster.py", "native_v2_config.py", "native-v2.py", "fetch-fdb.sh"):
+    for name in ("generate.py", "run-cluster.py", "native_v2_config.py", "native-v2.py", "fetch-fdb.sh",
+                 "experiment-runner.py", "experiment-menu.py", "file-command.py", "ack-service-acceptance.py",
+                 "ack-expected-scripts.json", "gc-acceptance.py"):
         shutil.copy2(Path(__file__).parent / name, root / "scripts" / name)
     print(f"Prepared {root}: private keys and configuration only; no services, targets or database opened.")
 
@@ -310,7 +444,8 @@ def pool_from_observations(manifest, observations):
         raise ValueError("Require twelve fresh administrator-verified observations")
     pool = []
     for expected, observation in zip(manifest["endpoints"], observations, strict=True):
-        if observation.get("schema") != 1 or observation.get("protocol") != 2 or \
+        if any(type(observation.get(k)) is not int for k in ("schema", "protocol", "node", "chain", "target")) or \
+                observation.get("schema") != 1 or observation.get("protocol") != 2 or \
                 observation.get("authority") != manifest["authority"] or \
                 observation.get("verification") != "control_mac_verified" or \
                 any(observation.get(k) != v for k, v in expected.items()):
@@ -324,6 +459,10 @@ def pool_from_observations(manifest, observations):
         pool.append(item)
     if len({(p["chain"], p["target"]) for p in pool}) != 12:
         raise ValueError("Duplicate logical endpoint")
+    if manifest.get("profile") in (MULTI_PROFILE, MULTI_GC_PROFILE):
+        if len({p["node"] for p in pool}) != 12 or len({p["engine_uuid"] for p in pool}) != 12 or \
+                len({p["target_incarnation"] for p in pool}) != 12:
+            raise ValueError("Twelve-process topology requires twelve actual independent Engine/target identities")
     return pool
 
 
@@ -339,7 +478,7 @@ def gc_inventory_from_observations(manifest, pool, observations, now_seconds):
         raise ValueError("Discovery comparison time must be a positive integer")
     if gc is None or len(pool) != 12 or len(observations) != 12:
         raise ValueError("Require the GC profile and twelve actual C/G observations")
-    inventory, boots = [], set()
+    inventory, boots, boots_by_node = [], set(), {}
     for endpoint, observed in zip(pool, observations, strict=True):
         integers = ("schema", "discovery_protocol", "node", "chain", "target", "data_protocol",
                     "disk_format", "gc_protocol", "capabilities")
@@ -351,15 +490,22 @@ def gc_inventory_from_observations(manifest, pool, observations, now_seconds):
                 observed.get("authority") != gc["authority"] or observed.get("key_id") != gc["key_id"] or \
                 any(observed.get(key) != value for key, value in endpoint.items()):
             raise ValueError("G observation does not bind the configured authority and actual C instance")
-        if (observed.get("data_protocol"), observed.get("disk_format"), observed.get("gc_protocol"),
-                observed.get("capabilities")) != (2, 3, 1, 3):
-            raise ValueError("Actual target does not admit format-3 Collect and Query")
+        if (observed.get("data_protocol"), observed.get("disk_format"), observed.get("capabilities")) != (2, 3, 3) or \
+                observed["gc_protocol"] not in (1, 2) or observed["gc_protocol"] < gc["gc_protocol"]:
+            raise ValueError("Actual target does not admit format-3 Collect and Query at the required GC protocol")
         observed_at, verified_at = observed.get("observed_at_seconds"), observed.get("verified_at_seconds")
         if type(observed_at) is not int or type(verified_at) is not int or \
                 not 0 < observed_at <= verified_at <= now_seconds or now_seconds - observed_at > 60:
             raise ValueError("G discovery is not a fresh observation")
-        boots.add(nonzero_uuid(observed.get("boot_nonce")))
-        inventory.append(dict(endpoint, data_protocol=2, disk_format=3, gc_protocol=1))
-    if len(boots) != 1:
-        raise ValueError("One-Storage profile observed multiple process boot sessions; retry startup")
+        boot = nonzero_uuid(observed.get("boot_nonce"))
+        boots.add(boot)
+        boots_by_node.setdefault(endpoint["node"], set()).add(boot)
+        # Record actual observed support, never project the requested minimum
+        # back into the observation. G2 explicitly includes G1 support.
+        inventory.append(dict(endpoint, data_protocol=2, disk_format=3, gc_protocol=observed["gc_protocol"]))
+    if storage_process_count(manifest) == 1:
+        if len(boots) != 1:
+            raise ValueError("One-Storage profile observed multiple process boot sessions; retry startup")
+    elif len(boots_by_node) != 12 or len(boots) != 12 or any(len(values) != 1 for values in boots_by_node.values()):
+        raise ValueError("Twelve-process discovery must bind a distinct live boot session to each Storage node")
     return inventory

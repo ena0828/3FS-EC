@@ -1,1 +1,1 @@
-target_add_lib(storage-client storage-fbs common mgmtd-client ec-repair)
+target_add_lib(storage-client storage-fbs common mgmtd-client ec-repair ec-rmw-core)

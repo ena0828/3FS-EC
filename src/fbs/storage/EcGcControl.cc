@@ -94,8 +94,11 @@ Result<Void> validate(const EcScopeEndpoint &value) {
   return Void{};
 }
 Result<Void> validate(const EcGcCertificate &value) {
-  if (value.version != 1 || value.metaMode != 3 || value.catalogVersion != 1 || value.enrollmentVersion != 1 ||
-      value.bindingVersion != 1 || value.dataProtocol != 2 || value.diskFormat != 3 || value.gcProtocol != 1 ||
+  const bool flat = value.version == 1 && value.metaMode == 3 && value.catalogVersion == 1 &&
+                    value.enrollmentVersion == 1 && value.gcProtocol == 1;
+  const bool tree = value.version == 2 && value.metaMode == 4 && value.catalogVersion == 2 &&
+                    value.enrollmentVersion == 2 && value.gcProtocol == 2;
+  if ((!flat && !tree) || value.bindingVersion != 1 || value.dataProtocol != 2 || value.diskFormat != 3 ||
       value.claimId.is_nil() || value.objectInode < 2 || value.objectInode > ((uint64_t{1} << 57) - 1) ||
       value.objectIncarnation.is_nil() || value.creatorClient.is_nil() || value.createRequest.is_nil() ||
       value.fragment.object != value.objectIncarnation || value.fragmentOperation.is_nil() ||
@@ -459,8 +462,9 @@ Result<VerifiedEcGcRequest> Codec::verifyRequest(const EcGcKey &key,
       !same(request.claims.certificate.endpoint, actual.endpoint)) {
     return makeError(StatusCode::kTokenMismatch, "GC key, authority, action or actual instance differs");
   }
-  if (!actual.enabled || actual.dataProtocol != 2 || actual.diskFormat != 3 || actual.gcProtocol != 1) {
-    return makeError(StatusCode::kInvalidConfig, "actual target does not enable data2/disk3/GC1 independently");
+  if (!actual.enabled || actual.dataProtocol != 2 || actual.diskFormat != 3 ||
+      !ecGcProtocolSupports(actual.gcProtocol, request.claims.certificate.gcProtocol)) {
+    return makeError(StatusCode::kInvalidConfig, "actual target does not enable the exact data2/disk3/GC protocol");
   }
   RETURN_ON_ERROR(checkTime(request.claims, now));
   CHECK_RESULT(claim, claimDigest(request.claims.certificate));

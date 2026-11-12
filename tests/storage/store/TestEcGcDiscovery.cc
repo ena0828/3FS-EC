@@ -270,7 +270,7 @@ TEST_F(TestEcGcDiscoveryRuntime, ActualFormatInstanceAndLiveReadOnlyPolicyAreObs
                          observed->claims.endpoint.targetIncarnation.data));
   EXPECT_EQ(observed->claims.diskFormat, 3);
   EXPECT_EQ(observed->claims.dataProtocol, 2);
-  EXPECT_EQ(observed->claims.gcProtocol, 1);
+  EXPECT_EQ(observed->claims.gcProtocol, kEcGcSupportedProtocol);
   EXPECT_EQ(observed->claims.capabilities, kEcGcDiscoveryCollectQuery);
   readOnly.store(true);
   auto queryOnly = observe(*request);

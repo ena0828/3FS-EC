@@ -6,7 +6,9 @@
 #include <limits>
 #include <sys/stat.h>
 
+#include "client/ec/EcStripeRecoveryWrite.h"
 #include "client/ec/EcStripeRunRecord.h"
+#include "fbs/meta/EcRequestDigest.h"
 #include "tests/GtestHelpers.h"
 
 namespace hf3fs::client::ec::test {
@@ -121,6 +123,111 @@ void completeObjectResume(std::string action) {
 TEST(TestEcStripeRunRecord, WriteResumesCompleteObjectAndObservationFromJson) { completeObjectResume("write"); }
 TEST(TestEcStripeRunRecord, ReadResumesCompleteObjectAndObservationFromJson) { completeObjectResume("read"); }
 TEST(TestEcStripeRunRecord, RepairResumesCompleteObjectAndObservationFromJson) { completeObjectResume("repair"); }
+
+TEST(TestEcStripeRunRecord, RecoveryWritePersistsIndependentIdentityAndKeepsV1Representation) {
+  folly::test::TemporaryDirectory temporary;
+  const auto parent = std::filesystem::path(temporary.path().string());
+  auto source = record();
+  const std::string input("restore\0me!", 11);
+  std::array<std::string_view, 10> parts{};
+  parts[0] = input;
+  auto hash = meta::computeEcLogicalSha256(parts, input.size());
+  ASSERT_OK(hash);
+  source.inputSha256 = *hash;
+  EcStripeRunObservation published;
+  published.state = "Published";
+  published.object = completeObject(source);
+  published.ownerUid = 123;
+  published.revision = 18;
+  published.mutationPublished = true;
+  auto old = EcStripeRunJournal::create(parent / "source", source);
+  ASSERT_OK(old);
+  ASSERT_OK((*old)->append(published));
+  old->reset();
+  auto oldBytes = readEcStripeInput(parent / "source" / "record.json", 65536);
+  ASSERT_OK(oldBytes);
+  EXPECT_EQ(oldBytes->find("recoverySource"), std::string::npos);
+  auto oldAgain = EcStripeRunJournal::resume(parent / "source");
+  ASSERT_OK(oldAgain);
+  EXPECT_EQ(serde::serialize((*oldAgain)->record()), serde::serialize(source));
+  oldAgain->reset();
+  // Digests here are local provenance fixtures, not forged remote authority.
+  auto fresh = prepareEcRecoveryWrite(record(),
+                                      source,
+                                      published,
+                                      (parent / "source").string(),
+                                      *hash,
+                                      *hash,
+                                      (parent / "input").string(),
+                                      input);
+  ASSERT_OK(fresh);
+  EXPECT_EQ(fresh->expectedRevision, 18);
+  EXPECT_EQ(fresh->object->object, published.object->object);
+  EXPECT_EQ(fresh->clientNamespace, source.clientNamespace);
+  EXPECT_NE(fresh->operation, source.operation);
+  auto created = EcStripeRunJournal::create(parent / "recovery", *fresh);
+  ASSERT_OK(created);
+  EcStripeRunObservation unknown;
+  unknown.state = "Indeterminate";
+  unknown.ownerUid = *fresh->expectedOwnerUid;
+  unknown.object = fresh->object;
+  unknown.errorCode = TransactionCode::kMaybeCommitted;
+  ASSERT_OK((*created)->append(unknown));
+  created->reset();
+  auto resumed = EcStripeRunJournal::resume(parent / "recovery");
+  ASSERT_OK(resumed);
+  EXPECT_EQ(serde::serialize((*resumed)->record()), serde::serialize(*fresh));
+  EXPECT_EQ((*resumed)->latest()->errorCode, unknown.errorCode);
+  auto overlap = *fresh;
+  overlap.publishRequest = overlap.recoverySource->getRequest;
+  EXPECT_FALSE(overlap.validate());
+  auto downgrade = *fresh;
+  downgrade.version = 1;
+  EXPECT_FALSE(downgrade.validate());
+  auto changedEpoch = *fresh;
+  ++changedEpoch.object->epoch;
+  EXPECT_FALSE(changedEpoch.validate());
+  auto oldBytesAfter = readEcStripeInput(parent / "source" / "record.json", 65536);
+  ASSERT_OK(oldBytesAfter);
+  EXPECT_EQ(*oldBytes, *oldBytesAfter);
+}
+
+TEST(TestEcStripeRunRecord, RecoveryWriteRejectsUnconfirmedSourceChangedInputAndReusedRequests) {
+  auto source = record();
+  const std::string input = "hello world";
+  std::array<std::string_view, 10> parts{};
+  parts[0] = input;
+  auto hash = meta::computeEcLogicalSha256(parts, input.size());
+  ASSERT_OK(hash);
+  source.inputSha256 = *hash;
+  EcStripeRunObservation published;
+  published.state = "Published";
+  published.object = completeObject(source);
+  published.ownerUid = 123;
+  published.revision = 18;
+  published.mutationPublished = true;
+  auto attempt = [&](EcStripeRunRecord fresh, EcStripeRunObservation state, std::string_view data) {
+    return prepareEcRecoveryWrite(std::move(fresh), source, state, "/source", *hash, *hash, "/input", data);
+  };
+  EXPECT_TRUE(attempt(record(), published, input));
+  EXPECT_FALSE(attempt(record(), published, "hello worle"));
+  EXPECT_FALSE(attempt(record(), published, "hello"));
+  auto incomplete = published;
+  incomplete.mutationPublished = false;
+  EXPECT_FALSE(attempt(record(), incomplete, input));
+  incomplete = published;
+  incomplete.errorCode = StatusCode::kIOError;
+  EXPECT_FALSE(attempt(record(), incomplete, input));
+  auto fresh = record();
+  fresh.getRequest = source.publishRequest;
+  EXPECT_FALSE(attempt(fresh, published, input));
+  fresh = record();
+  fresh.getRequest = fresh.beginRequest;
+  EXPECT_FALSE(attempt(fresh, published, input));
+  fresh = record();
+  fresh.cluster = "another-cluster";
+  EXPECT_FALSE(attempt(fresh, published, input));
+}
 
 TEST(TestEcStripeRunRecord, ResumeRejectsNarrowingNegativeAndFractionalNumbers) {
   folly::test::TemporaryDirectory temporary;

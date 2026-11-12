@@ -46,6 +46,14 @@ impl Clusters {
         self.files[group_id.cluster() as usize].fallocate(group_id, true)
     }
 
+    pub(crate) fn punch_empty_group(&self, group: GroupId) -> std::io::Result<()> {
+        self.files[group.cluster() as usize].punch_empty_group(group)
+    }
+
+    pub(crate) fn sync_trim(&self, group: GroupId) -> std::io::Result<()> {
+        self.files[group.cluster() as usize].sync_trim()
+    }
+
     pub fn pread(&self, pos: Position, buf: &mut [u8], offset: u32) -> Result<()> {
         self.files[pos.cluster() as usize].pread(pos, buf, offset)
     }

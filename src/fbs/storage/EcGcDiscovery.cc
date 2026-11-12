@@ -69,7 +69,8 @@ Result<Void> validate(const EcGcDiscoveryClaims &v) {
 }
 Result<Void> validate(const EcGcDiscoveryObservationClaims &v) {
   const auto &e = v.endpoint;
-  if (v.version != kEcGcDiscoveryVersion || v.dataProtocol != 2 || v.diskFormat != 3 || v.gcProtocol != 1 ||
+  if (v.version != kEcGcDiscoveryVersion || v.dataProtocol != 2 || v.diskFormat != 3 ||
+      !ecGcProtocolSupports(v.gcProtocol, 1) ||
       (v.capabilities != kEcGcDiscoveryCollectQuery && v.capabilities != kEcGcDiscoveryQueryOnly) || v.keyId.is_nil() ||
       v.authority.is_nil() || v.bootNonce.is_nil() || v.requestDigest == EcSha256{} || e.nodeId == NodeId{} ||
       e.chainId == ChainId{} || e.targetId == TargetId{} || e.engineUuid.is_nil() || e.targetIncarnation.is_nil())
@@ -188,8 +189,9 @@ Result<EcGcDiscoveryObservation> Codec::signObserved(const EcGcKey &key,
                                                      uint64_t now) {
   const auto &actual = local.endpoint;
   RETURN_ON_ERROR(verifyRequest(key, request, authority, actual.nodeId, now));
-  if (!local.enabled || local.dataProtocol != 2 || local.diskFormat != 3 || local.gcProtocol != 1 ||
-      bootNonce.is_nil() || actual.chainId != request.claims.chainId || actual.targetId != request.claims.targetId)
+  if (!local.enabled || local.dataProtocol != 2 || local.diskFormat != 3 ||
+      !ecGcProtocolSupports(local.gcProtocol, 1) || bootNonce.is_nil() || actual.chainId != request.claims.chainId ||
+      actual.targetId != request.claims.targetId)
     return makeError(StorageCode::kTargetStateInvalid, "GC discovery requires the actual enabled format3 instance");
   EcGcDiscoveryObservation result;
   CHECK_RESULT(requestDigest, digest(encode(request.claims)));

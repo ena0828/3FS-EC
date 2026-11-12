@@ -37,6 +37,7 @@ Result<Void> AllocateWorker::stopAndJoin() {
 }
 
 void AllocateWorker::loop() {
+  auto nextTrim = RelativeTime::zero();
   while (!stopping_) {
     auto lock = std::unique_lock(mutex_);
     if (cond_.wait_for(lock, 100_ms, [&] { return stopping_.load(); })) {
@@ -54,6 +55,42 @@ void AllocateWorker::loop() {
       // The legacy move path resets the operation etag and does not establish
       // the EC relocation durability contract. Preallocation remains enabled.
       if (!components_.storageTargets.ecOnly()) engine->compact_groups(maxReserved);
+    }
+    if (!stopping_ && config_.ec_empty_group_trim() && RelativeTime::now() >= nextTrim) {
+      const chunk_engine::RawEcStageTrimLimits limits{config_.ec_trim_max_groups(),
+                                                      config_.ec_trim_max_bytes().toInt(),
+                                                      config_.ec_trim_keep_empty_groups()};
+      // Synchronous owned call. stopAndJoin cannot return while a punch/fsync
+      // is still in flight. There is no detached trim or timeout-as-success.
+      const auto result = components_.storageTargets.trimEmptyGroups(limits);
+      nextTrim = RelativeTime::now() + config_.ec_trim_interval();
+      const auto &r = result.report;
+      if (result.status.error_code || !r.complete) {
+        XLOGF(ERR,
+              "EC empty-group trim code={} error={} complete={} attempted={} charged={} "
+              "punch_confirmed={} withdrawn={} extent_unconfirmed={} quarantined={} errno={}",
+              result.status.error_code,
+              std::string(result.status.error),
+              r.complete,
+              r.attempted_groups,
+              r.charged_bytes,
+              r.punch_confirmed_bytes,
+              r.withdrawn_preallocation_bytes,
+              r.unconfirmed_extent_bytes,
+              r.quarantined_groups,
+              r.os_errno);
+      } else if (r.attempted_groups || r.oversized_classes) {
+        XLOGF(INFO,
+              "EC empty-group trim attempted={} charged={} punch_confirmed={} withdrawn={} "
+              "extent_unconfirmed={} reconciled={} oversized={}; counts are not statfs free bytes",
+              r.attempted_groups,
+              r.charged_bytes,
+              r.punch_confirmed_bytes,
+              r.withdrawn_preallocation_bytes,
+              r.unconfirmed_extent_bytes,
+              r.reconciled_groups,
+              r.oversized_classes);
+      }
     }
   }
 

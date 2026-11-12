@@ -169,6 +169,19 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.executeEcHelper(request);
   }
 
+  CoTryTask<EcRmwStatusRsp> installEcRmw(serde::CallContext &ctx, const EcRmwInstallReq &request) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.installEcRmw(request);
+  }
+  CoTryTask<EcRmwStatusRsp> putEcRmw(serde::CallContext &ctx, const EcRmwPutReq &request) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.putEcRmw(request);
+  }
+  CoTryTask<EcRmwStatusRsp> actionEcRmw(serde::CallContext &ctx, const EcRmwActionReq &request) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.actionEcRmw(request);
+  }
+
   CoTryTask<EcSealStageV2Rsp> sealEcStageV2(serde::CallContext &ctx, const EcSealStageV2Req &request) {
     reportUpdateQueueLatency(ctx);
     return storageOperator_.sealEcStageV2(request);

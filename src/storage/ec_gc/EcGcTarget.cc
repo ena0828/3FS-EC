@@ -21,7 +21,7 @@ Result<EcGcLocalTarget> StorageTarget::gcLocalTarget(NodeId actualLocalNode) con
             std::begin(local.endpoint.targetIncarnation.data));
   local.dataProtocol = 2;
   local.diskFormat = format;
-  local.gcProtocol = 1;
+  local.gcProtocol = kEcGcSupportedProtocol;
   // This private adapter is reached only through the configured executor.
   // It does not publish a Discovery capability or a deployment mode flag.
   local.enabled = true;

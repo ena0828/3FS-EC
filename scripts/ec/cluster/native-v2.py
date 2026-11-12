@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and supervise a private, one-Storage-process native EC V2 lab."""
+"""Prepare and supervise a private one- or twelve-Storage-process native EC lab."""
 import argparse
 import fcntl
 import hashlib
@@ -19,9 +19,9 @@ import threading
 import time
 import tomllib
 
-from native_v2_config import (PROFILES, SERVICES, gc_inventory_from_observations, gc_settings, json_text,
+from native_v2_config import (PROFILES, SERVICES, file_api_enabled, required_services, gc_inventory_from_observations, gc_settings, json_text,
                               key_roles, pool_from_observations, prepare, profile_config_problems,
-                              replace_private, to_toml, write_new)
+                              replace_private, storage_process_count, storage_specs, topology_problems, to_toml, write_new)
 
 
 def inherited_runner():
@@ -38,10 +38,11 @@ def load_manifest(root):
     if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
         raise RuntimeError("Task root must belong to the supervisor UID with mode 0700")
     data = json.loads((root / "cluster.json").read_text(encoding="utf-8"))
-    if data.get("schema") != 1 or data.get("profile") not in PROFILES.values() or data.get("root") != str(root) or \
-            data.get("storage_count") != 1 or data.get("logical_target_count") != 12:
-        raise RuntimeError("Not a matching one-process native task bundle")
+    if type(data.get("schema")) is not int or data["schema"] != 1 or data.get("profile") not in PROFILES.values() or data.get("root") != str(root) or \
+            topology_problems(data):
+        raise RuntimeError("Not a matching explicitly prepared native process topology")
     gc_settings(data)
+    file_api_enabled(data)
     for directory in ("config", "secrets", "client", "state", "logs", "scripts", "data", "bin", "lib"):
         path = root / directory
         if path.is_symlink() or not path.is_dir():
@@ -51,12 +52,28 @@ def load_manifest(root):
     return data
 
 
+def active_build_processes(proc_root=Path("/proc")):
+    """Observe build tools; never signal or identify ownership from a PID file."""
+    found = []
+    pattern = re.compile(r"(?:cc1plus|cc1|g\+\+|c\+\+|clang(?:\+\+)?(?:-[0-9]+)?|rustc|cargo|ninja|cmake|ld(?:\.lld|\.gold)?|lto1)")
+    for path in proc_root.iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            name = (path / "comm").read_text().strip()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if pattern.fullmatch(name):
+            found.append({"pid": int(path.name), "comm": name})
+    return found
+
+
 def doctor(root, check_ports=True):
     manifest = load_manifest(root)
     problems, observations = [], {}
     env = dict(os.environ, LD_LIBRARY_PATH=str(root / "lib"))
     env.pop("LD_PRELOAD", None)
-    for name in (*SERVICES, "fdbserver", "fdbcli"):
+    for name in (*required_services(manifest), "fdbserver", "fdbcli"):
         binary = root / "bin" / name
         if not binary.is_file() or not os.access(binary, os.X_OK):
             problems.append(f"missing executable {binary}")
@@ -79,12 +96,14 @@ def doctor(root, check_ports=True):
     # dump as a schema: unset optional nested fields (e.g. network_type) are
     # omitted even though the native parser accepts them.
     observations["launcher_section_checks"] = []
-    for kind in ("mgmtd", "meta", "storage"):
+    launcher_specs = [(kind, kind + "_main") for kind in ("mgmtd", "meta")]
+    launcher_specs += [("storage", spec["stem"]) for spec in storage_specs(manifest)]
+    for kind, stem in launcher_specs:
         binary = root / "bin" / f"{kind}_main"
         if not binary.is_file() or not os.access(binary, os.X_OK):
             continue
-        path = root / "config" / f"{kind}_main_launcher.toml"
-        argv = [str(binary), "--dump_default_launcher_cfg", "--app_cfg", str(root / "config" / f"{kind}_main_app.toml")]
+        path = root / "config" / f"{stem}_launcher.toml"
+        argv = [str(binary), "--dump_default_launcher_cfg", "--app_cfg", str(root / "config" / f"{stem}_app.toml")]
         try:
             dumped = subprocess.run(argv, env=env, text=True, capture_output=True, timeout=15)
             if dumped.returncode:
@@ -125,18 +144,37 @@ def doctor(root, check_ports=True):
     memory = Path("/proc/meminfo").read_text()
     observations["memory_kib"] = {key: int(value) for key, value in re.findall(
         r"^(MemTotal|MemAvailable|SwapTotal|SwapFree):\s+(\d+)", memory, re.MULTILINE)}
-    if observations["memory_kib"].get("MemAvailable", 0) < 3 * 1024**2:
-        problems.append("less than 3 GiB currently available; finish builds/other experiments before startup")
+    count = storage_process_count(manifest)
+    required_gib = 6 if count == 12 else 3
+    observations["required_available_memory_gib"] = required_gib
+    if observations["memory_kib"].get("MemAvailable", 0) < required_gib * 1024**2:
+        problems.append(f"less than {required_gib} GiB available; finish all builds/other experiments before startup")
     disk = os.statvfs(root)
     observations["free_bytes"] = disk.f_bavail * disk.f_frsize
-    if observations["free_bytes"] < 4 * 1024**3:
-        problems.append("less than 4 GiB free in this task filesystem; no automatic cleanup or expansion")
+    required_disk_gib = 8 if count == 12 else 4
+    if observations["free_bytes"] < required_disk_gib * 1024**3:
+        problems.append(f"less than {required_disk_gib} GiB free; no automatic cleanup or expansion")
+    if count == 12:
+        observations["active_build_processes"] = active_build_processes()
+        if observations["active_build_processes"]:
+            problems.append("finish all compiler/build-tool processes before twelve-Storage startup; none are stopped automatically")
+        observations["free_inodes"] = disk.f_favail
+        observations["engine_data_files_lower_bound"] = 12 * 11 * 256
+        observations["engine_open_fds_lower_bound"] = 12 * 11 * 256 * 2
+        observations["buffer_pool_payload_bytes"] = 12 * (16 * 1024**2 + 4 * 4 * 1024**2)
+        if disk.f_favail < 50000:
+            problems.append("less than 50000 free inodes for twelve Engine trees and experiment records")
+        file_nr = [int(part) for part in Path("/proc/sys/fs/file-nr").read_text().split()]
+        observations["kernel_file_nr"] = file_nr
+        observations["global_fd_headroom_required"] = 12 * 6000 + 8192
+        if len(file_nr) != 3 or file_nr[2] - file_nr[0] < observations["global_fd_headroom_required"]:
+            problems.append("insufficient global kernel file-table headroom; per-process nofile alone is insufficient")
     _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     observations["nofile_hard"] = hard
     if hard != resource.RLIM_INFINITY and hard < 16384:
         problems.append("nofile hard limit must be at least 16384 for the shared Rust Engine")
     if check_ports:
-        for port in range(manifest["port_base"], manifest["port_base"] + 4):
+        for port in range(manifest["port_base"], manifest["port_base"] + 3 + storage_process_count(manifest)):
             with socket.socket() as probe:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
@@ -160,6 +198,7 @@ class NativeCluster(inherited_runner()):
         self.run_id = self.run_dir.name
         self.status_lock = threading.Lock()
         self.failure = None
+        self.storage_log_start = {}
         self.env.pop("LD_PRELOAD", None)
 
     def status(self):
@@ -168,7 +207,8 @@ class NativeCluster(inherited_runner()):
                     "profile": self.manifest["profile"],
                     "processes": [{"name": name, "pid": proc.pid, "exit_code": proc.poll()}
                                   for name, proc in self.processes],
-                    "logical_targets": 12, "storage_processes": 1,
+                    "logical_targets": 12, "storage_processes": storage_process_count(self.manifest),
+                    "storage_process_failure_domains": storage_process_count(self.manifest),
                     "independent_storage_failure_domains": 1, "performance_validated": False,
                     "failure": self.failure}
 
@@ -224,13 +264,13 @@ class NativeCluster(inherited_runner()):
             raise RuntimeError(json_text(checks))
         initialized = self.root / "state/initialized.json"
         fdb = self.root / "data/fdb"
-        storage = self.root / "data/storage-10001"
+        data_paths = [fdb] + [Path(spec["data_path"]) for spec in storage_specs(self.manifest)]
         if self.mode == "initialize":
-            if initialized.exists() or any(path.exists() and any(path.iterdir()) for path in (fdb, storage)):
+            if initialized.exists() or any(path.exists() and any(path.iterdir()) for path in data_paths):
                 raise RuntimeError("initialize requires empty task data directories; never reuse or clear an old database")
         elif not initialized.is_file():
             raise RuntimeError("resume requires successful initialization; partial bootstrap needs administrator diagnosis")
-        for path in (fdb, storage):
+        for path in data_paths:
             if path.is_symlink():
                 raise RuntimeError("Refusing redirected database directory")
             path.mkdir(mode=0o700, exist_ok=True)
@@ -242,11 +282,90 @@ class NativeCluster(inherited_runner()):
         self.start_sampler()
 
     def start_service(self, name):
-        kind = "storage" if name == "storage" else name
+        spec = next((value for value in storage_specs(self.manifest) if value["name"] == name), None)
+        kind, stem = ("storage", spec["stem"]) if spec else (name, name + "_main")
+        if spec and storage_process_count(self.manifest) == 12:
+            path = self.root / "logs" / (spec["name"] + ".log")
+            if path.is_symlink():
+                raise RuntimeError("Refusing redirected Storage log")
+            old = path.stat() if path.exists() else None
+            self.storage_log_start[name] = None if old is None else (old.st_dev, old.st_ino, old.st_size)
         self.start(name, [self.root / "bin" / f"{kind}_main",
-            "--app_cfg", self.config / f"{kind}_main_app.toml",
-            "--launcher_cfg", self.config / f"{kind}_main_launcher.toml",
-            "--cfg", self.config / f"{kind}_main.toml"])
+            "--app_cfg", self.config / f"{stem}_app.toml",
+            "--launcher_cfg", self.config / f"{stem}_launcher.toml",
+            "--cfg", self.config / f"{stem}.toml"])
+
+    def startup_memory_guard(self):
+        if storage_process_count(self.manifest) != 12:
+            return
+        memory = Path("/proc/meminfo").read_text()
+        available = re.search(r"^MemAvailable:\s+(\d+)", memory, re.MULTILINE)
+        if not available or int(available[1]) < 2 * 1024**2:
+            raise RuntimeError("Twelve-process startup exhausted its 2 GiB guest reserve; stop owned services normally")
+
+    def startup_resource_snapshot(self, node):
+        if storage_process_count(self.manifest) != 12:
+            return
+        records = []
+        for name, process in self.processes:
+            row = {"name": name, "pid": process.pid, "exit_code": process.poll()}
+            path = Path("/proc") / str(process.pid)
+            try:
+                text = (path / "status").read_text()
+                row["status_values"] = dict(re.findall(r"^(VmRSS|VmSize|Threads):\s+([^\n]+)", text, re.MULTILINE))
+                row["open_fds"] = len(list((path / "fd").iterdir()))
+                # Sum PSS/USS, not summed RSS, when accounting shared ELF pages.
+                smaps = (path / "smaps_rollup").read_text()
+                row["smaps_kib"] = {k: int(v) for k, v in re.findall(
+                    r"^(Pss|Private_Clean|Private_Dirty|Swap):\s+(\d+)", smaps, re.MULTILINE)}
+            except (FileNotFoundError, PermissionError, ProcessLookupError) as error:
+                row["observation_error"] = type(error).__name__
+            records.append(row)
+        write_new(self.run_dir / f"startup-resources-{node}.json", json_text({
+            "scope": "point_in_time_startup_only_not_benchmark", "processes": records,
+            "guest_meminfo": Path("/proc/meminfo").read_text(),
+            "physical_machine_failure_domains": 1, "configured_storage_processes": 12}))
+
+    def record_pinned_config_observations(self):
+        if storage_process_count(self.manifest) != 12:
+            return
+        self.admin(["get-config", "-t", "STORAGE", "-o", self.run_dir / "global-storage-config.toml"],
+                   "global-storage-config-version.log")
+        self.admin(["list-nodes"], "config-observation-nodes.log")
+        records = []
+        for spec in storage_specs(self.manifest):
+            name, node = spec["name"], spec["node"]
+            effective = self.run_dir / f"effective-{node}.toml"
+            self.admin(["get-config", "-n", str(node), "-o", effective], f"effective-{node}.log")
+            self.admin(["get-last-config-update-record", "-n", str(node)], f"config-attempt-{node}.log")
+            local = self.config / (spec["stem"] + ".toml")
+            row = {"node": node, "local_config": str(local),
+                   "local_config_sha256": hashlib.sha256(local.read_bytes()).hexdigest(),
+                   "effective_config": str(effective), "effective_config_sha256": hashlib.sha256(effective.read_bytes()).hexdigest(),
+                   "config_version_source": "config-observation-nodes.log; actual Mgmtd heartbeat value",
+                   "attempt_source": f"config-attempt-{node}.log"}
+            log = self.root / "logs" / (name + ".log")
+            if log.is_symlink() or not log.is_file():
+                row["rejection_count_status"] = "unavailable_missing_or_redirected_log"
+            else:
+                with log.open("rb") as stream:
+                    current = os.fstat(stream.fileno())
+                    old = self.storage_log_start[name]
+                    offset = old[2] if old else 0
+                    if old and ((current.st_dev, current.st_ino) != old[:2] or current.st_size < offset):
+                        row["rejection_count_status"] = "unavailable_rotation_or_truncation"
+                    else:
+                        stream.seek(offset)
+                        text = stream.read(current.st_size - offset).decode("utf-8", errors="replace")
+                        row.update(rejection_count_status="bounded_same_log_segment", from_byte=offset,
+                                   to_byte=current.st_size,
+                                   rejected_version_headers=text.count("Pinned local config rejected remote version."),
+                                   equivalent_version_headers=text.count("Pinned local config already matches remote version;"))
+            records.append(row)
+        write_new(self.run_dir / "pinned-config-observations.json", json_text({
+            "policy": "global_STORAGE_configuration_is_not_equivalent_to_all_per_node_local_configurations",
+            "config_versions_not_fabricated": True, "network_repeated_payloads_remain": True,
+            "counts_scope": "startup log segments only; not full lifetime or performance measurements", "nodes": records}))
 
     def node_ready(self, node, kind):
         text = self.admin(["list-nodes"], f"node-{node}.log")
@@ -284,15 +403,20 @@ class NativeCluster(inherited_runner()):
             # This initializes only the metadata root and configuration records;
             # no ordinary replicated data target or FUSE process is created.
             self.admin(["init-cluster", "--mgmtd", self.config / "mgmtd_main.toml", "--meta", self.config / "meta_main.toml",
-                "--storage", self.config / "storage_main.toml", "1", "65536", "1"], "init-cluster.log")
+                "--storage", self.config / (storage_specs(self.manifest)[0]["stem"] + ".toml"), "1", "65536", "1"], "init-cluster.log")
         self.stage = "storage-bootstrap"
         self.start_service("mgmtd")
         self.wait("mgmtd routing", lambda: "MGMTD" in self.admin(["list-nodes"], "nodes-mgmtd.log"))
         if self.mode == "initialize":
-            self.admin(["register-node", "10001", "STORAGE"], "register-storage.log")
+            for spec in storage_specs(self.manifest):
+                self.admin(["register-node", str(spec["node"]), "STORAGE"], f"register-{spec['name']}.log")
             self.admin(["register-node", "100", "META"], "register-meta.log")
-        self.start_service("storage")
-        self.wait("one Storage process", lambda: self.node_ready(10001, "STORAGE"))
+        for spec in storage_specs(self.manifest):
+            self.startup_memory_guard()
+            self.start_service(spec["name"])
+            self.wait(spec["name"], lambda node=spec["node"]: self.node_ready(node, "STORAGE"))
+            self.startup_resource_snapshot(spec["node"])
+            self.startup_memory_guard()
         if self.mode == "initialize":
             for endpoint in self.manifest["endpoints"]:
                 self.admin(["create-ec-target", "--node-id", str(endpoint["node"]), "--disk-index", "0",
@@ -344,12 +468,17 @@ class NativeCluster(inherited_runner()):
         meta["server"]["meta"].update(enable_ec_v2=True, ec_targets=pool)
         if gc:
             meta["server"]["meta"].update(enable_ec_exact_gc=True, enable_ec_revision_retirement=True)
+        if file_api_enabled(self.manifest):
+            meta["server"]["meta"].update(enable_ec_rmw=True, enable_ec_file_ranges=True)
         replace_private(meta_path, to_toml(meta))
         self.admin(["set-config", "-t", "META", "-f", meta_path, "--desc", "verified native-v2 physical pool"],
                    "set-meta-v2-config.log")
         self.stage = "meta-startup"
         self.start_service("meta")
         self.wait("authenticated Meta V2 service", lambda: self.node_ready(100, "META"))
+        self.record_pinned_config_observations()
+        self.startup_resource_snapshot("all-ready")
+        self.startup_memory_guard()
         if self.mode == "initialize":
             self.admin(["mkdir", "/ec-lab", "--perm", "0700"], "mkdir-user-workspace.log")
             self.admin(["set-perm", "/ec-lab", "-u", "1000", "-g", "1000", "-p", "0700"], "chown-user-workspace.log")
@@ -365,7 +494,7 @@ class NativeCluster(inherited_runner()):
             if self.sampler.is_alive():
                 raise RuntimeError("Startup sampler did not finish; refusing measurement-ready state")
         write_new(self.run_dir / "ready.json", json_text(self.status()))
-        print(f"READY: {self.manifest['profile']}; 1 Storage process, 12 logical targets; "
+        print(f"READY: {self.manifest['profile']}; {storage_process_count(self.manifest)} Storage processes, 12 logical targets; "
               f"client config {self.root / 'client/stripe-client.toml'}", flush=True)
         print("Services are ready; write/read/repair experiments have not been run.", flush=True)
 
@@ -406,18 +535,20 @@ def main():
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[3])
     parser.add_argument("--port-base", type=int, default=13500)
     parser.add_argument("--profile", choices=tuple(PROFILES),
-                        help="prepare only: v2 (default), or gc on a fresh root; never an in-place upgrade")
+                        help="prepare only: v2/gc (one process), v2-12/gc-12 (twelve); fresh roots only")
     parser.add_argument("--mode", choices=["initialize", "resume"], default="resume")
+    parser.add_argument("--file-api", action="store_true",
+                        help="prepare only: enable EC file sessions and RMW on a fresh gc/gc-12 profile")
     args = parser.parse_args()
     if sys.platform != "linux":
         parser.error("Use Python 3.11+ inside Linux/WSL; no Windows filesystem database support")
     os.umask(0o077)
     root = args.root.absolute()
     if args.command == "prepare":
-        prepare(root, args.source, args.port_base, args.profile or "v2")
+        prepare(root, args.source, args.port_base, args.profile or "v2", file_api=args.file_api)
         return 0
-    if args.profile is not None:
-        parser.error("--profile is prepare-only; start/resume uses the immutable prepared profile")
+    if args.profile is not None or args.file_api:
+        parser.error("--profile/--file-api are prepare-only; start/resume uses the immutable prepared profile")
     load_manifest(root)
     if args.command == "doctor":
         report = doctor(root)
@@ -433,7 +564,8 @@ def main():
             return 1
         print(json_text(snapshot))
         if args.command == "stop":
-            deadline = time.monotonic() + 240
+            shutdown_seconds = 240 if storage_process_count(load_manifest(root)) == 1 else 45 * 15 + 30
+            deadline = time.monotonic() + shutdown_seconds
             while time.monotonic() < deadline:
                 path = root / "state/last-supervisor.json"
                 if path.exists():
@@ -442,7 +574,7 @@ def main():
                         print(json_text(final))
                         return final["stage"] != "stopped"
                 time.sleep(0.5)
-            raise RuntimeError("Supervisor cleanup exceeded 240 seconds; inspect owned-process logs, no forced kill sent")
+            raise RuntimeError(f"Supervisor cleanup exceeded {shutdown_seconds} seconds; inspect owned-process logs, no forced kill sent")
         return 0
     # The foreground supervisor alone holds child Popen handles and the lock.
     # Status/stop communicate over its private socket instead of using PID files.

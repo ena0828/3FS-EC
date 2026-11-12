@@ -762,6 +762,34 @@ pub mod ffi {
         status: RawEcScopeStatus,
         value: RawUsedSize,
     }
+    #[derive(Default, Clone, Copy)]
+    struct RawEcStageTrimLimits {
+        max_groups: u32,
+        max_bytes: u64,
+        keep_empty_groups: u32,
+    }
+    // Counts are per-call, never a statfs result. An error retains all known
+    // progress; complete=false means an unexpected boundary failure occurred.
+    #[derive(Default, Clone, Copy)]
+    struct RawEcStageTrimReport {
+        attempted_groups: u32,
+        charged_bytes: u64,
+        punch_confirmed_groups: u32,
+        punch_confirmed_bytes: u64,
+        withdrawn_preallocation_bytes: u64,
+        unconfirmed_extent_bytes: u64,
+        reconciled_groups: u32,
+        quarantined_groups: u32,
+        busy_classes: u32,
+        oversized_classes: u32,
+        unsupported_groups: u32,
+        os_errno: i32,
+        complete: bool,
+    }
+    struct RawEcStageTrimResult {
+        status: RawEcScopeStatus,
+        report: RawEcStageTrimReport,
+    }
     struct RawEcStageMetricsResult {
         status: RawEcScopeStatus,
         value: Metrics,
@@ -829,6 +857,8 @@ pub mod ffi {
         ) -> RawEcStageReadResult;
         fn stage_used_size(handle: &EcStageHandle, prefix: &[u8]) -> RawEcStageUsedResult;
         fn stage_physical_used_size(handle: &EcStageHandle) -> RawEcStagePhysicalSizeResult;
+        fn stage_trim_empty_groups(handle: &EcStageHandle,
+                                   limits: &RawEcStageTrimLimits) -> RawEcStageTrimResult;
         fn stage_sample_metrics(handle: &EcStageHandle) -> RawEcStageMetricsResult;
         fn stage_set_allow_to_allocate(handle: &EcStageHandle, allow: bool) -> RawEcScopeStatus;
     }

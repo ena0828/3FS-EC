@@ -33,6 +33,7 @@
 #include "meta/components/SessionManager.h"
 #include "meta/event/Event.h"
 #include "meta/store/DirEntry.h"
+#include "meta/store/EcFileLifecycleCatalog.h"
 #include "meta/store/EcNamespaceGuard.h"
 #include "meta/store/Inode.h"
 #include "meta/store/MetaStore.h"
@@ -49,6 +50,15 @@ class RemoveOp : public Operation<RemoveRsp> {
         req_(req) {}
 
   OPERATION_TAGS(req_);
+
+  CoTryTask<void> validateIdempotentReplay(IReadWriteTransaction &raw) override {
+    EcFileTreeTxnBudget txn(raw);
+    auto prior = co_await EcFileLifecycleCatalog::replay(txn, req_);
+    CO_RETURN_ON_ERROR(prior);
+    if (*prior && (!config().authenticate() || !config().enable_ec_rmw()))
+      co_return makeError(StatusCode::kNotImplemented);
+    co_return Void{};
+  }
 
   bool needIdempotent(Uuid &clientId, Uuid &requestId) const override {
     if (!req_.checkUuid()) {
@@ -67,6 +77,13 @@ class RemoveOp : public Operation<RemoveRsp> {
 
     CHECK_REQUEST(req_);
 
+    EcFileTreeTxnBudget ecTxn(txn);
+    auto prior = co_await EcFileLifecycleCatalog::replay(ecTxn, req_);
+    CO_RETURN_ON_ERROR(prior);
+    if (*prior) {
+      if (!config().authenticate() || !config().enable_ec_rmw()) co_return makeError(StatusCode::kNotImplemented);
+      co_return std::move(**prior);
+    }
     Result<PathResolveOp::ResolveResult> resolveResult = makeError(MetaCode::kFoundBug);
     if (req_.path.path.has_value()) {
       resolveResult = co_await resolve(txn, req_.user)
@@ -119,6 +136,10 @@ class RemoveOp : public Operation<RemoveRsp> {
       co_return makeError(MetaCode::kNoPermission, msg);
     }
     if (inode.isFile()) {
+      if (inode.asFile().layout.isErasureCoded()) {
+        if (!config().authenticate() || !config().enable_ec_rmw()) co_return makeError(StatusCode::kNotImplemented);
+        co_return co_await EcFileLifecycleCatalog::unlink(ecTxn, req_, entry);
+      }
       CO_RETURN_ON_ERROR(inode.asFile().layout.checkReplicated());
     }
 

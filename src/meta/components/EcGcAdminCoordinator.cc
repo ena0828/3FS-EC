@@ -9,6 +9,7 @@
 #include <new>
 
 #include "fbs/storage/EcGcDiscovery.h"
+#include "meta/store/EcExactGcCatalog.h"
 
 namespace hf3fs::meta::server {
 namespace {
@@ -115,6 +116,11 @@ Result<Void> EcGcAdminCoordinator::checkEnabled() const {
   if (state_->closing.load(std::memory_order_acquire)) return makeError(StorageClientCode::kRequestCanceled);
   return Void{};
 }
+Result<storage::EcKeyFileIdentity> EcGcAdminCoordinator::loadedKeyFileIdentity() const {
+  RETURN_ON_ERROR(checkEnabled());
+  const auto &id = state_->key->fileIdentity();
+  return storage::EcKeyFileIdentity{id.device, id.inode};
+}
 void EcGcAdminCoordinator::close() {
   if (state_) state_->closing.store(true, std::memory_order_release);
 }
@@ -142,7 +148,7 @@ CoTryTask<EcGcAdminRsp> EcGcAdminCoordinator::executeOwned(std::shared_ptr<State
     if (action == storage::EcGcAction::Collect) {
       auto txn = state->engine->createReadWriteTransaction();
       if (!txn) co_return makeError(StatusCode::kKVStoreNotFound);
-      auto claim = co_await EcV2GcCatalog::claim(*txn, req.object, req.identity, req.claimId, *state->controlKey);
+      auto claim = co_await EcExactGcCatalog::claim(*txn, req.object, req.identity, req.claimId, *state->controlKey);
       CO_RETURN_ON_ERROR(claim);
       CO_RETURN_ON_ERROR(state->ready(action, deadline));
       CO_RETURN_ON_ERROR(co_await txn->commit());
@@ -152,7 +158,7 @@ CoTryTask<EcGcAdminRsp> EcGcAdminCoordinator::executeOwned(std::shared_ptr<State
       // A separate transaction proves G0 is durable; Query never creates it.
       auto txn = state->engine->createReadWriteTransaction();
       if (!txn) co_return makeError(StatusCode::kKVStoreNotFound);
-      auto loaded = co_await EcV2GcCatalog::getClaim(*txn, req.object, req.identity);
+      auto loaded = co_await EcExactGcCatalog::getClaim(*txn, req.object, req.identity);
       CO_RETURN_ON_ERROR(loaded);
       if (!*loaded) co_return makeError(StatusCode::kTokenStale, "no committed exact GC claim");
       if ((**loaded).claimId != req.claimId) co_return makeError(StatusCode::kTokenMismatch);
@@ -204,7 +210,8 @@ CoTryTask<EcGcAdminRsp> EcGcAdminCoordinator::executeOwned(std::shared_ptr<State
     const uint16_t required = action == storage::EcGcAction::Collect ? uint16_t{1} : uint16_t{2};
     if (!sameEndpoint(actual.endpoint, certificate->endpoint))
       co_return makeError(StatusCode::kTokenMismatch, "GC discovery cannot replace the claimed physical instance");
-    if (actual.dataProtocol != 2 || actual.diskFormat != 3 || actual.gcProtocol != 1 ||
+    if (actual.dataProtocol != 2 || actual.diskFormat != 3 ||
+        !storage::ecGcProtocolSupports(actual.gcProtocol, certificate->gcProtocol) ||
         (actual.capabilities & required) != required)
       co_return makeError(StatusCode::kNotImplemented, "claimed instance does not admit the requested GC action");
     EcGcCoordinator::Config config;

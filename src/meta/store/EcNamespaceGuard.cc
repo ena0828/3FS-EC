@@ -169,4 +169,34 @@ CoTryTask<void> EcNamespaceGuard::moveDirectory(IReadWriteTransaction &txn, cons
   co_return Void{};
 }
 
+CoTryTask<Void> EcNamespaceGuard::checkTreeFile(IReadWriteTransaction &txn, const Inode &file) {
+  if (!file.isFile() || !file.asFile().layout.ecLayout()) co_return makeError(StatusCode::kInvalidArg);
+  const auto *layout = file.asFile().layout.ecLayout();
+  CO_RETURN_ON_ERROR(layout->valid());
+  auto r = co_await load<RegisteredFile>(txn, kv::KeyPrefix::EcNamespaceFile, file.id);
+  CO_RETURN_ON_ERROR(r);
+  if (!*r || (**r).incarnation != layout->incarnation)
+    co_return makeError(StatusCode::kDataCorruption, "EC file lost namespace birth registration");
+  co_return Void{};
+}
+CoTryTask<Void> EcNamespaceGuard::adjustTreeLink(IReadWriteTransaction &txn,
+                                                 const Inode &file,
+                                                 InodeId parent,
+                                                 bool increment) {
+  CO_RETURN_ON_ERROR(co_await checkTreeFile(txn, file));
+  auto ancestors = co_await liveAncestors(txn, parent);
+  CO_RETURN_ON_ERROR(ancestors);
+  std::vector<std::pair<InodeId, uint64_t>> changes;
+  for (auto id : *ancestors) {
+    auto n = co_await subtreeCount(txn, id);
+    CO_RETURN_ON_ERROR(n);
+    if ((increment && *n == std::numeric_limits<uint64_t>::max()) || (!increment && !*n))
+      co_return makeError(StatusCode::kDataCorruption, "EC namespace link count overflow/underflow");
+    changes.emplace_back(id, increment ? *n + 1 : *n - 1);
+  }
+  for (auto [id, n] : changes) CO_RETURN_ON_ERROR(co_await storeCount(txn, id, n));
+  // Permanent original registration is retained; later links are accounted by
+  // the typed lifecycle ledger, not by rewriting the creation parent.
+  co_return Void{};
+}
 }  // namespace hf3fs::meta::server

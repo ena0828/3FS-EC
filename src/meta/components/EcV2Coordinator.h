@@ -22,7 +22,16 @@ class EcV2Coordinator {
   Result<storage::VersionedChainId> route(const EcV2PhysicalEndpoint &) const;
   const Uuid &authority() const { return authority_; }
   const storage::EcScopeControlKey &controlKey() const { return *controlKey_; }
+  // Historical owner observations only: no current pool or route is needed.
+  // Do not use this accessor to issue grants or to skip checkEnabled for I/O.
+  Result<const storage::EcScopeControlKey *> controlKeyForObservation() const {
+    if (initializationError_) return makeError(*initializationError_);
+    if (!controlKey_) return makeError(StatusCode::kInvalidConfig, "historical C-key verification is unavailable");
+    return controlKey_.get();
+  }
   std::shared_ptr<const storage::EcScopeControlKey> sharedControlKey() const { return controlKey_; }
+  // Internal mode4 issuer only; ordinary responses never expose this key.
+  std::shared_ptr<const storage::EcCapabilityKey> sharedDataKey() const { return dataKey_; }
   Result<std::vector<storage::EcKeyFileIdentity>> loadedKeyFileIdentities() const;
 
   // Caller must first commit checkIssuanceOpen in the same transaction that

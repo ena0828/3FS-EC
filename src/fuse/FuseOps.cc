@@ -198,6 +198,8 @@ void setTime(timespec &t, const UtcTime &ut) {
   t.tv_nsec = us % 1'000'000 * 1000;
 }
 
+bool isEcFile(const Inode &inode) { return inode.isFile() && inode.asFile().layout.isErasureCoded(); }
+
 void fillLinuxStat(struct ::stat &statbuf, const Inode &inode) {
   statbuf.st_dev = statbuf.st_rdev = 0;
   statbuf.st_ino = linux_ino(inode.id);
@@ -216,7 +218,9 @@ void fillLinuxStat(struct ::stat &statbuf, const Inode &inode) {
   statbuf.st_size = inode.isFile()      ? inode.asFile().length
                     : inode.isSymlink() ? inode.asSymlink().target.native().size()
                                         : 0;
-  statbuf.st_blocks = inode.isFile() ? (statbuf.st_size + 511) / 512 : 0;  // we don't allow holes
+  // EC physical allocation accounting is not a POSIX capability of this layer.
+  statbuf.st_blocks = isEcFile(inode) ? 0 : inode.isFile() ? (statbuf.st_size + 511) / 512 : 0;
+  if (isEcFile(inode)) statbuf.st_blksize = inode.asFile().layout.ecLayout()->shardBytes;
   setTime(statbuf.st_atim, inode.atime);
   setTime(statbuf.st_mtim, inode.mtime);
   setTime(statbuf.st_ctim, inode.ctime);
@@ -232,6 +236,7 @@ void add_entry(const Inode &inode, struct fuse_entry_param *e) {
   if (e) {
     fillLinuxStat(e->attr, inode);
     e->ino = e->attr.st_ino;
+    if (isEcFile(inode)) e->attr_timeout = e->entry_timeout = 0;
   }
 
   std::lock_guard lock{d.inodesMutex};
@@ -282,7 +287,7 @@ void remove_entry(InodeId ino, int n) {
 }
 
 template <typename T>
-void handle_error(fuse_req_t req, const hf3fs::Result<T> &ret, bool entry = false) {
+void handle_error(fuse_req_t req, const hf3fs::Result<T> &ret, bool entry = false, bool ecApplicationError = false) {
   if (ret.hasError()) {
     if (ret.error().code() != MetaCode::kNotFound) {
       XLOGF(INFO,
@@ -299,6 +304,9 @@ void handle_error(fuse_req_t req, const hf3fs::Result<T> &ret, bool entry = fals
             fuse_req_ctx(req)->pid);
     }
     int err = StatusCode::toErrno(ret.error().code());
+    // ENOSYS negotiates away OPEN/FSYNC/FLUSH or triggers CREATE fallback in FUSE.
+    // An EC application refusal must remain an error, not disable the operation.
+    if (ecApplicationError && err == ENOSYS) err = EOPNOTSUPP;
     auto userInfo = UserInfo(flat::Uid(fuse_req_ctx(req)->uid), flat::Gid(fuse_req_ctx(req)->gid), d.fuseToken);
     if (entry && ret.error().code() == MetaCode::kNotFound &&
         d.userConfig.getConfig(userInfo).negative_timeout() != 0) {
@@ -312,6 +320,11 @@ void handle_error(fuse_req_t req, const hf3fs::Result<T> &ret, bool entry = fals
   }
 }
 
+template <typename T>
+void handle_ec_error(fuse_req_t req, const hf3fs::Result<T> &ret) {
+  handle_error(req, ret, false, true);
+}
+
 void notify_inval_inode(InodeId inodeId) { fuse_lowlevel_notify_inval_inode(d.se, linux_ino(inodeId), -1, 0); }
 
 void notify_inval_entry(InodeId parent, std::string name) {
@@ -322,6 +335,12 @@ void hf3fs_init(void *userdata, struct fuse_conn_info *conn) {
   (void)userdata;
 
   XLOGF(INFO, "hf3fs_init()");
+  if (d.ecReads || d.ecFiles) {
+    conn->want &= ~FUSE_CAP_WRITEBACK_CACHE;
+#ifdef FUSE_CAP_DIRECT_IO_ALLOW_MMAP
+    conn->want &= ~FUSE_CAP_DIRECT_IO_ALLOW_MMAP;
+#endif
+  }
   if (d.enableWritebackCache && (conn->capable & FUSE_CAP_WRITEBACK_CACHE)) {
     conn->want |= FUSE_CAP_WRITEBACK_CACHE;
     XLOGF(INFO, "FUSE writeback cache: ON");
@@ -720,7 +739,7 @@ void hf3fs_lookup(fuse_req_t req, fuse_ino_t fparent, const char *name) {
       e.entry_timeout = d.userConfig.getConfig(userInfo).symlink_timeout();
     }
     add_entry(res.value(), &e);
-    if (d.userConfig.getConfig(userInfo).sync_on_stat()) {
+    if (!isEcFile(*res) && d.userConfig.getConfig(userInfo).sync_on_stat()) {
       if (!flushAndSync(req, linux_ino(res.value().id), false /* flushOnly */, SyncType::Lookup, nullptr, &e)) {
         return;
       }
@@ -774,7 +793,8 @@ void hf3fs_getattr(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fi) {
     }
   }
 
-  if (d.userConfig.getConfig(userInfo).sync_on_stat() &&
+  const auto cachedForStat = inodeOf(ino);
+  if ((!cachedForStat || !isEcFile(cachedForStat->inode)) && d.userConfig.getConfig(userInfo).sync_on_stat() &&
       !flushAndSync(req, fino, false /* flushOnly */, SyncType::GetAttr, fi)) {
     return;
   }
@@ -798,7 +818,7 @@ void hf3fs_getattr(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fi) {
     handle_error(req, res);
   } else {
     fillLinuxStat(buf, res.value());
-    fuse_reply_attr(req, &buf, d.userConfig.getConfig(userInfo).attr_timeout());
+    fuse_reply_attr(req, &buf, isEcFile(*res) ? 0 : d.userConfig.getConfig(userInfo).attr_timeout());
     if (auto pi = inodeOf(ino); pi) {
       pi->update(*res);
     }
@@ -829,6 +849,56 @@ void hf3fs_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr, int to_se
     return;
   }
 
+  if (pi && isEcFile(pi->inode) && (to_set & FUSE_SET_ATTR_SIZE)) {
+    // W3 commits size + current mtime/ctime together. Permit the kernel's
+    // implicit MTIME_NOW, but never partially apply explicit metadata changes.
+    const bool explicitMetadata =
+        (to_set & (FUSE_SET_ATTR_MODE | FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID | FUSE_SET_ATTR_ATIME |
+                   FUSE_SET_ATTR_ATIME_NOW | FUSE_SET_ATTR_TIMES_SET)) ||
+        ((to_set & FUSE_SET_ATTR_MTIME) && !(to_set & FUSE_SET_ATTR_MTIME_NOW));
+    if (!d.ecFiles || explicitMetadata) {
+      fuse_reply_err(req, EOPNOTSUPP);
+      return;
+    }
+    if (attr->st_size < 0) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    try {
+      std::optional<EcMountHandle> temporary;
+      auto handle = fi->fh ? reinterpret_cast<FileHandle *>(fi->fh)->ecFile : std::optional<EcMountHandle>{};
+      if (!handle) {
+        auto opened = folly::coro::blockingWait(d.ecFiles->open(pi->inode, userInfo, O_WRONLY));
+        if (!opened) {
+          handle_ec_error(req, opened);
+          return;
+        }
+        handle = opened->handle;
+        temporary = handle;
+      }
+      auto result = folly::coro::blockingWait(d.ecFiles->truncate(*handle, userInfo, uint64_t(attr->st_size)));
+      if (temporary) {
+        auto closed = folly::coro::blockingWait(d.ecFiles->release(*temporary, userInfo));
+        if (!closed) reportEcLocalMaintenanceFailure();
+      }
+      if (!result) {
+        handle_error(req, result);
+        return;
+      }
+      pi->dynamicAttr.wlock()->ecObservedLength = *result;
+      auto observed = withRequestInfo(req, d.metaClient->stat(userInfo, ino, std::nullopt, false));
+      if (!observed) {
+        handle_error(req, observed);
+        return;
+      }
+      struct stat value {};
+      fillLinuxStat(value, *observed);
+      fuse_reply_attr(req, &value, 0);
+    } catch (...) {
+      fuse_reply_err(req, EIO);
+    }
+    return;
+  }
   std::optional<Result<Inode>> res;
   if (to_set & (FUSE_SET_ATTR_MODE | FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID)) {
     std::optional<Permission> perm = std::nullopt;
@@ -900,7 +970,7 @@ void hf3fs_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr, int to_se
   if (res) {
     struct ::stat buf;
     fillLinuxStat(buf, res->value());
-    fuse_reply_attr(req, &buf, d.userConfig.getConfig(userInfo).attr_timeout());
+    fuse_reply_attr(req, &buf, isEcFile(res->value()) ? 0 : d.userConfig.getConfig(userInfo).attr_timeout());
   } else {
     hf3fs_getattr(req, linux_ino(ino), fi);
   }
@@ -1446,6 +1516,62 @@ void hf3fs_open(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fi) {
   //   }
   // }
 
+  if (isEcFile(ptr->inode) && d.ecFiles) {
+    bool replied = false;
+    try {
+      auto opened = folly::coro::blockingWait(d.ecFiles->open(ptr->inode, userInfo, fi->flags));
+      if (!opened) {
+        handle_ec_error(req, opened);
+        return;
+      }
+      fi->direct_io = 1;
+      fi->keep_cache = 0;
+      auto handle = std::make_unique<FileHandle>(FileHandle{ptr, true, Uuid::zero(), {}, opened->handle});
+      fi->fh = reinterpret_cast<uintptr_t>(handle.get());
+      const int rc = fuse_reply_open(req, fi);
+      replied = true;
+      if (rc == 0)
+        (void)handle.release();
+      else {
+        fi->fh = 0;
+        auto closed = folly::coro::blockingWait(d.ecFiles->release(opened->handle, userInfo));
+        if (!closed) reportEcLocalMaintenanceFailure();
+      }
+    } catch (...) {
+      if (!replied)
+        fuse_reply_err(req, EIO);
+      else
+        reportEcLocalMaintenanceFailure();
+    }
+    return;
+  }
+  if (isEcFile(ptr->inode)) {
+    if (!d.ecReads) {
+      fuse_reply_err(req, EOPNOTSUPP);
+      return;
+    }
+    try {
+      // Do not use withRequestInfo: uncertain lower work must never inherit a
+      // RequestContext that retains this borrowed fuse_req_t after the reply.
+      auto opened = folly::coro::blockingWait(d.ecReads->open(ptr->inode, userInfo, fi->flags, d.ecControl()));
+      if (!opened) {
+        handle_ec_error(req, opened);
+        return;
+      }
+      fi->direct_io = 1;
+      fi->keep_cache = 0;
+      auto handle = std::make_unique<FileHandle>(FileHandle{ptr, true, Uuid::zero(), std::move(*opened), {}});
+      fi->fh = reinterpret_cast<uintptr_t>(handle.get());
+      if (fuse_reply_open(req, fi) == 0)
+        (void)handle.release();
+      else
+        fi->fh = 0;
+    } catch (...) {
+      fuse_reply_err(req, EIO);
+    }
+    return;
+  }
+
   Uuid session;
   if ((fi->flags & O_ACCMODE) == O_WRONLY || (fi->flags & O_ACCMODE) == O_RDWR) {
     session = meta::client::SessionId::random();
@@ -1466,7 +1592,7 @@ void hf3fs_open(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fi) {
           : 0;
 
   XLOGF(DBG, "{}opened in o direct mode", fi->flags & O_DIRECT ? "" : "not ");
-  fi->fh = (uintptr_t)(new FileHandle{ptr, (bool)(fi->flags & O_DIRECT), session});
+  fi->fh = (uintptr_t)(new FileHandle{ptr, (bool)(fi->flags & O_DIRECT), session, {}, {}});
   fuse_reply_open(req, fi);
 }
 
@@ -1477,6 +1603,78 @@ void hf3fs_read(fuse_req_t req, fuse_ino_t fino, size_t size, off_t off, struct 
   record("read", fuse_req_ctx(req)->uid);
 
   auto pi = inodeOf(*fi, ino);
+  if (!pi) {
+    fuse_reply_err(req, ENOENT);
+    return;
+  }
+  if (isEcFile(pi->inode) && d.ecFiles) {
+    if (off < 0) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    if (!fi->fh || !reinterpret_cast<FileHandle *>(fi->fh)->ecFile) {
+      fuse_reply_err(req, EBADF);
+      return;
+    }
+    bool replied = false;
+    try {
+      auto user = UserInfo(Uid(fuse_req_ctx(req)->uid), Gid(fuse_req_ctx(req)->gid), d.fuseToken);
+      auto read = folly::coro::blockingWait(
+          d.ecFiles->read(*reinterpret_cast<FileHandle *>(fi->fh)->ecFile, user, uint64_t(off), size, true));
+      if (!read) {
+        handle_error(req, read);
+        return;
+      }
+      pi->dynamicAttr.wlock()->ecObservedLength = read->length;
+      const auto bytes = read->data.bytes();
+      fuse_reply_buf(req, reinterpret_cast<const char *>(bytes.data()), bytes.size());
+      replied = true;
+      // Owned bytes/admission leave scope only after actual synchronous reply.
+      // Remote debt is retained even if the kernel rejects the reply.
+    } catch (...) {
+      if (!replied) fuse_reply_err(req, EIO);
+    }
+    return;
+  }
+  if (isEcFile(pi->inode)) {
+    if (!d.ecReads || !fi->fh || !reinterpret_cast<FileHandle *>(fi->fh)->ecRead) {
+      fuse_reply_err(req, EOPNOTSUPP);
+      return;
+    }
+    if (off < 0) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    auto user = UserInfo(Uid(fuse_req_ctx(req)->uid), Gid(fuse_req_ctx(req)->gid), d.fuseToken);
+    bool replied = false;
+    try {
+      const auto handle = *reinterpret_cast<FileHandle *>(fi->fh)->ecRead;
+      auto read = folly::coro::blockingWait(d.ecReads->read(handle, user, uint64_t(off), size, true, d.ecControl()));
+      if (!read) {
+        handle_error(req, read);
+        return;
+      }
+      if (!read->localJoined || !read->data) {
+        const auto code = read->readFailure ? read->readFailure->code() : StatusCode::kIOError;
+        fuse_reply_err(req, StatusCode::toErrno(code));
+        return;
+      }
+      pi->dynamicAttr.wlock()->ecObservedLength = read->data->snapshot().file.length;
+      const auto bytes = read->data->bytes();
+      const auto delivered = fuse_reply_buf(req, reinterpret_cast<const char *>(bytes.data()), bytes.size());
+      replied = true;
+      const auto receipt = read->receipt;
+      const bool allT2 = read->cleanup.localJoined && read->cleanup.allReleased;
+      read->data.reset();  // Release the entire global payload lease before retirement.
+      if (delivered == 0) folly::coro::blockingWait(d.retireDeliveredEcRead(receipt, std::move(user), allT2));
+    } catch (...) {
+      if (!replied)
+        fuse_reply_err(req, EIO);
+      else
+        reportEcLocalMaintenanceFailure();
+    }
+    return;
+  }
   pi->dynamicAttr.wlock()->atime = UtcClock::now();
 
   std::unique_lock lock(pi->wbMtx);
@@ -1560,6 +1758,40 @@ void hf3fs_write(fuse_req_t req, fuse_ino_t fino, const char *buf, size_t size, 
   auto start = SteadyClock::now();
 
   auto userInfo = UserInfo(flat::Uid(fuse_req_ctx(req)->uid), flat::Gid(fuse_req_ctx(req)->gid), d.fuseToken);
+  const auto ecWriteInode = inodeOf(*fi, real_ino(fino));
+  if (ecWriteInode && isEcFile(ecWriteInode->inode)) {
+    if (d.userConfig.getConfig(userInfo).readonly()) {
+      fuse_reply_err(req, EROFS);
+      return;
+    }
+    if (!d.ecFiles || !fi->fh || !reinterpret_cast<FileHandle *>(fi->fh)->ecFile) {
+      fuse_reply_err(req, EOPNOTSUPP);
+      return;
+    }
+    if (off < 0) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    try {
+      auto result = folly::coro::blockingWait(d.ecFiles->write(*reinterpret_cast<FileHandle *>(fi->fh)->ecFile,
+                                                               userInfo,
+                                                               uint64_t(off),
+                                                               {reinterpret_cast<const uint8_t *>(buf), size}));
+      if (!result) {
+        handle_error(req, result);
+        return;
+      }
+      if (*result > size) {
+        fuse_reply_err(req, EIO);
+        return;
+      }
+      ecWriteInode->dynamicAttr.wlock()->ecObservedLength.reset();
+      fuse_reply_write(req, *result);
+    } catch (...) {
+      fuse_reply_err(req, EIO);
+    }
+    return;
+  }
   if (d.userConfig.getConfig(userInfo).dryrun_bench_mode()) {
     fuse_reply_write(req, size);
     return;
@@ -1689,6 +1921,24 @@ void hf3fs_write(fuse_req_t req, fuse_ino_t fino, const char *buf, size_t size, 
 }
 
 void hf3fs_fsync(fuse_req_t req, fuse_ino_t fino, int datasync, struct fuse_file_info *fi) {
+  const auto inode = inodeOf(*fi, real_ino(fino));
+  if (inode && isEcFile(inode->inode)) {
+    if (!d.ecFiles || !fi->fh || !reinterpret_cast<FileHandle *>(fi->fh)->ecFile) {
+      fuse_reply_err(req, EOPNOTSUPP);
+      return;
+    }
+    try {
+      auto user = UserInfo(Uid(fuse_req_ctx(req)->uid), Gid(fuse_req_ctx(req)->gid), d.fuseToken);
+      auto synced = folly::coro::blockingWait(d.ecFiles->fsync(*reinterpret_cast<FileHandle *>(fi->fh)->ecFile, user));
+      if (!synced)
+        handle_ec_error(req, synced);
+      else
+        fuse_reply_err(req, 0);
+    } catch (...) {
+      fuse_reply_err(req, EIO);
+    }
+    return;
+  }
   XLOGF(DBG, "fsync called");
   XLOGF(OP_LOG_LEVEL, "hf3fs_sync(ino={}, datasync={}, pid={})", fino, datasync, fuse_req_ctx(req)->pid);
   if (datasync) {
@@ -1702,6 +1952,25 @@ void hf3fs_fsync(fuse_req_t req, fuse_ino_t fino, int datasync, struct fuse_file
 }
 
 void hf3fs_flush(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fi) {
+  const auto inode = inodeOf(*fi, real_ino(fino));
+  if (inode && isEcFile(inode->inode)) {
+    if (d.ecFiles && fi->fh && reinterpret_cast<FileHandle *>(fi->fh)->ecFile) {
+      try {
+        auto u = UserInfo(Uid(fuse_req_ctx(req)->uid), Gid(fuse_req_ctx(req)->gid), d.fuseToken);
+        auto done = folly::coro::blockingWait(d.ecFiles->flush(*reinterpret_cast<FileHandle *>(fi->fh)->ecFile, u));
+        if (!done)
+          handle_ec_error(req, done);
+        else
+          fuse_reply_err(req, 0);
+      } catch (...) {
+        fuse_reply_err(req, EIO);
+      }
+      return;
+    }
+    // A legacy read-only handle accepted no writes; this is neither fsync nor T2.
+    fuse_reply_err(req, 0);
+    return;
+  }
   hf3fs_fsync(req, fino, false, fi);
 
   // auto pi = inodeOf(*fi, ino);
@@ -1748,6 +2017,25 @@ void hf3fs_release(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fi) {
   if (!ptr) {
     XLOGF(ERR, "hf3fs_release(ino={}): inode not found in list.", ino);
     fuse_reply_err(req, ENOENT);
+    return;
+  }
+
+  if (isEcFile(ptr->inode)) {
+    if (d.ecFiles && reinterpret_cast<FileHandle *>(fi->fh)->ecFile) {
+      try {
+        auto user = UserInfo(Uid(fuse_req_ctx(req)->uid), Gid(fuse_req_ctx(req)->gid), d.fuseToken);
+        auto done =
+            folly::coro::blockingWait(d.ecFiles->release(*reinterpret_cast<FileHandle *>(fi->fh)->ecFile, user));
+        if (!done)
+          handle_error(req, done);
+        else
+          fuse_reply_err(req, 0);
+      } catch (...) {
+        fuse_reply_err(req, EIO);
+      }
+      return;
+    }
+    fuse_reply_err(req, 0);
     return;
   }
 
@@ -1875,7 +2163,53 @@ void hf3fs_create(fuse_req_t req, fuse_ino_t fparent, const char *name, mode_t m
   }
 
   if (!S_ISREG(mode) && !S_ISDIR(mode) && !S_ISLNK(mode)) {
-    fuse_reply_err(req, ENOSYS);
+    fuse_reply_err(req, d.ecFiles && d.config->ec_file().create_new() ? EOPNOTSUPP : ENOSYS);
+    return;
+  }
+
+  if (d.ecFiles && d.config->ec_file().create_new()) {
+    if (!S_ISREG(mode)) {
+      fuse_reply_err(req, EOPNOTSUPP);
+      return;
+    }
+    bool replied = false;
+    try {
+      auto opened = folly::coro::blockingWait(d.ecFiles->create(meta::PathAt(parent, Path(name)),
+                                                                userInfo,
+                                                                fi->flags,
+                                                                uint32_t(mode & ALLPERMS),
+                                                                d.config->ec_file().shard_bytes()));
+      if (!opened) {
+        handle_ec_error(req, opened);
+        return;
+      }
+      struct fuse_entry_param e;
+      init_entry(&e, 0, 0);
+      add_entry(opened->inode, &e);
+      auto ptr = inodeOf(*fi, opened->inode.id);
+      if (!ptr) {
+        fuse_reply_err(req, EIO);
+        return;
+      }
+      fi->direct_io = 1;
+      fi->keep_cache = 0;
+      auto handle = std::make_unique<FileHandle>(FileHandle{ptr, true, Uuid::zero(), {}, opened->handle});
+      fi->fh = reinterpret_cast<uintptr_t>(handle.get());
+      const int rc = fuse_reply_create(req, &e, fi);
+      replied = true;
+      if (rc == 0)
+        (void)handle.release();
+      else {
+        fi->fh = 0;
+        auto closed = folly::coro::blockingWait(d.ecFiles->release(opened->handle, userInfo));
+        if (!closed) reportEcLocalMaintenanceFailure();
+      }
+    } catch (...) {
+      if (!replied)
+        fuse_reply_err(req, EIO);
+      else
+        reportEcLocalMaintenanceFailure();
+    }
     return;
   }
 
@@ -1894,7 +2228,7 @@ void hf3fs_create(fuse_req_t req, fuse_ino_t fparent, const char *name, mode_t m
 
     fi->direct_io = (!d.userConfig.getConfig(userInfo).enable_read_cache() || fi->flags & O_DIRECT) ? 1 : 0;
     // fi->direct_io = 1;  // newly created file, has to write, or read from remote
-    fi->fh = (uintptr_t)(new FileHandle{ptr, (bool)(fi->flags & O_DIRECT), session});
+    fi->fh = (uintptr_t)(new FileHandle{ptr, (bool)(fi->flags & O_DIRECT), session, {}, {}});
     XLOGF(DBG, "{}created in o direct mode", fi->flags & O_DIRECT ? "" : "not ");
     fuse_reply_create(req, &e, fi);
   }
@@ -1928,6 +2262,12 @@ void hf3fs_ioctl(fuse_req_t req,
   }
 
   auto userInfo = UserInfo(flat::Uid(fuse_req_ctx(req)->uid), flat::Gid(fuse_req_ctx(req)->gid), d.fuseToken);
+  const auto ioctlInode = inodeOf(ino);
+  if (ioctlInode && isEcFile(ioctlInode->inode) &&
+      (cmd == hf3fs::lib::fuse::HF3FS_IOC_FSYNC || cmd == hf3fs::lib::fuse::HF3FS_IOC_PUNCH_HOLE)) {
+    fuse_reply_err(req, EOPNOTSUPP);
+    return;
+  }
   switch (cmd) {
     case FS_IOC_GETFLAGS: {
       if (out_bufsz < sizeof(int)) {

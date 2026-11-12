@@ -8,6 +8,7 @@
 #include "analytics/StructuredTraceLog.h"
 #include "client/mgmtd/IMgmtdClientForServer.h"
 #include "client/mgmtd/RoutingInfo.h"
+#include "client/storage/EcRmwTransport.h"
 #include "client/storage/StorageMessenger.h"
 #include "common/net/Server.h"
 #include "common/net/Transport.h"
@@ -26,6 +27,7 @@
 #include "storage/aio/AioReadWorker.h"
 #include "storage/ec_gc/EcGcExecutor.h"
 #include "storage/ec_helper/EcHelperRuntime.h"
+#include "storage/ec_rmw/EcRmwRuntime.h"
 #include "storage/ec_scope/EcScopeControlExecutor.h"
 #include "storage/ec_scope/EcTargetDiscoveryExecutor.h"
 #include "storage/service/BufferPool.h"
@@ -55,6 +57,11 @@ class StorageOperator {
     CONFIG_ITEM(enable_ec_fragments, false);
     CONFIG_ITEM(allow_unsafe_ec_fragment_rpc_for_testing, false);
     CONFIG_ITEM(ec_capability_key_file, Path{});
+    CONFIG_ITEM(enable_ec_rmw, false);
+    CONFIG_ITEM(ec_rmw_key_file, Path{});
+    CONFIG_ITEM(ec_rmw_authority, std::string{});
+    CONFIG_OBJ(ec_rmw_client, client::StorageClient::Config);
+    CONFIG_OBJ(ec_rmw_transport, net::Client::Config);
     CONFIG_ITEM(enable_ec_helpers, false);
     CONFIG_ITEM(ec_helper_key_file, Path{});
     CONFIG_ITEM(enable_ec_gc, false);
@@ -123,6 +130,9 @@ class StorageOperator {
   CoTryTask<EcReconcileRsp> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req);
 
   CoTryTask<EcHelperHopRsp> executeEcHelper(const EcHelperHopReq &request);
+  CoTryTask<EcRmwStatusRsp> installEcRmw(const EcRmwInstallReq &);
+  CoTryTask<EcRmwStatusRsp> putEcRmw(const EcRmwPutReq &);
+  CoTryTask<EcRmwStatusRsp> actionEcRmw(const EcRmwActionReq &);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const EcScopeControlRequest &req);
   CoTryTask<EcScopeControlRsp> queryEcScopeDrain(const EcScopeControlRequest &req);
   CoTryTask<EcGcRsp> exchangeEcGc(const EcGcRequest &request);
@@ -200,6 +210,16 @@ class StorageOperator {
   std::unique_ptr<EcHelperRuntime> ecHelpers_;
 
   Result<Void> initEcGc();
+  Result<Void> initEcRmw();
+  CoTryTask<EcRmwStatus> installEcRmwOwned(EcRmwInstallReq);
+  std::shared_ptr<const EcRmwKey> ecRmwKey_;
+  Uuid ecRmwAuthority_ = Uuid::zero();
+  std::unique_ptr<EcRmwRuntime> ecRmw_;
+  std::shared_ptr<EcRmwResources> ecRmwResources_;
+  std::shared_ptr<hf3fs::client::IMgmtdClientForServer> ecRmwMgmtd_;
+  std::shared_ptr<client::StorageClient> ecRmwStorage_;
+  std::shared_ptr<client::EcRmwTransport> ecRmwTransport_;
+  std::optional<EcKeyFileIdentity> ecGcKeyFileIdentity_;
   std::unique_ptr<EcGcExecutor> ecGc_;
   std::optional<EcKeyFileIdentity> ecControlKeyFileIdentity_;
   std::optional<EcKeyFileIdentity> ecHelperKeyFileIdentity_;

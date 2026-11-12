@@ -6,6 +6,7 @@
 #include <memory>
 #include <openssl/evp.h>
 
+#include "meta/store/EcFileTreeGcGuard.h"
 #include "meta/store/EcV2LifecycleUtils.h"
 
 namespace hf3fs::meta::server {
@@ -446,6 +447,9 @@ CoTryTask<Void> EcV2GcCatalog::finishScope(Transaction &txn,
 CoTryTask<std::optional<EcGcClaim>> EcV2GcCatalog::getClaim(Transaction &txn,
                                                             const EcObjectRef &object,
                                                             const storage::EcFragmentIdentity &identity) {
+  // This extra conflict read does not broaden legacy mode-3 eligibility.
+  // A tree hold must not coexist with a new or previously irreversible claim.
+  CO_RETURN_ON_ERROR(co_await EcFileTreeGcGuard::requireUnheld(txn, object, identity));
   auto allocation = co_await getAllocation(txn, object, identity);
   CO_RETURN_ON_ERROR(allocation);
   auto key = allocationKey(KeyPrefix::EcGcClaim, identity);

@@ -7,6 +7,7 @@
 #include "fbs/storage/EcGcDiscovery.h"
 #include "fbs/storage/EcGcRpc.h"
 #include "fbs/storage/EcHelper.h"
+#include "fbs/storage/EcRmwRpc.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "fbs/storage/EcTargetDiscovery.h"
@@ -47,6 +48,9 @@ SERDE_SERVICE(StorageSerde, 3) {
   SERDE_SERVICE_METHOD(reconcileEcStageV2, 44, EcReconcileStageV2Req, EcStageV2Rsp);
   SERDE_SERVICE_METHOD(sealEcStageV2, 45, EcSealStageV2Req, EcSealStageV2Rsp);
   SERDE_SERVICE_METHOD(executeEcHelper, 46, EcHelperHopReq, EcHelperHopRsp);
+  SERDE_SERVICE_METHOD(installEcRmw, 47, EcRmwInstallReq, EcRmwStatusRsp);
+  SERDE_SERVICE_METHOD(putEcRmw, 48, EcRmwPutReq, EcRmwStatusRsp);
+  SERDE_SERVICE_METHOD(actionEcRmw, 49, EcRmwActionReq, EcRmwStatusRsp);
 };
 
 }  // namespace hf3fs::storage

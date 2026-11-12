@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 
 pub struct Allocator {
     allocator: Mutex<ChunkAllocator>,
+    // At most one class-local ticket. No pending physical action is replayed.
+    trim_pending: Mutex<Option<GroupId>>,
     pub counter: Arc<AllocatorCounter>,
     pub clusters: Clusters,
 }
@@ -18,6 +20,7 @@ impl Allocator {
             )?),
             counter,
             clusters,
+            trim_pending: Mutex::new(None),
         }))
     }
 
@@ -97,6 +100,10 @@ impl Allocator {
         allocator.finish_compact_task(group_id)
     }
 }
+
+#[path = "empty_group_trim.rs"]
+mod empty_group_trim;
+pub(crate) use empty_group_trim::{EmptyGroupTrimLimits, EmptyGroupTrimReport};
 
 impl Drop for Allocator {
     fn drop(&mut self) {

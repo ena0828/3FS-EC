@@ -319,6 +319,41 @@ pub(crate) fn stage_physical_used_size(
     }
 }
 
+// Keep the report outside catch_unwind so completed earlier classes survive
+// a panic. The panicking class is unknown and may leave a poisoned ticket.
+pub(crate) fn stage_trim_empty_groups(
+    handle: &EcStageHandle, limits: &ffi::RawEcStageTrimLimits,
+) -> ffi::RawEcStageTrimResult {
+    let mut report = EmptyGroupTrimReport::default();
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        engine(handle)?.trim_empty_groups(EmptyGroupTrimLimits {
+            max_groups: limits.max_groups,
+            max_bytes: limits.max_bytes,
+            keep_empty_groups: limits.keep_empty_groups,
+        }, &mut report)
+    }));
+    let status = match outcome {
+        Ok(Ok(())) => error(0, ""),
+        Ok(Err(err)) => stage_error(err),
+        Err(_) => { report.complete = false; error(4085, "empty-group trim panicked; progress incomplete") }
+    };
+    ffi::RawEcStageTrimResult { status, report: ffi::RawEcStageTrimReport {
+        attempted_groups: report.attempted_groups,
+        charged_bytes: report.charged_bytes,
+        punch_confirmed_groups: report.punch_confirmed_groups,
+        punch_confirmed_bytes: report.punch_confirmed_bytes,
+        withdrawn_preallocation_bytes: report.withdrawn_preallocation_bytes,
+        unconfirmed_extent_bytes: report.unconfirmed_extent_bytes,
+        reconciled_groups: report.reconciled_groups,
+        quarantined_groups: report.quarantined_groups,
+        busy_classes: report.busy_classes,
+        oversized_classes: report.oversized_classes,
+        unsupported_groups: report.unsupported_groups,
+        os_errno: report.os_errno,
+        complete: report.complete,
+    }}
+}
+
 pub(crate) fn stage_sample_metrics(handle: &EcStageHandle) -> ffi::RawEcStageMetricsResult {
     match boundary(false, || {
         Ok(crate::cxx::sample_metrics(

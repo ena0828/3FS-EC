@@ -158,6 +158,7 @@ struct StageInner {
     scopes: Arc<crate::ec_scope::EcScopeRegistry>,
     limits: ImmutableStageLimits,
     io_in_flight: AtomicUsize,
+    trim_cursor: AtomicUsize,
     #[cfg(test)]
     fault: Mutex<Option<StageFault>>,
 }
@@ -415,6 +416,7 @@ impl ImmutableStagingEngine {
             scopes,
             limits,
             io_in_flight: AtomicUsize::new(0),
+            trim_cursor: AtomicUsize::new(0),
             #[cfg(test)]
             fault: Mutex::new(None),
         })))
@@ -1319,6 +1321,9 @@ impl ImmutableStagingEngine {
         Ok(result)
     }
 }
+
+#[path = "immutable_trim.rs"]
+mod immutable_trim;
 
 #[cfg(test)]
 #[path = "immutable_stage_tests.rs"]

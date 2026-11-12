@@ -55,6 +55,9 @@ class IOperation {
   virtual bool isReadOnly() = 0;
   virtual bool retryMaybeCommitted() { return true; }
 
+  // Optional semantic replay guard; default preserves existing operations.
+  virtual CoTryTask<void> validateIdempotentReplay(IReadWriteTransaction &) { co_return Void{}; }
+
   virtual bool needIdempotent(Uuid &clientId, Uuid &requestId) const {
     boost::ignore_unused(clientId, requestId);
     return false;

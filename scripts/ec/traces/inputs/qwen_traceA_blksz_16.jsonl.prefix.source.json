@@ -1,0 +1,14 @@
+{
+  "schema": "qwen-bailian-input/v1",
+  "repository": "https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon",
+  "commit": "5f7439c51ec248a0c585f7d90a41a6f57773b912",
+  "path": "qwen_traceA_blksz_16.jsonl",
+  "license_spdx": "Apache-2.0",
+  "upstream_lfs_sha256": "07cedc9ed8aff301994ac68ed4aede8123b7603673575eeba9dd677de663db17",
+  "upstream_lfs_bytes_decimal": "56354493",
+  "input_sha256": "b6589db30813062fa5ef1156d0790929b48e10585874e9314f7614b59fec24ba",
+  "input_bytes_decimal": "64564",
+  "input_scope": "bounded-prefix",
+  "first_line_decimal": "1",
+  "byte_offset_decimal": "0"
+}

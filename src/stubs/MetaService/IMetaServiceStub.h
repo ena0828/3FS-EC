@@ -61,6 +61,30 @@ class IMetaServiceStub {
   IMETA_STUB_METHOD(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
   IMETA_STUB_METHOD(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
   IMETA_STUB_METHOD(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
+  IMETA_STUB_METHOD(describeEcFileV2, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
+  IMETA_STUB_METHOD(acquireEcRangeV2, AcquireEcRangeV2Req, EcRangeRsp);
+  IMETA_STUB_METHOD(queryEcRangeV2, QueryEcRangeV2Req, EcRangeRsp);
+  IMETA_STUB_METHOD(queryEcOwnedMutationV2, QueryEcOwnedMutationV2Req, EcOwnedMutationRsp);
+  IMETA_STUB_METHOD(openEcFileSession, OpenEcFileSessionReq, OpenEcFileSessionRsp);
+  IMETA_STUB_METHOD(beginEcFilePwrite, BeginEcFilePwriteReq, EcFilePwriteRsp);
+  IMETA_STUB_METHOD(queryEcFilePwrite, QueryEcFilePwriteReq, EcFilePwriteRsp);
+  IMETA_STUB_METHOD(advanceEcFilePwrite, AdvanceEcFilePwriteReq, EcFilePwriteRsp);
+  IMETA_STUB_METHOD(closeEcFileSession, CloseEcFileSessionReq, CloseEcFileSessionRsp);
+  IMETA_STUB_METHOD(acquireEcTreeRead, AcquireEcTreeReadReq, EcTreeReadRsp);
+  IMETA_STUB_METHOD(queryEcTreeRead, QueryEcTreeReadReq, EcTreeReadRsp);
+  IMETA_STUB_METHOD(releaseEcTreeRead, ReleaseEcTreeReadReq, EcTreeReadRsp);
+  IMETA_STUB_METHOD(advanceEcTreeReclaim, AdvanceEcTreeReclaimReq, AdvanceEcTreeReclaimRsp);
+  IMETA_STUB_METHOD(beginEcFileTruncate, BeginEcFileTruncateReq, EcFileTruncateRsp);
+  IMETA_STUB_METHOD(queryEcFileTruncate, QueryEcFileTruncateReq, EcFileTruncateRsp);
+  IMETA_STUB_METHOD(advanceEcFileTruncate, AdvanceEcFileTruncateReq, EcFileTruncateRsp);
+  IMETA_STUB_METHOD(closeEcFileTruncateDebt, CloseEcFileTruncateDebtReq, EcFileTruncateRsp);
+  IMETA_STUB_METHOD(beginEcFileAppend, BeginEcFileAppendReq, EcFileAppendRsp);
+  IMETA_STUB_METHOD(queryEcFileAppend, QueryEcFileAppendReq, EcFileAppendRsp);
+  IMETA_STUB_METHOD(syncEcFileSession, SyncEcFileSessionReq, SyncEcFileSessionRsp);
+  IMETA_STUB_METHOD(beginEcFileRepair, BeginEcFileRepairReq, EcFileRepairRsp);
+  IMETA_STUB_METHOD(queryEcFileRepair, QueryEcFileRepairReq, EcFileRepairRsp);
+  IMETA_STUB_METHOD(advanceEcFileRepair, AdvanceEcFileRepairReq, EcFileRepairRsp);
+  IMETA_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 #undef IMETA_STUB_METHOD
 };

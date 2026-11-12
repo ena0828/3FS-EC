@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <mutex>
 
 #include "chunk_engine/src/cxx.rs.h"
 #include "common/utils/CPUExecutorGroup.h"
@@ -90,6 +92,10 @@ class StorageTargets {
   Result<chunk_engine::Metrics> sampleEngineMetrics(uint32_t diskIndex) const;
   Result<Void> setAllowToAllocate(uint32_t diskIndex, bool allow) const;
 
+  // A single whole-process budget, not one budget per disk. Exact-GC only;
+  // legacy Engine pointers and relocation remain unavailable to this path.
+  chunk_engine::RawEcStageTrimResult trimEmptyGroups(const chunk_engine::RawEcStageTrimLimits &limits) const;
+
   // remove target.
   Result<Void> removeChunkEngineTarget(ChainId chainId, uint32_t diskIndex) {
     if (config_.ec_only()) {
@@ -121,6 +127,8 @@ class StorageTargets {
   std::vector<rust::Box<chunk_engine::Engine>> engines_;
   std::vector<std::shared_ptr<EcStagingEngine>> stagingEngines_;
 
+  mutable std::mutex trimRoundMutex_;
+  mutable size_t trimDiskCursor_ = 0;
   CoLockManager<> targetLocks_;
   RelativeTime spaceInfoUpdatedTime_;
   std::vector<SpaceInfo> cachedSpaceInfos_;

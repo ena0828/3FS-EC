@@ -246,6 +246,59 @@ Result<Void> StorageTargets::init(CPUExecutorGroup &executor) {
   return Void{};
 }
 
+chunk_engine::RawEcStageTrimResult StorageTargets::trimEmptyGroups(
+    const chunk_engine::RawEcStageTrimLimits &limits) const {
+  chunk_engine::RawEcStageTrimResult result{};
+  result.report.complete = true;
+  if (!config_.ec_only() || !config_.ec_staging_v2() || !config_.ec_exact_gc() || limits.max_groups == 0 ||
+      limits.max_groups > 64 || limits.max_bytes == 0 || limits.max_bytes > (64ULL << 30) ||
+      limits.keep_empty_groups > 1024) {
+    result.status.error_code = StatusCode::kInvalidArg;
+    result.status.error = rust::String("invalid exact-GC trim profile or round budget");
+    return result;
+  }
+  auto lock = std::unique_lock(trimRoundMutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    result.status.error_code = 7012;
+    result.status.error = rust::String("another trim round still owns synchronous I/O");
+    return result;
+  }
+  if (stagingEngines_.empty()) return result;
+  const auto first = trimDiskCursor_++ % stagingEngines_.size();
+  for (size_t offset = 0; offset < stagingEngines_.size(); ++offset) {
+    if (result.report.attempted_groups == limits.max_groups || result.report.charged_bytes == limits.max_bytes) break;
+    const auto index = (first + offset) % stagingEngines_.size();
+    const chunk_engine::RawEcStageTrimLimits remaining{limits.max_groups - result.report.attempted_groups,
+                                                       limits.max_bytes - result.report.charged_bytes,
+                                                       limits.keep_empty_groups};
+    auto disk = stagingEngines_[index]->trimEmptyGroups(remaining);
+    auto &sum = result.report;
+    const auto &part = disk.report;
+    sum.attempted_groups += part.attempted_groups;
+    sum.charged_bytes += part.charged_bytes;
+    sum.punch_confirmed_groups += part.punch_confirmed_groups;
+    sum.punch_confirmed_bytes += part.punch_confirmed_bytes;
+    sum.withdrawn_preallocation_bytes += part.withdrawn_preallocation_bytes;
+    sum.unconfirmed_extent_bytes += part.unconfirmed_extent_bytes;
+    sum.reconciled_groups += part.reconciled_groups;
+    sum.quarantined_groups += part.quarantined_groups;
+    sum.busy_classes += part.busy_classes;
+    sum.oversized_classes += part.oversized_classes;
+    sum.unsupported_groups += part.unsupported_groups;
+    if (part.os_errno) sum.os_errno = part.os_errno;
+    sum.complete = sum.complete && part.complete;
+    if (disk.status.error_code || !part.complete) {
+      result.status = std::move(disk.status);
+      if (!result.status.error_code) {
+        result.status.error_code = 4085;
+        result.status.error = rust::String("incomplete trim result");
+      }
+      return result;
+    }
+  }
+  return result;
+}
+
 Result<chunk_engine::RawUsedSize> StorageTargets::physicalUsedSize(uint32_t diskIndex) const {
   if (diskIndex >= targetPaths_.size()) return makeError(StatusCode::kInvalidArg, "invalid disk index");
   if (config_.ec_staging_v2()) {

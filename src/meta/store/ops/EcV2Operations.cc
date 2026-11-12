@@ -6,6 +6,7 @@
 #include "fbs/meta/EcRequestDigest.h"
 #include "meta/components/EcV2Coordinator.h"
 #include "meta/store/EcCreateCatalog.h"
+#include "meta/store/EcFileAccess.h"
 #include "meta/store/EcNamespaceGuard.h"
 #include "meta/store/EcV2PublishedCatalog.h"
 #include "meta/store/EcV2RepairPlanCatalog.h"
@@ -32,41 +33,6 @@ Result<Void> checkConfiguration(const Config &config) {
     return makeError(StatusCode::kNotImplemented, "native EC catalog is disabled");
   if (!config.authenticate()) return makeError(StatusCode::kAuthenticationFail, "native EC requires authentication");
   return Void{};
-}
-
-struct LoadedEcFile {
-  Inode inode;
-  EcObjectRecord object;
-};
-
-CoTryTask<LoadedEcFile> loadV2File(IReadWriteTransaction &txn,
-                                   const UserInfo &user,
-                                   const EcObjectRef &object,
-                                   std::optional<AccessType> access) {
-  CO_RETURN_ON_ERROR(co_await EcV2BindingCatalog::requireV2Mode(txn, object));
-  auto loaded = co_await Inode::load(txn, object.inode);
-  CO_RETURN_ON_ERROR(loaded);
-  if (!*loaded || !(**loaded).nlink) co_return makeError(MetaCode::kNotFound, "EC inode is absent or unlinked");
-  auto inode = std::move(**loaded);
-  if (!inode.isFile()) co_return makeError(MetaCode::kNotFile);
-  const auto *layout = inode.asFile().layout.ecLayout();
-  if (!layout || layout->incarnation != object.incarnation) {
-    co_return makeError(StatusCode::kTokenMismatch, "EC inode incarnation differs from the request");
-  }
-  CO_RETURN_ON_ERROR(layout->valid());
-  if (access) {
-    if (*access != AccessType::READ && (inode.acl.iflags & FS_IMMUTABLE_FL)) {
-      co_return makeError(MetaCode::kNoPermission, "EC inode is immutable");
-    }
-    CO_RETURN_ON_ERROR(inode.acl.checkPermission(user, *access));
-  }
-  auto catalog = co_await EcCatalog::getObject(txn, object);
-  CO_RETURN_ON_ERROR(catalog);
-  if (catalog->shardBytes != layout->shardBytes || catalog->length != inode.asFile().length) {
-    co_return makeError(StatusCode::kDataCorruption, "EC catalog and inode metadata disagree");
-  }
-  if (catalog->deleting) co_return makeError(StatusCode::kTokenStale, "EC object is deleting");
-  co_return LoadedEcFile{std::move(inode), std::move(*catalog)};
 }
 
 class CreateEcFileV2Op : public Operation<CreateEcFileRsp> {

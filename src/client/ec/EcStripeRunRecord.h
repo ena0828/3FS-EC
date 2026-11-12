@@ -6,6 +6,21 @@
 
 namespace hf3fs::client::ec {
 
+// Immutable provenance for a separate full-stripe Write, never a replacement
+// identity for the old operation. No grant or asserted cleanup completion.
+struct EcStripeRecoverySource {
+  SERDE_STRUCT_FIELD(version, uint16_t{1});
+  SERDE_STRUCT_FIELD(runPath, std::string{});
+  SERDE_STRUCT_FIELD(action, std::string{});
+  SERDE_STRUCT_FIELD(operation, Uuid::zero());
+  SERDE_STRUCT_FIELD(getRequest, Uuid::zero());
+  SERDE_STRUCT_FIELD(expectedEpoch, uint64_t{});
+  SERDE_STRUCT_FIELD(expectedRevision, uint64_t{});
+  SERDE_STRUCT_FIELD(replacementMask, uint16_t{});
+  SERDE_STRUCT_FIELD(recordSha256, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(observationSha256, storage::EcSha256{});
+};
+
 // Local CLI recovery journal, not a storage allocation or a remote durability
 // proof. It deliberately contains no user token, data grant or signing key.
 struct EcStripeRunRecord {
@@ -38,6 +53,9 @@ struct EcStripeRunRecord {
   SERDE_STRUCT_FIELD(blockWindow, uint8_t{1});
   SERDE_STRUCT_FIELD(command, std::string{});
   SERDE_STRUCT_FIELD(resumeCommand, std::string{});
+  // Absent from the exact persisted v1 representation. Version 2 is reserved
+  // for recovery-write and requires this complete fixed source commitment.
+  SERDE_STRUCT_FIELD(recoverySource, (std::optional<EcStripeRecoverySource>{}));
 
  public:
   EcStripeMutationIds mutationIds() const;

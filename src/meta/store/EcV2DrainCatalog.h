@@ -37,6 +37,7 @@ class EcVerifiedDrainAck {
 
  private:
   friend class EcV2DrainCatalog;
+  friend class EcFileTreeReadCatalog;
   EcVerifiedDrainAck(EcV2DrainIdentity identity, size_t index, EcV2DrainObservation observation)
       : identity_(std::move(identity)),
         index_(index),

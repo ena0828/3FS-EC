@@ -30,6 +30,24 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def selected_services(manifest, native_v2=False, native_gc=False, ec_file_mount=False):
+    is_v2 = manifest.get("profile") in {"native-v2-local-1-storage-12-targets", "native-v2-local-12-storage-12-targets"}
+    is_gc = manifest.get("profile") in {"native-gc-local-1-storage-12-targets", "native-gc-local-12-storage-12-targets"}
+    if native_v2 != is_v2 or native_gc != is_gc:
+        raise ValueError("--native-v2/--native-gc must match the prepared bundle profile")
+    file_api = manifest.get("file_api", False)
+    if type(file_api) is not bool or (file_api and not is_gc):
+        raise ValueError("File API must be explicitly prepared on a native GC profile")
+    if type(ec_file_mount) is not bool or (ec_file_mount and not (is_gc and file_api)):
+        raise ValueError("--ec-file-mount requires an already prepared native GC --file-api bundle")
+    services = NATIVE_V2_SERVICES if native_v2 or native_gc else SERVICES
+    if file_api:
+        services += ("ec_file_cli",)
+    if ec_file_mount:
+        services += ("hf3fs_fuse_main", "ec_mount_read_probe")
+    return services
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True)
@@ -37,6 +55,7 @@ def main():
     native_profile = parser.add_mutually_exclusive_group()
     native_profile.add_argument("--native-v2", action="store_true", help="Package the native V2 TCP profile including ec_stripe_cli, without FUSE")
     native_profile.add_argument("--native-gc", action="store_true", help="Package the explicitly prepared native GC profile using the same five services")
+    parser.add_argument("--ec-file-mount", action="store_true", help="Explicitly package mode4 FUSE and its probe for a native GC --file-api bundle; never mounts")
     parser.add_argument("--ec-example", type=Path, help="Optional compiled POSIX EC example and its runtime libraries")
     args = parser.parse_args()
     if sys.platform != "linux":
@@ -45,12 +64,11 @@ def main():
     if not (output / "cluster.json").is_file():
         parser.error("--output must be a bundle already prepared by cluster/generate.py")
     bundle_manifest = json.loads((output / "cluster.json").read_text())
-    is_native_v2 = bundle_manifest.get("profile") == "native-v2-local-1-storage-12-targets"
-    is_native_gc = bundle_manifest.get("profile") == "native-gc-local-1-storage-12-targets"
-    if args.native_v2 != is_native_v2 or args.native_gc != is_native_gc:
-        parser.error("--native-v2/--native-gc must match the prepared bundle profile")
-    services = NATIVE_V2_SERVICES if args.native_v2 or args.native_gc else SERVICES
-    for directory in (output / "bin", output / "lib", output / "provenance"):
+    try:
+        services = selected_services(bundle_manifest, args.native_v2, args.native_gc, args.ec_file_mount)
+    except ValueError as error:
+        parser.error(str(error))
+    for directory in (output / "bin", output / "lib", output / "provenance", output / "scripts"):
         if directory.is_symlink() or not directory.resolve().is_relative_to(output):
             parser.error(f"Refusing a redirected bundle directory: {directory}")
 
@@ -106,6 +124,13 @@ def main():
             else:
                 include(source_path, f"lib/{soname}", "shared-library")
 
+    if args.ec_file_mount:
+        for name in ("prepare-fuse-file.py", "prepare-fuse-read.py", "generate.py", "native_v2_config.py", "mode4-mount-acceptance.py"):
+            script = Path(__file__).with_name("cluster") / name
+            if not script.is_file():
+                raise RuntimeError(f"Missing mode4 preparation source: {script}; integrate the mount candidate first")
+            include(script, f"scripts/{name}", "script")
+
     # Complete preflight before writing any payload; existing FDB files are
     # reused only when their content hash exactly matches the selected input.
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -125,7 +150,8 @@ def main():
     manifest = {"build_directory": str(build), "bundle_directory": str(output),
                 "created_utc": stamp, "files": copies, "guest_system_libraries": omitted,
                 "ld_library_path_during_inspection": environment["LD_LIBRARY_PATH"],
-                "scope": "ELF DT_NEEDED closure; runtime dlopen providers remain guest dependencies"}
+                "scope": "ELF DT_NEEDED closure; runtime dlopen providers remain guest dependencies",
+                "ec_file_mount": args.ec_file_mount, "mount_started": False}
     (record / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({"services": len(services), "ec_example": bool(args.ec_example),
                       "payload_files": len(copies), "manifest": str(record / "manifest.json")}))

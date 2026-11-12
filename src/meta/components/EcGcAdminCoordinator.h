@@ -16,6 +16,7 @@ class EcGcAdminCoordinator {
                        const EcV2Coordinator &);
   Result<Void> checkEnabled() const;
   void close();
+  Result<storage::EcKeyFileIdentity> loadedKeyFileIdentity() const;
   CoTryTask<EcGcAdminRsp> collect(EcGcAdminReq) const;
   CoTryTask<EcGcAdminRsp> query(EcGcAdminReq) const;
 

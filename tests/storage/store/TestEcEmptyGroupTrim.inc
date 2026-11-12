@@ -1,0 +1,158 @@
+// Included inside the existing real Engine/GC executor fixture namespace.
+// The fixture's signed Meta evidence is synthetic; this is local integration,
+// not the independent Meta38/39 service acceptance experiment.
+TEST_F(TestEcGcExecutor, EmptyGroupTrimPreservesLedgerAndRequiresFreshPhysicalAllocation) {
+  ASSERT_NO_FATAL_FAILURE(seal());
+  chunk_engine::RawEcStageTrimLimits limits{1, 256ULL << 20, 0};
+  auto occupied = engine->trimEmptyGroups(limits);
+  ASSERT_EQ(occupied.status.error_code, 0);
+  EXPECT_TRUE(occupied.report.complete);
+  EXPECT_EQ(occupied.report.attempted_groups, 0);
+  const auto oldClaim = claims(EcGcAction::Query);
+  const auto collect = sign(claims(EcGcAction::Collect));
+  auto ledger = run(EcGcAction::Collect, collect);
+  ASSERT_OK(ledger);
+  auto before = engine->physicalUsedSize();
+  ASSERT_OK(before);
+  ASSERT_GT(before->allocated_size, 0);
+  auto tooSmall = limits;
+  tooSmall.max_bytes = before->allocated_size - 1;
+  auto deniedByBudget = engine->trimEmptyGroups(tooSmall);
+  ASSERT_EQ(deniedByBudget.status.error_code, 0);
+  EXPECT_EQ(deniedByBudget.report.attempted_groups, 0);
+  EXPECT_GT(deniedByBudget.report.oversized_classes, 0);
+  auto keep = limits;
+  keep.keep_empty_groups = 1;
+  auto retained = engine->trimEmptyGroups(keep);
+  ASSERT_EQ(retained.status.error_code, 0);
+  EXPECT_EQ(retained.report.attempted_groups, 0);
+  auto trimmed = engine->trimEmptyGroups(limits);
+  ASSERT_EQ(trimmed.status.error_code, 0) << std::string(trimmed.status.error);
+  EXPECT_TRUE(trimmed.report.complete);
+  EXPECT_EQ(trimmed.report.punch_confirmed_groups, 1);
+  EXPECT_EQ(trimmed.report.withdrawn_preallocation_bytes, before->allocated_size);
+  EXPECT_EQ(trimmed.report.unconfirmed_extent_bytes, 0);
+  const auto query = sign(oldClaim);
+  auto observed = run(EcGcAction::Query, query);
+  ASSERT_OK(observed);
+  EXPECT_EQ(observed->claims.ledgerSha256, ledger->claims.ledgerSha256);
+  ASSERT_OK(executor->stopAndJoin());
+  executor.reset();
+  target.reset();
+  engine.reset();
+  ASSERT_NO_FATAL_FAILURE(open(false));
+  ASSERT_NO_FATAL_FAILURE(start());
+  auto reopened = run(EcGcAction::Query, query);
+  ASSERT_OK(reopened);
+  EXPECT_EQ(reopened->claims.ledgerSha256, ledger->claims.ledgerSha256);
+  auto after = engine->physicalUsedSize();
+  ASSERT_OK(after);
+  EXPECT_EQ(after->allocated_size, 0);
+  request.identity.allocation = Uuid::from(850, 851);
+  request.operationId = Uuid::from(852, 853);
+  std::fill(data.begin(), data.end(), 'T');
+  auto integrity = computeEcIntegrity(request.identity, data);
+  ASSERT_OK(integrity);
+  request.integrity = *integrity;
+  ASSERT_OK(engine->setAllowToAllocate(false));
+  ASSERT_ERROR(target->executeEcStage(request), StorageClientCode::kNoSpace);
+  ASSERT_OK(engine->setAllowToAllocate(true));
+  ASSERT_NO_FATAL_FAILURE(seal());
+  auto noOldTask = engine->trimEmptyGroups(limits);
+  ASSERT_EQ(noOldTask.status.error_code, 0);
+  EXPECT_EQ(noOldTask.report.attempted_groups, 0);
+  auto read = target->executeEcStage(op(EcStageOperation::ReadBlock));
+  ASSERT_OK(read);
+  EXPECT_EQ(read->data, data.substr(0, kEcIntegrityBlockBytes));
+  auto stillPermanent = run(EcGcAction::Query, query);
+  ASSERT_OK(stillPermanent);
+  EXPECT_EQ(stillPermanent->claims.ledgerSha256, ledger->claims.ledgerSha256);
+}
+
+TEST_F(TestEcGcExecutor, WholeRoundGroupAndByteBudgetIsSharedAcrossTwoRealDisks) {
+  ASSERT_OK(executor->stopAndJoin());
+  executor.reset();
+  target.reset();
+  engine.reset();
+  struct rlimit limit {};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limit), 0);
+  ASSERT_GE(limit.rlim_max, 16384u);
+  if (limit.rlim_cur < 16384) {
+    limit.rlim_cur = 16384;
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &limit), 0);
+  }
+  folly::test::TemporaryDirectory disk0;
+  folly::test::TemporaryDirectory disk1;
+  StorageTargets::Config process;
+  process.set_target_paths({disk0.path(), disk1.path()});
+  process.set_allow_disk_without_uuid(true);
+  process.set_ec_only(true);
+  process.set_ec_staging_v2(true);
+  process.set_ec_exact_gc(true);
+  AtomicallyTargetMap map;
+  StorageTargets targets(process, map);
+  CPUExecutorGroup loader(1, "TrimDisks");
+  ASSERT_OK(targets.load(loader));
+  ASSERT_TRUE(targets.engines().empty());
+  ASSERT_NO_FATAL_FAILURE(start());
+  std::array<uint64_t, 2> initial{};
+  for (uint32_t disk = 0; disk != 2; ++disk) {
+    CreateTargetReq create;
+    create.diskIndex = disk;
+    create.chainId = ChainId{701 + disk};
+    create.targetId = TargetId{702 + disk};
+    create.onlyChunkEngine = true;
+    ASSERT_OK(targets.create(create, true));
+    auto found = map.getByTargetId(create.targetId);
+    ASSERT_OK(found);
+    const auto store = (*found)->storageTarget;
+    ASSERT_NE(store, nullptr);
+    request.vChainId = {create.chainId, ChainVer{9}};
+    request.targetId = create.targetId;
+    request.identity.allocation = Uuid::from(900, 901 + disk);
+    request.operationId = Uuid::from(902, 903 + disk);
+    auto integrity = computeEcIntegrity(request.identity, data);
+    ASSERT_OK(integrity);
+    request.integrity = *integrity;
+    ASSERT_OK(store->executeEcStage(request));
+    for (uint8_t block = 0; block < request.integrity.blockCount; ++block) {
+      auto append = op(EcStageOperation::Append);
+      append.blockIndex = block;
+      append.payload = data.substr(size_t(block) * kEcIntegrityBlockBytes, kEcIntegrityBlockBytes);
+      ASSERT_OK(store->executeEcStage(append));
+    }
+    ASSERT_OK(store->executeEcStage(op(EcStageOperation::Seal)));
+    auto state = store->ecScopeState();
+    ASSERT_OK(state);
+    actual = state->second;
+    claimId = Uuid::from(904, 905 + disk);
+    const auto token = sign(claims(EcGcAction::Collect));
+    auto collected = folly::coro::blockingWait(executor->execute(EcGcAction::Collect, token, store));
+    ASSERT_OK(collected);
+    expectOk(Codec::verifyAck(*key, *collected, token));
+    auto size = targets.physicalUsedSize(disk);
+    ASSERT_OK(size);
+    initial[disk] = size->allocated_size;
+    ASSERT_GT(initial[disk], 0);
+  }
+  auto first = targets.trimEmptyGroups({1, 256ULL << 20, 0});
+  ASSERT_EQ(first.status.error_code, 0) << std::string(first.status.error);
+  EXPECT_EQ(first.report.attempted_groups, 1);
+  EXPECT_EQ(first.report.punch_confirmed_groups, 1);
+  EXPECT_EQ(first.report.charged_bytes, initial[0]);
+  EXPECT_EQ(targets.physicalUsedSize(0)->allocated_size, 0);
+  EXPECT_EQ(targets.physicalUsedSize(1)->allocated_size, initial[1]);
+  auto tooSmall = targets.trimEmptyGroups({64, initial[1] - 1, 0});
+  ASSERT_EQ(tooSmall.status.error_code, 0);
+  EXPECT_EQ(tooSmall.report.attempted_groups, 0);
+  EXPECT_EQ(tooSmall.report.charged_bytes, 0);
+  auto second = targets.trimEmptyGroups({64, initial[1], 0});
+  ASSERT_EQ(second.status.error_code, 0);
+  EXPECT_EQ(second.report.attempted_groups, 1);
+  EXPECT_EQ(second.report.punch_confirmed_groups, 1);
+  EXPECT_EQ(second.report.charged_bytes, initial[1]);
+  EXPECT_EQ(targets.physicalUsedSize(0)->allocated_size, 0);
+  EXPECT_EQ(targets.physicalUsedSize(1)->allocated_size, 0);
+  ASSERT_OK(executor->stopAndJoin());
+  executor.reset();
+}

@@ -23,12 +23,14 @@ Result<Void> StorageOperator::initEcGc() {
   if (config_.enable_ec_scope_control()) RETURN_ON_ERROR(add(ecControlKeyFileIdentity_));
   if (config_.enable_ec_helpers()) RETURN_ON_ERROR(add(ecHelperKeyFileIdentity_));
   CHECK_RESULT(key, EcGcKey::loadFile(std::filesystem::path(config_.ec_gc_key_file().string()), keyId, otherRoles));
+  const auto loadedIdentity = key->fileIdentity();
   auto shared = std::shared_ptr<const EcGcKey>(std::move(key));
   CHECK_RESULT(executor,
                EcGcExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_, [this] {
                  return config_.read_only();
                }));
   ecGc_ = std::move(executor);
+  ecGcKeyFileIdentity_ = EcKeyFileIdentity{loadedIdentity.device, loadedIdentity.inode};
   return Void{};
 }
 

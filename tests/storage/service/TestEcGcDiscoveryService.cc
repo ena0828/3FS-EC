@@ -241,7 +241,7 @@ TEST_F(TestEcGcDiscoveryService, RealTcpReturnsActualInstanceAndCurrentReadOnlyM
   EXPECT_EQ(observed->claims.authority, authority);
   EXPECT_EQ(observed->claims.dataProtocol, 2);
   EXPECT_EQ(observed->claims.diskFormat, 3);
-  EXPECT_EQ(observed->claims.gcProtocol, 1);
+  EXPECT_EQ(observed->claims.gcProtocol, kEcGcSupportedProtocol);
   EXPECT_EQ(observed->claims.capabilities, kEcGcDiscoveryCollectQuery);
   EXPECT_FALSE(observed->claims.bootNonce.is_nil());
   config.storage().set_read_only(true);

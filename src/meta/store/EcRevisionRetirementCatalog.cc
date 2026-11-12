@@ -1,7 +1,9 @@
 #include "EcRevisionRetirementCatalog.h"
 
+#include "EcTreeGcCatalog.h"
 #include "common/kv/KeyPrefix.h"
 #include "common/utils/SerDeser.h"
+#include "detail/EcGcTxnScope.h"
 #include "meta/store/EcCatalog.h"
 #include "meta/store/EcV2GcCatalog.h"
 
@@ -58,8 +60,21 @@ CoTryTask<std::optional<EcRevisionRetirementRsp>> previous(kv::IReadWriteTransac
 CoTryTask<EcRevisionRetirementRsp> EcRevisionRetirementCatalog::retire(kv::IReadWriteTransaction &txn,
                                                                        const EcRevisionRetirementReq &req) {
   CO_RETURN_ON_ERROR(req.valid());
-  auto old = co_await previous(txn, req);
+  // A permanent request binds its full object before caller-supplied identity
+  // is used for typed dispatch. Valid replays still validate enrollment/history.
+  EcGcTxnScope scope(txn);
+  auto &budget = scope.transaction();
+  auto old = co_await previous(budget, req);
   CO_RETURN_ON_ERROR(old);
+  auto tree = co_await EcTreeGcCatalog::isTree(budget, req.object);
+  CO_RETURN_ON_ERROR(tree);
+  if (*tree) co_return co_await EcTreeGcCatalog::retire(budget, req, false);
+  std::string treeKey(kv::toStr(kv::KeyPrefix::EcTreeRetirement));
+  treeKey.append(req.client.uuid.asStringView());
+  treeKey.append(req.uuid.asStringView());
+  auto treeRequest = co_await txn.get(treeKey);
+  CO_RETURN_ON_ERROR(treeRequest);
+  if (*treeRequest) co_return makeError(StatusCode::kTokenMismatch, "retirement UUID belongs to a tree request");
   if (*old) co_return **old;
   auto historical = co_await loadHistorical(txn, req);
   CO_RETURN_ON_ERROR(historical);
@@ -86,8 +101,21 @@ CoTryTask<EcRevisionRetirementRsp> EcRevisionRetirementCatalog::retire(kv::IRead
 CoTryTask<EcRevisionRetirementRsp> EcRevisionRetirementCatalog::query(kv::IReadWriteTransaction &txn,
                                                                       const EcRevisionRetirementReq &req) {
   CO_RETURN_ON_ERROR(req.valid());
-  auto old = co_await previous(txn, req);
+  // A permanent request binds its full object before caller-supplied identity
+  // is used for typed dispatch. Valid replays still validate enrollment/history.
+  EcGcTxnScope scope(txn);
+  auto &budget = scope.transaction();
+  auto old = co_await previous(budget, req);
   CO_RETURN_ON_ERROR(old);
+  auto tree = co_await EcTreeGcCatalog::isTree(budget, req.object);
+  CO_RETURN_ON_ERROR(tree);
+  if (*tree) co_return co_await EcTreeGcCatalog::retire(budget, req, true);
+  std::string treeKey(kv::toStr(kv::KeyPrefix::EcTreeRetirement));
+  treeKey.append(req.client.uuid.asStringView());
+  treeKey.append(req.uuid.asStringView());
+  auto treeRequest = co_await txn.get(treeKey);
+  CO_RETURN_ON_ERROR(treeRequest);
+  if (*treeRequest) co_return makeError(StatusCode::kTokenMismatch, "retirement UUID belongs to a tree request");
   if (!*old) {
     auto historical = co_await loadHistorical(txn, req);
     CO_RETURN_ON_ERROR(historical);

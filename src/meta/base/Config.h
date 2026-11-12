@@ -79,6 +79,14 @@ struct Config : ConfigBase<Config> {
   // Explicit root-only, exact-allocation GC. No scan, TTL or automatic retire.
   CONFIG_ITEM(enable_ec_exact_gc, false);
   CONFIG_ITEM(enable_ec_revision_retirement, false);
+  // Bounded file-range metadata only; not POSIX file lifecycle support.
+  CONFIG_ITEM(enable_ec_file_ranges, false);
+  // Independent trusted Storage RMW, disabled unless explicitly configured.
+  CONFIG_ITEM(enable_ec_rmw, false);
+  CONFIG_ITEM(ec_rmw_key_file, Path{});
+  CONFIG_ITEM(ec_rmw_authority, std::string{});
+  CONFIG_ITEM(ec_rmw_grant_ttl_seconds, uint64_t{60});
+  CONFIG_OBJ(ec_rmw_transport, net::Client::Config);
   CONFIG_ITEM(ec_gc_key_file, Path{});
   CONFIG_ITEM(ec_gc_key_id, std::string{});
   CONFIG_ITEM(ec_gc_authority, std::string{});

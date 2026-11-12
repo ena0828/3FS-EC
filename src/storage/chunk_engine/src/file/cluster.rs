@@ -60,6 +60,20 @@ impl Cluster {
         }
     }
 
+    // Preserve errno for the exact-GC maintenance report. This never chooses
+    // an extent: the allocator owns the empty-group ticket until sync returns.
+    pub(crate) fn punch_empty_group(&self, group: GroupId) -> std::io::Result<()> {
+        let result = unsafe {
+            libc::fallocate(self.direct_fd.as_raw_fd(), PUNCH_HOLE_FLAGS,
+                            group.offset().into(), group.size().into())
+        };
+        if result == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    pub(crate) fn sync_trim(&self) -> std::io::Result<()> {
+        self.direct_fd.sync_all()
+    }
+
     pub fn pread(&self, pos: Position, mut buf: &mut [u8], offset: u32) -> Result<()> {
         let aligned = is_aligned_io(buf, offset);
         let mut offset = pos.offset() + offset;

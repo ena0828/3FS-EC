@@ -32,6 +32,7 @@ CoTryTask<meta::ReleaseEcReadV2Rsp> releaseAfterCleanup(std::shared_ptr<detail::
                                                         std::shared_ptr<detail::EcStripeClientReadState> state,
                                                         EcStripeControl control) {
   if (!state) co_return makeError(StatusCode::kInvalidArg, "empty stripe read session");
+  if (state->externalRange) co_return makeError(StatusCode::kInvalidArg, "tree range release requires Meta55");
   co_await state->cleaned;
   co_return co_await core->releaseOwned(state->pin, control);
 }
@@ -169,6 +170,11 @@ CoTask<EcStripeMutationOutcome> EcStripeClient::repair(EcStripeRepair request, E
 }
 Result<EcStripeReadSession> EcStripeClient::startRead(EcStripePinIds request, EcStripeControl control) {
   return core_->startRead(std::move(request), control);
+}
+Result<EcStripeReadSession> EcStripeClient::startPinnedRead(EcStripePinIds request,
+                                                            meta::AcquireEcReadV2Rsp read,
+                                                            EcStripeControl control) {
+  return core_->startRead(std::move(request), control, std::move(read));
 }
 CoTryTask<meta::ReleaseEcReadV2Rsp> EcStripeClient::release(EcStripeReadSession &session, EcStripeControl control) {
   auto state = session.state_;

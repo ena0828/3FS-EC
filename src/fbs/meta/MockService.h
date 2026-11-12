@@ -58,5 +58,31 @@ class MockMetaService : public serde::ServiceWrapper<MockMetaService, MetaSerde>
   META_MOCK_SERVICE_METHOD(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
   META_MOCK_SERVICE_METHOD(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
   META_MOCK_SERVICE_METHOD(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
+  META_MOCK_SERVICE_METHOD(describeEcFileV2, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
+  META_MOCK_SERVICE_METHOD(acquireEcRangeV2, AcquireEcRangeV2Req, EcRangeRsp);
+  META_MOCK_SERVICE_METHOD(queryEcRangeV2, QueryEcRangeV2Req, EcRangeRsp);
+  META_MOCK_SERVICE_METHOD(queryEcOwnedMutationV2, QueryEcOwnedMutationV2Req, EcOwnedMutationRsp);
+  META_MOCK_SERVICE_METHOD(openEcFileSession, OpenEcFileSessionReq, OpenEcFileSessionRsp);
+  META_MOCK_SERVICE_METHOD(beginEcFilePwrite, BeginEcFilePwriteReq, EcFilePwriteRsp);
+  META_MOCK_SERVICE_METHOD(queryEcFilePwrite, QueryEcFilePwriteReq, EcFilePwriteRsp);
+  META_MOCK_SERVICE_METHOD(advanceEcFilePwrite, AdvanceEcFilePwriteReq, EcFilePwriteRsp);
+  META_MOCK_SERVICE_METHOD(closeEcFileSession, CloseEcFileSessionReq, CloseEcFileSessionRsp);
+  META_MOCK_SERVICE_METHOD(acquireEcTreeRead, AcquireEcTreeReadReq, EcTreeReadRsp);
+  META_MOCK_SERVICE_METHOD(queryEcTreeRead, QueryEcTreeReadReq, EcTreeReadRsp);
+  META_MOCK_SERVICE_METHOD(releaseEcTreeRead, ReleaseEcTreeReadReq, EcTreeReadRsp);
+  META_MOCK_SERVICE_METHOD(advanceEcTreeReclaim, AdvanceEcTreeReclaimReq, AdvanceEcTreeReclaimRsp);
+  META_MOCK_SERVICE_METHOD(beginEcFileTruncate, BeginEcFileTruncateReq, EcFileTruncateRsp);
+  META_MOCK_SERVICE_METHOD(queryEcFileTruncate, QueryEcFileTruncateReq, EcFileTruncateRsp);
+  META_MOCK_SERVICE_METHOD(advanceEcFileTruncate, AdvanceEcFileTruncateReq, EcFileTruncateRsp);
+  META_MOCK_SERVICE_METHOD(closeEcFileTruncateDebt, CloseEcFileTruncateDebtReq, EcFileTruncateRsp);
+  META_MOCK_SERVICE_METHOD(beginEcFileAppend, BeginEcFileAppendReq, EcFileAppendRsp);
+  META_MOCK_SERVICE_METHOD(queryEcFileAppend, QueryEcFileAppendReq, EcFileAppendRsp);
+  META_MOCK_SERVICE_METHOD(syncEcFileSession, SyncEcFileSessionReq, SyncEcFileSessionRsp);
+  META_MOCK_SERVICE_METHOD(beginEcFileRepair, BeginEcFileRepairReq, EcFileRepairRsp);
+  META_MOCK_SERVICE_METHOD(queryEcFileRepair, QueryEcFileRepairReq, EcFileRepairRsp);
+  META_MOCK_SERVICE_METHOD(advanceEcFileRepair, AdvanceEcFileRepairReq, EcFileRepairRsp);
+  META_MOCK_SERVICE_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
+
+  META_MOCK_SERVICE_METHOD(bindEcRmwOutput, BindEcRmwOutputReq, BindEcRmwOutputRsp);
 };
 }  // namespace hf3fs::meta

@@ -216,6 +216,13 @@ class NativeGcConfiguration(unittest.TestCase):
         restarted = [dict(item, boot_nonce=str(uuid.UUID(int=84)), observed_at_seconds=1990,
                           verified_at_seconds=1995) for item in observed]
         self.assertEqual(inventory, gc_inventory_from_observations(manifest, pool, restarted, 2000))
+        newer = [dict(item, gc_protocol=2) for item in observed]
+        actual = gc_inventory_from_observations(manifest, pool, newer, 1000)
+        self.assertEqual({item["gc_protocol"] for item in actual}, {2})
+        file_manifest = dict(manifest, file_api=True, gc=dict(manifest["gc"], gc_protocol=2))
+        self.assertEqual(actual, gc_inventory_from_observations(file_manifest, pool, newer, 1000))
+        with self.assertRaises(ValueError):
+            gc_inventory_from_observations(file_manifest, pool, observed, 1000)
 
     def test_missing_stale_wrong_instance_wrong_format_and_readonly_are_not_success(self):
         manifest, _, pool, observed = self.gc_fixture()
@@ -224,7 +231,7 @@ class NativeGcConfiguration(unittest.TestCase):
         for field, value in (("verification", "unverified"), ("authority", self.authority),
                 ("key_id", str(uuid.UUID(int=85))), ("engine_uuid", str(uuid.UUID(int=86))),
                 ("target_incarnation", str(uuid.UUID(int=87))), ("chain", 1), ("target", 1),
-                ("data_protocol", 3), ("disk_format", 2), ("gc_protocol", 2), ("capabilities", 2),
+                ("data_protocol", 3), ("disk_format", 2), ("gc_protocol", 3), ("capabilities", 2),
                 ("boot_nonce", str(uuid.UUID(int=0))), ("observed_at_seconds", 900),
                 ("verified_at_seconds", 1001), ("observed_at_seconds", "990"),
                 ("schema", True), ("discovery_protocol", 2.0), ("node", 10001.0),

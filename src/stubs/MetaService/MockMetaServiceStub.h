@@ -70,6 +70,30 @@ class DummyMetaServiceStub : public IMetaServiceStub {
   NOT_IMPLEMENTED_FUNC(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
   NOT_IMPLEMENTED_FUNC(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
   NOT_IMPLEMENTED_FUNC(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
+  NOT_IMPLEMENTED_FUNC(describeEcFileV2, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
+  NOT_IMPLEMENTED_FUNC(acquireEcRangeV2, AcquireEcRangeV2Req, EcRangeRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcRangeV2, QueryEcRangeV2Req, EcRangeRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcOwnedMutationV2, QueryEcOwnedMutationV2Req, EcOwnedMutationRsp);
+  NOT_IMPLEMENTED_FUNC(openEcFileSession, OpenEcFileSessionReq, OpenEcFileSessionRsp);
+  NOT_IMPLEMENTED_FUNC(beginEcFilePwrite, BeginEcFilePwriteReq, EcFilePwriteRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcFilePwrite, QueryEcFilePwriteReq, EcFilePwriteRsp);
+  NOT_IMPLEMENTED_FUNC(advanceEcFilePwrite, AdvanceEcFilePwriteReq, EcFilePwriteRsp);
+  NOT_IMPLEMENTED_FUNC(closeEcFileSession, CloseEcFileSessionReq, CloseEcFileSessionRsp);
+  NOT_IMPLEMENTED_FUNC(acquireEcTreeRead, AcquireEcTreeReadReq, EcTreeReadRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcTreeRead, QueryEcTreeReadReq, EcTreeReadRsp);
+  NOT_IMPLEMENTED_FUNC(releaseEcTreeRead, ReleaseEcTreeReadReq, EcTreeReadRsp);
+  NOT_IMPLEMENTED_FUNC(advanceEcTreeReclaim, AdvanceEcTreeReclaimReq, AdvanceEcTreeReclaimRsp);
+  NOT_IMPLEMENTED_FUNC(beginEcFileTruncate, BeginEcFileTruncateReq, EcFileTruncateRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcFileTruncate, QueryEcFileTruncateReq, EcFileTruncateRsp);
+  NOT_IMPLEMENTED_FUNC(advanceEcFileTruncate, AdvanceEcFileTruncateReq, EcFileTruncateRsp);
+  NOT_IMPLEMENTED_FUNC(closeEcFileTruncateDebt, CloseEcFileTruncateDebtReq, EcFileTruncateRsp);
+  NOT_IMPLEMENTED_FUNC(beginEcFileAppend, BeginEcFileAppendReq, EcFileAppendRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcFileAppend, QueryEcFileAppendReq, EcFileAppendRsp);
+  NOT_IMPLEMENTED_FUNC(syncEcFileSession, SyncEcFileSessionReq, SyncEcFileSessionRsp);
+  NOT_IMPLEMENTED_FUNC(beginEcFileRepair, BeginEcFileRepairReq, EcFileRepairRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcFileRepair, QueryEcFileRepairReq, EcFileRepairRsp);
+  NOT_IMPLEMENTED_FUNC(advanceEcFileRepair, AdvanceEcFileRepairReq, EcFileRepairRsp);
+  NOT_IMPLEMENTED_FUNC(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
   virtual CoTryTask<AuthRsp> authenticate(const AuthReq &req) { co_return AuthRsp{req.user}; }
   CoTryTask<AuthRsp> authenticate(const AuthReq &req, const net::UserRequestOptions &, serde::Timestamp *) override {
@@ -178,6 +202,30 @@ class MetaServiceStub<hf3fs::stubs::StubMockContext<IMetaServiceStub>> : public 
   FORWARD_RPC_FUNC(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
   FORWARD_RPC_FUNC(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
   FORWARD_RPC_FUNC(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
+  FORWARD_RPC_FUNC(describeEcFileV2, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
+  FORWARD_RPC_FUNC(acquireEcRangeV2, AcquireEcRangeV2Req, EcRangeRsp);
+  FORWARD_RPC_FUNC(queryEcRangeV2, QueryEcRangeV2Req, EcRangeRsp);
+  FORWARD_RPC_FUNC(queryEcOwnedMutationV2, QueryEcOwnedMutationV2Req, EcOwnedMutationRsp);
+  FORWARD_RPC_FUNC(openEcFileSession, OpenEcFileSessionReq, OpenEcFileSessionRsp);
+  FORWARD_RPC_FUNC(beginEcFilePwrite, BeginEcFilePwriteReq, EcFilePwriteRsp);
+  FORWARD_RPC_FUNC(queryEcFilePwrite, QueryEcFilePwriteReq, EcFilePwriteRsp);
+  FORWARD_RPC_FUNC(advanceEcFilePwrite, AdvanceEcFilePwriteReq, EcFilePwriteRsp);
+  FORWARD_RPC_FUNC(closeEcFileSession, CloseEcFileSessionReq, CloseEcFileSessionRsp);
+  FORWARD_RPC_FUNC(acquireEcTreeRead, AcquireEcTreeReadReq, EcTreeReadRsp);
+  FORWARD_RPC_FUNC(queryEcTreeRead, QueryEcTreeReadReq, EcTreeReadRsp);
+  FORWARD_RPC_FUNC(releaseEcTreeRead, ReleaseEcTreeReadReq, EcTreeReadRsp);
+  FORWARD_RPC_FUNC(advanceEcTreeReclaim, AdvanceEcTreeReclaimReq, AdvanceEcTreeReclaimRsp);
+  FORWARD_RPC_FUNC(beginEcFileTruncate, BeginEcFileTruncateReq, EcFileTruncateRsp);
+  FORWARD_RPC_FUNC(queryEcFileTruncate, QueryEcFileTruncateReq, EcFileTruncateRsp);
+  FORWARD_RPC_FUNC(advanceEcFileTruncate, AdvanceEcFileTruncateReq, EcFileTruncateRsp);
+  FORWARD_RPC_FUNC(closeEcFileTruncateDebt, CloseEcFileTruncateDebtReq, EcFileTruncateRsp);
+  FORWARD_RPC_FUNC(beginEcFileAppend, BeginEcFileAppendReq, EcFileAppendRsp);
+  FORWARD_RPC_FUNC(queryEcFileAppend, QueryEcFileAppendReq, EcFileAppendRsp);
+  FORWARD_RPC_FUNC(syncEcFileSession, SyncEcFileSessionReq, SyncEcFileSessionRsp);
+  FORWARD_RPC_FUNC(beginEcFileRepair, BeginEcFileRepairReq, EcFileRepairRsp);
+  FORWARD_RPC_FUNC(queryEcFileRepair, QueryEcFileRepairReq, EcFileRepairRsp);
+  FORWARD_RPC_FUNC(advanceEcFileRepair, AdvanceEcFileRepairReq, EcFileRepairRsp);
+  FORWARD_RPC_FUNC(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 #undef FORWARD_RPC_FUNC
 

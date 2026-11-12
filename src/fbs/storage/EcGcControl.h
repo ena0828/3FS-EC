@@ -19,6 +19,12 @@ class AckSigner;
 }  // namespace ec_gc_control_detail
 
 inline constexpr uint16_t kEcGcControlVersion = 1;
+// Highest supported GC certificate protocol. Runtime2 supports exact G1 and
+// G2, without upgrading a mode3 claim. Discovery is a point observation only.
+inline constexpr uint16_t kEcGcSupportedProtocol = 2;
+inline constexpr bool ecGcProtocolSupports(uint16_t supported, uint16_t required) {
+  return supported >= 1 && supported <= kEcGcSupportedProtocol && required >= 1 && required <= supported;
+}
 inline constexpr size_t kEcGcCertificateBytes = 1046;
 inline constexpr size_t kEcGcRequestBytes = 1122;
 inline constexpr size_t kEcGcAckBytes = 268;

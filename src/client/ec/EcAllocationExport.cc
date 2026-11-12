@@ -140,7 +140,7 @@ Result<Void> validate(const EcStripeRunRecord &run,
         fragment.integrity.wholeCrc32c != intent.fragmentCrc32c[i] || !serde::equals(identity, original.identity) ||
         fragment.operation != original.operation || fragment.placement != original.placement ||
         (run.action == "repair" && fragment.integrity != original.integrity) ||
-        (run.action == "write" && original.integrity != storage::EcIntegrityDescriptor{}) ||
+        (run.action != "repair" && original.integrity != storage::EcIntegrityDescriptor{}) ||
         !serde::equals(identity, reserved.identity) || fragment.operation != reserved.operation ||
         binding.endpoint() != reserved.endpoint || !owner(binding.writer, reserved.writer) ||
         std::find(set.endpoints.begin(), set.endpoints.begin() + set.count, binding.endpoint()) ==
@@ -201,6 +201,13 @@ folly::dynamic allocationJson(const meta::EcV2AllocationBinding &binding) {
 }
 }  // namespace
 
+Result<Void> validatePublishedEcStripeRun(const EcStripeRunRecord &run,
+                                          const EcStripeRunObservation &observed,
+                                          const meta::EcV2MutationRsp &rsp) {
+  if (!observed.object) return corrupt();
+  return validate(run, observed, rsp);
+}
+
 CoTryTask<void> exportEcAllocations(std::shared_ptr<meta::client::MetaClient> metadata,
                                     const EcStripeRunJournal &journal,
                                     flat::UserInfo credentials,
@@ -212,8 +219,8 @@ CoTryTask<void> exportEcAllocations(std::shared_ptr<meta::client::MetaClient> me
     if (!metadata || metadata->clientId().uuid != run.clientNamespace || !journal.latest())
       co_return makeError(StatusCode::kTokenMismatch, "export requires the original client namespace and journal");
     const auto &observed = *journal.latest();
-    if ((run.action != "write" && run.action != "repair") || !observed.mutationPublished || !observed.object ||
-        !observed.revision || observed.errorCode ||
+    if ((run.action != "write" && run.action != "repair" && run.action != "recovery-write") ||
+        !observed.mutationPublished || !observed.object || !observed.revision || observed.errorCode ||
         (observed.state != "Published" && !(run.action == "repair" && observed.state == "ReadReleased")) ||
         observed.object->shardBytes != run.shardBytes || (run.object && run.object->object != observed.object->object))
       co_return makeError(StatusCode::kInvalidArg, "export requires an observed Published write/repair run");
@@ -242,7 +249,7 @@ CoTryTask<void> exportEcAllocations(std::shared_ptr<meta::client::MetaClient> me
     // Await the real request to completion; this deadline never destroys an
     // in-flight borrowed RPC or implies a remote mutation was canceled.
     CO_RETURN_ON_ERROR(active(control));
-    CO_RETURN_ON_ERROR(validate(run, observed, *result));
+    CO_RETURN_ON_ERROR(validatePublishedEcStripeRun(run, observed, *result));
     folly::dynamic allocations = folly::dynamic::array;
     for (const auto &binding : *result->allocations) allocations.push_back(allocationJson(binding));
     const auto &manifest = result->record.candidate;

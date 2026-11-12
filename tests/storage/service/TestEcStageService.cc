@@ -19,6 +19,7 @@
 #include "client/storage/StorageMessenger.h"
 #include "common/net/Server.h"
 #include "fbs/storage/EcStageResultV2.h"
+#include "fbs/storage/EcStageValidationV2.h"
 #include "storage/ec_codec/EcCodec.h"
 #include "storage/ec_repair/EcHelperAuthorization.h"
 #include "storage/service/Components.h"
@@ -26,6 +27,7 @@
 #include "tests/EcRepairTestData.h"
 #include "tests/GtestHelpers.h"
 #include "tests/lib/UnitTestFabric.h"
+#include "tests/storage/EcRmwTestAccess.h"
 
 namespace hf3fs::storage {
 class StorageEcStageAuthorizationTestAccess {
@@ -1501,6 +1503,8 @@ TEST_F(TestEcStageService, BlockQuorumReadyPrecedesRealTcpLateCleanup) {
   selected = makeError(StatusCode::kUnknown);
   EXPECT_EQ(reader.snapshot().reservedPayloadBytes, 0);
 }
+
+#include "EcRmwNativeTests.inc"
 
 }  // namespace
 }  // namespace hf3fs::storage

@@ -24,6 +24,7 @@
 #include <variant>
 #include <vector>
 
+#include "MetadataRoutingInfoChecker.h"
 #include "ServerSelectionStrategy.h"
 #include "common/monitor/Recorder.h"
 #include "common/monitor/Sample.h"
@@ -330,7 +331,9 @@ CoTryTask<Void> MetaClient::waitRoutingInfo(const Rsp &rsp, const RetryConfig &r
   auto waitTime = retryConfig.retry_total_time() / 2;
   while (true) {
     auto routingInfo = mgmtd_->getRoutingInfo()->raw();
-    if (RoutingInfoChecker::checkRoutingInfo(rsp, *routingInfo)) {
+    auto ready = MetadataRoutingInfoChecker::check(rsp, *routingInfo);
+    CO_RETURN_ON_ERROR(ready);
+    if (*ready) {
       co_return Void{};
     }
 
@@ -569,6 +572,35 @@ CoTryTask<EcRevisionRetirementRsp> MetaClient::queryEcRevisionRetirementV2(Query
   once.set_retry_init_wait(0_ms);
   co_return co_await retry(&IMetaServiceStub::queryEcRevisionRetirementV2, req, std::move(once));
 }
+CoTryTask<DescribeEcFileV2Rsp> MetaClient::describeEcFileV2(DescribeEcFileV2Req req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "caller must persist the EC file/range request UUID");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::describeEcFileV2, req, std::move(once));
+}
+CoTryTask<EcRangeRsp> MetaClient::acquireEcRangeV2(AcquireEcRangeV2Req req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "caller must persist the EC file/range request UUID");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::acquireEcRangeV2, req, std::move(once));
+}
+CoTryTask<EcRangeRsp> MetaClient::queryEcRangeV2(QueryEcRangeV2Req req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "caller must persist the EC file/range request UUID");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcRangeV2, req, std::move(once));
+}
+
+CoTryTask<EcOwnedMutationRsp> MetaClient::queryEcOwnedMutationV2(QueryEcOwnedMutationV2Req req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "original owner-query UUID is required");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcOwnedMutationV2, req, std::move(once));
+}
+
 CoTryTask<ReleaseEcReadV2Rsp> MetaClient::releaseEcReadV2(ReleaseEcReadV2Req req) {
   if (req.uuid.is_nil()) req.uuid = Uuid::random();
   co_return co_await retry(&IMetaServiceStub::releaseEcReadV2, req);
@@ -1078,6 +1110,165 @@ CoTryTask<void> MetaClient::lockDirectory(const UserInfo &userInfo,
                                           LockDirectoryReq::LockAction action) {
   co_return (co_await retry(&IMetaServiceStub::lockDirectory, LockDirectoryReq{userInfo, inode, action}))
       .then(RETURN_VOID);
+}
+
+CoTryTask<OpenEcFileSessionRsp> MetaClient::openEcFileSession(OpenEcFileSessionReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist original file operation UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::openEcFileSession, req, std::move(once));
+}
+CoTryTask<EcFilePwriteRsp> MetaClient::beginEcFilePwrite(BeginEcFilePwriteReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist original file operation UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::beginEcFilePwrite, req, std::move(once));
+}
+CoTryTask<EcFilePwriteRsp> MetaClient::queryEcFilePwrite(QueryEcFilePwriteReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist original file operation UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcFilePwrite, req, std::move(once));
+}
+CoTryTask<EcFilePwriteRsp> MetaClient::advanceEcFilePwrite(AdvanceEcFilePwriteReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist original file operation UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::advanceEcFilePwrite, req, std::move(once));
+}
+CoTryTask<CloseEcFileSessionRsp> MetaClient::closeEcFileSession(CloseEcFileSessionReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist original file operation UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::closeEcFileSession, req, std::move(once));
+}
+CoTryTask<EcTreeReadRsp> MetaClient::acquireEcTreeRead(AcquireEcTreeReadReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist original file operation UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::acquireEcTreeRead, req, std::move(once));
+}
+CoTryTask<EcTreeReadRsp> MetaClient::queryEcTreeRead(QueryEcTreeReadReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist original file operation UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcTreeRead, req, std::move(once));
+}
+CoTryTask<AdvanceEcTreeReclaimRsp> MetaClient::advanceEcTreeReclaim(AdvanceEcTreeReclaimReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist reclaim request UUID first");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::advanceEcTreeReclaim, req, std::move(once));
+}
+CoTryTask<EcTreeReadRsp> MetaClient::releaseEcTreeRead(ReleaseEcTreeReadReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist original file operation UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::releaseEcTreeRead, req, std::move(once));
+}
+
+CoTryTask<RenameRsp> MetaClient::renameWithIdentity(RenameReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist rename request UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::rename, req, std::move(once));
+}
+CoTryTask<HardLinkRsp> MetaClient::hardLinkWithIdentity(HardLinkReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist link request UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::hardLink, req, std::move(once));
+}
+CoTryTask<RemoveRsp> MetaClient::unlinkWithIdentity(RemoveReq req) {
+  if (req.uuid.is_nil() || req.recursive)
+    co_return makeError(StatusCode::kInvalidArg, "fixed unlink requires a UUID and a single file");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::remove, req, std::move(once));
+}
+
+CoTryTask<EcFileTruncateRsp> MetaClient::beginEcFileTruncate(BeginEcFileTruncateReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist fixed truncate request UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::beginEcFileTruncate, req, std::move(once));
+}
+CoTryTask<EcFileTruncateRsp> MetaClient::queryEcFileTruncate(QueryEcFileTruncateReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist fixed truncate request UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcFileTruncate, req, std::move(once));
+}
+CoTryTask<EcFileTruncateRsp> MetaClient::advanceEcFileTruncate(AdvanceEcFileTruncateReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist fixed truncate request UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::advanceEcFileTruncate, req, std::move(once));
+}
+CoTryTask<EcFileTruncateRsp> MetaClient::closeEcFileTruncateDebt(CloseEcFileTruncateDebtReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist fixed truncate request UUID before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::closeEcFileTruncateDebt, req, std::move(once));
+}
+
+CoTryTask<EcFileAppendRsp> MetaClient::beginEcFileAppend(BeginEcFileAppendReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist fixed append/fsync request before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::beginEcFileAppend, req, std::move(once));
+}
+CoTryTask<EcFileAppendRsp> MetaClient::queryEcFileAppend(QueryEcFileAppendReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist fixed append/fsync request before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcFileAppend, req, std::move(once));
+}
+CoTryTask<SyncEcFileSessionRsp> MetaClient::syncEcFileSession(SyncEcFileSessionReq req) {
+  if (req.uuid.is_nil())
+    co_return makeError(StatusCode::kInvalidArg, "persist fixed append/fsync request before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::syncEcFileSession, req, std::move(once));
+}
+
+CoTryTask<EcFileRepairRsp> MetaClient::beginEcFileRepair(BeginEcFileRepairReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist fixed repair request before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::beginEcFileRepair, req, std::move(once));
+}
+CoTryTask<EcFileRepairRsp> MetaClient::queryEcFileRepair(QueryEcFileRepairReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist fixed repair request before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcFileRepair, req, std::move(once));
+}
+CoTryTask<EcFileRepairRsp> MetaClient::advanceEcFileRepair(AdvanceEcFileRepairReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist fixed repair request before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::advanceEcFileRepair, req, std::move(once));
+}
+CoTryTask<EcFileRepairRsp> MetaClient::closeEcFileRepairDebt(CloseEcFileRepairDebtReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist fixed repair request before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::closeEcFileRepairDebt, req, std::move(once));
 }
 
 }  // namespace hf3fs::meta::client

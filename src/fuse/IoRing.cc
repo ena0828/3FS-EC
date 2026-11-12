@@ -1,5 +1,8 @@
 #include "IoRing.h"
 
+#include <algorithm>
+#include <cstring>
+#include <fcntl.h>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -92,7 +95,19 @@ CoTask<void> IoRing::process(
 
   auto &config = userConfig.getConfig(userInfo_);
 
+  // Snapshot each claimed SQE/argument once before any await. No later access
+  // to caller-mutable ring parameters may expand a validated buffer or extent.
+  std::vector<IoSqe> sqes(toProc), lookupSqes(toProc);
+  std::vector<IoArgs> arguments(toProc);
+  std::vector<bool> validIndex(toProc, false);
+  for (int i = 0; i != toProc; ++i) {
+    sqes[i] = sqeSection[(spt + i) % entries];
+    validIndex[i] = sqes[i].index >= 0 && sqes[i].index < entries - 1;
+    if (validIndex[i]) arguments[i] = ringSection[sqes[i].index];
+    lookupSqes[i] = IoSqe{i, sqes[i].userdata};
+  }
   std::vector<ssize_t> res;
+  std::vector<std::optional<client::ec::EcReadReceipt>> deliveredEc(toProc);
   if (!forRead_ && config.readonly()) {
     res = std::vector<ssize_t>(toProc, static_cast<ssize_t>(-StatusCode::kReadOnlyMode));
   } else {
@@ -104,29 +119,25 @@ CoTask<void> IoRing::process(
 
     std::vector<std::shared_ptr<RcInode>> inodes;
     inodes.reserve(toProc);
-    lookupFiles(inodes, ringSection, sqeSection + spt, std::min(toProc, entries - spt));
-    if ((int)inodes.size() < toProc) {
-      lookupFiles(inodes, ringSection, sqeSection, toProc - (int)inodes.size());
-    }
+    lookupFiles(inodes, arguments.data(), lookupSqes.data(), toProc);
 
     std::vector<Result<lib::ShmBufForIO>> bufs;
     bufs.reserve(toProc);
-    lookupBufs(bufs, ringSection, sqeSection + spt, std::min(toProc, entries - spt));
-    if ((int)bufs.size() < toProc) {
-      lookupBufs(bufs, ringSection, sqeSection, toProc - (int)bufs.size());
-    }
+    lookupBufs(bufs, arguments.data(), lookupSqes.data(), toProc);
 
     lib::agent::PioV ioExec(storageClient, config.chunk_size_limit(), res);
+    std::vector<bool> replicated(toProc, false);
     std::vector<uint64_t> truncateVers;
     if (!forRead_) {
       truncateVers.resize(toProc, 0);
     }
 
     for (int i = 0; i < toProc; ++i) {
-      auto idx = (spt + i) % entries;
-      auto sqe = sqeSection[idx];
-
-      const auto &args = ringSection[sqe.index];
+      if (!validIndex[i]) {
+        res[i] = -static_cast<ssize_t>(StatusCode::kInvalidArg);
+        continue;
+      }
+      const auto &args = arguments[i];
 
       ++iod;
       totalBytes += args.ioLen;
@@ -148,6 +159,85 @@ CoTask<void> IoRing::process(
         continue;
       }
 
+      if (inodes[i]->inode.isFile() && inodes[i]->inode.asFile().layout.isErasureCoded()) {
+        auto &clients = getFuseClientsInstance();
+        if (clients.ecFiles) {
+          if (flags_ & HF3FS_IOR_ALLOW_READ_UNCOMMITTED) {
+            res[i] = -static_cast<ssize_t>(StatusCode::kNotImplemented);
+            continue;
+          }
+          try {
+            auto opened = co_await clients.ecFiles->open(inodes[i]->inode, userInfo_, forRead_ ? O_RDONLY : O_WRONLY);
+            if (!opened) {
+              res[i] = -static_cast<ssize_t>(opened.error().code());
+              continue;
+            }
+            if (forRead_) {
+              auto read = co_await clients.ecFiles->read(opened->handle, userInfo_, args.fileOff, args.ioLen, false);
+              if (!read)
+                res[i] = -static_cast<ssize_t>(read.error().code());
+              else if (read->data.size() > args.ioLen)
+                res[i] = -static_cast<ssize_t>(StatusCode::kDataCorruption);
+              else {
+                if (read->data.size()) std::memcpy(bufs[i]->ptr(), read->data.bytes().data(), read->data.size());
+                res[i] = static_cast<ssize_t>(read->data.size());
+                inodes[i]->dynamicAttr.wlock()->ecObservedLength = read->length;
+              }
+              // Payload is destroyed here, after copy to the owned ring's Shm
+              // lease; the worker never receives the Shm pointer or SQE.
+            } else {
+              auto written =
+                  co_await clients.ecFiles->write(opened->handle,
+                                                  userInfo_,
+                                                  args.fileOff,
+                                                  {reinterpret_cast<const uint8_t *>(bufs[i]->ptr()), args.ioLen});
+              res[i] = written ? static_cast<ssize_t>(*written) : -static_cast<ssize_t>(written.error().code());
+              if (written) inodes[i]->dynamicAttr.wlock()->ecObservedLength.reset();
+            }
+            auto closed = co_await clients.ecFiles->release(opened->handle, userInfo_);
+            if (!closed) reportEcLocalMaintenanceFailure();  // Result bytes remain valid; debt remains durable.
+          } catch (...) {
+            res[i] = -static_cast<ssize_t>(StatusCode::kIOError);
+          }
+          continue;
+        }
+        if (!forRead_ || !clients.ecReads || (flags_ & HF3FS_IOR_ALLOW_READ_UNCOMMITTED)) {
+          res[i] = -static_cast<ssize_t>(StatusCode::kNotImplemented);
+          continue;
+        }
+        try {
+          auto opened = co_await clients.ecReads->open(inodes[i]->inode, userInfo_, O_RDONLY, clients.ecControl());
+          if (!opened) {
+            res[i] = -static_cast<ssize_t>(opened.error().code());
+            continue;
+          }
+          auto read = co_await clients.ecReads
+                          ->read(std::move(*opened), userInfo_, args.fileOff, args.ioLen, false, clients.ecControl());
+          if (!read) {
+            res[i] = -static_cast<ssize_t>(read.error().code());
+            continue;
+          }
+          if (!read->localJoined || !read->data) {
+            res[i] = -static_cast<ssize_t>(read->readFailure ? read->readFailure->code() : StatusCode::kIOError);
+            continue;
+          }
+          const auto bytes = read->data->bytes();
+          if (bytes.size() > args.ioLen) {
+            res[i] = -static_cast<ssize_t>(StatusCode::kDataCorruption);
+            continue;
+          }
+          if (!bytes.empty()) std::memcpy(bufs[i]->ptr(), bytes.data(), bytes.size());
+          inodes[i]->dynamicAttr.wlock()->ecObservedLength = read->data->snapshot().file.length;
+          res[i] = static_cast<ssize_t>(bytes.size());
+          if (read->cleanup.localJoined && read->cleanup.allReleased) deliveredEc[i] = read->receipt;
+          read->data.reset();  // Before CQE and any local retirement; no borrowed buffer enters F5.
+        } catch (...) {
+          res[i] = -static_cast<ssize_t>(StatusCode::kIOError);
+        }
+        continue;
+      }
+      // Only the replicated PioV path needs a registered Storage IOBuffer.
+      // EC data is an owned CPU payload copied to the already bounded ShmBuf.
       auto memh = co_await bufs[i]->memh(args.ioLen);
       if (!memh) {
         res[i] = -static_cast<ssize_t>(memh.error().code());
@@ -158,6 +248,7 @@ CoTask<void> IoRing::process(
         continue;
       }
 
+      replicated[i] = true;
       if (!forRead_) {
         auto beginWrite =
             co_await inodes[i]->beginWrite(userInfo_, *getFuseClientsInstance().metaClient, args.fileOff, args.ioLen);
@@ -189,18 +280,19 @@ CoTask<void> IoRing::process(
     if (flags_ & HF3FS_IOR_ALLOW_READ_UNCOMMITTED) {
       readOpt.set_allowReadUncommitted(true);
     }
-    auto execRes = co_await (forRead_ ? ioExec.executeRead(userInfo_, readOpt)
-                                      : ioExec.executeWrite(userInfo_, storageIo.write()));
+    Result<Void> execRes = Void{};
+    if (std::any_of(replicated.begin(), replicated.end(), [](bool value) { return value; })) {
+      execRes = co_await (forRead_ ? ioExec.executeRead(userInfo_, readOpt)
+                                   : ioExec.executeWrite(userInfo_, storageIo.write()));
+    }
 
     now = SteadyClock::now();
     submitLatency.addSample(now - start, monitor::TagSet{{"io", ioType}, {"uid", uids}});
     start = now;
 
     if (!execRes) {
-      for (auto &r : res) {
-        if (r >= 0) {
-          r = -static_cast<ssize_t>(execRes.error().code());
-        }
+      for (size_t i = 0; i != res.size(); ++i) {
+        if (replicated[i] && res[i] >= 0) res[i] = -static_cast<ssize_t>(execRes.error().code());
       }
     } else {
       ioExec.finishIo(!(flags_ & HF3FS_IOR_FORBID_READ_HOLES));
@@ -209,11 +301,10 @@ CoTask<void> IoRing::process(
     if (!forRead_) {
       for (int i = 0; i < toProc; ++i) {
         auto &inode = inodes[i];
-        if (!inode) {
+        if (!inode || !replicated[i]) {
           continue;
         }
-        auto sqe = sqeSection[(spt + i) % entries];
-        auto off = ringSection[sqe.index].fileOff;
+        auto off = arguments[i].fileOff;
         auto r = res[i];
         inode->finishWrite(userInfo_.uid, truncateVers[i], off, r);
       }
@@ -221,11 +312,6 @@ CoTask<void> IoRing::process(
   }
 
   auto newSpt = (spt + toProc) % entries;
-
-  std::vector<IoSqe> sqes(toProc);
-  for (int i = 0; i < toProc; ++i) {
-    sqes[i] = sqeSection[(spt + i) % entries];
-  }
 
   {
     // lock for between threads (io workers)
@@ -269,6 +355,17 @@ CoTask<void> IoRing::process(
   }
 
   sem_post(cqeSem.get());
+
+  // CQEs have been published and the registered buffers are no longer touched.
+  // Maintenance is still owned by this ring worker and joined during shutdown.
+  for (const auto &receipt : deliveredEc) {
+    if (!receipt) continue;
+    try {
+      co_await getFuseClientsInstance().retireDeliveredEcRead(*receipt, userInfo_, true);
+    } catch (...) {
+      reportEcLocalMaintenanceFailure();
+    }
+  }
 
   size_t doneBytes = 0;
   for (auto r : res) {

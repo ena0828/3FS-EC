@@ -1,5 +1,6 @@
 #include "FuseClients.h"
 
+#include <exception>
 #include <folly/Random.h>
 #include <folly/ScopeGuard.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
@@ -7,6 +8,7 @@
 #include <folly/functional/Partial.h>
 #include <folly/logging/xlog.h>
 #include <fuse3/fuse_lowlevel.h>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -45,13 +47,63 @@ Result<Void> establishClientSession(client::IMgmtdClientForClient &mgmtdClient) 
 }
 }  // namespace
 
-FuseClients::~FuseClients() { stop(); }
+FuseClients::~FuseClients() {
+  // Entry points must perform checked shutdown while all external configuration
+  // and globals remain alive. A destructor cannot recover an unknown join.
+  if (!stop()) std::terminate();
+}
 
 Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
                                const String &mountPoint,
                                const String &tokenFile,
                                FuseConfig &fuseConfig) {
   config = &fuseConfig;
+  fullyStopped = false;
+  if (fuseConfig.batch_io_coros() <= 0 || fuseConfig.io_jobq_size() <= 0 || fuseConfig.io_jobq_sizes().hi() <= 0 ||
+      fuseConfig.io_jobq_sizes().lo() <= 0)
+    return makeError(StatusCode::kInvalidArg, "owned ring shutdown requires consumers and nonempty queues");
+  if (fuseConfig.ec_read().enable()) {
+    ecHighWorkers = fuseConfig.io_worker_coros().hi();
+    ecLowWorkers = fuseConfig.io_worker_coros().lo();
+    if (ecHighWorkers <= 0 || ecLowWorkers <= 0 || int64_t(ecHighWorkers) + ecLowWorkers >= fuseConfig.batch_io_coros())
+      return makeError(StatusCode::kInvalidArg, "EC mount requires a consumer for every priority queue");
+    if (fuseConfig.enable_writeback_cache())
+      return makeError(StatusCode::kInvalidArg, "EC mount read requires writeback cache disabled");
+    const auto &ec = fuseConfig.ec_read();
+    client::ec::EcReadSpool::Limits limits{ec.retained_runs(), ec.outstanding_runs(), ec.logical_spool_bytes()};
+    auto opened = ec.create_state() ? client::ec::EcReadSpool::create(ec.state_directory(), appInfo.clusterId, limits)
+                                    : client::ec::EcReadSpool::open(ec.state_directory(), appInfo.clusterId, limits);
+    RETURN_ON_ERROR(opened);
+    ecSpool = std::move(*opened);
+    ecOperationTime = std::chrono::seconds(ec.maximum_operation_seconds());
+    ecRetireCompleted = ec.retire_completed();
+    if (ecRetireCompleted) {
+      ecArchiveDirectory = ec.archive_directory();
+      RETURN_ON_ERROR(validateEcArchiveDirectory(ecArchiveDirectory, ecSpool->directory()));
+    }
+    ecExecutor = std::make_unique<folly::CPUThreadPoolExecutor>(2);
+  }
+
+  if (fuseConfig.ec_file().enable()) {
+    const auto &ec = fuseConfig.ec_file();
+    if (ecSpool || fuseConfig.enable_writeback_cache() || !ec.retained_sessions() || ec.retained_sessions() > 4096 ||
+        !ec.maximum_operation_seconds() || ec.maximum_operation_seconds() > 3600 || !ec.shard_bytes() ||
+        ec.shard_bytes() > (1u << 20))
+      return makeError(StatusCode::kInvalidConfig,
+                       "mode4 mount requires its own durable namespace and disabled writeback cache");
+    ecHighWorkers = fuseConfig.io_worker_coros().hi();
+    ecLowWorkers = fuseConfig.io_worker_coros().lo();
+    if (ecHighWorkers <= 0 || ecLowWorkers <= 0 || int64_t(ecHighWorkers) + ecLowWorkers >= fuseConfig.batch_io_coros())
+      return makeError(StatusCode::kInvalidConfig, "mode4 mount needs owned priority consumers");
+    auto state = EcFileMountState::open({ec.state_directory(),
+                                         appInfo.clusterId,
+                                         ec.create_state(),
+                                         ec.retained_sessions(),
+                                         Uuid::zero(),
+                                         ec.maximum_input_bytes()});
+    RETURN_ON_ERROR(state);
+    ecFileState = std::move(*state);
+  }
 
   fuseMount = appInfo.clusterId;
   XLOGF_IF(FATAL,
@@ -107,7 +159,12 @@ Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
   auto containerHostnameRes = SysResource::hostname(/*physicalMachineName=*/false);
   RETURN_ON_ERROR(containerHostnameRes);
 
+  // Mgmtd's clientStart belongs to this process. Replicated file sessions and
+  // reliable Storage updates must use the same registered process identity.
   auto clientId = ClientId::random(*physicalHostnameRes);
+  if ((ecFileState && clientId.uuid == ecFileState->clientNamespace()) ||
+      (ecSpool && clientId.uuid == ecSpool->clientNamespace()))
+    return makeError(StatusCode::kInvalidArg, "process and durable EC client identities must differ");
 
   mgmtdClient->setClientSessionPayload({clientId.uuid.toHexString(),
                                         flat::NodeType::FUSE,
@@ -126,6 +183,7 @@ Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
   RETURN_ON_ERROR(establishClientSession(*mgmtdClient));
 
   storageClient = storage::client::StorageClient::create(clientId, fuseConfig.storage(), *mgmtdClient);
+  if (!storageClient) return makeError(StatusCode::kIOError, "failed to start process Storage client");
 
   metaClient =
       std::make_shared<meta::client::MetaClient>(clientId,
@@ -135,6 +193,49 @@ Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
                                                  storageClient,
                                                  true /* dynStripe */);
   metaClient->start(client->tpg().bgThreadPool());
+  if (ecFileState || ecSpool) {
+    // Only EC managers receive this durable namespace. It is not a Mgmtd
+    // process session and must not own legacy file sessions or reliable updates.
+    auto ecClientId =
+        ClientId(ecFileState ? ecFileState->clientNamespace() : ecSpool->clientNamespace(), *physicalHostnameRes);
+    ecStorageClient = storage::client::StorageClient::create(ecClientId, fuseConfig.storage(), *mgmtdClient);
+    if (!ecStorageClient) return makeError(StatusCode::kIOError, "failed to start durable EC Storage client");
+    ecMetaClient =
+        std::make_shared<meta::client::MetaClient>(ecClientId,
+                                                   fuseConfig.meta(),
+                                                   std::make_unique<meta::client::MetaClient::StubFactory>(ctxCreator),
+                                                   mgmtdClient,
+                                                   ecStorageClient,
+                                                   true /* dynStripe */);
+    ecMetaClient->start(client->tpg().bgThreadPool());
+  }
+  if (ecSpool) {
+    client::ec::EcReadDispatcher::Limits limits{ecOperationTime,
+                                                std::chrono::seconds(fuseConfig.ec_read().cleanup_attempt_seconds())};
+    auto connected =
+        client::ec::EcReadDispatcher::connect(ecSpool, ecMetaClient, ecStorageClient, mgmtdClient, *ecExecutor, limits);
+    RETURN_ON_ERROR(connected);
+    ecDispatcher = std::move(*connected);
+    ecReads = std::make_shared<EcFuseReadAdapter>(ecDispatcher);
+  }
+
+  if (ecFileState) {
+    ecRmw = std::make_shared<storage::client::EcRmwTransport>(fuseConfig.client());
+    RETURN_ON_ERROR(ecRmw->start());
+    auto mounted = EcFileMount::start(ecFileState,
+                                      {ecMetaClient,
+                                       ecStorageClient,
+                                       mgmtdClient,
+                                       ecRmw,
+                                       [this](const flat::UserInfo &u) { return userConfig.getConfig(u).readonly(); }},
+                                      flat::Token(fuseToken),
+                                      std::chrono::seconds(fuseConfig.ec_file().maximum_operation_seconds()));
+    RETURN_ON_ERROR(mounted);
+    ecFiles = std::move(*mounted);
+    // Store the owner before recovery: all failure/exception exits reach the
+    // same checked FuseClients::stop before session hooks or globals teardown.
+    RETURN_ON_ERROR(folly::coro::blockingWait(ecFiles->recoverState()));
+  }
 
   iojqs.reserve(3);
   iojqs.emplace_back(new BoundedQueue<IoRingJob>(fuseConfig.io_jobq_sizes().hi()));
@@ -147,7 +248,7 @@ Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
   auto coros = fuseConfig.batch_io_coros();
   for (int i = 0; i < coros; ++i) {
     auto exec = &tp.get(i % tp.size());
-    co_withCancellation(cancelIos.getToken(), ioRingWorker(i, coros)).scheduleOn(exec).start();
+    ioScope.add(co_withCancellation(cancelIos.getToken(), ioRingWorker(i, coros)).scheduleOn(exec));
   }
 
   ioWatches.reserve(3);
@@ -175,44 +276,113 @@ Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
   return Void{};
 }
 
-void FuseClients::stop() {
-  if (notifyInvalExec) {
-    notifyInvalExec->stop();
-    notifyInvalExec.reset();
-  }
-  if (onFuseConfigUpdated) {
+Result<Void> FuseClients::stop() noexcept {
+  if (fullyStopped) return Void{};
+  try {
     onFuseConfigUpdated.reset();
+    // Stop new claims first. Watchers may be blocked enqueueing an already
+    // claimed batch; consumers must remain running until those watchers join.
+    ioClaimsClosed.store(true);
+    for (auto &t : ioWatches) t.request_stop();
+    for (size_t i = 0; i != ioWatches.size(); ++i) sem_post(iors.sems[i].get());
+    // Wake idle consumers into an all-queue drain before joining watchers.
+    // They cannot exit while a watcher may still enqueue a claimed batch.
+    ioStopping.store(true);
+    cancelIos.requestCancellation();
+    ioWatches.clear();
+    ioWatchesJoined.store(true);
+    if (!ioJoined) {
+      if (ioJoinStarted) return makeError(StatusCode::kIOError);
+      ioJoinStarted = true;
+      folly::coro::blockingWait(folly::coro::co_withCancellation(CancellationToken{}, ioScope.joinAsync()));
+      ioJoined = true;
+    }
+    if (periodicSyncRunner) {
+      folly::coro::blockingWait(periodicSyncRunner->stopAll());
+      periodicSyncRunner.reset();
+    }
+    if (periodicSyncWorker) {
+      periodicSyncWorker->stopAndJoin();
+      periodicSyncWorker.reset();
+    }
+    // Pending invalidations can access d.se, which the outer FUSE guard has
+    // not yet destroyed. join drains them before session/config teardown.
+    if (notifyInvalExec) {
+      notifyInvalExec->join();
+      notifyInvalExec.reset();
+    }
+    if (ecFiles) {
+      RETURN_ON_ERROR(ecFiles->stop());
+      if (!ecFiles->remoteCleanupComplete()) reportEcLocalMaintenanceFailure();
+      ecFiles.reset();
+    }
+    if (ecRmw) {
+      ecRmw->stopAndJoin();
+      ecRmw.reset();
+    }
+    ecFileState.reset();
+    if (ecDispatcher) {
+      auto report = folly::coro::blockingWait(ecDispatcher->stop());
+      if (!report.localJoined || !report.lowerJoinConfirmed) return makeError(StatusCode::kIOError);
+      ecReads.reset();
+      ecDispatcher.reset();
+    }
+    ecExecutor.reset();
+    ecSpool.reset();
+    // EC managers and all their local work have joined. Keep the shared routing
+    // source, network and configuration alive until both client pairs stop.
+    if (ecMetaClient) {
+      ecMetaClient->stop();
+      ecMetaClient.reset();
+    }
+    if (ecStorageClient) {
+      ecStorageClient->stop();
+      ecStorageClient.reset();
+    }
+    if (metaClient) {
+      metaClient->stop();
+      metaClient.reset();
+    }
+    if (storageClient) {
+      storageClient->stop();
+      storageClient.reset();
+    }
+    if (mgmtdClient) {
+      folly::coro::blockingWait(mgmtdClient->stop());
+      mgmtdClient.reset();
+    }
+    if (client) {
+      client->stopAndJoin();
+      client.reset();
+    }
+    fullyStopped = true;
+    return Void{};
+  } catch (...) {
+    // No client/config/global destruction follows a failure at the application
+    // boundary. The caller must execute the explicit top-level fail-stop path.
+    return makeError(StatusCode::kIOError);
   }
+}
 
-  cancelIos.requestCancellation();
-
-  for (auto &t : ioWatches) {
-    t.request_stop();
-  }
-  if (periodicSyncRunner) {
-    folly::coro::blockingWait(periodicSyncRunner->stopAll());
-    periodicSyncRunner.reset();
-  }
-  if (periodicSyncWorker) {
-    periodicSyncWorker->stopAndJoin();
-    periodicSyncWorker.reset();
-  }
-  if (metaClient) {
-    metaClient->stop();
-    metaClient.reset();
-  }
-  if (storageClient) {
-    storageClient->stop();
-    storageClient.reset();
-  }
-  if (mgmtdClient) {
-    folly::coro::blockingWait(mgmtdClient->stop());
-    mgmtdClient.reset();
-  }
-  if (client) {
-    client->stopAndJoin();
-    client.reset();
-  }
+client::ec::EcStripeControl FuseClients::ecControl() const {
+  return {std::chrono::steady_clock::now() + ecOperationTime, cancelIos.getToken()};
+}
+CoTask<void> FuseClients::retireDeliveredEcRead(client::ec::EcReadReceipt receipt, flat::UserInfo user, bool allT2) {
+  if (!ecRetireCompleted || !allT2 || !ecDispatcher) co_return;
+  // Invoked only after successful reply/CQE publication and payload destruction.
+  // The original dispatcher rechecks current Query44 and every signed T2 tuple.
+  const auto archive = ecArchiveDirectory / fmt::format("{}-{:020}-{}.json",
+                                                        receipt.clientNamespace.toHexString(),
+                                                        receipt.sequence,
+                                                        receipt.rangeId.toHexString());
+  auto retired = co_await ecDispatcher->retire(receipt, std::move(user), archive, ecControl());
+  if (!retired)
+    XLOGF(ERR,
+          "EC local retirement pending: owner={} sequence={} range={} code={}",
+          receipt.ownerUid,
+          receipt.sequence,
+          receipt.rangeId,
+          retired.error().code());
 }
 
 CoTask<void> FuseClients::ioRingWorker(int i, int ths) {
@@ -221,11 +391,31 @@ CoTask<void> FuseClients::ioRingWorker(int i, int ths) {
   bool checkHigher = true;
 
   while (true) {
-    auto res = co_await folly::coro::co_awaitTry([this, &checkHigher, i, ths]() -> CoTask<void> {
+    bool drained = false;
+    auto res = co_await folly::coro::co_awaitTry([this, &checkHigher, &drained, i, ths]() -> CoTask<void> {
       IoRingJob job;
-      auto hiThs = config->io_worker_coros().hi(), loThs = config->io_worker_coros().lo();
+      // EC scheduling uses the validated startup partition; a hot user option
+      // cannot remove its only queue consumer. Closing drains all priorities.
+      auto hiThs = (ecReads || ecFiles) ? ecHighWorkers : config->io_worker_coros().hi();
+      auto loThs = (ecReads || ecFiles) ? ecLowWorkers : config->io_worker_coros().lo();
       auto prio = i < hiThs ? 0 : i < (ths - loThs) ? 1 : 2;
-      if (!config->enable_priority()) {
+      if (ioStopping.load()) {
+        bool found = false;
+        for (auto &queue : iojqs) {
+          if (auto queued = queue->try_dequeue()) {
+            job = std::move(*queued);
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          if (ioWatchesJoined.load())
+            drained = true;
+          else
+            co_await folly::coro::co_withCancellation(CancellationToken{}, folly::coro::sleep(1_ms));
+          co_return;
+        }
+      } else if (!config->enable_priority()) {
         job = co_await iojqs[prio]->co_dequeue();
       } else {
         bool gotJob = false;
@@ -319,7 +509,7 @@ CoTask<void> FuseClients::ioRingWorker(int i, int ths) {
                   if (!shm) {
                     bufs.emplace_back(makeError(StatusCode::kInvalidArg, "buf id not found"));
                     continue;
-                  } else if (shm->size < arg.bufOff + arg.ioLen) {
+                  } else if (arg.bufOff > shm->size || arg.ioLen > shm->size - arg.bufOff) {
                     bufs.emplace_back(makeError(StatusCode::kInvalidArg, "invalid buf off and/or io len"));
                     continue;
                   }
@@ -328,17 +518,25 @@ CoTask<void> FuseClients::ioRingWorker(int i, int ths) {
                   lastShm = shm;
                 }
 
+                if (arg.bufOff > shm->size || arg.ioLen > shm->size - arg.bufOff ||
+                    arg.bufOff > uint64_t(std::numeric_limits<off_t>::max()) ||
+                    arg.ioLen > uint64_t(std::numeric_limits<off_t>::max()) - arg.bufOff) {
+                  bufs.emplace_back(makeError(StatusCode::kInvalidArg, "invalid bounded shared-memory slice"));
+                  continue;
+                }
                 bufs.emplace_back(lib::ShmBufForIO(std::move(shm), arg.bufOff));
               }
             };
 
-        co_await job.ior->process(job.sqeProcTail,
-                                  job.toProc,
-                                  *storageClient,
-                                  config->storage_io(),
-                                  userConfig,
-                                  std::move(lookupFiles),
-                                  std::move(lookupBufs));
+        co_await folly::coro::co_withCancellation(CancellationToken{},
+                                                  job.ior->process(job.sqeProcTail,
+                                                                   job.toProc,
+                                                                   *storageClient,
+                                                                   config->storage_io(),
+                                                                   userConfig,
+                                                                   std::move(lookupFiles),
+                                                                   std::move(lookupBufs)));
+        if (ioClaimsClosed.load()) break;
 
         if (iojqs[0]->full() || job.ior->priority != prio) {
           sem_post(iors.sems[job.ior->priority].get());  // wake the watchers
@@ -358,11 +556,13 @@ CoTask<void> FuseClients::ioRingWorker(int i, int ths) {
     if (UNLIKELY(res.hasException())) {
       XLOGF(INFO, "io worker #{} cancelled", i);
       if (res.hasException<OperationCancelled>()) {
+        if (ioStopping.load()) continue;
         break;
       } else {
         XLOGF(FATAL, "got exception in io worker #{}", i);
       }
     }
+    if (drained) break;
   }
 }
 
@@ -385,7 +585,7 @@ void FuseClients::watch(int prio, std::stop_token stop) {
       gotJobs = false;
 
       auto n = iors.ioRings->slots.nextAvail.load();
-      for (int i = 0; i < n; ++i) {
+      for (int i = 0; i < n && !stop.stop_requested() && !ioClaimsClosed.load(); ++i) {
         auto ior = iors.ioRings->table[i].load();
 
         if (ior && ior->priority == prio) {
@@ -396,7 +596,7 @@ void FuseClients::watch(int prio, std::stop_token stop) {
           }
         }
       }
-    } while (gotJobs);  // loop till we found no more jobs and then block in the next iter
+    } while (gotJobs && !stop.stop_requested() && !ioClaimsClosed.load());
   }
 }
 

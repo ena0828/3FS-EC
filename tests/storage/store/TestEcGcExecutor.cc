@@ -16,6 +16,7 @@
 
 #include "storage/ec_gc/EcGcExecutor.h"
 #include "storage/store/StorageTarget.h"
+#include "storage/store/StorageTargets.h"
 #include "tests/GtestHelpers.h"
 
 namespace hf3fs::storage {
@@ -575,6 +576,8 @@ TEST_F(TestEcGcExecutor, ReadOnlyHotUpdateAfterQueueAdmissionPreventsActualMutat
   ASSERT_OK(target->executeEcStage(op(EcStageOperation::ReadBlock)));
   ASSERT_ERROR(run(EcGcAction::Query, sign(claims(EcGcAction::Query))), StorageCode::kChunkMetadataNotFound);
 }
+
+#include "TestEcEmptyGroupTrim.inc"
 
 }  // namespace
 }  // namespace hf3fs::storage

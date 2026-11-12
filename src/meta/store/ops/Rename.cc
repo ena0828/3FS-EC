@@ -24,6 +24,7 @@
 #include "fbs/meta/Service.h"
 #include "meta/components/GcManager.h"
 #include "meta/store/DirEntry.h"
+#include "meta/store/EcFileLifecycleCatalog.h"
 #include "meta/store/EcNamespaceGuard.h"
 #include "meta/store/Inode.h"
 #include "meta/store/MetaStore.h"
@@ -59,6 +60,15 @@ class RenameOp : public Operation<RenameRsp> {
   static bool underTrash(const std::vector<Inode> &ancestors) {
     return ancestors.size() >= 2 && ancestors[ancestors.size() - 1].id == InodeId::root() &&
            ancestors[ancestors.size() - 2].asDirectory().name == "trash";
+  }
+
+  CoTryTask<void> validateIdempotentReplay(IReadWriteTransaction &raw) override {
+    EcFileTreeTxnBudget txn(raw);
+    auto prior = co_await EcFileLifecycleCatalog::replay(txn, req_);
+    CO_RETURN_ON_ERROR(prior);
+    if (*prior && (!config().authenticate() || !config().enable_ec_rmw()))
+      co_return makeError(StatusCode::kNotImplemented);
+    co_return Void{};
   }
 
   bool needIdempotent(Uuid &clientId, Uuid &requestId) const override {
@@ -238,6 +248,13 @@ class RenameOp : public Operation<RenameRsp> {
     XLOGF(DBG, "RenameOp: {}", req_);
 
     CHECK_REQUEST(req_);
+    EcFileTreeTxnBudget ecTxn(txn);
+    auto prior = co_await EcFileLifecycleCatalog::replay(ecTxn, req_);
+    CO_RETURN_ON_ERROR(prior);
+    if (*prior) {
+      if (!config().authenticate() || !config().enable_ec_rmw()) co_return makeError(StatusCode::kNotImplemented);
+      co_return std::move(**prior);
+    }
 
     auto [srcResult, dstResult] =
         co_await folly::coro::collectAll(resolve(txn, req_.user).path(req_.src, AtFlags(AT_SYMLINK_NOFOLLOW)),
@@ -252,6 +269,8 @@ class RenameOp : public Operation<RenameRsp> {
       XLOGF(CRITICAL, "Rename already finished, dst {}, req {}, uuid {}", *dstResult->dirEntry, req_, req_.uuid);
       auto inode = co_await dstResult->dirEntry->snapshotLoadInode(txn);
       CO_RETURN_ON_ERROR(inode);
+      if (inode->isFile() && inode->asFile().layout.isErasureCoded())
+        co_return makeError(StatusCode::kTokenMismatch, "EC rename replay requires permanent request evidence");
       co_return RenameRsp(std::move(*inode));
     }
 
@@ -264,14 +283,16 @@ class RenameOp : public Operation<RenameRsp> {
       co_return MAKE_ERROR_F(MetaCode::kNotFound, "rename src {}, inodeId != {}", *srcResult->dirEntry, *req_.inodeId);
     }
     // if src and dst points to same dir entry, do nothing
-    if (dstResult->dirEntry.has_value() && dstResult->dirEntry->parent == srcResult->dirEntry->parent &&
-        dstResult->dirEntry->name == srcResult->dirEntry->name) {
+    const bool sameEntry = dstResult->dirEntry.has_value() &&
+                           dstResult->dirEntry->parent == srcResult->dirEntry->parent &&
+                           dstResult->dirEntry->name == srcResult->dirEntry->name;
+    if (sameEntry) {
       auto inode = co_await dstResult->dirEntry->snapshotLoadInode(txn);
       CO_RETURN_ON_ERROR(inode);
-      co_return RenameRsp(std::move(*inode));
+      if (!inode->isFile() || !inode->asFile().layout.isErasureCoded()) co_return RenameRsp(std::move(*inode));
     }
     // move to trash shouldn't replace file already exists
-    if (dstResult->dirEntry.has_value() && dstResult->dirEntry->isFile() && req_.moveToTrash) {
+    if (dstResult->dirEntry.has_value() && dstResult->dirEntry->isFile() && req_.moveToTrash && !sameEntry) {
       co_return MAKE_ERROR_F(MetaCode::kExists, "rename dest {} exist", req_.dest);
     }
     // dst shouldn't be a non-empty directory
@@ -299,8 +320,37 @@ class RenameOp : public Operation<RenameRsp> {
     CO_RETURN_ON_ERROR(co_await checkPermission(txn, *srcResult, srcInode, false));
     CO_RETURN_ON_ERROR(co_await checkPermission(txn, *dstResult, dstInode, true));
 
-    // EC file namespace changes remain disabled until their lifecycle is integrated.
-    // Directory moves preserve descendants and checkLoop validates destination ancestors.
+    const bool hasEcFile = (srcInode->isFile() && srcInode->asFile().layout.isErasureCoded()) ||
+                           (dstInode && dstInode->isFile() && dstInode->asFile().layout.isErasureCoded());
+    if (hasEcFile) {
+      if (!config().authenticate() || !config().enable_ec_rmw()) co_return makeError(StatusCode::kNotImplemented);
+      auto renamed = co_await EcFileLifecycleCatalog::rename(ecTxn,
+                                                             req_,
+                                                             *srcResult->dirEntry,
+                                                             dstResult->getParentId(),
+                                                             req_.dest.path->filename().native(),
+                                                             gcManager());
+      CO_RETURN_ON_ERROR(renamed);
+      addEvent(Event::Type::Rename)
+          .addField("srcParent", srcResult->getParentId())
+          .addField("srcName", srcResult->dirEntry->name)
+          .addField("dstParent", dstResult->getParentId())
+          .addField("dstName", req_.dest.path->filename().native())
+          .addField("inode", srcResult->dirEntry->id)
+          .addField("user", req_.user.uid)
+          .addField("host", req_.client.hostname);
+      addTrace(MetaEventTrace{.eventType = Event::Type::Rename,
+                              .inodeId = srcResult->dirEntry->id,
+                              .parentId = srcResult->getParentId(),
+                              .entryName = srcResult->dirEntry->name,
+                              .dstParentId = dstResult->getParentId(),
+                              .dstEntryName = req_.dest.path->filename().native(),
+                              .userId = req_.user.uid,
+                              .client = req_.client});
+      co_return renamed;
+    }
+    // Legacy files and existing guarded directory moves retain their old path.
+    // No recursive directory merge or nonzero renameat2 flags are introduced.
     if (srcInode->isFile()) {
       CO_RETURN_ON_ERROR(srcInode->asFile().layout.checkReplicated());
     }

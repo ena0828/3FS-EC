@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:3fs-ec:kv-observation:v1",
+  "title": "Input observations, not actual cache or storage operations",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "sequence_decimal", "kind", "request_id", "source", "clock", "namespace_sha256"],
+  "properties": {
+    "schema": {"const": "ec-kv-observation/v1"},
+    "sequence_decimal": {"$ref": "#/$defs/uint"},
+    "kind": {"enum": ["request_arrival", "input_block_observation"]},
+    "request_id": {"$ref": "#/$defs/sha"},
+    "namespace_sha256": {"$ref": "#/$defs/sha"},
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "line_decimal", "byte_offset_decimal", "line_sha256"],
+      "properties": {
+        "path": {"type": "string"}, "line_decimal": {"$ref": "#/$defs/positive"},
+        "byte_offset_decimal": {"$ref": "#/$defs/uint"}, "line_sha256": {"$ref": "#/$defs/sha"}
+      }
+    },
+    "clock": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_seconds_decimal", "source_ns_decimal", "scaled_ns_decimal", "region"],
+      "properties": {
+        "source_seconds_decimal": {"type": "string"},
+        "source_ns_decimal": {"$ref": "#/$defs/uint"}, "scaled_ns_decimal": {"$ref": "#/$defs/uint"},
+        "region": {"enum": ["warmup", "measurement"]}
+      }
+    },
+    "request": {
+      "type": "object", "additionalProperties": false,
+      "required": ["chat_id_decimal", "parent_chat_id_decimal", "turn_decimal", "type", "input_tokens_decimal", "output_tokens_decimal", "source_hash_count_decimal"],
+      "properties": {
+        "chat_id_decimal": {"$ref": "#/$defs/uint"},
+        "parent_chat_id_decimal": {"type": "string", "pattern": "^(?:-1|0|[1-9][0-9]*)$"},
+        "turn_decimal": {"$ref": "#/$defs/uint"}, "type": {"type": "string", "minLength": 1},
+        "input_tokens_decimal": {"$ref": "#/$defs/uint"}, "output_tokens_decimal": {"$ref": "#/$defs/uint"},
+        "source_hash_count_decimal": {"$ref": "#/$defs/uint"}
+      }
+    },
+    "object": {
+      "type": "object", "additionalProperties": false,
+      "required": ["key_sha256", "block_index_decimal", "valid_tokens", "logical_bytes_decimal", "reuse_scope", "prefix_chain_sha256", "source_hash_start_decimal", "source_hash_ids_decimal", "tail_padding_uncertain"],
+      "properties": {
+        "key_sha256": {"$ref": "#/$defs/sha"}, "block_index_decimal": {"$ref": "#/$defs/uint"},
+        "valid_tokens": {"type": "integer", "minimum": 1, "maximum": 128},
+        "logical_bytes_decimal": {"$ref": "#/$defs/positive"},
+        "reuse_scope": {"enum": ["request", "synthetic-tenant"]},
+        "prefix_chain_sha256": {"$ref": "#/$defs/sha"}, "source_hash_start_decimal": {"$ref": "#/$defs/uint"},
+        "source_hash_ids_decimal": {"type": "array", "minItems": 1, "maxItems": 8, "items": {"$ref": "#/$defs/uint"}},
+        "tail_padding_uncertain": {"type": "boolean"}
+      }
+    }
+  },
+  "oneOf": [
+    {"properties": {"kind": {"const": "request_arrival"}}, "required": ["request"], "not": {"required": ["object"]}},
+    {"properties": {"kind": {"const": "input_block_observation"}}, "required": ["object"], "not": {"required": ["request"]}}
+  ],
+  "$defs": {
+    "uint": {"type": "string", "pattern": "^(?:0|[1-9][0-9]*)$"},
+    "positive": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -74,6 +74,7 @@ struct Components {
   Result<Void> stopMgmtdClient();
   const flat::AppInfo &getAppInfo() const { return appInfo; }
   const EcCapabilityKey *getEcCapabilityKey() const { return ecCapabilityKey_.get(); }
+  std::shared_ptr<const EcCapabilityKey> sharedEcCapabilityKey() const { return ecCapabilityKey_; }
 
   Result<robin_hood::unordered_set<std::string>> getActiveClientsList();
   void triggerHeartbeatIfNeed();
@@ -99,7 +100,7 @@ struct Components {
   friend class StorageOperator;
   Result<Void> loadEcCapabilityKey();
   // Initialized before workers start and kept alive until all borrowed jobs drain.
-  std::unique_ptr<EcCapabilityKey> ecCapabilityKey_;
+  std::shared_ptr<const EcCapabilityKey> ecCapabilityKey_;
 
  public:
   ConstructLog<"storage::Components"> constructLog_;

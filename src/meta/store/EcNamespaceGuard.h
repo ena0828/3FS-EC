@@ -13,6 +13,11 @@ class EcNamespaceGuard {
   static CoTryTask<uint64_t> subtreeCount(IReadWriteTransaction &txn, InodeId directory);
   static CoTryTask<void> checkRemove(IReadWriteTransaction &txn, InodeId directory);
   static CoTryTask<void> moveDirectory(IReadWriteTransaction &txn, const Inode &directory, InodeId newParent);
+
+ private:
+  friend class EcFileLifecycleCatalog;
+  static CoTryTask<Void> checkTreeFile(IReadWriteTransaction &, const Inode &);
+  static CoTryTask<Void> adjustTreeLink(IReadWriteTransaction &, const Inode &, InodeId, bool increment);
 };
 
 }  // namespace hf3fs::meta::server

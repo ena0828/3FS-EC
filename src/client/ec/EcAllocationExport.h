@@ -3,6 +3,11 @@
 #include "client/ec/EcStripeRunRecord.h"
 
 namespace hf3fs::client::ec {
+// Pure validation shared by metadata export and the explicit recovery writer.
+// The caller supplies a real authenticated RPC33 response, never a grant.
+Result<Void> validatePublishedEcStripeRun(const EcStripeRunRecord &,
+                                          const EcStripeRunObservation &,
+                                          const meta::EcV2MutationRsp &);
 // The caller retains the journal's exclusive lock until this task completes.
 // Queries the original operation through authenticated MetaClient RPC 33;
 // never acquires a pin, issues a grant or mutates remote metadata. The archive

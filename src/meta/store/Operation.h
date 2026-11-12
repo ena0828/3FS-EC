@@ -227,6 +227,7 @@ class OperationDriver {
     auto idem = !readonly && operation_.needIdempotent(clientId, requestId);
     if (idem) {
       OperationRecorder::server().addIdempotentCount();
+      CO_RETURN_ON_ERROR(co_await operation_.validateIdempotentReplay(txn));
       IDEMPOTENT_CHECK();
       auto result = co_await handler(txn);
       if (result) {
@@ -235,6 +236,7 @@ class OperationDriver {
       } else if (ErrorHandling::success(result) || !ErrorHandling::retryable(result.error())) {
         // this is final result, discard other modifications and save result
         txn.reset();
+        CO_RETURN_ON_ERROR(co_await operation_.validateIdempotentReplay(txn));
         IDEMPOTENT_CHECK();
         CO_RETURN_ON_ERROR(co_await Idempotent::store(txn, clientId, requestId, result));
         CO_RETURN_ON_ERROR(co_await txn.commit());

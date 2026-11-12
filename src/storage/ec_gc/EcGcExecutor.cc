@@ -122,7 +122,7 @@ Result<EcGcDiscoveryObservation> EcGcExecutor::observeCapabilities(
     const auto &b = after.endpoint;
     if (a.nodeId != b.nodeId || a.chainId != b.chainId || a.targetId != b.targetId || a.engineUuid != b.engineUuid ||
         a.targetIncarnation != b.targetIncarnation || !after.enabled || after.dataProtocol != 2 ||
-        after.diskFormat != 3 || after.gcProtocol != 1)
+        after.diskFormat != 3 || after.gcProtocol != kEcGcSupportedProtocol)
       return makeError(StorageCode::kTargetStateInvalid);
     // Keep the same session/target through the map fence and final fresh
     // authority/expiry/closing check. A later stop cannot invalidate an already

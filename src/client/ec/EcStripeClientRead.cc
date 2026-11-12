@@ -122,12 +122,19 @@ CoTryTask<EcStripeReadOutput> readReady(std::shared_ptr<EcStripeClientCore> core
   const auto started = std::chrono::steady_clock::now();
   CO_RETURN_ON_ERROR(core->active(state->control));
   if (state->stop.isCancellationRequested()) co_return makeError(StorageClientCode::kRequestCanceled);
-  meta::AcquireEcReadV2Req request;
-  core->request(request, state->pin.acquireRequest);
-  request.object = state->pin.object;
-  request.stripe = state->pin.stripe;
-  request.pin = state->pin.pin;
-  auto acquired = co_await core->meta->acquireEcReadV2(std::move(request));
+  Result<meta::AcquireEcReadV2Rsp> acquired = makeError(StatusCode::kInvalidArg);
+  if (state->externalRange) {
+    if (!state->suppliedRead) co_return makeError(StatusCode::kDataCorruption, "tree pin lost its supplied read");
+    acquired = std::move(*state->suppliedRead);
+    state->suppliedRead.reset();
+  } else {
+    meta::AcquireEcReadV2Req request;
+    core->request(request, state->pin.acquireRequest);
+    request.object = state->pin.object;
+    request.stripe = state->pin.stripe;
+    request.pin = state->pin.pin;
+    acquired = co_await core->meta->acquireEcReadV2(std::move(request));
+  }
   CO_RETURN_ON_ERROR(acquired);
   CO_RETURN_ON_ERROR(core->validOwner(acquired->snapshot.owner));
   if (acquired->manifest.object != state->pin.object || acquired->manifest.stripe != state->pin.stripe ||
@@ -186,7 +193,9 @@ CoTryTask<EcStripeReadOutput> readReady(std::shared_ptr<EcStripeClientCore> core
 }
 }  // namespace
 
-Result<EcStripeReadSession> EcStripeClientCore::startRead(EcStripePinIds pin, EcStripeControl control) {
+Result<EcStripeReadSession> EcStripeClientCore::startRead(EcStripePinIds pin,
+                                                          EcStripeControl control,
+                                                          std::optional<meta::AcquireEcReadV2Rsp> supplied) {
   RETURN_ON_ERROR(validControl(control));
   RETURN_ON_ERROR(validPin(pin));
   // Peak per active block includes ten selected bytes plus Rust's twelve
@@ -202,6 +211,8 @@ Result<EcStripeReadSession> EcStripeClientCore::startRead(EcStripePinIds pin, Ec
       return makeError(StorageClientCode::kResourceBusy);
     auto state = std::make_shared<EcStripeClientReadState>();
     state->pin = std::move(pin);
+    state->externalRange = supplied.has_value();
+    state->suppliedRead = std::move(supplied);
     state->control = control;
     state->reservation = std::make_shared<EcReadReservation>(budget, bytes);
     ++activeOperations;

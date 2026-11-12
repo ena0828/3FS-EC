@@ -59,6 +59,9 @@ std::string journalJson(const T &value) {
   serde::Out<serde::JsonObject> out;
   const auto table = out.tableBegin(false);
   refl::Helper::iterate<T>([&](auto field) {
+    if constexpr (std::is_same_v<T, EcStripeRunRecord>) {
+      if (value.version == 1 && field.name == "recoverySource") return;
+    }
     out.key(field.name);
     const auto &item = value.*field.getter;
     if constexpr (std::is_same_v<std::decay_t<decltype(item)>, std::optional<meta::EcObjectRecord>>) {
@@ -73,7 +76,7 @@ std::string journalJson(const T &value) {
   return out.toString(true, true);
 }
 
-// Journal v1 contains only unsigned integral numbers, represented exactly in
+// Both journal versions contain only unsigned integral numbers, represented exactly in
 // JSON's signed int64 range. Check before native Serde can narrow an integer.
 // This is a local persistence contract, not a change to the RPC JSON formatter.
 bool exactJournalNumbers(const folly::dynamic &value, unsigned depth = 0) {
@@ -92,7 +95,7 @@ bool exactJournalNumbers(const folly::dynamic &value, unsigned depth = 0) {
 Result<std::string> checkedJournalJson(const auto &value) {
   auto text = journalJson(value);
   if (!exactJournalNumbers(folly::parseJson(text)))
-    return makeError(StatusCode::kInvalidFormat, "journal v1 integers must be in [0, INT64_MAX]");
+    return makeError(StatusCode::kInvalidFormat, "journal integers must be in [0, INT64_MAX]");
   return text;
 }
 
@@ -108,7 +111,7 @@ Result<T> readJournalJson(std::string_view text) {
     // overflow of narrow fields, omitted defaults and unknown schema fields.
     // Inode/UID use the journal DTO, not the native readable formatter.
     if (input != folly::parseJson(journalJson(value)))
-      return makeError(StatusCode::kInvalidFormat, "journal differs from its exact v1 representation");
+      return makeError(StatusCode::kInvalidFormat, "journal differs from its exact versioned representation");
     return value;
   } catch (const std::exception &) {
     return makeError(StatusCode::kInvalidFormat, "malformed journal JSON");
@@ -167,13 +170,15 @@ EcStripePinIds EcStripeRunRecord::pinIds(const meta::EcObjectRef &value) const {
   return {value, 0, pin, acquireRequest, releaseRequest};
 }
 Result<Void> EcStripeRunRecord::validate() const {
-  if (version != 1 || (action != "write" && action != "read" && action != "repair") || cluster.empty() ||
-      cluster.size() > 1024 || inputPath.size() > 4096 || remotePath.size() > 4096 || sourceOrder.size() > 10 ||
-      command.size() > 16384 || resumeCommand.size() > 16384 || clientNamespace.is_nil() || !shardBytes ||
-      shardBytes > (1u << 20) || inputBytes > uint64_t(shardBytes) * 10 || !inputBytes || createRequest.is_nil() ||
-      operation.is_nil() || beginRequest.is_nil() || bindRequest.is_nil() || publishRequest.is_nil() ||
-      getRequest.is_nil() || prepareRepairRequest.is_nil() || pin.is_nil() || acquireRequest.is_nil() ||
-      releaseRequest.is_nil() || planId.is_nil() || blockWindow == 0 || blockWindow > 4) {
+  const bool recovery = version == 2 && action == "recovery-write" && recoverySource.has_value();
+  if ((!recovery &&
+       (version != 1 || recoverySource || (action != "write" && action != "read" && action != "repair"))) ||
+      cluster.empty() || cluster.size() > 1024 || inputPath.size() > 4096 || remotePath.size() > 4096 ||
+      sourceOrder.size() > 10 || command.size() > 16384 || resumeCommand.size() > 16384 || clientNamespace.is_nil() ||
+      !shardBytes || shardBytes > (1u << 20) || inputBytes > uint64_t(shardBytes) * 10 || !inputBytes ||
+      createRequest.is_nil() || operation.is_nil() || beginRequest.is_nil() || bindRequest.is_nil() ||
+      publishRequest.is_nil() || getRequest.is_nil() || prepareRepairRequest.is_nil() || pin.is_nil() ||
+      acquireRequest.is_nil() || releaseRequest.is_nil() || planId.is_nil() || blockWindow == 0 || blockWindow > 4) {
     return makeError(StatusCode::kInvalidArg, "invalid fixed stripe run record");
   }
   if (std::all_of(inputSha256.begin(), inputSha256.end(), [](uint8_t byte) { return byte == 0; }))
@@ -194,6 +199,39 @@ Result<Void> EcStripeRunRecord::validate() const {
         return makeError(StatusCode::kInvalidArg, "duplicate/invalid repair source");
       seen |= uint16_t(1u << index);
     }
+  }
+  if (recovery) {
+    const auto &source = *recoverySource;
+    const std::array ids{createRequest,
+                         operation,
+                         beginRequest,
+                         bindRequest,
+                         publishRequest,
+                         getRequest,
+                         prepareRepairRequest,
+                         pin,
+                         acquireRequest,
+                         releaseRequest,
+                         planId};
+    for (size_t i = 0; i != ids.size(); ++i) {
+      if (ids[i] == source.operation || ids[i] == source.getRequest ||
+          std::find(ids.begin(), ids.begin() + i, ids[i]) != ids.begin() + i)
+        return makeError(StatusCode::kTokenMismatch, "recovery request identities overlap");
+    }
+    const auto nonzero = [](const storage::EcSha256 &hash) { return hash != storage::EcSha256{}; };
+    if (!expectedOwnerUid || inputPath.empty() || !std::filesystem::path(inputPath).is_absolute() ||
+        !remotePath.empty() || !object || object->deleting || !object->epoch || source.version != 1 ||
+        source.runPath.size() > 4096 || !std::filesystem::path(source.runPath).is_absolute() ||
+        (source.action != "write" && source.action != "repair" && source.action != "recovery-write") ||
+        source.operation.is_nil() || source.getRequest.is_nil() || source.operation == operation ||
+        !source.expectedEpoch || source.expectedEpoch != object->epoch || !nonzero(source.recordSha256) ||
+        !nonzero(source.observationSha256) ||
+        (source.action == "repair" &&
+         (!source.expectedRevision || !source.replacementMask || (source.replacementMask & ~meta::kEcAllShards) ||
+          std::popcount(source.replacementMask) > 2)) ||
+        (source.action != "repair" && source.replacementMask != meta::kEcAllShards) || !strategy.empty() ||
+        replacementMask || !sourceOrder.empty())
+      return makeError(StatusCode::kInvalidArg, "invalid fixed recovery-write source or input");
   }
   return Void{};
 }

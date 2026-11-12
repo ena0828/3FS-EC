@@ -36,6 +36,28 @@ struct FuseConfig : public ConfigBase<FuseConfig> {
   CONFIG_ITEM(max_readahead, 16_MB);
   CONFIG_ITEM(max_background, 32);
   CONFIG_ITEM(enable_writeback_cache, false);
+  CONFIG_SECT(ec_read, {
+    CONFIG_ITEM(enable, false);
+    CONFIG_ITEM(state_directory, "");
+    CONFIG_ITEM(create_state, false);
+    CONFIG_ITEM(maximum_operation_seconds, 300u);
+    CONFIG_ITEM(cleanup_attempt_seconds, 5u);
+    CONFIG_ITEM(retained_runs, 64u);
+    CONFIG_ITEM(outstanding_runs, 32u);
+    CONFIG_ITEM(logical_spool_bytes, uint64_t{256} << 20);
+    CONFIG_ITEM(retire_completed, false);
+    CONFIG_ITEM(archive_directory, "");
+  });
+  CONFIG_SECT(ec_file, {
+    CONFIG_ITEM(enable, false);
+    CONFIG_ITEM(create_new, false);
+    CONFIG_ITEM(state_directory, "");
+    CONFIG_ITEM(create_state, false);
+    CONFIG_ITEM(retained_sessions, 128u);
+    CONFIG_ITEM(maximum_input_bytes, uint64_t{256} << 20);
+    CONFIG_ITEM(maximum_operation_seconds, 300u);
+    CONFIG_ITEM(shard_bytes, uint32_t{1} << 20);
+  });
   CONFIG_OBJ(client, net::Client::Config);
   CONFIG_OBJ(mgmtd, client::MgmtdClientForClient::Config);
   CONFIG_OBJ(storage, storage::client::StorageClient::Config);

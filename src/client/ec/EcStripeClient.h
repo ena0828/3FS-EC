@@ -69,6 +69,7 @@ struct EcStripeMutationOutcome {
 namespace detail {
 struct EcStripeClientCore;
 struct EcStripeClientReadState;
+struct EcFileClientCore;
 }  // namespace detail
 
 class EcStripeReadOutput {
@@ -157,6 +158,10 @@ class EcStripeClient {
   ~EcStripeClient();
 
  private:
+  friend struct detail::EcFileClientCore;
+  // Data transport only for an already acquired tree-range pin. No Meta34 or
+  // Meta36 call belongs to this session; its range owner uses Meta55 for T2.
+  Result<EcStripeReadSession> startPinnedRead(EcStripePinIds, meta::AcquireEcReadV2Rsp, EcStripeControl);
   explicit EcStripeClient(std::shared_ptr<detail::EcStripeClientCore>);
   std::shared_ptr<detail::EcStripeClientCore> core_;
 };

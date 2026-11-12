@@ -2,6 +2,8 @@
 
 #include "FuseApplication.h"
 
+#include <folly/ScopeGuard.h>
+
 #include "FuseMainLoop.h"
 #include "FuseOps.h"
 #include "common/app/Thread.h"
@@ -53,6 +55,7 @@ Result<Void> FuseApplication::Impl::parseFlags(int *argc, char ***argv) {
 Result<Void> FuseApplication::parseFlags(int *argc, char ***argv) { return impl_->parseFlags(argc, argv); }
 
 Result<Void> FuseApplication::Impl::initApplication() {
+  auto partialInitialization = folly::makeGuard([]() noexcept { checkedFuseShutdownOrExit(); });
   if (FLAGS_dump_default_cfg) {
     fmt::print("{}\n", hf3fsConfig.toString());
     exit(0);
@@ -75,11 +78,12 @@ Result<Void> FuseApplication::Impl::initApplication() {
 
   XLOGF(INFO, "Start to init fuse clients");
   auto initRes = initFuseClients();
-  XLOGF_IF(FATAL, !initRes, "Init fuse clients failed: {}", initRes.error());
+  RETURN_ON_ERROR(initRes);  // The partial-init guard must run before returning failure.
   XLOGF(INFO, "Init fuse clients finished");
 
   launcher_.reset();
 
+  partialInitialization.dismiss();
   return Void{};
 }
 
@@ -98,7 +102,7 @@ Result<Void> FuseApplication::Impl::initFuseClients() {
 Result<Void> FuseApplication::initApplication() { return impl_->initApplication(); }
 
 void FuseApplication::Impl::stop() {
-  getFuseClientsInstance().stop();
+  checkedFuseShutdownOrExit();
   hf3fs::stopAndJoin(nullptr);
 }
 
@@ -113,6 +117,7 @@ bool FuseApplication::configPushable() const { return FLAGS_cfg.empty() && !FLAG
 void FuseApplication::onConfigUpdated() { app_detail::persistConfig(impl_->hf3fsConfig); }
 
 int FuseApplication::Impl::mainLoop() {
+  auto beforeGlobalShutdown = folly::makeGuard([]() noexcept { checkedFuseShutdownOrExit(); });
   Thread::unblockInterruptSignals();
 
   return fuseMainLoop(programName, allowOther, configMountpoint, configMaxBufSize, configClusterId);

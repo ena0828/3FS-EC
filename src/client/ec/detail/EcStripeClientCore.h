@@ -18,6 +18,8 @@ struct EcManagedCall {
 
 struct EcStripeClientReadState : EcManagedCall<Result<EcStripeReadOutput>> {
   EcStripePinIds pin;
+  std::optional<meta::AcquireEcReadV2Rsp> suppliedRead;
+  bool externalRange = false;
   EcStripeControl control;
   CancellationSource stop;
   folly::coro::Baton cleaned;
@@ -142,7 +144,9 @@ struct EcStripeClientCore : std::enable_shared_from_this<EcStripeClientCore> {
   static std::optional<Status> collectStageResults(EcStripeMutationOutcome &,
                                                    std::span<Result<storage::EcStageStateV2>>);
   CoTryTask<meta::ReleaseEcReadV2Rsp> releaseOwned(EcStripePinIds, EcStripeControl);
-  Result<EcStripeReadSession> startRead(EcStripePinIds, EcStripeControl);
+  Result<EcStripeReadSession> startRead(EcStripePinIds,
+                                        EcStripeControl,
+                                        std::optional<meta::AcquireEcReadV2Rsp> = std::nullopt);
   static CoTask<void> readOwned(std::shared_ptr<EcStripeClientCore>, std::shared_ptr<EcStripeClientReadState>);
 
   Result<Void> validateObservation(const meta::EcV2MutationRsp &, const meta::BeginEcMutationV2Req &) const;

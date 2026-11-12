@@ -20,6 +20,14 @@
 #include "fbs/core/user/User.h"
 #include "fbs/meta/Common.h"
 #include "fbs/meta/Ec.h"
+#include "fbs/meta/EcFileAppend.h"
+#include "fbs/meta/EcFileRange.h"
+#include "fbs/meta/EcFileRepairRpc.h"
+#include "fbs/meta/EcFileRpc.h"
+#include "fbs/meta/EcFileTreeRead.h"
+#include "fbs/meta/EcFileTruncateRpc.h"
+#include "fbs/meta/EcRmw.h"
+#include "fbs/meta/EcTreeGc.h"
 #include "fbs/meta/EcV2Grants.h"
 #include "fbs/meta/EcV2Repair.h"
 #include "fbs/meta/Schema.h"
@@ -900,7 +908,324 @@ struct EcRevisionRetirementRsp : RspBase {
   SERDE_STRUCT_FIELD(referencesReleased, false);
 };
 
+// File metadata/range RPCs deliberately have their own disabled-by-default gate.
+struct DescribeEcFileV2Req : ReqBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(access, AccessType::READ);
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (client.uuid.is_nil() || object.incarnation.is_nil() || object.inode.isTreeRoot() ||
+        object.inode > InodeId::normalMax() || (access != AccessType::READ && access != AccessType::WRITE))
+      return INVALID("invalid EC file description request");
+    return VALID;
+  }
+};
+struct DescribeEcFileV2Rsp : RspBase {
+  SERDE_STRUCT_FIELD(file, EcFileState{});
+};
+struct EcRangeReq : ReqBase {
+  SERDE_STRUCT_FIELD(rangeId, Uuid::zero());
+  SERDE_STRUCT_FIELD(selection, EcRangeSelection{});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (client.uuid.is_nil() || rangeId.is_nil()) return INVALID("fixed EC range identity is required");
+    return selection.valid();
+  }
+};
+struct AcquireEcRangeV2Req : EcRangeReq {};
+struct QueryEcRangeV2Req : EcRangeReq {};
+struct EcRangeRsp : RspBase {
+  SERDE_STRUCT_FIELD(snapshot, EcRangeSnapshot{});
+};
+
+// Owner-bound recovery observation. No grant or current inode attributes.
+struct QueryEcOwnedMutationV2Req : EcOperationReq {
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcOperationReq::valid());
+    if (client.uuid.is_nil()) return INVALID("fixed mutation owner namespace is required");
+    return VALID;
+  }
+};
+struct EcOwnedMutationRsp : RspBase {
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(clientNamespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(record, EcOperationRecord{});
+  SERDE_STRUCT_FIELD(contentSha256, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(shardBytes, uint32_t{});
+  SERDE_STRUCT_FIELD(drain, (std::optional<EcV2DrainProgress>{}));
+  SERDE_STRUCT_FIELD(publishedContentConfirmed, false);
+};
+
 // testRpc
+// Meta 46-49/51: requests retain caller-assigned IDs. Existing objects open by
+// exact incarnation/birth; creation alone resolves the supplied pathname.
+struct AdvanceEcTreeReclaimReq : ReqBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  // nil is a bounded read-only queue inspection; otherwise one exact node.
+  SERDE_STRUCT_FIELD(node, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (object.incarnation.is_nil() || object.inode.isTreeRoot() || object.inode > InodeId::normalMax())
+      return INVALID("exact tree object required");
+    return VALID;
+  }
+};
+struct AdvanceEcTreeReclaimRsp : RspBase {
+  SERDE_STRUCT_FIELD(progress, EcTreeReclaimProgress{});
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(clientNamespace, Uuid::zero());
+};
+struct OpenEcFileSessionReq : CreateEcFileReq {
+  SERDE_STRUCT_FIELD(createNew, false);
+  // Existing exact incarnation only; never resolves a pathname or upgrades mode 2/3.
+  SERDE_STRUCT_FIELD(resolveBirth, false);
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(birth, Uuid::zero());
+  SERDE_STRUCT_FIELD(session, Uuid::zero());
+  SERDE_STRUCT_FIELD(rights, uint8_t{kEcSessionRead});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (session.is_nil() || !rights || (rights & ~(kEcSessionRead | kEcSessionWrite)))
+      return INVALID("invalid file session identity or rights");
+    if (createNew) {
+      RETURN_ON_ERROR(CreateEcFileReq::valid());
+      if (resolveBirth || !object.incarnation.is_nil() || !birth.is_nil())
+        return INVALID("new file cannot select an old birth");
+    } else {
+      if (object.incarnation.is_nil() || object.inode.isTreeRoot() || object.inode > InodeId::normalMax() ||
+          (resolveBirth ? !birth.is_nil() : birth.is_nil()) || path.path.has_value())
+        return INVALID("existing file open requires exact object/birth");
+    }
+    return VALID;
+  }
+};
+struct OpenEcFileSessionRsp : RspBase {
+  SERDE_STRUCT_FIELD(inode, Inode{});
+  SERDE_STRUCT_FIELD(object, EcObjectRecord{});
+  SERDE_STRUCT_FIELD(root, EcTreeRoot{});
+  SERDE_STRUCT_FIELD(session, EcFileSessionRecord{});
+};
+struct EcFilePwriteReq : EcOperationReq {
+  SERDE_STRUCT_FIELD(session, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcOperationReq::valid());
+    if (session.is_nil()) return INVALID("file session required");
+    return VALID;
+  }
+};
+struct BeginEcFilePwriteReq : EcFilePwriteReq {
+  SERDE_STRUCT_FIELD(offset, uint64_t{});
+  SERDE_STRUCT_FIELD(length, uint64_t{});
+  SERDE_STRUCT_FIELD(inputSha256, storage::EcSha256{});
+};
+struct QueryEcFilePwriteReq : EcFilePwriteReq {
+  SERDE_STRUCT_FIELD(child, Uuid::zero());
+};
+struct AdvanceEcFilePwriteReq : EcFilePwriteReq {
+  SERDE_STRUCT_FIELD(action, EcFileAdvanceAction::Plan);
+  SERDE_STRUCT_FIELD(intent, EcFileChildIntent{});
+  SERDE_STRUCT_FIELD(child, Uuid::zero());
+  SERDE_STRUCT_FIELD(outputRevocation, Uuid::zero());
+  SERDE_STRUCT_FIELD(sourceRevocation, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcFilePwriteReq::valid());
+    if (action == EcFileAdvanceAction::Plan) {
+      if (intent.object != object || intent.parent != operation || intent.child != child || child.is_nil())
+        return INVALID("planned child differs from parent request");
+    } else if (action == EcFileAdvanceAction::Publish) {
+      if (child.is_nil()) return INVALID("publication child required");
+    } else if (action == EcFileAdvanceAction::CleanupChild) {
+      if (child.is_nil() || outputRevocation.is_nil() || sourceRevocation.is_nil())
+        return INVALID("cleanup must preserve explicit child and revocation IDs");
+    } else if (action != EcFileAdvanceAction::SealPrefix)
+      return INVALID("invalid file advance action");
+    return VALID;
+  }
+};
+struct EcFilePwriteRsp : RspBase {
+  SERDE_STRUCT_FIELD(progress, EcFilePwriteProgress{});
+};
+struct CloseEcFileSessionReq : ReqBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(session, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (object.incarnation.is_nil() || object.inode.isTreeRoot() || object.inode > InodeId::normalMax() ||
+        session.is_nil())
+      return INVALID("invalid close identity");
+    return VALID;
+  }
+};
+struct CloseEcFileSessionRsp : RspBase {
+  SERDE_STRUCT_FIELD(session, EcFileSessionRecord{});
+};
+
+// Insert in fbs/meta/Service.h after AcquireEcReadV2Rsp is defined, with
+// fbs/meta/EcFileTreeRead.h included at the top of that file.
+struct EcTreeReadReq : ReqBase {
+  SERDE_STRUCT_FIELD(intent, EcTreeReadIntent{});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    RETURN_ON_ERROR(intent.selection.valid());
+    if (intent.version != kEcFileTreeVersion || intent.session.is_nil() || intent.request.is_nil() ||
+        intent.range.is_nil())
+      return INVALID("invalid tree read identity");
+    return VALID;
+  }
+};
+struct AcquireEcTreeReadReq : EcTreeReadReq {
+  SERDE_STRUCT_FIELD(stripeIndex, (std::optional<uint8_t>{}));
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcTreeReadReq::valid());
+    if (stripeIndex && *stripeIndex >= kEcFileRangeMaxStripes) return INVALID("tree read stripe index exceeds bound");
+    return VALID;
+  }
+};
+struct QueryEcTreeReadReq : EcTreeReadReq {};
+struct ReleaseEcTreeReadReq : EcTreeReadReq {
+  SERDE_STRUCT_FIELD(revocations, (std::array<Uuid, 8>{}));
+};
+struct EcTreeReadRsp : RspBase {
+  SERDE_STRUCT_FIELD(record, EcTreeReadRecord{});
+  SERDE_STRUCT_FIELD(read, (std::optional<AcquireEcReadV2Rsp>{}));
+};
+
+// Include fbs/meta/EcFileTruncateRpc.h in Service.h. Numbers 56..59 are reserved
+// for this layer; do not replace W1/W2/tree-read/W4 method registrations.
+struct EcFileTruncateReq : ReqBase {
+  SERDE_STRUCT_FIELD(intent, EcFileTruncateIntent{});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    return validateEcFileTruncateIntent(intent);
+  }
+};
+struct BeginEcFileTruncateReq : EcFileTruncateReq {};
+struct QueryEcFileTruncateReq : EcFileTruncateReq {};
+struct AdvanceEcFileTruncateReq : EcFileTruncateReq {};
+struct CloseEcFileTruncateDebtReq : EcFileTruncateReq {
+  SERDE_STRUCT_FIELD(outputRevocation, Uuid::zero());
+  SERDE_STRUCT_FIELD(sourceRevocation, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcFileTruncateReq::valid());
+    if (outputRevocation.is_nil() || sourceRevocation.is_nil() || outputRevocation == sourceRevocation)
+      return INVALID("fixed independent truncate revocations are required");
+    return VALID;
+  }
+};
+struct EcFileTruncateRsp : RspBase {
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(progress, EcFileTruncateProgress{});
+};
+
+struct EcFileAppendReq : ReqBase {
+  SERDE_STRUCT_FIELD(intent, EcFileAppendIntent{});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    return validateEcAppend(intent);
+  }
+};
+struct BeginEcFileAppendReq : EcFileAppendReq {
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcFileAppendReq::valid());
+    if (uuid != intent.request) return INVALID("append acceptance request differs from permanent intent");
+    return VALID;
+  }
+};
+struct QueryEcFileAppendReq : EcFileAppendReq {};
+struct EcFileAppendRsp : RspBase {
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(record, (std::optional<EcFileAppendRecord>{}));
+};
+struct SyncEcFileSessionReq : ReqBase {
+  SERDE_STRUCT_FIELD(intent, EcFileSyncIntent{});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    RETURN_ON_ERROR(validateEcSync(intent));
+    if (uuid != intent.request) return INVALID("fsync request differs from permanent barrier identity");
+    return VALID;
+  }
+};
+struct SyncEcFileSessionRsp : RspBase {
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(record, EcFileSyncRecord{});
+};
+
+struct EcFileRepairReq : ReqBase {
+  SERDE_STRUCT_FIELD(intent, EcFileRepairIntent{});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    return validateEcFileRepairIntent(intent);
+  }
+};
+struct BeginEcFileRepairReq : EcFileRepairReq {
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcFileRepairReq::valid());
+    if (uuid != intent.request) return INVALID("repair acceptance UUID changed");
+    return VALID;
+  }
+};
+struct QueryEcFileRepairReq : EcFileRepairReq {};
+struct AdvanceEcFileRepairReq : EcFileRepairReq {
+  SERDE_STRUCT_FIELD(action, EcFileRepairAdvance::Prepare);
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcFileRepairReq::valid());
+    if (action != EcFileRepairAdvance::Prepare && action != EcFileRepairAdvance::Publish)
+      return INVALID("unknown repair action");
+    return VALID;
+  }
+};
+struct CloseEcFileRepairDebtReq : EcFileRepairReq {
+  SERDE_STRUCT_FIELD(outputRevocation, Uuid::zero());
+  SERDE_STRUCT_FIELD(sourceRevocation, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcFileRepairReq::valid());
+    if (outputRevocation.is_nil() || sourceRevocation.is_nil() || outputRevocation == sourceRevocation)
+      return INVALID("fixed distinct debt revocations required");
+    return VALID;
+  }
+};
+struct EcFileRepairRsp : RspBase {
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(progress, EcFileRepairProgress{});
+  // Present only after a committed issuance for an accepted READ|WRITE session.
+  SERDE_STRUCT_FIELD(access, (std::optional<EcFileRepairAccess>{}));
+};
+
 struct TestRpcReq : ReqBase {
   SERDE_STRUCT_FIELD(path, PathAt());
   SERDE_STRUCT_FIELD(flags, uint32_t(0));
@@ -914,12 +1239,30 @@ struct TestRpcRsp : RspBase {
 
 /* MetaSerde service */
 SERDE_SERVICE(MetaSerde, 4) {
-#define META_SERVICE_METHOD(NAME, CODE, REQ, RSP)                                   \
-  SERDE_SERVICE_METHOD(NAME, CODE, REQ, RSP);                                       \
-                                                                                    \
- public:                                                                            \
-  static constexpr std::string_view getRpcName(const REQ &) { return #NAME; }       \
-  static_assert(serde::SerializableToBytes<REQ> && serde::SerializableToJson<REQ>); \
+ private:
+  // Meta has more methods than the generic field reflection's Rank<64>.
+  // Keep its accumulator independent, then export one complete tuple to Helper.
+  static std::tuple<> CollectMetaMethod(::hf3fs::refl::Rank<0>);
+
+#define META_SERVICE_METHOD(NAME, CODE, REQ, RSP)                                                                \
+  SERDE_SERVICE_METHOD_SENDER(NAME, CODE, REQ, RSP)                                                              \
+ private:                                                                                                        \
+  struct MetaMethodId##CODE : std::type_identity<decltype(CollectMetaMethod(::hf3fs::refl::Rank<128>{}))> {};    \
+  static_assert(std::tuple_size_v<typename MetaMethodId##CODE::type> < 128,                                      \
+                "Meta method reflection capacity exceeded");                                                     \
+  static auto CollectMetaMethod(::hf3fs::refl::Rank<std::tuple_size_v<typename MetaMethodId##CODE::type> + 1>) { \
+    if constexpr (std::is_void_v<T>) {                                                                           \
+      return ::hf3fs::refl::Append_t<typename MetaMethodId##CODE::type,                                          \
+                                     ::hf3fs::serde::MethodInfo<#NAME, T, REQ, RSP, CODE, nullptr>>{};           \
+    } else {                                                                                                     \
+      return ::hf3fs::refl::Append_t<typename MetaMethodId##CODE::type,                                          \
+                                     ::hf3fs::serde::MethodInfo<#NAME, T, REQ, RSP, CODE, &T::NAME>>{};          \
+    }                                                                                                            \
+  }                                                                                                              \
+                                                                                                                 \
+ public:                                                                                                         \
+  static constexpr std::string_view getRpcName(const REQ &) { return #NAME; }                                    \
+  static_assert(serde::SerializableToBytes<REQ> && serde::SerializableToJson<REQ>);                              \
   static_assert(serde::SerializableToBytes<RSP> && serde::SerializableToJson<RSP>)
 
   META_SERVICE_METHOD(statFs, 1, StatFsReq, StatFsRsp);
@@ -966,9 +1309,41 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(retireEcRevisionV2, 40, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
   META_SERVICE_METHOD(queryEcRevisionRetirementV2, 41, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
 
+  META_SERVICE_METHOD(describeEcFileV2, 42, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
+  META_SERVICE_METHOD(acquireEcRangeV2, 43, AcquireEcRangeV2Req, EcRangeRsp);
+  META_SERVICE_METHOD(queryEcRangeV2, 44, QueryEcRangeV2Req, EcRangeRsp);
+
+  META_SERVICE_METHOD(queryEcOwnedMutationV2, 45, QueryEcOwnedMutationV2Req, EcOwnedMutationRsp);
+  META_SERVICE_METHOD(openEcFileSession, 46, OpenEcFileSessionReq, OpenEcFileSessionRsp);
+  META_SERVICE_METHOD(beginEcFilePwrite, 47, BeginEcFilePwriteReq, EcFilePwriteRsp);
+  META_SERVICE_METHOD(queryEcFilePwrite, 48, QueryEcFilePwriteReq, EcFilePwriteRsp);
+  META_SERVICE_METHOD(advanceEcFilePwrite, 49, AdvanceEcFilePwriteReq, EcFilePwriteRsp);
+  META_SERVICE_METHOD(closeEcFileSession, 51, CloseEcFileSessionReq, CloseEcFileSessionRsp);
+  META_SERVICE_METHOD(acquireEcTreeRead, 53, AcquireEcTreeReadReq, EcTreeReadRsp);
+  META_SERVICE_METHOD(queryEcTreeRead, 54, QueryEcTreeReadReq, EcTreeReadRsp);
+  META_SERVICE_METHOD(releaseEcTreeRead, 55, ReleaseEcTreeReadReq, EcTreeReadRsp);
+  META_SERVICE_METHOD(advanceEcTreeReclaim, 60, AdvanceEcTreeReclaimReq, AdvanceEcTreeReclaimRsp);
+  META_SERVICE_METHOD(beginEcFileTruncate, 56, BeginEcFileTruncateReq, EcFileTruncateRsp);
+  META_SERVICE_METHOD(queryEcFileTruncate, 57, QueryEcFileTruncateReq, EcFileTruncateRsp);
+  META_SERVICE_METHOD(advanceEcFileTruncate, 58, AdvanceEcFileTruncateReq, EcFileTruncateRsp);
+  META_SERVICE_METHOD(closeEcFileTruncateDebt, 59, CloseEcFileTruncateDebtReq, EcFileTruncateRsp);
+  META_SERVICE_METHOD(beginEcFileAppend, 61, BeginEcFileAppendReq, EcFileAppendRsp);
+  META_SERVICE_METHOD(queryEcFileAppend, 62, QueryEcFileAppendReq, EcFileAppendRsp);
+  META_SERVICE_METHOD(syncEcFileSession, 63, SyncEcFileSessionReq, SyncEcFileSessionRsp);
+  META_SERVICE_METHOD(beginEcFileRepair, 64, BeginEcFileRepairReq, EcFileRepairRsp);
+  META_SERVICE_METHOD(queryEcFileRepair, 65, QueryEcFileRepairReq, EcFileRepairRsp);
+  META_SERVICE_METHOD(advanceEcFileRepair, 66, AdvanceEcFileRepairReq, EcFileRepairRsp);
+  META_SERVICE_METHOD(closeEcFileRepairDebt, 67, CloseEcFileRepairDebtReq, EcFileRepairRsp);
+
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
+  META_SERVICE_METHOD(bindEcRmwOutput, 52, BindEcRmwOutputReq, BindEcRmwOutputRsp);
 
 #undef META_SERVICE_METHOD
+
+ private:
+  using MetaMethodList = decltype(CollectMetaMethod(::hf3fs::refl::Rank<128>{}));
+  static auto CollectField(::hf3fs::refl::Rank<>)->MetaMethodList;
+  friend struct ::hf3fs::refl::Helper;
 };
 
 }  // namespace hf3fs::meta

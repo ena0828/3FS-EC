@@ -1,5 +1,6 @@
 #include "meta/store/EcGcCompletionCatalog.h"
 
+#include "meta/store/EcExactGcCatalog.h"
 #include "meta/store/EcV2LifecycleUtils.h"
 
 namespace hf3fs::meta::server {
@@ -19,7 +20,7 @@ CoTryTask<EcGcClaim> exactClaim(kv::IReadWriteTransaction &txn,
                                 const storage::EcFragmentIdentity &identity,
                                 const Uuid &claimId) {
   if (claimId.is_nil()) co_return makeError(StatusCode::kInvalidArg);
-  auto claim = co_await EcV2GcCatalog::getClaim(txn, object, identity);
+  auto claim = co_await EcExactGcCatalog::getClaim(txn, object, identity);
   CO_RETURN_ON_ERROR(claim);
   if (!*claim) co_return makeError(StatusCode::kTokenStale, "exact GC claim has not been committed");
   if ((**claim).claimId != claimId) co_return makeError(StatusCode::kTokenMismatch, "GC claim ID differs");
@@ -54,14 +55,32 @@ Result<Void> checkRecord(const EcGcCompletion &value,
   if (value.claimDigest != digest) return makeError(StatusCode::kDataCorruption, "GC completion digest differs");
   return Void{};
 }
+CoTryTask<std::optional<EcGcCompletion>> getWithClaim(kv::IReadWriteTransaction &txn,
+                                                      const EcGcClaim &claim,
+                                                      const storage::EcGcKey &key,
+                                                      const Uuid &authority) {
+  auto ledgerKey = completionKey(claim.allocation.fragment.identity);
+  CO_RETURN_ON_ERROR(ledgerKey);
+  auto value = co_await load<EcGcCompletion>(txn, *ledgerKey);
+  CO_RETURN_ON_ERROR(value);
+  if (*value) CO_RETURN_ON_ERROR(checkRecord(**value, claim, key, authority));
+  co_return value;
+}
 }  // namespace
 
 Result<storage::EcGcCertificate> EcGcCompletionCatalog::project(const EcGcClaim &claim) {
-  if (claim.version != kEcGcCatalogVersion || claim.enrollment.version != kEcGcCatalogVersion ||
-      claim.allocation.version != kEcBindingCatalogVersion || claim.enrollment.object != claim.allocation.object ||
+  const bool flat = claim.version == 1 && claim.enrollment.version == 1;
+  const bool tree = claim.version == 2 && claim.enrollment.version == 2;
+  if ((!flat && !tree) || claim.allocation.version != kEcBindingCatalogVersion ||
+      claim.enrollment.object != claim.allocation.object ||
       claim.allocation.fragment.identity.object != claim.enrollment.object.incarnation)
     return makeError(StatusCode::kDataCorruption, "GC claim projection identity or version differs");
   storage::EcGcCertificate out;
+  if (tree) {
+    out.version = 2;
+    out.metaMode = 4;
+    out.gcProtocol = 2;
+  }
   out.catalogVersion = claim.version;
   out.enrollmentVersion = claim.enrollment.version;
   out.bindingVersion = claim.allocation.version;
@@ -87,23 +106,24 @@ Result<storage::EcGcCertificate> EcGcCompletionCatalog::project(const EcGcClaim 
   return out;
 }
 
-CoTryTask<std::optional<EcGcCompletion>> EcGcCompletionCatalog::get(Transaction &txn,
+CoTryTask<std::optional<EcGcCompletion>> EcGcCompletionCatalog::get(Transaction &raw,
                                                                     const EcObjectRef &object,
                                                                     const storage::EcFragmentIdentity &identity,
                                                                     const Uuid &claimId,
                                                                     const storage::EcGcKey &key,
                                                                     const Uuid &authority) {
+  EcGcTxnScope scope(raw);
+  auto tree = co_await EcTreeGcCatalog::isTree(scope.transaction(), object);
+  CO_RETURN_ON_ERROR(tree);
+  // Flat catalogs retain their original transaction behavior. Only mode4
+  // carries this common budget through dispatch, eligibility and ECGD.
+  Transaction &txn = *tree ? scope.transaction() : raw;
   auto claim = co_await exactClaim(txn, object, identity, claimId);
   CO_RETURN_ON_ERROR(claim);
-  auto ledgerKey = completionKey(identity);
-  CO_RETURN_ON_ERROR(ledgerKey);
-  auto value = co_await load<EcGcCompletion>(txn, *ledgerKey);
-  CO_RETURN_ON_ERROR(value);
-  if (*value) CO_RETURN_ON_ERROR(checkRecord(**value, *claim, key, authority));
-  co_return value;
+  co_return co_await getWithClaim(txn, *claim, key, authority);
 }
 
-CoTryTask<EcGcCompletion> EcGcCompletionCatalog::record(Transaction &txn,
+CoTryTask<EcGcCompletion> EcGcCompletionCatalog::record(Transaction &raw,
                                                         const EcObjectRef &object,
                                                         const storage::EcFragmentIdentity &identity,
                                                         const Uuid &claimId,
@@ -111,11 +131,17 @@ CoTryTask<EcGcCompletion> EcGcCompletionCatalog::record(Transaction &txn,
                                                         const storage::EcGcAck &ack,
                                                         const storage::EcGcKey &key,
                                                         const Uuid &authority) {
+  EcGcTxnScope scope(raw);
+  auto tree = co_await EcTreeGcCatalog::isTree(scope.transaction(), object);
+  CO_RETURN_ON_ERROR(tree);
+  // Flat catalogs retain their original transaction behavior. Only mode4
+  // carries this common budget through dispatch, eligibility and ECGD.
+  Transaction &txn = *tree ? scope.transaction() : raw;
   auto claim = co_await exactClaim(txn, object, identity, claimId);
   CO_RETURN_ON_ERROR(claim);
   auto digest = checkExchange(*claim, request, ack, key, authority);
   CO_RETURN_ON_ERROR(digest);
-  auto prior = co_await get(txn, object, identity, claimId, key, authority);
+  auto prior = co_await getWithClaim(txn, *claim, key, authority);
   CO_RETURN_ON_ERROR(prior);
   if (*prior) {
     const auto &first = (**prior).ack.claims;

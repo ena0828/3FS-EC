@@ -16,6 +16,7 @@
 
 #include "client/mgmtd/ICommonMgmtdClient.h"
 #include "client/mgmtd/IMgmtdClientForServer.h"
+#include "client/storage/EcRmwTransport.h"
 #include "client/storage/StorageClient.h"
 #include "common/kv/IKVEngine.h"
 #include "common/kv/ITransaction.h"
@@ -34,6 +35,8 @@
 #include "meta/components/Distributor.h"
 #include "meta/components/EcCoordinator.h"
 #include "meta/components/EcGcAdminCoordinator.h"
+#include "meta/components/EcRmwPlanIssuer.h"
+#include "meta/components/EcRmwPublicationVerifier.h"
 #include "meta/components/EcV2Coordinator.h"
 #include "meta/components/FileHelper.h"
 #include "meta/components/Forward.h"
@@ -63,6 +66,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   void afterStop();
 
   CoTryTask<AuthRsp> authenticate(AuthReq req);
+  CoTryTask<BindEcRmwOutputRsp> bindEcRmwOutput(BindEcRmwOutputReq req);
 
   CoTryTask<StatFsRsp> statFs(StatFsReq req);
 
@@ -95,6 +99,30 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<EcGcAdminRsp> queryEcFragmentGcV2(QueryEcFragmentGcV2Req req);
   CoTryTask<EcRevisionRetirementRsp> retireEcRevisionV2(RetireEcRevisionV2Req req);
   CoTryTask<EcRevisionRetirementRsp> queryEcRevisionRetirementV2(QueryEcRevisionRetirementV2Req req);
+  CoTryTask<DescribeEcFileV2Rsp> describeEcFileV2(DescribeEcFileV2Req req);
+  CoTryTask<EcRangeRsp> acquireEcRangeV2(AcquireEcRangeV2Req req);
+  CoTryTask<EcRangeRsp> queryEcRangeV2(QueryEcRangeV2Req req);
+  CoTryTask<EcOwnedMutationRsp> queryEcOwnedMutationV2(QueryEcOwnedMutationV2Req req);
+  CoTryTask<OpenEcFileSessionRsp> openEcFileSession(OpenEcFileSessionReq req);
+  CoTryTask<EcFilePwriteRsp> beginEcFilePwrite(BeginEcFilePwriteReq req);
+  CoTryTask<EcFilePwriteRsp> queryEcFilePwrite(QueryEcFilePwriteReq req);
+  CoTryTask<EcFilePwriteRsp> advanceEcFilePwrite(AdvanceEcFilePwriteReq req);
+  CoTryTask<CloseEcFileSessionRsp> closeEcFileSession(CloseEcFileSessionReq req);
+  CoTryTask<EcTreeReadRsp> acquireEcTreeRead(AcquireEcTreeReadReq req);
+  CoTryTask<EcTreeReadRsp> queryEcTreeRead(QueryEcTreeReadReq req);
+  CoTryTask<EcTreeReadRsp> releaseEcTreeRead(ReleaseEcTreeReadReq req);
+  CoTryTask<AdvanceEcTreeReclaimRsp> advanceEcTreeReclaim(AdvanceEcTreeReclaimReq req);
+  CoTryTask<EcFileTruncateRsp> beginEcFileTruncate(BeginEcFileTruncateReq req);
+  CoTryTask<EcFileTruncateRsp> queryEcFileTruncate(QueryEcFileTruncateReq req);
+  CoTryTask<EcFileTruncateRsp> advanceEcFileTruncate(AdvanceEcFileTruncateReq req);
+  CoTryTask<EcFileTruncateRsp> closeEcFileTruncateDebt(CloseEcFileTruncateDebtReq req);
+  CoTryTask<EcFileAppendRsp> beginEcFileAppend(BeginEcFileAppendReq req);
+  CoTryTask<EcFileAppendRsp> queryEcFileAppend(QueryEcFileAppendReq req);
+  CoTryTask<SyncEcFileSessionRsp> syncEcFileSession(SyncEcFileSessionReq req);
+  CoTryTask<EcFileRepairRsp> beginEcFileRepair(BeginEcFileRepairReq req);
+  CoTryTask<EcFileRepairRsp> queryEcFileRepair(QueryEcFileRepairReq req);
+  CoTryTask<EcFileRepairRsp> advanceEcFileRepair(AdvanceEcFileRepairReq req);
+  CoTryTask<EcFileRepairRsp> closeEcFileRepairDebt(CloseEcFileRepairDebtReq req);
 
   CoTryTask<MkdirsRsp> mkdirs(MkdirsReq req);
 
@@ -159,6 +187,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
     folly::coro::Baton *nextBaton = nullptr;
   };
 
+  Result<Void> initEcRmw();
   kv::FDBRetryStrategy::Config createRetryConfig() const;
   kv::FDBRetryStrategy createRetryStrategy() const { return kv::FDBRetryStrategy(createRetryConfig()); }
 
@@ -214,6 +243,8 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<void> authenticateEcV2(ReqBase &req);
   CoTryTask<void> authenticateEcGcAdmin(ReqBase &req);
   CoTryTask<void> authenticateEcRevisionRetirement(EcRevisionRetirementReq &req);
+  CoTryTask<void> authenticateEcFileRange(ReqBase &req);
+  CoTryTask<void> authenticateEcFileSession(ReqBase &req);
   CoTryTask<EcV2DrainRecord> advanceEcV2Drain(const EcOperationReq &, EcV2DrainRecord);
 
   const Config &config_;
@@ -234,6 +265,10 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   std::unique_ptr<EcCoordinator> ecCoordinator_;
   std::unique_ptr<EcV2Coordinator> ecV2Coordinator_;
   std::unique_ptr<EcGcAdminCoordinator> ecGcAdmin_;
+  std::shared_ptr<storage::client::StorageClient> ecRmwStorage_;
+  std::shared_ptr<storage::client::EcRmwTransport> ecRmwTransport_;
+  std::shared_ptr<EcRmwPlanIssuer> ecRmwIssuer_;
+  std::shared_ptr<EcRmwPublicationVerifier> ecRmwVerifier_;
 
   Shards<std::map<InodeId, Batch>, 63> batches_;
 

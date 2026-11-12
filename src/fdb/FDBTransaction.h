@@ -44,6 +44,9 @@ class FDBTransaction : public IReadWriteTransaction {
   CoTask<bool> onError(fdb_error_t errcode);
 
   CoTryTask<int64_t> getReadVersion();
+  // Read-only observation of this exact engine transaction. Sample before
+  // commit; this estimate is distinct from application budget accounting.
+  CoTryTask<int64_t> getApproximateSize();
   int64_t getCommittedVersion() override;
   void setReadVersion(int64_t version) override;
 

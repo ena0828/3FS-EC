@@ -126,6 +126,30 @@ class MetaClient {
   CoTryTask<EcGcAdminRsp> queryEcFragmentGcV2(QueryEcFragmentGcV2Req req);
   CoTryTask<EcRevisionRetirementRsp> retireEcRevisionV2(RetireEcRevisionV2Req req);
   CoTryTask<EcRevisionRetirementRsp> queryEcRevisionRetirementV2(QueryEcRevisionRetirementV2Req req);
+  CoTryTask<DescribeEcFileV2Rsp> describeEcFileV2(DescribeEcFileV2Req req);
+  CoTryTask<EcRangeRsp> acquireEcRangeV2(AcquireEcRangeV2Req req);
+  CoTryTask<EcRangeRsp> queryEcRangeV2(QueryEcRangeV2Req req);
+  CoTryTask<EcOwnedMutationRsp> queryEcOwnedMutationV2(QueryEcOwnedMutationV2Req req);
+  CoTryTask<OpenEcFileSessionRsp> openEcFileSession(OpenEcFileSessionReq req);
+  CoTryTask<EcFilePwriteRsp> beginEcFilePwrite(BeginEcFilePwriteReq req);
+  CoTryTask<EcFilePwriteRsp> queryEcFilePwrite(QueryEcFilePwriteReq req);
+  CoTryTask<EcFilePwriteRsp> advanceEcFilePwrite(AdvanceEcFilePwriteReq req);
+  CoTryTask<CloseEcFileSessionRsp> closeEcFileSession(CloseEcFileSessionReq req);
+  CoTryTask<EcTreeReadRsp> acquireEcTreeRead(AcquireEcTreeReadReq req);
+  CoTryTask<EcTreeReadRsp> queryEcTreeRead(QueryEcTreeReadReq req);
+  CoTryTask<EcTreeReadRsp> releaseEcTreeRead(ReleaseEcTreeReadReq req);
+  CoTryTask<AdvanceEcTreeReclaimRsp> advanceEcTreeReclaim(AdvanceEcTreeReclaimReq req);
+  CoTryTask<EcFileTruncateRsp> beginEcFileTruncate(BeginEcFileTruncateReq req);
+  CoTryTask<EcFileTruncateRsp> queryEcFileTruncate(QueryEcFileTruncateReq req);
+  CoTryTask<EcFileTruncateRsp> advanceEcFileTruncate(AdvanceEcFileTruncateReq req);
+  CoTryTask<EcFileTruncateRsp> closeEcFileTruncateDebt(CloseEcFileTruncateDebtReq req);
+  CoTryTask<EcFileAppendRsp> beginEcFileAppend(BeginEcFileAppendReq req);
+  CoTryTask<EcFileAppendRsp> queryEcFileAppend(QueryEcFileAppendReq req);
+  CoTryTask<SyncEcFileSessionRsp> syncEcFileSession(SyncEcFileSessionReq req);
+  CoTryTask<EcFileRepairRsp> beginEcFileRepair(BeginEcFileRepairReq req);
+  CoTryTask<EcFileRepairRsp> queryEcFileRepair(QueryEcFileRepairReq req);
+  CoTryTask<EcFileRepairRsp> advanceEcFileRepair(AdvanceEcFileRepairReq req);
+  CoTryTask<EcFileRepairRsp> closeEcFileRepairDebt(CloseEcFileRepairDebtReq req);
 
   CoTryTask<Inode> stat(const UserInfo &userInfo,
                         InodeId inodeId,
@@ -233,6 +257,11 @@ class MetaClient {
                         const std::optional<UtcTime> atime,
                         const std::optional<UtcTime> mtime,
                         std::optional<VersionedLength> hint);
+
+  // Durable IDs supplied by the caller; one finite exchange, no new namespace on retry.
+  CoTryTask<HardLinkRsp> hardLinkWithIdentity(HardLinkReq req);
+  CoTryTask<RenameRsp> renameWithIdentity(RenameReq req);
+  CoTryTask<RemoveRsp> unlinkWithIdentity(RemoveReq req);
 
   CoTryTask<Inode> hardLink(const UserInfo &userInfo,
                             InodeId oldParent,

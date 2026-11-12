@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "client/ec/EcAllocationExport.h"
+#include "client/ec/EcStripeRecoveryWrite.h"
 #include "client/ec/EcStripeRunRecord.h"
 #include "client/meta/MetaClient.h"
 #include "client/mgmtd/MgmtdClientForAdmin.h"
@@ -139,7 +140,9 @@ Result<std::unique_ptr<EcStripeRunJournal>> journal(const Config &config,
         (!config.strategy().empty() && config.strategy() != record.strategy) ||
         (config.replacement_mask() && config.replacement_mask() != record.replacementMask) ||
         (!config.source_order().empty() && config.source_order() != record.sourceOrder) ||
-        (config.block_window() && config.block_window() != record.blockWindow))
+        (config.block_window() && config.block_window() != record.blockWindow) ||
+        (record.recoverySource && !config.source_run().empty() &&
+         std::filesystem::absolute(config.source_run()).string() != record.recoverySource->runPath))
       return makeError(StatusCode::kTokenMismatch, "resume parameters differ from immutable run record");
     return std::move(value);
   }
@@ -161,6 +164,33 @@ Result<std::unique_ptr<EcStripeRunJournal>> journal(const Config &config,
     CHECK_RESULT(hash, contentDigest(bytes));
     record.inputSha256 = hash;
     record.inputBytes = bytes.size();
+  } else if (command == "new-recovery-write") {
+    if (config.source_run().empty() || config.input_file().empty() || !config.remote_path().empty() ||
+        !config.strategy().empty() || config.replacement_mask() || !config.source_order().empty())
+      return makeError(StatusCode::kInvalidArg,
+                       "recovery requires explicit source_run/input_file and no create/repair parameters");
+    const auto sourcePath = std::filesystem::absolute(config.source_run());
+    CHECK_RESULT(source, EcStripeRunJournal::resume(sourcePath));
+    if (!source->latest()) return makeError(StatusCode::kInvalidArg, "source has no confirmed publication observation");
+    CHECK_RESULT(recordText, readEcStripeInput(sourcePath / "record.json", 65536));
+    CHECK_RESULT(observationText,
+                 readEcStripeInput(sourcePath / fmt::format("state-{:020}.json", source->latest()->sequence), 65536));
+    CHECK_RESULT(recordHash, contentDigest(recordText));
+    CHECK_RESULT(observationHash, contentDigest(observationText));
+    const auto input = std::filesystem::absolute(config.input_file());
+    CHECK_RESULT(bytes, readEcStripeInput(input, size_t(source->record().shardBytes) * 10));
+    CHECK_RESULT(prepared,
+                 prepareEcRecoveryWrite(std::move(record),
+                                        source->record(),
+                                        *source->latest(),
+                                        sourcePath.string(),
+                                        recordHash,
+                                        observationHash,
+                                        input.string(),
+                                        bytes));
+    record = std::move(prepared);
+    if (config.shard_bytes() && config.shard_bytes() != record.shardBytes)
+      return makeError(StatusCode::kTokenMismatch, "recovery cannot change the recorded shard layout");
   } else if (command == "new-read" || command == "new-repair") {
     CHECK_RESULT(source, EcStripeRunJournal::resume(config.source_run()));
     if (!source->latest() || !source->latest()->mutationPublished || !source->latest()->object ||
@@ -196,6 +226,10 @@ Result<std::unique_ptr<EcStripeRunJournal>> journal(const Config &config,
                                   quote(record.inputPath),
                                   quote(record.remotePath),
                                   record.shardBytes);
+  } else if (record.action == "recovery-write") {
+    record.command += fmt::format(" --config.source_run={} --config.input_file={}",
+                                  quote(record.recoverySource->runPath),
+                                  quote(record.inputPath));
   } else {
     record.command += fmt::format(" --config.source_run={}", quote(config.source_run()));
     if (record.action == "repair")
@@ -221,7 +255,12 @@ EcStripeRunObservation observation(const EcStripeRunJournal &journal, const EcSt
   result.dataPhaseElapsedNanoseconds.reset();
   return result;
 }
-Result<Void> run(EcStripeRunJournal &journal, EcStripeClient &manager, const Config &config, std::string_view command) {
+Result<Void> run(EcStripeRunJournal &journal,
+                 EcStripeClient &manager,
+                 const Config &config,
+                 std::string_view command,
+                 std::shared_ptr<meta::client::MetaClient> metadata,
+                 const flat::UserInfo &credentials) {
   const auto &record = journal.record();
   if (record.expectedOwnerUid && *record.expectedOwnerUid != manager.owner().uid.toUnderType())
     return makeError(StatusCode::kTokenMismatch, "authenticated user differs from source run owner");
@@ -250,8 +289,11 @@ Result<Void> run(EcStripeRunJournal &journal, EcStripeClient &manager, const Con
     return makeError(std::move(error));
   };
   auto object = state.object ? state.object : record.object;
+  if (record.action == "recovery-write")
+    object = record.object;  // Never rebase the fixed epoch or CAS from a later observation.
   if (command == "release") {
-    if (!object || record.action == "write") return makeError(StatusCode::kInvalidArg, "this run owns no read pin");
+    if (!object || record.action == "write" || record.action == "recovery-write")
+      return makeError(StatusCode::kInvalidArg, "this run owns no read pin; old cleanup remains separate");
     auto released = blockingWait(manager.release(record.pinIds(object->object), control()));
     if (!released) return recordFailure(released.error());
     state.state = released->drain.state == meta::EcV2DrainState::ReadReleased ? "ReadReleased" : "Closing";
@@ -262,11 +304,18 @@ Result<Void> run(EcStripeRunJournal &journal, EcStripeClient &manager, const Con
       return makeError(StorageCode::kEcSealOutcomeUnknown, "remote pin drain remains pending");
     return Void{};
   }
-  if (record.action == "write") {
+  if (record.action == "write" || record.action == "recovery-write") {
     CHECK_RESULT(bytes, readEcStripeInput(record.inputPath, size_t(record.shardBytes) * 10));
     CHECK_RESULT(hash, contentDigest(bytes));
     if (bytes.size() != record.inputBytes || hash != record.inputSha256)
       return makeError(StatusCode::kTokenMismatch, "input bytes/SHA differ from fixed record");
+    std::optional<meta::EcV2MutationRsp> recoverySource;
+    if (record.action == "recovery-write") {
+      auto verified = blockingWait(verifyEcRecoveryWriteSource(metadata, record, credentials, control()));
+      if (!verified) return recordFailure(verified.error());
+      recoverySource = std::move(*verified);
+      if (!object) return makeError(StatusCode::kDataCorruption, "recovery lost its fixed existing object");
+    }
     if (!object) {
       meta::CreateEcFileV2Req create;
       create.uuid = record.createRequest;
@@ -285,6 +334,10 @@ Result<Void> run(EcStripeRunJournal &journal, EcStripeClient &manager, const Con
     request.ids = record.mutationIds();
     request.logicalData = std::move(bytes);
     auto result = blockingWait(manager.write(std::move(request), control()));
+    if (recoverySource && result.published()) {
+      auto verified = validateEcRecoveryWritePublication(record, *recoverySource, *result.observation);
+      if (!verified) result.failure = verified.error();
+    }
     state.coreElapsedNanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(result.elapsed).count();
     if (result.dataPhaseElapsed)
       state.dataPhaseElapsedNanoseconds =
@@ -297,6 +350,8 @@ Result<Void> run(EcStripeRunJournal &journal, EcStripeClient &manager, const Con
     state.mutationPublished = state.mutationPublished || result.published();
     if (result.failure) return recordFailure(*result.failure);
     RETURN_ON_ERROR(journal.append(state));
+    if (recoverySource)
+      fmt::print("Recovery Write observed separately. No old operation, read pin or GC protection was released.\n");
   } else if (record.action == "repair") {
     if (!object) return makeError(StatusCode::kInvalidArg);
     EcStripeRepair request;
@@ -350,20 +405,27 @@ Result<Void> run(EcStripeRunJournal &journal, EcStripeClient &manager, const Con
 
 int execute(int argc, char **argv) {
   if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-    std::cout << "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/new-run new-write|new-read|new-repair\n"
-                 "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/run resume|release|inspect\n"
-                 "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/published-run "
-                 "--config.allocation_output=/absolute/new.json export-allocations\n"
-                 "new-write: --config.input_file=... --config.remote_path=/... --config.shard_bytes=...\n"
-                 "new-read: --config.source_run=/absolute/published-run\n"
-                 "new-repair: source_run plus --config.strategy=central|pipeline|helper, replacement_mask, optional "
-                 "source_order and block_window\n"
-                 "Uses actual mgmtd/Meta/Storage clients and a real user token_file (owner-only). No signing keys are "
-                 "accepted.\n"
-                 "Single stripe only; no FUSE, multi-stripe mapping or physical GC. Input preparation, output files "
-                 "and UI are excluded from core timing.\n"
-                 "112KiB logical data with ~11KiB shards has one block; cross 640KiB logical and use multi-block "
-                 "shards to exercise slice overlap.\n";
+    std::cout
+        << "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/new-run new-write|new-read|new-repair\n"
+           "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/new-run "
+           "--config.source_run=/absolute/published-run --config.input_file=/absolute/restored-data "
+           "new-recovery-write\n"
+           "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/run resume|release|inspect\n"
+           "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/published-run "
+           "--config.allocation_output=/absolute/new.json export-allocations\n"
+           "new-write: --config.input_file=... --config.remote_path=/... --config.shard_bytes=...\n"
+           "new-read: --config.source_run=/absolute/published-run\n"
+           "new-repair: source_run plus --config.strategy=central|pipeline|helper, replacement_mask, optional "
+           "source_order and block_window\n"
+           "Uses actual mgmtd/Meta/Storage clients and a real user token_file (owner-only). No signing keys are "
+           "accepted.\n"
+           "Single stripe only; no FUSE, multi-stripe mapping or physical GC. Input preparation, output files "
+           "and UI are excluded from core timing.\n"
+           "recovery-write replaces the same stripe-zero object with fixed expectedRevision and identical SHA/length; "
+           "requires READ+WRITE and an explicitly prepared healthy twelve-endpoint Meta pool. Old cleanup is "
+           "retained.\n"
+           "112KiB logical data with ~11KiB shards has one block; cross 640KiB logical and use multi-block "
+           "shards to exercise slice overlap.\n";
     return 0;
   }
   const std::string executable = argv[0];
@@ -464,26 +526,23 @@ int execute(int argc, char **argv) {
     return 0;
   }
   folly::CPUThreadPoolExecutor executor(config.worker_threads());
+  const flat::UserInfo credentials{flat::Uid(config.user_info().uid()),
+                                   flat::Gid(config.user_info().gid()),
+                                   std::move(*token)};
   EcStripeClient::Limits limits;
   limits.maxOperations = config.max_operations();
   limits.maxApplicationBytes = config.max_application_bytes();
   limits.writeFragments = config.write_fragments();
   limits.readBlocks = config.read_blocks();
   limits.maxOperationTime = std::chrono::seconds(config.deadline_seconds());
-  auto manager = blockingWait(EcStripeClient::connect(
-      metadata,
-      dataClient,
-      mgmtdClient,
-      flat::UserInfo{flat::Uid(config.user_info().uid()), flat::Gid(config.user_info().gid()), std::move(*token)},
-      namespaceId.uuid,
-      executor,
-      limits));
+  auto manager = blockingWait(
+      EcStripeClient::connect(metadata, dataClient, mgmtdClient, credentials, namespaceId.uuid, executor, limits));
   if (!manager) {
     std::cerr << manager.error().describe() << '\n';
     return 2;
   }
   SCOPE_EXIT { blockingWait((*manager)->close()); };
-  auto result = run(record, **manager, config, command);
+  auto result = run(record, **manager, config, command, metadata, credentials);
   blockingWait((*manager)->close());
   if (record.latest()) fmt::print("{}\n", serde::toJsonString(*record.latest(), true, true));
   fmt::print("Local manager joined; active_operations={} reserved_application_bytes={}.\n",

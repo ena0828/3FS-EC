@@ -8,6 +8,8 @@
 #include <limits>
 #include <new>
 
+#include "meta/store/EcExactGcCatalog.h"
+
 namespace hf3fs::meta::server {
 namespace {
 using Control = storage::client::EcRequestControl;
@@ -62,9 +64,10 @@ Result<std::unique_ptr<EcGcCoordinator>> EcGcCoordinator::create(Config config,
   for (size_t i = 0; i < config.targets.size(); ++i) {
     const auto &target = config.targets[i];
     const auto &e = target.endpoint;
-    if (!target.enabled || target.dataProtocol != 2 || target.diskFormat != 3 || target.gcProtocol != 1 ||
-        e.nodeId == flat::NodeId{} || e.chainId == storage::ChainId{} || e.targetId == storage::TargetId{} ||
-        e.engineUuid.is_nil() || e.targetIncarnation.is_nil())
+    if (!target.enabled || target.dataProtocol != 2 || target.diskFormat != 3 ||
+        !storage::ecGcProtocolSupports(target.gcProtocol, 1) || e.nodeId == flat::NodeId{} ||
+        e.chainId == storage::ChainId{} || e.targetId == storage::TargetId{} || e.engineUuid.is_nil() ||
+        e.targetIncarnation.is_nil())
       return makeError(StatusCode::kInvalidConfig, "GC target requires an exact enabled instance and protocols");
     for (size_t j = 0; j < i; ++j)
       if (sameEndpoint(config.targets[j].endpoint, e))
@@ -92,7 +95,7 @@ CoTryTask<EcConfirmedGcClaim> EcGcCoordinator::loadCommitted(std::shared_ptr<Sta
   // An externally supplied transaction cannot leak its uncommitted RYW state
   // across this boundary. A fresh database read is mandatory even after retry.
   auto txn = state->engine->createReadWriteTransaction();
-  auto claim = co_await EcV2GcCatalog::getClaim(*txn, object, identity);
+  auto claim = co_await EcExactGcCatalog::getClaim(*txn, object, identity);
   CO_RETURN_ON_ERROR(claim);
   if (!*claim) co_return makeError(StatusCode::kTokenStale, "GC claim is not durably present");
   if ((**claim).claimId != claimId) co_return makeError(StatusCode::kTokenMismatch);
@@ -130,7 +133,8 @@ CoTryTask<EcGcCompletion> EcGcCoordinator::executeOwned(std::shared_ptr<State> s
     const auto &certificate = confirmed->certificate();
     const auto target =
         std::find_if(state->config.targets.begin(), state->config.targets.end(), [&](const auto &value) {
-          return sameEndpoint(value.endpoint, certificate.endpoint);
+          return sameEndpoint(value.endpoint, certificate.endpoint) &&
+                 storage::ecGcProtocolSupports(value.gcProtocol, certificate.gcProtocol);
         });
     if (target == state->config.targets.end())
       co_return makeError(StatusCode::kNotImplemented, "exact claimed instance is not configured for GC");

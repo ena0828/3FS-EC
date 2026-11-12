@@ -8,7 +8,9 @@
 #include <folly/Math.h>
 #include <folly/Synchronized.h>
 #include <folly/Utility.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
+#include <folly/experimental/coro/AsyncScope.h>
 #include <folly/experimental/coro/Mutex.h>
 #include <folly/fibers/Semaphore.h>
 #include <folly/logging/xlog.h>
@@ -33,6 +35,8 @@
 #include <folly/concurrency/AtomicSharedPtr.h>
 #include <fuse3/fuse_lowlevel.h>
 
+#include "EcFileMount.h"
+#include "EcFuseRead.h"
 #include "FuseConfig.h"
 #include "IoRing.h"
 #include "IovTable.h"
@@ -77,9 +81,14 @@ struct RcInode {
     std::optional<meta::VersionedLength> hintLength;  // local hint length
     std::optional<UtcTime> atime;                     // local read time, but only update for write open
     std::optional<UtcTime> mtime;                     // local write time
+    std::optional<uint64_t> ecObservedLength;         // An observation, never authority to skip Acquire43.
 
     void update(const Inode &inode, uint64_t syncver = 0, bool fsync = false) {
       if (!inode.isFile()) {
+        return;
+      }
+      if (inode.asFile().layout.isErasureCoded()) {
+        ecObservedLength = inode.asFile().length;
         return;
       }
 
@@ -147,6 +156,8 @@ struct FileHandle {
   std::shared_ptr<RcInode> rcinode;
   bool oDirect;
   Uuid sessionId;
+  std::optional<client::ec::EcReadHandle> ecRead;
+  std::optional<EcMountHandle> ecFile;
 
   /* FileHandle(std::shared_ptr<RcInode> rcinode, bool oDirect, Uuid sessionId) */
   /*       : rcinode(rcinode), */
@@ -184,7 +195,9 @@ struct FuseClients {
                     const String &mountPoint,
                     const String &tokenFile,
                     FuseConfig &fuseConfig);
-  void stop();
+  Result<Void> stop() noexcept;
+  client::ec::EcStripeControl ecControl() const;
+  CoTask<void> retireDeliveredEcRead(client::ec::EcReadReceipt, flat::UserInfo, bool allT2);
 
   CoTask<void> ioRingWorker(int i, int ths);
   void watch(int prio, std::stop_token stop);
@@ -196,6 +209,25 @@ struct FuseClients {
   std::shared_ptr<client::MgmtdClientForClient> mgmtdClient;
   std::shared_ptr<storage::client::StorageClient> storageClient;
   std::shared_ptr<meta::client::MetaClient> metaClient;
+  // Separate durable EC identity; never used by the replicated FUSE/USRBIO path.
+  std::shared_ptr<storage::client::StorageClient> ecStorageClient;
+  std::shared_ptr<meta::client::MetaClient> ecMetaClient;
+  std::shared_ptr<client::ec::EcReadSpool> ecSpool;
+  std::shared_ptr<client::ec::EcReadDispatcher> ecDispatcher;
+  std::shared_ptr<EcFuseReadAdapter> ecReads;
+  std::shared_ptr<EcFileMountState> ecFileState;
+  std::shared_ptr<EcFileMount> ecFiles;
+  std::shared_ptr<storage::client::EcRmwTransport> ecRmw;
+  std::unique_ptr<folly::CPUThreadPoolExecutor> ecExecutor;
+  std::filesystem::path ecArchiveDirectory;
+  bool ecRetireCompleted = false;
+  std::chrono::seconds ecOperationTime{300};
+  folly::coro::AsyncScope ioScope;
+  std::atomic_bool ioClaimsClosed{false};
+  std::atomic_bool ioStopping{false};
+  std::atomic_bool ioWatchesJoined{false};
+  int ecHighWorkers = 0, ecLowWorkers = 0;
+  bool ioJoinStarted = false, ioJoined = false, fullyStopped = false;
 
   std::string fuseToken;
   std::string fuseMount;

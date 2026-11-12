@@ -68,10 +68,11 @@ int main(int argc, char *argv[]) {
   appInfo.releaseVersion = flat::ReleaseVersion::fromVersionInfo();
 
   auto &d = getFuseClientsInstance();
+  auto partialInitialization = folly::makeGuard([]() noexcept { checkedFuseShutdownOrExit(); });
   if (auto res = d.init(appInfo, hf3fsConfig.mountpoint(), hf3fsConfig.token_file(), hf3fsConfig); !res) {
-    XLOGF(FATAL, "Init fuse clients failed: {}", res.error());
+    XLOGF(ERR, "Init fuse clients failed: {}", res.error());
+    return 1;  // Execute the checked partial-initialization guard.
   }
-  SCOPE_EXIT { d.stop(); };
 
   return fuseMainLoop(argv[0],
                       hf3fsConfig.allow_other(),

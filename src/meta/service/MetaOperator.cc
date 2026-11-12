@@ -171,7 +171,8 @@ MetaOperator::MetaOperator(const Config &cfg,
       ecCoordinator_(std::make_unique<EcCoordinator>(cfg, mgmtdClient, storageClient)),
       ecV2Coordinator_(std::make_unique<EcV2Coordinator>(cfg, mgmtdClient, storageClient)),
       ecGcAdmin_(
-          std::make_unique<EcGcAdminCoordinator>(cfg, kvEngine, storageClient, *ecCoordinator_, *ecV2Coordinator_)) {
+          std::make_unique<EcGcAdminCoordinator>(cfg, kvEngine, storageClient, *ecCoordinator_, *ecV2Coordinator_)),
+      ecRmwStorage_(storageClient) {
   sessionManager_->setCloseFunc(
       [&](const auto &req) -> CoTryTask<void> { co_return (co_await close(req)).then([](auto &) { return Void{}; }); });
 }
@@ -191,6 +192,7 @@ CoTryTask<void> MetaOperator::init(std::optional<Layout> layout) {
   }
 
   CO_RETURN_ON_ERROR(co_await gcManager_->init());
+  CO_RETURN_ON_ERROR(initEcRmw());
   XLOGF(INFO, "MetaOperator::init success.");
   co_return Void{};
 }
@@ -262,6 +264,12 @@ void MetaOperator::afterStop() {
   if (fileHelper_) {
     fileHelper_->stopAndJoin();
   }
+  // ServiceGroup has joined every request before afterStop. No verifier or
+  // Install/Bind coroutine may borrow the transport/config past this point.
+  if (ecRmwTransport_) ecRmwTransport_->stopAndJoin();
+  ecRmwVerifier_.reset();
+  ecRmwIssuer_.reset();
+  ecRmwTransport_.reset();
   metaEventTraceLog_.close();
   XLOGF(INFO, "MetaOperator::afterStop finished");
 }
