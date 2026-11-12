@@ -1,0 +1,114 @@
+name: EC hosted environment preflight
+
+on:
+  push:
+    branches: [feat/ec-distributed]
+    paths: [.github/workflows/ec-hosted-preflight.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  environment:
+    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-distributed' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out this revision without submodules or saved credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+          persist-credentials: false
+
+      - name: Observe resources and FUSE device access (no build or mount)
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import resource
+          import shutil
+          import stat
+          import subprocess
+
+          def command(argv):
+              try:
+                  result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+                  return {"argv": argv, "exitcode": result.returncode,
+                          "stdout": result.stdout[:8192], "stderr": result.stderr[:8192]}
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  return {"argv": argv, "error": type(error).__name__ + ": " + str(error)}
+
+          # Opening and immediately closing the device does not create a mount.
+          device_probe = r'''
+          import json, os, stat
+          value = {"uid": os.geteuid(), "opened": False}
+          try:
+              info = os.stat("/dev/fuse", follow_symlinks=False)
+              value.update(character_device=stat.S_ISCHR(info.st_mode),
+                           mode=oct(stat.S_IMODE(info.st_mode)),
+                           owner_uid=info.st_uid, owner_gid=info.st_gid)
+              if not value["character_device"]:
+                  raise ValueError("/dev/fuse is not a character device")
+              fd = os.open("/dev/fuse", os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  value["opened"] = True
+              finally:
+                  os.close(fd)
+          except (OSError, ValueError) as error:
+              value.update(error=type(error).__name__, errno=getattr(error, "errno", None))
+          print(json.dumps(value, sort_keys=True))
+          raise SystemExit(0 if value["opened"] else 1)
+          '''
+
+          memory = {}
+          for line in Path("/proc/meminfo").read_text().splitlines():
+              key, value = line.split(":", 1)
+              if key in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+                  memory[key + "_bytes"] = int(value.split()[0]) * 1024
+          cpuinfo = Path("/proc/cpuinfo").read_text()
+          disks = []
+          for location in (Path.cwd(), Path(os.environ["RUNNER_TEMP"])):
+              usage = os.statvfs(location)
+              disks.append({"path": str(location), "total_bytes": usage.f_blocks * usage.f_frsize,
+                            "available_bytes": usage.f_bavail * usage.f_frsize,
+                            "free_inodes": usage.f_favail,
+                            "filesystem": command(["findmnt", "-n", "-o", "FSTYPE,OPTIONS", "-T", str(location)])})
+          tools = {}
+          for name in ("clang-14", "clang++-14", "g++-12", "cmake", "ninja", "meson",
+                       "cargo", "rustc", "pkg-config", "fusermount3"):
+              path = shutil.which(name)
+              tools[name] = {"path": path, "version": command([path, "--version"]) if path else None}
+          user_access = command(["/usr/bin/python3", "-c", device_probe])
+          root_access = command(["sudo", "-n", "/usr/bin/python3", "-c", device_probe])
+          ready = (os.geteuid() != 0 and user_access.get("exitcode") == 0
+                   and root_access.get("exitcode") == 0)
+          report = {
+              "schema": 1, "purpose": "hosted_environment_preflight_only",
+              "repository": os.environ.get("GITHUB_REPOSITORY"), "revision": os.environ.get("GITHUB_SHA"),
+              "runner_os": os.environ.get("RUNNER_OS"), "runner_arch": os.environ.get("RUNNER_ARCH"),
+              "image_os": os.environ.get("ImageOS"), "image_version": os.environ.get("ImageVersion"),
+              "uname": list(platform.uname()), "uid": os.geteuid(), "gid": os.getegid(),
+              "cpu_count": os.cpu_count(), "avx2_observed": "avx2" in cpuinfo.split(),
+              "memory": memory, "disks": disks, "tools": tools,
+              "rlimit_nofile": list(resource.getrlimit(resource.RLIMIT_NOFILE)),
+              "rlimit_memlock": list(resource.getrlimit(resource.RLIMIT_MEMLOCK)),
+              "kernel_fuse_filesystems": [line.strip() for line in Path("/proc/filesystems").read_text().splitlines()
+                                          if "fuse" in line],
+              "fuse_module_present": Path("/sys/module/fuse").is_dir(),
+              "fuse_user_access": user_access, "fuse_root_access": root_access,
+              "ordinary_user_and_root_device_open_passed": ready,
+              "packages_installed": False, "modules_loaded_by_workflow": False,
+              "build_executed": False, "services_started": False, "mount_performed": False,
+              "native_acceptance_passed": False, "cold_build_capacity_proven": False,
+              "note": "Resource observations are not proof of fitting a cold build into 14 GB or six hours. Device open is not a successful FUSE mount."
+          }
+          print(json.dumps(report, indent=2, sort_keys=True), flush=True)
+          if not ready:
+              raise SystemExit("FUSE device access prerequisite was not met; no mount or dependency installation attempted.")
+          PY
