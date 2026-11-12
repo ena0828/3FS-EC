@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Pure acceptance-contract tests; no ELF, FDB, WSL or service is executed."""
+
+import copy
+import importlib.util
+from pathlib import Path
+import signal
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+
+SPEC = importlib.util.spec_from_file_location("core_runner", Path(__file__).with_name("run-core-tests.py"))
+RUNNER = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(RUNNER)
+
+
+def xml(names):
+    return {"cases": [{"name": name, "executed": True, "failed": False, "skipped": False}
+                      for name in names],
+            "declared_tests": str(len(names)), "declared_failures": "0", "declared_errors": "0"}
+
+
+def receipt(binary, output):
+    return {"status": "passed", "exitcode": 0, "bootstrap": "passed", "failures": [],
+            "selected": list(RUNNER.META_CASES), "test_results": xml(RUNNER.META_CASES),
+            "passed_tests": 7,
+            "commands": [{"argv": [str(binary), *RUNNER.flags(RUNNER.META_FILTER), *ending], "exitcode": 0}
+                         for ending in (["--gtest_list_tests"],
+                                        ["--gtest_output=xml:" + str(output / "tests.xml")])],
+            "server": {"exitcode_before_cleanup": None, "exitcode_after_cleanup": -15,
+                       "cleanup": {"leader_reaped": True}},
+            "binaries": {name: {"path": str(binary), "sha256": "a" * 64, "sha256_after": "a" * 64}
+                         for name in ("test_meta", "fdbcli", "fdbserver")}}
+
+
+class TestCoreAcceptanceContract(unittest.TestCase):
+    def test_fixed_sets_and_required_cli(self):
+        self.assertEqual(len(set(RUNNER.META_CASES)), 7)
+        self.assertEqual(len(set(RUNNER.FUSE_CASES)), 14)
+        parsed = RUNNER.parser().parse_args(["--source", "/source", "--build", "/build",
+                                            "--fdb-bin-dir", "/fdb", "--work", "/private/new"])
+        self.assertEqual(parsed.work, Path("/private/new"))
+        RUNNER.check_listing([{"name": name, "disabled": False}
+                              for name in reversed(RUNNER.META_CASES)], RUNNER.META_CASES)
+
+    def test_listing_rejects_missing_extra_duplicate_and_disabled(self):
+        original = [{"name": name, "disabled": False} for name in RUNNER.META_CASES]
+        disabled = copy.deepcopy(original)
+        disabled[0]["disabled"] = True
+        for invalid in (original[:-1], original + [{"name": "Other.Test", "disabled": False}],
+                        original[:-1] + original[:1], disabled):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                RUNNER.check_listing(invalid, RUNNER.META_CASES)
+
+    def test_xml_rejects_failure_skip_unexecuted_and_suite_failure(self):
+        RUNNER.check_xml(xml(RUNNER.FUSE_CASES), RUNNER.FUSE_CASES)
+        for field, value in (("failed", True), ("skipped", True), ("executed", False)):
+            record = xml(RUNNER.FUSE_CASES)
+            record["cases"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                RUNNER.check_xml(record, RUNNER.FUSE_CASES)
+        for field, value in (("declared_tests", "13"), ("declared_failures", "1"),
+                             ("declared_errors", None)):
+            record = xml(RUNNER.FUSE_CASES)
+            record[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                RUNNER.check_xml(record, RUNNER.FUSE_CASES)
+
+    def test_xml_rejects_duplicate_case_even_when_total_matches(self):
+        record = xml(RUNNER.META_CASES)
+        record["cases"][-1] = record["cases"][0]
+        with self.assertRaises(ValueError):
+            RUNNER.check_xml(record, RUNNER.META_CASES)
+
+    def test_limits_check_does_not_upgrade_lower_soft_limits(self):
+        high = RUNNER.MEMLOCK_BYTES
+        nofile, memlock = RUNNER.checked_limits((65536, 65536), (high, high), -1)
+        self.assertEqual(nofile["soft_after"], 65536)
+        self.assertFalse(memlock["hard_limit_changed"])
+        RUNNER.checked_limits((-1, -1), (-1, -1), -1)
+        for arguments in (((1024, 65536), (high, high)), ((65536, 65536), (high - 1, high))):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                RUNNER.checked_limits(*arguments, -1)
+
+    def test_meta_receipt_accepts_exact_commands_join_and_binary_binding(self):
+        binary, output = Path("/build/tests/test_meta"), Path("/work/meta")
+        RUNNER.check_meta_receipt(receipt(binary, output), binary, output)
+
+    def test_meta_receipt_rejects_nonzero_exit_extra_run_or_unjoined_fdb(self):
+        binary, output = Path("/build/tests/test_meta"), Path("/work/meta")
+        variants = []
+        item = receipt(binary, output)
+        item["commands"][-1]["exitcode"] = 1
+        variants.append(item)
+        item = receipt(binary, output)
+        item["commands"].append(copy.deepcopy(item["commands"][-1]))
+        variants.append(item)
+        item = receipt(binary, output)
+        item["server"]["cleanup"]["leader_reaped"] = False
+        variants.append(item)
+        item = receipt(binary, output)
+        item["binaries"]["test_meta"]["sha256_after"] = "b" * 64
+        variants.append(item)
+        for item in variants:
+            with self.subTest(item=item), self.assertRaises(ValueError):
+                RUNNER.check_meta_receipt(item, binary, output)
+
+    def test_zero_exit_does_not_hide_timeout_interruption_or_launch_failure(self):
+        for field, value in (("timed_out", True), ("interrupted", True), ("launch_error", "error"),
+                             ("interrupted_or_timeout", "KeyboardInterrupt")):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                RUNNER.command_ok({"exitcode": 0, field: value})
+
+    def test_case_diagnostics_preserves_identity_and_bounds_assertion_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tests.xml"
+            detail = "x" * 3000
+            path.write_text('<testsuites><testsuite><testcase classname="Fixture" name="Case" status="run">'
+                            '<failure>' + detail + '</failure></testcase></testsuite></testsuites>',
+                            encoding="utf-8")
+            case, = RUNNER.case_diagnostics(path)
+            self.assertEqual(case["name"], "Fixture.Case")
+            self.assertTrue(case["executed"])
+            self.assertTrue(case["failed"])
+            self.assertFalse(case["skipped"])
+            self.assertEqual(len(case["detail"].encode("utf-8")), 2048)
+            self.assertTrue(case["detail_truncated"])
+
+    def test_signal_requests_existing_cleanup_once_and_defers_during_join(self):
+        # Direct handler calls and fake stop: no OS signal or child process.
+        helper = SimpleNamespace(stop_owned_process=mock.Mock(return_value={"leader_reaped": True}))
+        guard = RUNNER.Interrupts(helper)
+        guard.original_stop = helper.stop_owned_process
+        with mock.patch.object(signal, "setitimer", create=True), \
+             mock.patch.object(signal, "ITIMER_REAL", 0, create=True):
+            with self.assertRaises(KeyboardInterrupt):
+                guard.handle(15, None)
+            guard.handle(15, None)
+            self.assertEqual(len(guard.received), 2)
+            guard = RUNNER.Interrupts(helper)
+            def finish_join(process):
+                guard.handle(15, None)
+                self.assertEqual(guard.cleaning, 1)
+                return {"leader_reaped": True}
+            guard.original_stop = finish_join
+            self.assertTrue(guard.stop(object())["leader_reaped"])
+            self.assertEqual(guard.cleaning, 0)
+            self.assertEqual(guard.received[0]["signal"], 15)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

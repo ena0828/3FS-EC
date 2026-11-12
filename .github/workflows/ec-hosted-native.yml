@@ -1,0 +1,52 @@
+name: EC hosted native core validation
+
+on:
+  push:
+    branches: [feat/ec-distributed]
+    paths:
+      - .github/workflows/ec-hosted-native.yml
+      - scripts/ec/ci/build-native.sh
+      - scripts/ec/ci/run-core-tests.py
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-distributed' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Check out this revision and pinned submodules
+        timeout-minutes: 10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: recursive
+          lfs: false
+          persist-credentials: false
+
+      - name: Prepare dependencies and build the two native test targets
+        timeout-minutes: 240
+        shell: bash
+        run: bash scripts/ec/ci/build-native.sh
+
+      - name: Run private FDB native cases and FUSE component tests
+        # The job's 350-minute limit also applies; this is not extra time.
+        timeout-minutes: 95
+        shell: bash
+        run: |
+          uid=$(id -u)
+          gid=$(id -g)
+          runner_user=$(id -un)
+          runner_home=$HOME
+          test "$uid" -ne 0
+          sudo -n prlimit --memlock=3221225472:3221225472 --nofile=65536:65536 -- \
+            setpriv --reuid="$uid" --regid="$gid" --init-groups \
+            env HOME="$runner_home" USER="$runner_user" LOGNAME="$runner_user" \
+            LD_LIBRARY_PATH=/usr/local/lib /usr/bin/python3 -B \
+            "$GITHUB_WORKSPACE/scripts/ec/ci/run-core-tests.py" \
+            --source "$GITHUB_WORKSPACE" \
+            --build "$RUNNER_TEMP/ec-native/build" \
+            --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
+            --work "$RUNNER_TEMP/ec-native/acceptance"
