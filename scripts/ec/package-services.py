@@ -124,8 +124,15 @@ def main():
             else:
                 include(source_path, f"lib/{soname}", "shared-library")
 
+    if bundle_manifest.get("file_api") is True:
+        script = Path(__file__).with_name("cluster") / "file-cli-acceptance.py"
+        if not script.is_file():
+            raise RuntimeError(f"Missing file API acceptance source: {script}")
+        include(script, "scripts/file-cli-acceptance.py", "script")
+
     if args.ec_file_mount:
-        for name in ("prepare-fuse-file.py", "prepare-fuse-read.py", "generate.py", "native_v2_config.py", "mode4-mount-acceptance.py"):
+        for name in ("prepare-fuse-file.py", "prepare-fuse-read.py", "generate.py", "native_v2_config.py",
+                     "mode4-mount-acceptance.py", "mode4-usrbio-acceptance.py", "fuse-read-acceptance.py"):
             script = Path(__file__).with_name("cluster") / name
             if not script.is_file():
                 raise RuntimeError(f"Missing mode4 preparation source: {script}; integrate the mount candidate first")
