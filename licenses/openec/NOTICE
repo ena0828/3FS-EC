@@ -4,12 +4,14 @@ Upstream: https://github.com/ukulililixl/openec
 Revision: 04e91d8c9f94bb9f22b7a98570482dfd0eb767b3
 The upstream Apache License, Version 2.0, is reproduced in LICENSE.
 
-The four openec-*.patch files in scripts/ec/reference are local
+The five openec-*.patch files in scripts/ec/reference are local
 modifications, not unmodified upstream releases:
 - openec-algorithm-01.patch corrects the GF width passed to matrix inversion.
 - openec-algorithm-02.patch releases decoded matrix allocations.
 - openec-algorithm-03.patch gives the computation matrix owned storage.
 - openec-posix.patch adds a local POSIX backend and its build selection.
+- openec-local-redis.patch uses each role's configured Redis address in
+  the three cache-worker overloads, retaining separate thread connections.
 
 Patch headers and hunks identify the changed source files and lines.
 This attribution notice was added for this patch distribution; it is not

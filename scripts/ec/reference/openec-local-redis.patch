@@ -1,0 +1,29 @@
+--- a/src/common/OECWorker.cc
++++ b/src/common/OECWorker.cc
+@@ -1142,7 +1142,7 @@
+                             int num,
+                             int ref) {
+   redisReply* rReply;
+-  redisContext* writeCtx = RedisUtil::createContext("127.0.0.1");
++  redisContext* writeCtx = RedisUtil::createContext(_conf->_localIp);
+   
+   struct timeval time1, time2;
+   gettimeofday(&time1, NULL);
+@@ -1183,7 +1183,7 @@
+   gettimeofday(&time1, NULL);
+ 
+   redisReply* rReply;
+-  redisContext* writeCtx = RedisUtil::createContext("127.0.0.1");
++  redisContext* writeCtx = RedisUtil::createContext(_conf->_localIp);
+   
+   gettimeofday(&time2, NULL);
+   cout << "OECWorker::cacheWorker.createCtx: " << RedisUtil::duration(time1, time2) << endl;
+@@ -1230,7 +1230,7 @@
+   gettimeofday(&time1, NULL);
+  
+   redisReply* rReply;
+-  redisContext* writeCtx = RedisUtil::createContext("127.0.0.1");
++  redisContext* writeCtx = RedisUtil::createContext(_conf->_localIp);
+ 
+   int replyid=0;
+   int count=0;

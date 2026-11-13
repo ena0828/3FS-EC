@@ -76,6 +76,16 @@
             "sha256": "32ff0ab7bcac12dc134e3aef24774ae311ed29d7b8d21565f1404c8e9dc86432"
           }
         ]
+      },
+      {
+        "path": "openec-local-redis.patch",
+        "sha256": "653f92fcc005e30c33b919dfe3400513c30f4910bb230782f87e18f8319e4991",
+        "after": [
+          {
+            "path": "src/common/OECWorker.cc",
+            "sha256": "70ce8d98a887e73af38968821bf874f154b3834057cba84be3d17780ca28a4b3"
+          }
+        ]
       }
     ],
     "tree": "36293fbecce474631ca812c2eff9768c80fcb4f6"
