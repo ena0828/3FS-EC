@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Pure source/filter/XML admission checks; no native binary or socket is opened."""
+"""Pure source/filter/XML and safe failure checks; no native binary or socket."""
+from contextlib import redirect_stdout
 import copy
 import fnmatch
 import importlib.util
+import io
+import json
 from pathlib import Path
 import re
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 
@@ -126,6 +130,125 @@ class RpcFrameEntrypoints(unittest.TestCase):
                 row["execution"][{"timeout": "timed_out"}.get(mutation, mutation)] = True
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 regression.check_suites(value, build, built)
+
+
+class NativeFailureDiagnostics(unittest.TestCase):
+    relative = "tests/storage/service/TestEcStageService.cc"
+
+    def parse_case(self, failures, *, tag="failure", skipped=False):
+        # This is the pinned GoogleTest XML shape: compiler-independent location
+        # then summary in the attribute, plus private full detail in CDATA/text.
+        root = ET.Element("testsuites", tests="1", failures=str(int(bool(failures))))
+        item = ET.SubElement(root, "testcase", classname="TestFixture", name="Case",
+                             status="run", result="completed")
+        for message in failures:
+            node = ET.SubElement(item, tag, message=message)
+            node.text = message + "\nStack trace: PRIVATE_STACK_TOKEN"
+        if skipped:
+            ET.SubElement(item, "skipped")
+        with tempfile.TemporaryDirectory(prefix="native failure XML ") as folder:
+            path = Path(folder) / "result.xml"
+            ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+            return driver.xml_tests(path)
+
+    def test_real_xml_shape_exposes_only_source_and_scalar_assertions(self):
+        message = ("/private/PRIVATE_BUILD_TOKEN/source/" + self.relative + ":1750\n"
+                   "Expected equality of these values:\n  privateExpression\n    Which is: 2\n"
+                   "  anotherPrivateExpression\n    Which is: 1\nPRIVATE_BEARER_TOKEN")
+        parsed = self.parse_case([message])
+        row = parsed["cases"][0]
+        self.assertTrue(row["failed"])
+        detail = row["failure_diagnostics"]["assertions"][0]
+        self.assertEqual(detail["source"], {"file": self.relative, "line": 1750})
+        self.assertEqual(detail["classification"], "equality")
+        self.assertEqual(detail["scalar_values"], [{"role": "operand", "value": 2},
+                                                   {"role": "operand", "value": 1}])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            driver.print_summary({"suites": [{"suite": "service", "status": "failed",
+                                  "executed_count": 1, "selected_count": 1,
+                                  "xml_results": parsed, "failures": []}], "failures": []})
+        line = output.getvalue().split("NATIVE_CASE_FAILURE ", 1)[1].splitlines()[0]
+        self.assertEqual(json.loads(line)["diagnostics"], row["failure_diagnostics"])
+        for secret in ("PRIVATE_", "privateExpression", "anotherPrivateExpression", "Stack trace"):
+            self.assertNotIn(secret, json.dumps(parsed) + output.getvalue())
+
+    def test_boolean_error_node_and_missing_or_untrusted_location_are_explicit(self):
+        messages = ["C:\\private\\source\\" + self.relative.replace("/", "\\") +
+                    ":12\nValue of: privatePredicate()\n  Actual: false\nExpected: true",
+                    "/private/not-in-repository.cc:7\nunknown private message",
+                    "../prefix/" + self.relative + ":9\nExpected: true"]
+        rows = self.parse_case(messages, tag="error")["cases"][0]
+        details = rows["failure_diagnostics"]["assertions"]
+        self.assertTrue(rows["failed"])
+        self.assertEqual(details[0]["kind"], "error")
+        self.assertEqual(details[0]["classification"], "boolean")
+        self.assertEqual(details[0]["source"], {"file": self.relative, "line": 12})
+        self.assertEqual(details[0]["scalar_values"], [{"role": "actual", "value": False},
+                                                     {"role": "expected", "value": True}])
+        for row in details[1:]:
+            self.assertNotIn("source", row)
+            self.assertTrue(row["details_redacted"])
+        self.assertNotIn("privatePredicate", json.dumps(rows))
+
+    def test_size_assertion_and_numeric_bounds_do_not_echo_strings_or_stack(self):
+        prefix = self.relative + ":99\nExpected equality of these values:\n"
+        lines = ["Which is: 1", "Actual: -3.5", "Expected: 1e3", "Which is: true",
+                 "Which is: 999", "Actual: nan", "Actual: inf", "Actual: 1e9999",
+                 "Which is: 99999999999999999999999999999999", 'Which is: "PRIVATE_TOKEN"',
+                 "Actual: 10 PRIVATE_SUFFIX"]
+        message = prefix + "\n".join(lines) + "\n" + ("PRIVATE_PADDING" * 1000)
+        row = self.parse_case([message] * 9)["cases"][0]
+        details = row["failure_diagnostics"]
+        self.assertEqual((details["assertion_count"], details["assertions_omitted"]), (9, 6))
+        self.assertEqual(len(details["assertions"]), 3)
+        for item in details["assertions"]:
+            self.assertTrue(item["input_truncated"])
+            self.assertEqual([value["value"] for value in item["scalar_values"]], [1, -3.5, 1000, True])
+        encoded = json.dumps(details)
+        self.assertLess(len(encoded), 3000)
+        self.assertNotIn("PRIVATE", encoded)
+        for scalar in ("nan", "inf", "1e9999", "99999999999999999999999999999999", '"123"', "0x123"):
+            self.assertIsNone(driver.failure_scalar(scalar))
+        many = ET.Element("testsuites", tests="17", failures="17")
+        for index in range(17):
+            item = ET.SubElement(many, "testcase", classname="TestFixture", name="Case" + str(index),
+                                 status="run", result="completed")
+            ET.SubElement(item, "failure", message=message)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "many.xml"
+            ET.ElementTree(many).write(path, encoding="utf-8")
+            parsed = driver.xml_tests(path)
+        self.assertEqual(len(parsed["cases"]), 17)
+        self.assertTrue(all(item["failed"] for item in parsed["cases"]))
+        self.assertEqual(parsed["cases"][-1]["failure_diagnostics"]["status"], "case_limit")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            driver.print_summary({"suites": [{"suite": "service", "status": "failed",
+                                  "executed_count": 17, "selected_count": 17,
+                                  "xml_results": parsed, "failures": []}], "failures": []})
+        self.assertEqual(output.getvalue().count("NATIVE_CASE_FAILURE "), 16)
+        self.assertIn('NATIVE_CASE_FAILURE_LIMIT {"omitted_cases": 1}', output.getvalue())
+
+    def test_diagnostic_exception_preserves_original_failure_and_skip_flags(self):
+        with mock.patch.object(driver, "failure_diagnostics", side_effect=OSError("PRIVATE_DISK_ERROR")):
+            parsed = self.parse_case([self.relative + ":1\nValue of: x\nActual: false"], skipped=True)
+        row = parsed["cases"][0]
+        self.assertEqual({key: row[key] for key in ("name", "executed", "failed", "skipped")},
+                         {"name": "TestFixture.Case", "executed": True, "failed": True, "skipped": True})
+        self.assertEqual(row["failure_diagnostics"], {"status": "unavailable", "details_redacted": True})
+        self.assertNotIn("PRIVATE", json.dumps(parsed))
+
+    def test_success_four_fields_and_existing_exact_set_rejection_are_unchanged(self):
+        row = self.parse_case([])["cases"][0]
+        self.assertEqual(row, {"name": "TestFixture.Case", "executed": True, "failed": False, "skipped": False})
+        original = client_record()
+        regression.check_rpc_frames(original)
+        failed = self.parse_case([self.relative + ":1\nValue of: x\nActual: false\nExpected: true"])["cases"][0]
+        failed["name"] = original["suites"][0]["xml_results"]["cases"][0]["name"]
+        original["suites"][0]["xml_results"]["cases"][0] = failed
+        with self.assertRaises(ValueError):
+            regression.check_rpc_frames(original)
 
 
 if __name__ == "__main__":
