@@ -6,8 +6,10 @@ with_lab=false
 with_regression=false
 backend=scalar
 backend_seen=false
+build_jobs=1
+build_jobs_seen=false
 usage() {
-    echo 'Usage: build-native.sh [--backend scalar|isal] [--with-lab-targets] [--with-ec-regression-targets]' >&2
+    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs 1|2] [--with-lab-targets] [--with-ec-regression-targets]' >&2
 }
 while (($#)); do
     case "$1" in
@@ -17,6 +19,14 @@ while (($#)); do
             fi
             backend="$2"
             backend_seen=true
+            shift 2
+            ;;
+        --build-jobs)
+            if "$build_jobs_seen" || (($# < 2)) || [[ "$2" != 1 && "$2" != 2 ]]; then
+                usage; exit 2
+            fi
+            build_jobs="$2"
+            build_jobs_seen=true
             shift 2
             ;;
         --with-lab-targets)
@@ -281,6 +291,118 @@ git -C third_party/rocksdb diff --binary | sha256sum
 
 ln -s -- "$work/cargo-target" "$source_root/target"
 ulimit -n 65536
+# Only top-level Ninja concurrency changes. Nested Cargo, Make and Arrow remain
+# at one job. This admission policy is not a proof of peak RSS or completion time.
+python3 - "$work" "$build_jobs" <<'PY'
+from pathlib import Path
+import json
+import os
+import sys
+
+GIB = 1024 ** 3
+
+def require(value, message):
+    if not value:
+        raise ValueError(message)
+
+def cgroup_rows(root, membership, mountinfo):
+    # Map only a verified full-root cgroup v2 mount. A namespaced root is fine;
+    # hidden host ancestors are not observable and are not claimed as verified.
+    matches = []
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) > 6 and fields[4] == str(root) and ' - cgroup2 ' in line:
+            matches.append(fields)
+    require(len(matches) == 1 and matches[0][3] == '/', 'unverified cgroup v2 mount mapping')
+    entries = [line.split(':', 2) for line in membership.splitlines() if line.startswith('0::')]
+    require(len(entries) == 1 and len(entries[0]) == 3, 'missing unified cgroup membership')
+    relative = entries[0][2]
+    require(relative.startswith('/') and '..' not in Path(relative).parts, 'invalid cgroup namespace path')
+    base = root.resolve(strict=True)
+    current = (base / relative.lstrip('/')).resolve(strict=True)
+    require(current == base or base in current.parents, 'cgroup membership outside mounted root')
+    result = []
+    while True:
+        require(len(result) < 32, 'cgroup ancestor bound exceeded')
+        row = {'path': str(current), 'cpu_max': None, 'memory_max': None, 'memory_current': None}
+        for controller, filename in [('cpu', 'cpu.max'), ('memory', 'memory.max')]:
+            path = current / filename
+            if not path.exists():
+                # Root cgroups have no parent-imposed max file. On a child, a
+                # disabled parent controller must be explicitly observable.
+                enabled = set() if current == base else set((current.parent / 'cgroup.subtree_control').read_text().split())
+                require(current == base or controller not in enabled, 'enabled cgroup controller limit missing')
+                row[controller + '_scope'] = 'root-no-max' if current == base else 'parent-controller-disabled'
+                continue
+            raw = path.read_text().strip()
+            if controller == 'cpu':
+                parts = raw.split()
+                require(len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0,
+                        'invalid cgroup CPU period')
+                require(parts[0] == 'max' or (parts[0].isdigit() and int(parts[0]) > 0),
+                        'invalid cgroup CPU quota')
+                row['cpu_max'] = raw
+            else:
+                require(raw == 'max' or raw.isdigit(), 'invalid cgroup memory limit')
+                used = (current / 'memory.current').read_text().strip()
+                require(used.isdigit(), 'invalid cgroup memory usage')
+                row.update(memory_max=raw, memory_current=int(used))
+        result.append(row)
+        if current == base:
+            return result
+        current = current.parent
+
+def resource_plan(jobs, memory, affinity, groups):
+    require(type(jobs) is int and jobs in (1, 2), 'unknown build concurrency')
+    require(type(affinity) is int and affinity > 0, 'CPU affinity unavailable')
+    total, available = memory['MemTotal'], memory['MemAvailable']
+    require(type(total) is int and type(available) is int and 0 <= available <= total,
+            'invalid host memory observation')
+    cpus, headroom = affinity, available
+    for row in groups:
+        if row['cpu_max'] is not None:
+            quota, period = row['cpu_max'].split()
+            if quota != 'max':
+                cpus = min(cpus, int(quota) // int(period))
+        if row['memory_max'] not in (None, 'max'):
+            headroom = min(headroom, max(0, int(row['memory_max']) - row['memory_current']))
+    admitted = jobs == 1 or (total >= 15 * GIB and headroom >= 12 * GIB and cpus >= 4)
+    return {'schema': 1, 'status': 'admitted' if admitted else 'insufficient-resources',
+            'requested_jobs': jobs, 'effective_jobs': jobs if admitted else None,
+            'affinity_cpus': affinity, 'visible_effective_cpu_floor': cpus,
+            'host_memory_bytes': memory, 'visible_memory_headroom_bytes': headroom,
+            'cgroup_ancestors': groups,
+            'j2_thresholds': {'memtotal_bytes': 15 * GIB, 'headroom_bytes': 12 * GIB, 'cpu_floor': 4},
+            'pools': {'compile': jobs, 'link': 1},
+            'nested_jobs': {'cmake_environment': 1, 'cargo': 1, 'make': 1, 'jemalloc': 1},
+            'scope': 'visible host/cgroup admission only; hidden ancestors, peak RSS and elapsed time unproven'}
+
+work, jobs = Path(sys.argv[1]), int(sys.argv[2])
+memory = {}
+for line in Path('/proc/meminfo').read_text().splitlines():
+    key, _, value = line.partition(':')
+    if key in ('MemTotal', 'MemAvailable'):
+        amount, unit = value.split()
+        require(unit == 'kB', 'unexpected memory unit')
+        memory[key] = int(amount) * 1024
+try:
+    groups = cgroup_rows(Path('/sys/fs/cgroup'), Path('/proc/self/cgroup').read_text(),
+                         Path('/proc/self/mountinfo').read_text())
+    record = resource_plan(jobs, memory, len(os.sched_getaffinity(0)), groups)
+except (OSError, ValueError) as error:
+    # Keep the original serial build path usable without inventing a verified
+    # cgroup budget. Parallel opt-in always fails closed on unknown observations.
+    record = {'schema': 1, 'status': 'unverified-serial' if jobs == 1 else 'unverified-refused',
+              'requested_jobs': jobs, 'effective_jobs': 1 if jobs == 1 else None,
+              'error_type': type(error).__name__, 'pools': {'compile': jobs, 'link': 1}}
+with (work / 'provenance/build-resources.json').open('x') as stream:
+    json.dump(record, stream, indent=2)
+    stream.write('\n')
+print(json.dumps({'build_resources': record}), flush=True)
+require(record['effective_jobs'] == jobs, 'parallel build resource admission refused')
+PY
+
+# BEGIN REQUESTED BUILD
 cmake -S "$source_root" -B "$work/build" -G Ninja \
     -DCMAKE_CXX_COMPILER=/usr/bin/clang++-14 -DCMAKE_C_COMPILER=/usr/bin/clang-14 \
     "-DCMAKE_C_COMPILER_EXTERNAL_TOOLCHAIN=$gcc_toolchain" \
@@ -290,15 +412,28 @@ cmake -S "$source_root" -B "$work/build" -G Ninja \
     -DFOLLY_CXX_FLAGS=-g0 -DSHUFFLE_METHOD=g++11 -DENABLE_FUSE_APPLICATION=ON \
     '-DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/lib' \
     '-DCMAKE_SHARED_LINKER_FLAGS=-L/usr/local/lib' \
-    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DHF3FS_EXTERNAL_BUILD_JOBS=1 "${backend_cmake_args[@]}"
-cmake --build "$work/build" --parallel 1 --target test_meta test_fuse_ec
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DHF3FS_EXTERNAL_BUILD_JOBS=1 "${backend_cmake_args[@]}" \
+    "-DCMAKE_JOB_POOLS=ec_compile=$build_jobs;ec_link=1" \
+    -DCMAKE_JOB_POOL_COMPILE=ec_compile -DCMAKE_JOB_POOL_LINK=ec_link
+build_targets=(test_meta test_fuse_ec)
 if "$with_regression"; then
-    cmake --build "$work/build" --parallel 1 --target test_storage_store test_storage_service test_client
+    build_targets+=(test_storage_store test_storage_service test_client)
 fi
 if "$with_lab"; then
-    cmake --build "$work/build" --parallel 1 --target storage_main mgmtd_main meta_main admin_cli \
-        ec_stripe_cli ec_file_cli hf3fs_fuse_main ec_mount_read_probe
+    build_targets+=(storage_main mgmtd_main meta_main admin_cli ec_stripe_cli ec_file_cli hf3fs_fuse_main ec_mount_read_probe)
 fi
+build_argv=(cmake --build "$work/build" --parallel "$build_jobs" --target "${build_targets[@]}")
+python3 - "$work/provenance/build-command.json" "${build_argv[@]}" <<'PY'
+from pathlib import Path
+import json
+import sys
+with Path(sys.argv[1]).open('x') as stream:
+    json.dump({'schema': 1, 'argv': sys.argv[2:]}, stream, indent=2)
+    stream.write('\n')
+PY
+printf 'Requested build: '; printf '%q ' "${build_argv[@]}"; printf '\n'
+"${build_argv[@]}"
+# END REQUESTED BUILD
 [[ "$(git -C "$work/build/src/apache-arrow-cpp" rev-parse HEAD)" == b7d2f7ffca66c868bd2fce5b3749c6caa002a7f0 ]]
 printf 'Arrow actual checkout: '
 git -C "$work/build/src/apache-arrow-cpp" rev-parse HEAD
@@ -355,7 +490,11 @@ common = {'schema': 1, 'source': str(source), 'revision': os.environ['GITHUB_SHA
           'build': str(work / 'build'), 'backend': backend, 'isal': isal,
           'build_script_sha256': sha(source / 'scripts/ec/ci/build-native.sh'),
           'cmake_cache_sha256': sha(work / 'build/CMakeCache.txt'),
-          'acceptance_executed': False}
+          'acceptance_executed': False,
+          'build_resources': json.loads((work / 'provenance/build-resources.json').read_text()),
+          'build_resources_sha256': sha(work / 'provenance/build-resources.json'),
+          'build_command': json.loads((work / 'provenance/build-command.json').read_text()),
+          'build_command_sha256': sha(work / 'provenance/build-command.json')}
 record = dict(common, targets=list(paths), binaries={name: sha(path) for name, path in paths.items()},
               ec_regression_targets_requested=with_regression == 'true', lab_targets_requested=with_lab == 'true')
 path = work / 'provenance/native-build.json'

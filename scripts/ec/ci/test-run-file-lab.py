@@ -30,6 +30,56 @@ def passed_mount():
 
 
 class FileLabGates(unittest.TestCase):
+    def test_shutdown_accepts_only_normal_fdb_zero_or_sigterm(self):
+        final = {'run': 'fixed-run', 'stage': 'stopped', 'failure': None}
+        for fdb_code in (0, -15):
+            with self.subTest(fdb_code=fdb_code):
+                cleanup = {'clean': True, 'exit_codes': dict.fromkeys(lab.SERVICE_NAMES, 0)}
+                cleanup['exit_codes']['fdb'] = fdb_code
+                lab.require_shutdown(final, cleanup, 'fixed-run', 0)
+
+    def test_shutdown_rejects_invalid_codes_names_and_unknown_join(self):
+        final = {'run': 'fixed-run', 'stage': 'stopped', 'failure': None}
+        valid = {'clean': True, 'exit_codes': dict.fromkeys(lab.SERVICE_NAMES, 0)}
+        invalid = []
+        for name in sorted(lab.SERVICE_NAMES):
+            for code in (None, False, True, '0', 0.0, -9, 1):
+                bad = copy.deepcopy(valid)
+                bad['exit_codes'][name] = code
+                invalid.append(bad)
+            if name != 'fdb':
+                bad = copy.deepcopy(valid)
+                bad['exit_codes'][name] = -15
+                invalid.append(bad)
+            bad = copy.deepcopy(valid)
+            del bad['exit_codes'][name]
+            invalid.append(bad)
+        extra = copy.deepcopy(valid)
+        extra['exit_codes']['other'] = 0
+        invalid.extend((extra, {'clean': True}, {'clean': True, 'exit_codes': []},
+                        dict(valid, clean=False), dict(valid, clean=1)))
+        for bad in invalid:
+            with self.subTest(cleanup=bad):
+                with self.assertRaises(lab.GateError):
+                    lab.require_shutdown(final, bad, 'fixed-run', 0)
+
+    def test_shutdown_still_requires_same_run_stopped_and_successful_supervisor(self):
+        final = {'run': 'fixed-run', 'stage': 'stopped', 'failure': None}
+        cleanup = {'clean': True, 'exit_codes': dict.fromkeys(lab.SERVICE_NAMES, 0)}
+        for update in ({'run': 'other'}, {'stage': 'ready'}, {'failure': 'failed'}):
+            with self.subTest(update=update):
+                with self.assertRaises(lab.GateError):
+                    lab.require_shutdown(dict(final, **update), cleanup, 'fixed-run', 0)
+        for missing in final:
+            with self.subTest(missing=missing):
+                incomplete = {key: value for key, value in final.items() if key != missing}
+                with self.assertRaises(lab.GateError):
+                    lab.require_shutdown(incomplete, cleanup, 'fixed-run', 0)
+        for code in (None, False, True, 0.0, '0', -15, 1):
+            with self.subTest(supervisor_code=code):
+                with self.assertRaises(lab.GateError):
+                    lab.require_shutdown(final, cleanup, 'fixed-run', code)
+
     def test_terminal_proof_accepts_exact_two_mount_four_probe_result(self):
         lab.require_mount_result(passed_mount())
         self.assertTrue(lab.mount_cleanup_known(passed_mount()))

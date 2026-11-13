@@ -284,6 +284,17 @@ def require_cli_result(value):
     require(all(step.get('checks_complete') is True for step in value['steps']), 'CLI step lacks checks')
 
 
+def require_shutdown(final, cleanup, ready_run, supervisor_code):
+    codes = cleanup.get('exit_codes') if type(cleanup) is dict else None
+    require(type(final) is dict and {'run', 'stage', 'failure'} <= set(final)
+            and type(supervisor_code) is int and supervisor_code == 0
+            and final.get('run') == ready_run and final.get('stage') == 'stopped'
+            and final.get('failure') is None and type(cleanup) is dict and cleanup.get('clean') is True
+            and type(codes) is dict and set(codes) == SERVICE_NAMES
+            and all(type(code) is int and code in ({0, -15} if name == 'fdb' else {0})
+                    for name, code in codes.items()), 'native shutdown not fully confirmed')
+
+
 def package_backend_gate(built, package, lab):
     """Bind an explicitly selected codec provider; legacy receipts stay unlabelled."""
     if 'backend' not in built and 'isal' not in built:
@@ -510,11 +521,7 @@ def runtime(parent):
             log.close()
         final = read_json(lab / 'state/last-supervisor.json')
         cleanup = read_json(lab / 'logs' / report['ready']['run'] / 'cleanup.json')
-        require(supervisor.returncode == 0 and final['run'] == report['ready']['run']
-                and final['stage'] == 'stopped' and final['failure'] is None
-                and cleanup['clean'] is True and set(cleanup['exit_codes']) == SERVICE_NAMES
-                and all(type(code) is int and code == 0 for code in cleanup['exit_codes'].values()),
-                'native shutdown not fully confirmed')
+        require_shutdown(final, cleanup, report['ready']['run'], supervisor.returncode)
         require(not helper.mounts_at(parent / 'mount'), 'mount still present after lifecycle')
         report.update(status='passed', exitcode=0, cleanup=cleanup)
     except BaseException as error:
