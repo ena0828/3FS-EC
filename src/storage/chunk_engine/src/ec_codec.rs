@@ -1,8 +1,10 @@
 //! Bounded owned-output CXX arithmetic bridge. Identity, source integrity,
 //! authorization, and durable publication remain the caller's responsibility.
+use std::collections::VecDeque;
 use std::panic::{catch_unwind, UnwindSafe};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use hf3fs_ec::Codec;
+use hf3fs_ec::{Backend, Codec, ContributionPlan, RepairPlan};
 
 use crate::cxx::ffi::{EcCodecFormat, EcCodecInput, EcCodecResult, EcCodecShard};
 
@@ -13,6 +15,9 @@ const INVALID: u16 = 3;
 const CORRUPT: u16 = 2;
 const NO_MEMORY: u16 = 26;
 const FOUND_BUG: u16 = 998;
+const BACKEND: Backend = Backend::Scalar;
+const REPAIR_CACHE_CAPACITY: usize = 64;
+const CONTRIBUTION_CACHE_CAPACITY: usize = 128;
 type BridgeResult<T> = Result<T, (u16, String)>;
 
 fn invalid(message: &str) -> (u16, String) {
@@ -45,20 +50,169 @@ fn boundary(
     }
 }
 
-fn codec(format: &EcCodecFormat) -> BridgeResult<Codec> {
-    if (
+fn checked_format(format: &EcCodecFormat) -> BridgeResult<[u16; 5]> {
+    let fields = [
         format.codec_id,
         format.matrix_version,
         format.data_shards,
         format.parity_shards,
         format.field_polynomial,
-    ) != (1, 1, 10, 2, 0x11d)
-    {
+    ];
+    if fields != [1, 1, 10, 2, 0x11d] {
         return Err(invalid(
             "unsupported EC codec, matrix, dimensions or field polynomial",
         ));
     }
-    Codec::new(K, N - K).map_err(codec_error)
+    Ok(fields)
+}
+
+fn codec(format: &EcCodecFormat) -> BridgeResult<&'static Codec> {
+    checked_format(format)?;
+    static CODEC: OnceLock<BridgeResult<Codec>> = OnceLock::new();
+    // Only this fixed construction result is shared, never a request result.
+    CODEC
+        .get_or_init(|| Codec::with_backend(K, N - K, BACKEND).map_err(codec_error))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanKey {
+    format: [u16; 5],
+    backend: Backend,
+    healthy: [usize; K],
+    targets: [usize; N - K],
+    target_count: usize,
+}
+
+impl PlanKey {
+    fn checked(
+        format: &EcCodecFormat,
+        healthy: &[usize],
+        targets: &[usize],
+    ) -> BridgeResult<Self> {
+        let format = checked_format(format)?;
+        if healthy.len() != K || targets.is_empty() || targets.len() > N - K {
+            return Err(invalid(
+                "EC plan requires ten sources and one or two targets",
+            ));
+        }
+        let mut seen = [false; N];
+        for &index in healthy.iter().chain(targets) {
+            if index >= N || seen[index] {
+                return Err(invalid(
+                    "EC plan indices must be distinct, disjoint and in range",
+                ));
+            }
+            seen[index] = true;
+        }
+        let mut key = Self {
+            format,
+            backend: BACKEND,
+            healthy: [0; K],
+            targets: [0; N - K],
+            target_count: targets.len(),
+        };
+        // Order is semantic: coefficients match the caller's input columns and
+        // requested output rows. A bitmap or sorted key would be incorrect.
+        key.healthy.copy_from_slice(healthy);
+        key.targets[..targets.len()].copy_from_slice(targets);
+        Ok(key)
+    }
+
+    fn targets(&self) -> &[usize] {
+        &self.targets[..self.target_count]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContributionKey {
+    plan: PlanKey,
+    helper: usize,
+}
+
+impl ContributionKey {
+    fn checked(plan: PlanKey, helper: usize) -> BridgeResult<Self> {
+        if !plan.healthy.contains(&helper) {
+            return Err(invalid("EC contribution helper is not a healthy source"));
+        }
+        Ok(Self { plan, helper })
+    }
+}
+
+#[derive(Default)]
+struct PlanEntries {
+    repairs: VecDeque<(PlanKey, Arc<RepairPlan>)>,
+    contributions: VecDeque<(ContributionKey, Arc<ContributionPlan>)>,
+}
+
+impl PlanEntries {
+    fn repair(&mut self, codec: &Codec, key: PlanKey) -> BridgeResult<Arc<RepairPlan>> {
+        if let Some((_, plan)) = self.repairs.iter().find(|(stored, _)| *stored == key) {
+            return Ok(Arc::clone(plan));
+        }
+        let plan = Arc::new(
+            codec
+                .repair_plan(&key.healthy, key.targets())
+                .map_err(codec_error)?,
+        );
+        if self.repairs.len() == REPAIR_CACHE_CAPACITY {
+            self.repairs.pop_front();
+        }
+        self.repairs.push_back((key, Arc::clone(&plan)));
+        Ok(plan)
+    }
+}
+
+// The cache retains at most 64 repair and 128 single-helper plans. FIFO avoids
+// unbounded key growth; outstanding calls may retain an evicted Arc until their
+// byte operation ends. No payload, validation result, identity or grant is kept.
+// The one lock serializes only lookup and small fixed-size coefficient creation,
+// preventing concurrent misses from repeating the same inversion. All byte
+// operations (including copies, padding and parity checks) run after unlocking.
+#[derive(Default)]
+struct PlanCache {
+    entries: Mutex<PlanEntries>,
+}
+
+fn poisoned_cache() -> (u16, String) {
+    (FOUND_BUG, "EC arithmetic plan cache is poisoned".into())
+}
+
+impl PlanCache {
+    fn repair(&self, codec: &Codec, key: PlanKey) -> BridgeResult<Arc<RepairPlan>> {
+        self.entries
+            .lock()
+            .map_err(|_| poisoned_cache())?
+            .repair(codec, key)
+    }
+
+    fn contribution(
+        &self,
+        codec: &Codec,
+        key: ContributionKey,
+    ) -> BridgeResult<Arc<ContributionPlan>> {
+        let mut entries = self.entries.lock().map_err(|_| poisoned_cache())?;
+        if let Some((_, plan)) = entries
+            .contributions
+            .iter()
+            .find(|(stored, _)| *stored == key)
+        {
+            return Ok(Arc::clone(plan));
+        }
+        let repair = entries.repair(codec, key.plan)?;
+        let plan = Arc::new(repair.contribution(key.helper).map_err(codec_error)?);
+        if entries.contributions.len() == CONTRIBUTION_CACHE_CAPACITY {
+            entries.contributions.pop_front();
+        }
+        entries.contributions.push_back((key, Arc::clone(&plan)));
+        Ok(plan)
+    }
+}
+
+fn plans() -> &'static PlanCache {
+    static PLANS: OnceLock<PlanCache> = OnceLock::new();
+    PLANS.get_or_init(PlanCache::default)
 }
 
 fn shape(logical_length: u64, shard_bytes: u32) -> BridgeResult<usize> {
@@ -216,7 +370,8 @@ pub(crate) fn ec_codec_recover(
             .enumerate()
             .filter_map(|(i, shard)| shard.is_none().then_some(i))
             .collect();
-        let plan = codec.repair_plan(&healthy, &targets).map_err(codec_error)?;
+        let key = PlanKey::checked(format, &healthy, &targets)?;
+        let plan = plans().repair(codec, key)?;
         let data = shards
             .iter()
             .map(|shard| copy_bytes(shard.data))
@@ -236,7 +391,7 @@ pub(crate) fn ec_codec_recover(
                 shard.ok_or_else(|| (FOUND_BUG, "EC reconstruction omitted a shard".into()))
             })
             .collect::<BridgeResult<Vec<_>>>()?;
-        verify_codeword(&codec, &complete, logical_length, size)?;
+        verify_codeword(codec, &complete, logical_length, size)?;
         Ok(output(complete, 0..N))
     })
 }
@@ -258,11 +413,13 @@ pub(crate) fn ec_codec_contribute(
                 "EC contribution requires ten sources, one or two targets and <=1MiB input",
             ));
         }
-        let codec = codec(format)?;
         let healthy: Vec<_> = healthy.iter().map(|&index| index as usize).collect();
         let targets: Vec<_> = targets.iter().map(|&index| index as usize).collect();
-        let plan = codec.repair_plan(&healthy, &targets).map_err(codec_error)?;
-        let contribution = plan.contribution(helper as usize).map_err(codec_error)?;
+        let key = ContributionKey::checked(
+            PlanKey::checked(format, &healthy, &targets)?,
+            helper as usize,
+        )?;
+        let contribution = plans().contribution(codec(format)?, key)?;
         Ok(output(
             contribution.apply(data).map_err(codec_error)?,
             targets,
@@ -358,6 +515,248 @@ mod tests {
         );
         assert_eq!(rejected.error_code, INVALID);
         assert!(rejected.shards.is_empty());
+    }
+
+    #[test]
+    fn cached_plans_preserve_order_and_actual_helper_identity() {
+        fn shared<T: Send + Sync>() {}
+        shared::<Codec>();
+        shared::<RepairPlan>();
+        shared::<ContributionPlan>();
+
+        let codec = codec(&format()).unwrap();
+        assert!(std::ptr::eq(codec, super::codec(&format()).unwrap()));
+        let cache = PlanCache::default();
+        let input: Vec<Vec<u8>> = (0..K)
+            .map(|i| (0..65).map(|j| (i * 17 + j) as u8).collect())
+            .collect();
+        let codeword = codec.encode(&input).unwrap();
+        let mut healthy = [11, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let key = PlanKey::checked(&format(), &healthy, &[9, 10]).unwrap();
+        healthy.reverse();
+        let keys = [
+            key,
+            PlanKey::checked(&format(), &healthy, &[9, 10]).unwrap(),
+            PlanKey::checked(&format(), &key.healthy, &[10, 9]).unwrap(),
+            PlanKey::checked(&format(), &healthy, &[10, 9]).unwrap(),
+        ];
+        let mut retained = Vec::new();
+        for key in keys {
+            let plan = cache.repair(codec, key).unwrap();
+            assert!(Arc::ptr_eq(&plan, &cache.repair(codec, key).unwrap()));
+            for other in &retained {
+                assert!(!Arc::ptr_eq(other, &plan));
+            }
+            retained.push(Arc::clone(&plan));
+            let sources: Vec<_> = key.healthy.iter().map(|&i| codeword[i].clone()).collect();
+            let expected: Vec<_> = key.targets().iter().map(|&i| codeword[i].clone()).collect();
+            assert_eq!(plan.recover_slice(&sources).unwrap(), expected);
+            let mut combined = vec![vec![0u8; 65]; key.target_count];
+            let mut previous = None;
+            for helper in key.healthy {
+                let contribution_key = ContributionKey::checked(key, helper).unwrap();
+                let contribution = cache.contribution(codec, contribution_key).unwrap();
+                assert!(Arc::ptr_eq(
+                    &contribution,
+                    &cache.contribution(codec, contribution_key).unwrap()
+                ));
+                if let Some(previous) = previous {
+                    assert!(!Arc::ptr_eq(&previous, &contribution));
+                }
+                assert_eq!(contribution.helper(), helper);
+                assert_eq!(contribution.targets(), key.targets());
+                for (sum, bytes) in combined
+                    .iter_mut()
+                    .zip(contribution.apply(&codeword[helper]).unwrap())
+                {
+                    for (sum, byte) in sum.iter_mut().zip(bytes) {
+                        *sum ^= byte;
+                    }
+                }
+                // A hit retains no bytes or length. Empty and different input
+                // slices still perform this call's arithmetic.
+                assert_eq!(
+                    contribution.apply(&[]).unwrap(),
+                    vec![Vec::<u8>::new(); key.target_count]
+                );
+                assert_eq!(
+                    contribution.apply(&[0; 3]).unwrap(),
+                    vec![vec![0; 3]; key.target_count]
+                );
+                previous = Some(contribution);
+            }
+            assert_eq!(combined, expected);
+        }
+        // The unused target slot is zero, which is also a valid shard number.
+        // Therefore target_count is essential even when the arrays coincide.
+        let healthy = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11];
+        let one = PlanKey::checked(&format(), &healthy, &[10]).unwrap();
+        let two = PlanKey::checked(&format(), &healthy, &[10, 0]).unwrap();
+        let one = cache.repair(codec, one).unwrap();
+        let two = cache.repair(codec, two).unwrap();
+        assert!(!Arc::ptr_eq(&one, &two));
+        let sources: Vec<_> = healthy.iter().map(|&i| codeword[i].clone()).collect();
+        assert_eq!(one.recover_slice(&sources).unwrap(), vec![codeword[10].clone()]);
+        assert_eq!(
+            two.recover_slice(&sources).unwrap(),
+            vec![codeword[10].clone(), codeword[0].clone()]
+        );
+    }
+
+    #[test]
+    fn cache_capacity_is_bounded_and_evicted_borrows_remain_valid() {
+        let codec = codec(&format()).unwrap();
+        let cache = PlanCache::default();
+        let key =
+            PlanKey::checked(&format(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], &[10, 11]).unwrap();
+        let helper = ContributionKey::checked(key, 0).unwrap();
+        let old = cache.repair(codec, key).unwrap();
+        let old_contribution = cache.contribution(codec, helper).unwrap();
+        // 66 missing pairs, both output orders, two actual helpers per pair:
+        // enough distinct keys to evict both bounded FIFO caches.
+        for a in 0..N {
+            for b in a + 1..N {
+                let healthy: Vec<_> = (0..N).filter(|&i| i != a && i != b).collect();
+                for targets in [[a, b], [b, a]] {
+                    let next = PlanKey::checked(&format(), &healthy, &targets).unwrap();
+                    for &helper in &healthy[..2] {
+                        cache
+                            .contribution(codec, ContributionKey::checked(next, helper).unwrap())
+                            .unwrap();
+                    }
+                    let entries = cache.entries.lock().unwrap();
+                    assert!(entries.repairs.len() <= REPAIR_CACHE_CAPACITY);
+                    assert!(entries.contributions.len() <= CONTRIBUTION_CACHE_CAPACITY);
+                }
+            }
+        }
+        assert_eq!(
+            cache.entries.lock().unwrap().repairs.len(),
+            REPAIR_CACHE_CAPACITY
+        );
+        assert_eq!(
+            cache.entries.lock().unwrap().contributions.len(),
+            CONTRIBUTION_CACHE_CAPACITY
+        );
+        assert!(!Arc::ptr_eq(&old, &cache.repair(codec, key).unwrap()));
+        assert!(!Arc::ptr_eq(
+            &old_contribution,
+            &cache.contribution(codec, helper).unwrap()
+        ));
+        let data = vec![vec![7; 17]; K];
+        assert_eq!(
+            old.recover_slice(&data).unwrap(),
+            codec
+                .repair_plan(&key.healthy, key.targets())
+                .unwrap()
+                .recover_slice(&data)
+                .unwrap()
+        );
+        assert_eq!(
+            old_contribution.apply(&[9; 17]).unwrap(),
+            old.contribution(0).unwrap().apply(&[9; 17]).unwrap()
+        );
+    }
+
+    #[test]
+    fn concurrent_same_key_misses_share_one_plan() {
+        let codec = codec(&format()).unwrap();
+        let cache = Arc::new(PlanCache::default());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let key =
+            PlanKey::checked(&format(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], &[11, 10]).unwrap();
+        let helper = ContributionKey::checked(key, 9).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (
+                        cache.repair(codec, key).unwrap(),
+                        cache.contribution(codec, helper).unwrap(),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        for result in &results[1..] {
+            assert!(Arc::ptr_eq(&results[0].0, &result.0));
+            assert!(Arc::ptr_eq(&results[0].1, &result.1));
+        }
+        let entries = cache.entries.lock().unwrap();
+        assert_eq!(entries.repairs.len(), 1);
+        assert_eq!(entries.contributions.len(), 1);
+    }
+
+    #[test]
+    fn warmed_bridge_cache_does_not_bypass_request_validation() {
+        let healthy = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert_eq!(
+            ec_codec_contribute(&format(), &healthy, &[10, 11], 0, &[1]).error_code,
+            0
+        );
+        let mut bad_format = format();
+        bad_format.field_polynomial = 0x11b;
+        let mut duplicate = healthy;
+        duplicate[9] = 0;
+        let mut out_of_range = healthy;
+        out_of_range[9] = 12;
+        for result in [
+            ec_codec_contribute(&bad_format, &healthy, &[10, 11], 0, &[1]),
+            ec_codec_contribute(&format(), &healthy[..9], &[10, 11], 0, &[1]),
+            ec_codec_contribute(&format(), &duplicate, &[10, 11], 0, &[1]),
+            ec_codec_contribute(&format(), &out_of_range, &[10, 11], 0, &[1]),
+            ec_codec_contribute(&format(), &healthy, &[], 0, &[1]),
+            ec_codec_contribute(&format(), &healthy, &[10, 10], 0, &[1]),
+            ec_codec_contribute(&format(), &healthy, &[9, 10], 0, &[1]),
+            ec_codec_contribute(&format(), &healthy, &[10, 12], 0, &[1]),
+            ec_codec_contribute(&format(), &healthy, &[10, 11], 10, &[1]),
+            ec_codec_contribute(&format(), &healthy, &[10, 11], 12, &[1]),
+        ] {
+            assert_eq!(result.error_code, INVALID);
+            assert!(result.shards.is_empty());
+        }
+
+        let mut encoded = ec_codec_encode(&format(), &[1, 2], 1);
+        assert_eq!(encoded.error_code, 0);
+        for corrupt in [false, true] {
+            if corrupt {
+                encoded.shards[9].data[0] = 1;
+            }
+            let input: Vec<_> = encoded.shards[..K]
+                .iter()
+                .map(|shard| EcCodecInput {
+                    index: shard.index,
+                    data: &shard.data,
+                })
+                .collect();
+            let result = ec_codec_recover(&format(), &input, 2, 1);
+            assert_eq!(result.error_code, if corrupt { CORRUPT } else { 0 });
+            if corrupt {
+                assert!(result.shards.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn poisoned_cache_is_an_explicit_internal_error() {
+        let cache = PlanCache::default();
+        let codec = codec(&format()).unwrap();
+        let key =
+            PlanKey::checked(&format(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], &[10]).unwrap();
+        cache.repair(codec, key).unwrap();
+        let failure = catch_unwind(|| {
+            let _guard = cache.entries.lock().unwrap();
+            panic!("injected cache construction unwind");
+        });
+        assert!(failure.is_err());
+        assert_eq!(cache.repair(codec, key).unwrap_err().0, FOUND_BUG);
+        let helper = ContributionKey::checked(key, 0).unwrap();
+        assert_eq!(cache.contribution(codec, helper).unwrap_err().0, FOUND_BUG);
     }
 
     #[test]
