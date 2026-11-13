@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -21,6 +22,9 @@ SCRIPT = HERE / 'build-native.sh'
 spec = importlib.util.spec_from_file_location('prepare_isal', HERE / 'prepare-isal.py')
 isal = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(isal)
+spec = importlib.util.spec_from_file_location('prepare_local', HERE / 'prepare-local-build.py')
+local = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(local)
 
 
 def bash_path():
@@ -48,7 +52,7 @@ class BuildInputs(unittest.TestCase):
         if bash is None:
             self.skipTest('Native Bash unavailable; no WSL fallback')
         text = SCRIPT.read_text(encoding='utf-8')
-        marker = '\n[[ "${GITHUB_ACTIONS:-}"'
+        marker = '\n# END ARGUMENT PARSER'
         self.assertEqual(text.count(marker), 1)
         parser = text.split(marker, 1)[0] + '\nprintf "%s %s %s %s\\n" "$backend" "$with_lab" "$with_regression" "$build_jobs"\n'
         cases = [([], 'scalar false false 1'),
@@ -57,7 +61,9 @@ class BuildInputs(unittest.TestCase):
                  (['--with-ec-regression-targets', '--backend', 'isal', '--with-lab-targets'], 'isal true true 1'),
                  (['--with-lab-targets', '--backend', 'scalar', '--with-ec-regression-targets'], 'scalar true true 1'),
                  (['--build-jobs', '2', '--backend', 'isal'], 'isal false false 2'),
-                 (['--build-jobs', '1'], 'scalar false false 1')]
+                 (['--build-jobs', '1'], 'scalar false false 1'),
+                 (['--local-source', '/fixed/source', '--local-work', '/fixed/native',
+                   '--local-revision', 'a' * 40], 'scalar false false 1')]
         for argv, expected in cases:
             with self.subTest(argv=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
@@ -68,7 +74,12 @@ class BuildInputs(unittest.TestCase):
                      ['--with-ec-regression-targets', '--with-ec-regression-targets'],
                      ['--build-jobs'], ['--build-jobs', '0'], ['--build-jobs', '3'],
                      ['--build-jobs', '02'], ['--build-jobs=2'],
-                     ['--build-jobs', '1', '--build-jobs', '2']):
+                     ['--build-jobs', '1', '--build-jobs', '2'],
+                     ['--local-source', '/fixed/source'], ['--local-work', '/fixed/native'],
+                     ['--local-revision', 'a' * 40], ['--local-source', 'relative'],
+                     ['--local-source', '/a', '--local-source', '/b'],
+                     ['--local-revision', 'a' * 39], ['--local-revision', 'A' * 40],
+                     ['--local-work', '/a', '--local-work', '/b']):
             with self.subTest(rejected=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 2)
@@ -136,7 +147,7 @@ class BuildInputs(unittest.TestCase):
             self.skipTest('Native Bash unavailable; no WSL fallback')
         text = SCRIPT.read_text(encoding='utf-8')
         block = text.split('# BEGIN REQUESTED BUILD\n', 1)[1].split('# END REQUESTED BUILD', 1)[0]
-        env_block = text.split('export CC=/usr/bin/gcc-12', 1)[1].split('\nbash "$source_root/scripts/ec/cluster/fetch-fdb.sh"', 1)[0]
+        env_block = text.split('export CC=/usr/bin/gcc-12', 1)[1].split('# END BUILD ENVIRONMENT', 1)[0]
         base = ['test_meta', 'test_fuse_ec']
         regression = ['test_storage_store', 'test_storage_service', 'test_client']
         lab = ['storage_main', 'mgmtd_main', 'meta_main', 'admin_cli', 'ec_stripe_cli',
@@ -155,10 +166,13 @@ cmake() {
 }
 python3() { cat >/dev/null; }
 '''
-            for jobs, full in [(1, False), (2, False), (1, True), (2, True)]:
+            for jobs, full, mode in [(1, False, False), (2, False, False), (1, True, False),
+                                     (2, True, False), (1, True, True), (2, True, True)]:
                 (Path(folder) / 'cmake-argv').write_text('')
-                flags = f'build_jobs={jobs}\nwith_lab={str(full).lower()}\nwith_regression={str(full).lower()}\n'
-                result = subprocess.run([bash, '-s'], input=prefix + env_block + '\n' + flags + block,
+                dependency = '/fixed/work/deps' if mode else '/usr/local'
+                flags = (f'build_jobs={jobs}\nwith_lab={str(full).lower()}\nwith_regression={str(full).lower()}\n'
+                         f'local_mode={str(mode).lower()}\ndependency_prefix={dependency}\n')
+                result = subprocess.run([bash, '-s'], input=prefix + flags + env_block + '\n' + block,
                                         text=True, capture_output=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 chunks = (Path(folder) / 'cmake-argv').read_text().split('END\n')
@@ -168,6 +182,14 @@ python3() { cat >/dev/null; }
                 self.assertIn('-DCMAKE_JOB_POOL_COMPILE=ec_compile', configure)
                 self.assertIn('-DCMAKE_JOB_POOL_LINK=ec_link', configure)
                 self.assertIn('-DHF3FS_EXTERNAL_BUILD_JOBS=1', configure)
+                self.assertIn('-DCMAKE_EXE_LINKER_FLAGS=-L' + dependency + '/lib', configure)
+                self.assertIn('-DCMAKE_SHARED_LINKER_FLAGS=-L' + dependency + '/lib', configure)
+                if mode:
+                    self.assertIn('-DCMAKE_CXX_FLAGS=-I' + dependency + '/include', configure)
+                    self.assertIn('-DCMAKE_C_FLAGS=-I' + dependency + '/include', configure)
+                    self.assertIn('-DCMAKE_BUILD_RPATH=' + dependency + '/lib', configure)
+                else:
+                    self.assertFalse(any(item.startswith('-DCMAKE_BUILD_RPATH=') for item in configure))
                 self.assertEqual(actual, ['--build', '/fixed/work/build', '--parallel', str(jobs), '--target',
                                           *base, *(regression + lab if full else [])])
                 self.assertEqual((Path(folder) / 'nested').read_text().splitlines(), ['1', '1', '-j1'])
@@ -248,6 +270,201 @@ python3() { cat >/dev/null; }
             path.write_bytes(b'not the fixed library')
             with self.assertRaises(ValueError):
                 isal.provider_record(prefix)
+
+    def test_local_dependency_list_and_inherited_configuration_rejection(self):
+        required = local.packages(HERE.parent / 'install-build-deps.sh')
+        self.assertIn('libclang-18-dev', required)
+        self.assertIn('lld-14', required)
+        self.assertNotIn('rustup', required)  # An explicit separate preparation step.
+        local.clean_environment({'PATH': '/usr/bin:/bin', 'HOME': '/home/test'})
+        for name in ('LD_PRELOAD', 'CPATH', 'RUSTFLAGS', 'RUSTUP_HOME', 'CARGO_BUILD_RUSTFLAGS',
+                     'CARGO_REGISTRIES_CRATES_IO_INDEX', 'RUSTUP_DIST_SERVER',
+                     'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER', 'GIT_CONFIG_COUNT', 'BASH_FUNC_cmake%%'):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                local.clean_environment({name: 'injected'})
+        with tempfile.TemporaryDirectory(prefix='local-cargo-') as folder:
+            parent = Path(folder)
+            source = parent / 'source'
+            source.mkdir()
+            local.cargo_ancestor_configs(source)
+            (parent / '.cargo').mkdir()
+            (parent / '.cargo/config.toml').write_text('[build]\nrustflags = ["--cfg", "injected"]')
+            with self.assertRaises(ValueError):
+                local.cargo_ancestor_configs(source)
+
+    def test_local_path_policy_accepts_siblings_rejects_reuse_nesting_and_permissions(self):
+        # Filesystem ownership/Unix mode observations are injected on Windows;
+        # the real containment and existence checks still operate on new files.
+        with tempfile.TemporaryDirectory(prefix='local-shape-') as folder:
+            parent = Path(folder)
+            source = parent / 'source'
+            source.mkdir()
+            work = parent / 'native'
+            info = SimpleNamespace(st_mode=0o40700, st_uid=1234)
+            with mock.patch.object(local, 'canonical', side_effect=lambda value: value), \
+                    mock.patch.object(Path, 'stat', return_value=info):
+                # stat mock would make nonexistent paths exist; retain the real
+                # existence results independently, including the fresh-work bit.
+                with mock.patch.object(Path, 'exists', return_value=False), \
+                        mock.patch.object(Path, 'is_symlink', return_value=False):
+                    local.fresh_paths(source, work, 1234)
+                    with self.assertRaises(ValueError):
+                        local.fresh_paths(source, source / 'native', 1234)
+                    with self.assertRaises(ValueError):
+                        local.fresh_paths(source, work, 1235)
+                    info.st_mode = 0o40755
+                    with self.assertRaises(ValueError):
+                        local.fresh_paths(source, work, 1234)
+                with self.assertRaises(ValueError):
+                    local.fresh_paths(source, work, 1234)
+
+    def test_local_git_gate_rejects_wrong_revision_dirty_and_unpinned_submodule(self):
+        source, revision = Path('/fixed/source'), 'a' * 40
+        def check(dirty='', submodule=' ' + 'b' * 40 + ' third_party/one\n', head=revision):
+            def output(argv, **kwargs):
+                if argv[3:] == ['rev-parse', '--show-toplevel']:
+                    return str(source) + '\n'
+                if argv[3:] == ['rev-parse', 'HEAD']:
+                    return head + '\n'
+                if argv[3] == 'status':
+                    return dirty
+                if argv[3:] == ['submodule', 'status', '--recursive']:
+                    return submodule
+                self.fail('Unexpected Git query: ' + repr(argv))
+            with mock.patch.object(local.subprocess, 'check_output', side_effect=output), \
+                    mock.patch.object(local.subprocess, 'run', return_value=SimpleNamespace(returncode=1)):
+                return local.git_state(source, revision)
+        self.assertTrue(check())
+        for args in ({'head': 'c' * 40}, {'dirty': '!! target/\n'}, {'submodule': ''},
+                     {'submodule': '+' + 'b' * 40 + ' third_party/one\n'},
+                     {'submodule': '-' + 'b' * 40 + ' third_party/one\n'}):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                check(**args)
+
+    def test_real_install_branches_keep_local_unprivileged(self):
+        bash = bash_path()
+        if bash is None:
+            self.skipTest('Native Bash unavailable; no WSL fallback')
+        text = SCRIPT.read_text()
+        blocks = [text.split('# BEGIN ' + name + ' INSTALL\n', 1)[1].split('# END ' + name + ' INSTALL', 1)[0]
+                  for name in ('FDB', 'FUSE')]
+        blocks.append(text.split('# BEGIN RUST TOOLCHAIN INSTALL\n', 1)[1].split('# END RUST TOOLCHAIN INSTALL', 1)[0])
+        with tempfile.TemporaryDirectory(prefix='local-install-') as folder:
+            captured = Path(folder) / 'calls'
+            env = dict(os.environ, CAPTURE=captured.as_posix())
+            prefix = '''set -euo pipefail
+work=/private/native
+dependency_prefix=/private/native/deps
+RUSTUP_TOOLCHAIN=1.99.1
+record() { printf '%s\\n' "$*" >> "$CAPTURE"; }
+sudo() { record "sudo $*"; }
+install() { record "install $*"; }
+cp() { record "cp $*"; }
+meson() { record "meson $*"; }
+ninja() { record "ninja $*"; }
+rustup() { record "rustup $*"; }
+'''
+            for mode in (True, False):
+                captured.write_text('')
+                result = subprocess.run([bash, '-s'], input=prefix + 'local_mode=' + str(mode).lower() + '\n' + '\n'.join(blocks),
+                                        text=True, capture_output=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = captured.read_text().splitlines()
+                if mode:
+                    self.assertFalse(any(row.startswith('sudo ') for row in calls))
+                    self.assertTrue(any('-Dutils=false -Duseroot=false' in row for row in calls))
+                    self.assertTrue(any(row.startswith('install -m 755 ') and row.endswith('/deps/lib/libfdb_c.so') for row in calls))
+                    self.assertIn('rustup toolchain install 1.99.1 --profile minimal --no-self-update', calls)
+                else:
+                    self.assertEqual(sum(row.startswith('sudo ') for row in calls), 5)
+                    self.assertFalse(any('-Dutils=false' in row for row in calls))
+                    self.assertIn('rustup toolchain install 1.99.1 --profile minimal', calls)
+
+    def test_real_final_receipt_four_modes_and_loader_mismatch(self):
+        blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", SCRIPT.read_text(), re.S)
+        block, = [item for item in blocks if "path = work / 'provenance/native-build.json'" in item]
+        code = compile(block, str(SCRIPT) + ':actual-final-receipt', 'exec')
+        fixed_isal = '40ccd5e5abaff0451feff750d2b011370a546ac4706d1b06b9285ac26eda2c3c'
+        for backend, mode, bad_loader in [('scalar', False, False), ('isal', False, False),
+                                           ('scalar', True, False), ('isal', True, False), ('scalar', True, True)]:
+            with self.subTest(backend=backend, local=mode, bad_loader=bad_loader), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder).resolve()
+                source, work, deps = root / 'source', root / 'native', root / 'native/deps'
+                def put(path, data=b'fixture'):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                    path.chmod(0o700)
+                    return path
+                def sha(path):
+                    return hashlib.sha256(path.read_bytes()).hexdigest()
+                for name in ('build-native.sh', 'prepare-isal.py'):
+                    put(source / 'scripts/ec/ci' / name)
+                put(source / 'scripts/ec/reference/downloads.json')
+                for name in ('libfdb_c.so', 'libfuse3.so.3'):
+                    put(deps / 'lib' / name)
+                names = ['test_meta', 'test_fuse_ec', 'test_storage_store', 'test_storage_service', 'test_client']
+                names += ['storage_main', 'mgmtd_main', 'meta_main', 'admin_cli', 'ec_stripe_cli',
+                          'ec_file_cli', 'hf3fs_fuse_main', 'ec_mount_read_probe']
+                for name in names:
+                    put(work / 'build' / ('tests' if name.startswith('test_') else 'bin') / name)
+                cache = 'HF3FS_EC_BACKEND:STRING=' + backend + '\n'
+                isal_prefix = work / 'isal-prefix'
+                provider = isal_prefix / 'usr/lib/x86_64-linux-gnu/libisal.so.2.0.31'
+                if backend == 'isal':
+                    put(provider)
+                    # resolve() of the unversioned path is mocked below for
+                    # portable testing; no privilege-dependent Windows symlink.
+                    put(provider.parent / 'libisal.so')
+                    cache += 'HF3FS_EC_ISAL_ROOT:PATH=' + str(isal_prefix) + '\n'
+                    receipt = {'status': 'private-packages-prepared-not-executed', 'backend': backend,
+                               'prefix': str(isal_prefix), 'provider': {'path': str(provider), 'sha256': fixed_isal},
+                               'source_lock_sha256': sha(source / 'scripts/ec/reference/downloads.json'),
+                               'helper_sha256': sha(source / 'scripts/ec/ci/prepare-isal.py')}
+                    put(work / 'provenance/isal-prepare.json', json.dumps(receipt).encode())
+                put(work / 'build/CMakeCache.txt', cache.encode())
+                for name in ('build-resources.json', 'build-command.json'):
+                    put(work / 'provenance' / name, b'{}')
+                put(work / 'provenance/local-preflight.json', b'{"tools":{}}')
+                original_digest, original_resolve = hashlib.file_digest, Path.resolve
+                def digest(stream, algorithm):
+                    if Path(stream.name) == provider:
+                        return SimpleNamespace(hexdigest=lambda: fixed_isal)
+                    return original_digest(stream, algorithm)
+                def resolve(path, *args, **kwargs):
+                    if path == provider.parent / 'libisal.so':
+                        return provider
+                    return original_resolve(path, *args, **kwargs)
+                calls = []
+                def ldd(argv, **kwargs):
+                    self.assertEqual(argv[0], 'ldd')
+                    calls.append(kwargs['env'].get('LD_LIBRARY_PATH'))
+                    lib = deps / 'lib/libfdb_c.so'
+                    if bad_loader and kwargs['env'].get('LD_LIBRARY_PATH') == '/usr/local/lib':
+                        lib = put(root / 'wrong/libfdb_c.so')
+                    rows = ['libfdb_c.so => ' + str(lib) + ' (0x1)',
+                            'libfuse3.so.3 => ' + str(deps / 'lib/libfuse3.so.3') + ' (0x2)']
+                    if backend == 'isal':
+                        rows.append('libisal.so.2 => ' + str(provider) + ' (0x3)')
+                    return '\n'.join(rows)
+                argv = ['-', str(source), str(work), backend, 'true', 'true', 'a' * 40, str(mode).lower(), str(deps)]
+                with mock.patch('sys.argv', argv), mock.patch.object(hashlib, 'file_digest', side_effect=digest), \
+                        mock.patch.object(Path, 'resolve', resolve), \
+                        mock.patch.object(subprocess, 'check_output', side_effect=ldd), \
+                        mock.patch('sys.stdout', new=io.StringIO()):
+                    if bad_loader:
+                        with self.assertRaises(SystemExit):
+                            exec(code, {})
+                        self.assertFalse((work / 'provenance/native-build.json').exists())
+                        continue
+                    exec(code, {})
+                native = json.loads((work / 'provenance/native-build.json').read_text())
+                lab = json.loads((work / 'provenance/lab-build.json').read_text())
+                self.assertEqual(native['revision'], 'a' * 40)
+                self.assertEqual(native['dependency_prefix'], str(deps))
+                self.assertEqual((len(native['targets']), len(lab['targets'])), (13, 8))
+                self.assertFalse(native['acceptance_executed'])
+                self.assertEqual(lab['native_build_receipt_sha256'], sha(work / 'provenance/native-build.json'))
+                self.assertEqual(calls, [None, '/usr/local/lib'] * 13 if mode else [])
 
 
 if __name__ == '__main__':
