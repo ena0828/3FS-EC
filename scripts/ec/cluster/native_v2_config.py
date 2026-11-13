@@ -17,7 +17,9 @@ PROFILE = "native-v2-local-1-storage-12-targets"
 GC_PROFILE = "native-gc-local-1-storage-12-targets"
 MULTI_PROFILE = "native-v2-local-12-storage-12-targets"
 MULTI_GC_PROFILE = "native-gc-local-12-storage-12-targets"
-PROFILES = {"v2": PROFILE, "gc": GC_PROFILE, "v2-12": MULTI_PROFILE, "gc-12": MULTI_GC_PROFILE}
+SPARE_GC_PROFILE = "native-gc-local-14-storage-14-targets"
+PROFILES = {"v2": PROFILE, "gc": GC_PROFILE, "v2-12": MULTI_PROFILE,
+            "gc-12": MULTI_GC_PROFILE, "gc-14": SPARE_GC_PROFILE}
 
 
 def storage_process_count(manifest):
@@ -26,7 +28,13 @@ def storage_process_count(manifest):
         return 1
     if profile in (MULTI_PROFILE, MULTI_GC_PROFILE):
         return 12
+    if profile == SPARE_GC_PROFILE:
+        return 14
     raise ValueError("Unknown native process topology")
+
+
+def target_count(manifest):
+    return 14 if manifest.get("profile") == SPARE_GC_PROFILE else 12
 
 
 def storage_specs(manifest):
@@ -43,19 +51,22 @@ def topology_problems(manifest):
     count = storage_process_count(manifest)
     problems = []
     if type(manifest.get("storage_count")) is not int or manifest["storage_count"] != count or \
-            type(manifest.get("logical_target_count")) is not int or manifest["logical_target_count"] != 12:
+            type(manifest.get("logical_target_count")) is not int or manifest["logical_target_count"] != target_count(manifest):
         problems.append("Storage process/target count differs from explicit profile")
-    expected = [dict(node=10001 + (i if count == 12 else 0), chain=910001+i, target=1100001+i) for i in range(12)]
+    expected = [dict(node=10001 + (i if count > 1 else 0), chain=910001+i, target=1100001+i) for i in range(target_count(manifest))]
     actual = manifest.get("endpoints", [])
     if actual != expected or any(type(e.get(k)) is not int for e in actual for k in ("node", "chain", "target")):
-        problems.append("Endpoint map must be the fixed twelve target/chain identities for this profile")
+        problems.append("Endpoint map must be the fixed profile target/chain identities for this profile")
     if type(manifest.get("independent_storage_failure_domains")) is not int or manifest["independent_storage_failure_domains"] != 1:
         problems.append("A local process topology still has one physical machine failure domain")
-    if count == 12 and (type(manifest.get("storage_process_failure_domains")) is not int or
-                        manifest["storage_process_failure_domains"] != 12 or
+    if count > 1 and (type(manifest.get("storage_process_failure_domains")) is not int or
+                        manifest["storage_process_failure_domains"] != count or
                         manifest.get("deployment_scope") != "single_machine_distinct_processes_not_physical_hosts" or
                         manifest.get("remote_global_storage_config_policy") != "pinned_local_mismatch_rejected_not_version_acked"):
         problems.append("Twelve-process manifest must explicitly preserve physical/configuration limitations")
+    if count == 14 and (manifest.get("initial_placement_nodes") != list(range(10001, 10013)) or
+                        manifest.get("spare_nodes") != [10013, 10014] or manifest.get("file_api") is not True):
+        problems.append("Spare profile requires file API and explicit initial twelve plus two spare nodes")
     storage_specs(manifest)
     return problems
 
@@ -75,7 +86,7 @@ def gc_settings(manifest):
         if "gc" in manifest:
             raise ValueError("V2 bundle cannot acquire GC settings; prepare a new GC root")
         return None
-    if manifest.get("profile") not in (GC_PROFILE, MULTI_GC_PROFILE):
+    if manifest.get("profile") not in (GC_PROFILE, MULTI_GC_PROFILE, SPARE_GC_PROFILE):
         raise ValueError("Unknown native profile")
     config = manifest.get("gc", {})
     if not isinstance(config, dict):
@@ -117,7 +128,7 @@ def profile_config_problems(manifest, configs):
     count = storage_process_count(manifest)
     # Preserve the original one-process names and values. Twelve-process roots
     # use actual per-node paths; no generic STORAGE template can replace them.
-    names = ["storage_main.toml"] if count == 1 else [f"storage-{10001+i}.toml" for i in range(12)]
+    names = ["storage_main.toml"] if count == 1 else [f"storage-{10001+i}.toml" for i in range(count)]
     problems = []
     for name in names:
         storage = configs[name]["server"]
@@ -154,7 +165,7 @@ def profile_config_problems(manifest, configs):
         expected = bool(file_api and meta.get("enable_ec_v2") is True)
         if meta.get(key, False) is not expected:
             problems.append(f"Meta {key} must follow the prepared file API and verified V2 pool")
-    if count == 12:
+    if count > 1:
         if meta.get("ec_allow_colocated_test_targets") is not False:
             problems.append("Twelve-process placement requires twelve distinct Storage node IDs")
         for spec in storage_specs(manifest):
@@ -223,6 +234,8 @@ def generate_configs(source, root, port_base, authority, cluster_id, *, profile=
         requested["gc"] = gc
     requested["file_api"] = file_api
     file_api = file_api_enabled(requested)
+    if profile == "gc-14" and not file_api:
+        raise ValueError("gc-14 requires explicit --file-api; old flat repair does not prove lost-source publication")
     gc = gc_settings(requested)
     root = str(root)
     configs, hashes = {}, {}
@@ -366,7 +379,7 @@ def generate_configs(source, root, port_base, authority, cluster_id, *, profile=
         file_client["client"] = {"force_use_tcp": True}
         file_client["log"] = f"INFO:normal; normal=file:path={root}/logs/ec-file.log,async=true,sync_level=ERR"
         configs["file-client.toml"] = file_client
-    if profile in ("v2-12", "gc-12"):
+    if profile in ("v2-12", "gc-12", "gc-14"):
         storage = configs.pop("storage_main.toml")
         launcher = configs.pop("storage_main_launcher.toml")
         configs.pop("storage_main_app.toml")
@@ -398,7 +411,7 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False):
         raise RuntimeError("port-base leaves insufficient consecutive ports for this profile")
     authority, cluster_id = str(uuid.uuid4()), "ec_native_" + secrets.token_hex(6)
     gc = None
-    if profile in ("gc", "gc-12"):
+    if profile in ("gc", "gc-12", "gc-14"):
         gc = {"authority": str(uuid.uuid4()), "key_id": str(uuid.uuid4()), "client_namespace": str(uuid.uuid4()),
               "data_protocol": 2, "disk_format": 3, "gc_protocol": 2 if file_api else 1}
     configs, hashes = generate_configs(source.resolve(strict=True), root, port_base, authority, cluster_id,
@@ -416,32 +429,35 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False):
         destination = root / ("client" if name in ("stripe-client.toml", "file-client.toml") else "config") / name
         write_new(destination, to_toml(data))
     write_new(root / "config/fdb.cluster", f"{cluster_id}:{secrets.token_hex(8)}@127.0.0.1:{port_base}\n")
-    endpoints = [{"node": 10001 + (i if count == 12 else 0), "chain": 910001 + i, "target": 1100001 + i} for i in range(12)]
+    endpoints = [{"node": 10001 + (i if count > 1 else 0), "chain": 910001 + i, "target": 1100001 + i} for i in range(14 if count == 14 else 12)]
     write_new(root / "config/chains.csv", "ChainId,TargetId\n" + "".join(f"{e['chain']},{e['target']}\n" for e in endpoints))
     write_new(root / "config/chain-table.csv", "ChainId\n" + "".join(f"{e['chain']}\n" for e in endpoints))
     manifest = {"schema": 1, "profile": PROFILES[profile], "root": str(root), "cluster_id": cluster_id,
-        "authority": authority, "port_base": port_base, "storage_count": count, "logical_target_count": 12,
+        "authority": authority, "port_base": port_base, "storage_count": count, "logical_target_count": len(endpoints),
         "independent_storage_failure_domains": 1, "endpoints": endpoints, "source_config_sha256": hashes,
         "fdb_version": "7.3.63", "state": "prepared_not_started", "performance_validated": False}
     if gc:
         manifest["gc"] = gc
     if file_api:
         manifest["file_api"] = True
-    if count == 12:
-        manifest["storage_process_failure_domains"] = 12
+    if count > 1:
+        manifest["storage_process_failure_domains"] = count
         manifest["deployment_scope"] = "single_machine_distinct_processes_not_physical_hosts"
         manifest["remote_global_storage_config_policy"] = "pinned_local_mismatch_rejected_not_version_acked"
+    if count == 14:
+        manifest.update(initial_placement_nodes=list(range(10001, 10013)), spare_nodes=[10013, 10014])
     write_new(root / "cluster.json", json_text(manifest))
     for name in ("generate.py", "run-cluster.py", "native_v2_config.py", "native-v2.py", "fetch-fdb.sh",
                  "experiment-runner.py", "experiment-menu.py", "file-command.py", "ack-service-acceptance.py",
-                 "ack-expected-scripts.json", "gc-acceptance.py"):
+                 "ack-expected-scripts.json", "gc-acceptance.py", "native_fault_control.py"):
         shutil.copy2(Path(__file__).parent / name, root / "scripts" / name)
     print(f"Prepared {root}: private keys and configuration only; no services, targets or database opened.")
 
 
 def pool_from_observations(manifest, observations):
-    if len(observations) != 12:
-        raise ValueError("Require twelve fresh administrator-verified observations")
+    expected_count = len(manifest["endpoints"])
+    if expected_count not in (12, 14) or len(observations) != expected_count:
+        raise ValueError("Require every fixed endpoint fresh administrator-verified observation")
     pool = []
     for expected, observation in zip(manifest["endpoints"], observations, strict=True):
         if any(type(observation.get(k)) is not int for k in ("schema", "protocol", "node", "chain", "target")) or \
@@ -457,11 +473,11 @@ def pool_from_observations(manifest, observations):
                 raise ValueError("Discovery returned a zero persistent instance")
             item[key] = str(parsed)
         pool.append(item)
-    if len({(p["chain"], p["target"]) for p in pool}) != 12:
+    if len({(p["chain"], p["target"]) for p in pool}) != expected_count:
         raise ValueError("Duplicate logical endpoint")
-    if manifest.get("profile") in (MULTI_PROFILE, MULTI_GC_PROFILE):
-        if len({p["node"] for p in pool}) != 12 or len({p["engine_uuid"] for p in pool}) != 12 or \
-                len({p["target_incarnation"] for p in pool}) != 12:
+    if manifest.get("profile") in (MULTI_PROFILE, MULTI_GC_PROFILE, SPARE_GC_PROFILE):
+        if len({p["node"] for p in pool}) != expected_count or len({p["engine_uuid"] for p in pool}) != expected_count or \
+                len({p["target_incarnation"] for p in pool}) != expected_count:
             raise ValueError("Twelve-process topology requires twelve actual independent Engine/target identities")
     return pool
 
@@ -476,7 +492,7 @@ def gc_inventory_from_observations(manifest, pool, observations, now_seconds):
     gc = gc_settings(manifest)
     if type(now_seconds) is not int or now_seconds <= 0:
         raise ValueError("Discovery comparison time must be a positive integer")
-    if gc is None or len(pool) != 12 or len(observations) != 12:
+    if gc is None or len(pool) not in (12, 14) or len(observations) != len(pool):
         raise ValueError("Require the GC profile and twelve actual C/G observations")
     inventory, boots, boots_by_node = [], set(), {}
     for endpoint, observed in zip(pool, observations, strict=True):
@@ -506,6 +522,6 @@ def gc_inventory_from_observations(manifest, pool, observations, now_seconds):
     if storage_process_count(manifest) == 1:
         if len(boots) != 1:
             raise ValueError("One-Storage profile observed multiple process boot sessions; retry startup")
-    elif len(boots_by_node) != 12 or len(boots) != 12 or any(len(values) != 1 for values in boots_by_node.values()):
+    elif len(boots_by_node) != len(pool) or len(boots) != len(pool) or any(len(values) != 1 for values in boots_by_node.values()):
         raise ValueError("Twelve-process discovery must bind a distinct live boot session to each Storage node")
     return inventory

@@ -32,7 +32,7 @@ def digest(path):
 
 def selected_services(manifest, native_v2=False, native_gc=False, ec_file_mount=False):
     is_v2 = manifest.get("profile") in {"native-v2-local-1-storage-12-targets", "native-v2-local-12-storage-12-targets"}
-    is_gc = manifest.get("profile") in {"native-gc-local-1-storage-12-targets", "native-gc-local-12-storage-12-targets"}
+    is_gc = manifest.get("profile") in {"native-gc-local-1-storage-12-targets", "native-gc-local-12-storage-12-targets", "native-gc-local-14-storage-14-targets"}
     if native_v2 != is_v2 or native_gc != is_gc:
         raise ValueError("--native-v2/--native-gc must match the prepared bundle profile")
     file_api = manifest.get("file_api", False)
@@ -129,6 +129,12 @@ def main():
         if not script.is_file():
             raise RuntimeError(f"Missing file API acceptance source: {script}")
         include(script, "scripts/file-cli-acceptance.py", "script")
+
+    if bundle_manifest.get("profile") == "native-gc-local-14-storage-14-targets" and bundle_manifest.get("file_api") is True:
+        script = Path(__file__).with_name("cluster") / "spare-fault-acceptance.py"
+        if not script.is_file():
+            raise RuntimeError(f"Missing spare Storage acceptance source: {script}")
+        include(script, "scripts/spare-fault-acceptance.py", "script")
 
     if args.ec_file_mount:
         for name in ("prepare-fuse-file.py", "prepare-fuse-read.py", "generate.py", "native_v2_config.py",

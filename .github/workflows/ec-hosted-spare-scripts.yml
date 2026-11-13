@@ -1,0 +1,82 @@
+name: EC spare Storage script checks
+
+on:
+  push:
+    branches: [feat/ec-spare-faults]
+    paths:
+      - .github/workflows/ec-hosted-spare-scripts.yml
+      - scripts/ec/**
+      - configs/**
+      - '!**/*.md'
+      - '!**/*.rst'
+      - '!**/README*'
+      - '!**/docs/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ec-spare-scripts-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scripts:
+    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-spare-faults' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact source revision
+        timeout-minutes: 3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+          persist-credentials: false
+
+      - name: Check configuration and owned supervisor controls without native services
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+          import unittest
+
+          if sys.platform != "linux" or sys.version_info < (3, 11):
+              raise SystemExit("These checks require Linux and Python 3.11+")
+          source = Path.cwd().resolve()
+          scripts = source / "scripts/ec/cluster"
+          sys.path.insert(0, str(scripts))
+          suites = {
+              "test-native-v2-config.py": 13,
+              "test-native-multiprocess-config.py": 6,
+              "test-native-spare-storage.py": 7,
+              "test-portable-experiments.py": 4,
+          }
+          rows = []
+          for filename, expected in suites.items():
+              spec = importlib.util.spec_from_file_location(filename[:-3].replace("-", "_"), scripts / filename)
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[spec.name] = module
+              spec.loader.exec_module(module)
+              suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+              if suite.countTestCases() != expected:
+                  raise SystemExit(f"Unexpected test inventory in {filename}")
+              result = unittest.TextTestRunner(verbosity=2).run(suite)
+              rows.append({"file": filename, "sha256": hashlib.sha256((scripts / filename).read_bytes()).hexdigest(),
+                           "run": result.testsRun, "expected": expected, "skipped": len(result.skipped),
+                           "failures": len(result.failures), "errors": len(result.errors),
+                           "passed": result.wasSuccessful() and not result.skipped and result.testsRun == expected})
+          passed = all(row["passed"] for row in rows)
+          print("SPARE_SCRIPT_CHECKS " + json.dumps({
+              "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "python": sys.version, "checks": rows, "passed": passed,
+              "native_services_started": False, "real_storage_faults": False,
+              "scope": "Python configuration and supervisor checks; includes a private Unix control socket"}, sort_keys=True))
+          raise SystemExit(0 if passed else 1)
+          PY

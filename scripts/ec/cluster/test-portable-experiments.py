@@ -133,7 +133,7 @@ class PortableExperiments(unittest.TestCase):
                 self.assertEqual((root / "scripts" / name).read_bytes(), (SCRIPTS / name).read_bytes())
             expected = json.loads((root / "scripts/ack-expected-scripts.json").read_text())
             self.assertEqual(set(expected), {"experiment-runner.py", "run-cluster.py", "generate.py",
-                                             "native-v2.py", "native_v2_config.py"})
+                                             "native-v2.py", "native_v2_config.py", "native_fault_control.py"})
             for name, digest in expected.items():
                 self.assertEqual(hashlib.sha256((root / "scripts" / name).read_bytes()).hexdigest(), digest)
             self.assertFalse((root / "state/control.sock").exists())

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and supervise a private one- or twelve-Storage-process native EC lab."""
+"""Prepare and supervise a private native EC lab with an explicit process topology."""
 import argparse
 import fcntl
 import hashlib
@@ -19,7 +19,9 @@ import threading
 import time
 import tomllib
 
-from native_v2_config import (PROFILES, SERVICES, file_api_enabled, required_services, gc_inventory_from_observations, gc_settings, json_text,
+from native_fault_control import FaultController, initial_placement, validate_placement
+from native_v2_config import (PROFILES, SERVICES, SPARE_GC_PROFILE, target_count, file_api_enabled, required_services,
+                              gc_inventory_from_observations, gc_settings, json_text,
                               key_roles, pool_from_observations, prepare, profile_config_problems,
                               replace_private, storage_process_count, storage_specs, topology_problems, to_toml, write_new)
 
@@ -145,28 +147,29 @@ def doctor(root, check_ports=True):
     observations["memory_kib"] = {key: int(value) for key, value in re.findall(
         r"^(MemTotal|MemAvailable|SwapTotal|SwapFree):\s+(\d+)", memory, re.MULTILINE)}
     count = storage_process_count(manifest)
-    required_gib = 6 if count == 12 else 3
+    required_gib = (7 if count == 14 else 6) if count > 1 else 3
     observations["required_available_memory_gib"] = required_gib
     if observations["memory_kib"].get("MemAvailable", 0) < required_gib * 1024**2:
         problems.append(f"less than {required_gib} GiB available; finish all builds/other experiments before startup")
     disk = os.statvfs(root)
     observations["free_bytes"] = disk.f_bavail * disk.f_frsize
-    required_disk_gib = 8 if count == 12 else 4
+    required_disk_gib = (10 if count == 14 else 8) if count > 1 else 4
     if observations["free_bytes"] < required_disk_gib * 1024**3:
         problems.append(f"less than {required_disk_gib} GiB free; no automatic cleanup or expansion")
-    if count == 12:
+    if count > 1:
         observations["active_build_processes"] = active_build_processes()
         if observations["active_build_processes"]:
-            problems.append("finish all compiler/build-tool processes before twelve-Storage startup; none are stopped automatically")
+            problems.append("finish all compiler/build-tool processes before multi-Storage startup; none are stopped automatically")
         observations["free_inodes"] = disk.f_favail
-        observations["engine_data_files_lower_bound"] = 12 * 11 * 256
-        observations["engine_open_fds_lower_bound"] = 12 * 11 * 256 * 2
-        observations["buffer_pool_payload_bytes"] = 12 * (16 * 1024**2 + 4 * 4 * 1024**2)
-        if disk.f_favail < 50000:
-            problems.append("less than 50000 free inodes for twelve Engine trees and experiment records")
+        observations["engine_data_files_lower_bound"] = count * 11 * 256
+        observations["engine_open_fds_lower_bound"] = count * 11 * 256 * 2
+        observations["buffer_pool_payload_bytes"] = count * (16 * 1024**2 + 4 * 4 * 1024**2)
+        required_inodes = 60000 if count == 14 else 50000
+        if disk.f_favail < required_inodes:
+            problems.append(f"less than {required_inodes} free inodes for the prepared Engine trees and experiment records")
         file_nr = [int(part) for part in Path("/proc/sys/fs/file-nr").read_text().split()]
         observations["kernel_file_nr"] = file_nr
-        observations["global_fd_headroom_required"] = 12 * 6000 + 8192
+        observations["global_fd_headroom_required"] = count * 6000 + 8192
         if len(file_nr) != 3 or file_nr[2] - file_nr[0] < observations["global_fd_headroom_required"]:
             problems.append("insufficient global kernel file-table headroom; per-process nofile alone is insufficient")
     _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -199,6 +202,7 @@ class NativeCluster(inherited_runner()):
         self.status_lock = threading.Lock()
         self.failure = None
         self.storage_log_start = {}
+        self.fault_control = FaultController(self)
         self.env.pop("LD_PRELOAD", None)
 
     def status(self):
@@ -207,10 +211,10 @@ class NativeCluster(inherited_runner()):
                     "profile": self.manifest["profile"],
                     "processes": [{"name": name, "pid": proc.pid, "exit_code": proc.poll()}
                                   for name, proc in self.processes],
-                    "logical_targets": 12, "storage_processes": storage_process_count(self.manifest),
+                    "logical_targets": target_count(self.manifest), "storage_processes": storage_process_count(self.manifest),
                     "storage_process_failure_domains": storage_process_count(self.manifest),
                     "independent_storage_failure_domains": 1, "performance_validated": False,
-                    "failure": self.failure}
+                    "failure": self.failure, "maintenance": self.fault_control.snapshot()}
 
     def control(self):
         if self.control_path.exists():
@@ -238,21 +242,37 @@ class NativeCluster(inherited_runner()):
                     conn.settimeout(2)
                     try:
                         _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                        command = conn.recv(64).decode("ascii").strip()
-                        if uid != os.geteuid() or command not in {"status", "stop"}:
-                            raise ValueError("invalid local supervisor request")
-                        if command == "stop":
-                            self.halt.set()
-                        conn.sendall(json_text(self.status()).encode())
-                    except (OSError, UnicodeError, ValueError):
-                        continue
+                        payload = bytearray()
+                        while b"\n" not in payload:
+                            part = conn.recv(1024)
+                            if not part:
+                                break
+                            payload.extend(part)
+                            if len(payload) > 4096:
+                                raise ValueError("oversized supervisor request")
+                        command = payload.decode("ascii").strip()
+                        if uid != os.geteuid():
+                            raise ValueError("invalid local supervisor UID")
+                        if command in {"status", "stop"}:
+                            if command == "stop":
+                                self.halt.set()
+                            response = self.status()
+                        else:
+                            response = self.fault_control.submit(json.loads(command))
+                        conn.sendall(json_text(response).encode())
+                    except (OSError, UnicodeError, ValueError, RuntimeError) as error:
+                        try:
+                            conn.sendall(json_text({"error": str(error), "accepted": False,
+                                                    "outcome_unknown": True}).encode())
+                        except OSError:
+                            pass
         self.control_thread = threading.Thread(target=serve, name="native-v2-control", daemon=True)
         self.control_thread.start()
 
     def healthy(self):
         if self.halt.is_set():
             raise InterruptedError("Supervisor stop requested")
-        super().healthy()
+        self.fault_control.healthy()
 
     def admin(self, *args, **kwargs):
         self.healthy()
@@ -281,10 +301,38 @@ class NativeCluster(inherited_runner()):
         self.disk_snapshot("before")
         self.start_sampler()
 
+    def start(self, name, command):
+        generation = sum(child == name for child, _ in self.processes)
+        if not generation and self.manifest["profile"] != SPARE_GC_PROFILE:
+            return super().start(name, command)
+        if generation:
+            spec = next((v for v in storage_specs(self.manifest) if v["name"] == name), None)
+            if name != "meta" and spec is None:
+                raise RuntimeError("Only explicitly prepared Storage/Meta children support restart")
+            port = spec["port"] if spec else self.manifest["port_base"] + 2
+            with socket.socket() as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(("127.0.0.1", port))  # Refuse a borrowed listener; never signal it.
+        suffix = f".restart-{generation}" if generation else ""
+        log = (self.run_dir / f"{name}{suffix}.stdout.log").open("xb")
+        self.logs.append(log)
+        proc = subprocess.Popen(list(map(str, command)), cwd=self.root, env=self.env,
+                                stdout=log, stderr=subprocess.STDOUT)
+        try:
+            self.processes.append((name, proc))
+        except BaseException:
+            # The local handle still owns this child even if registration fails.
+            try:
+                proc.terminate()
+            finally:
+                proc.wait()
+            raise
+        print(f"Started {name} pid={proc.pid} generation={generation}", flush=True)
+
     def start_service(self, name):
         spec = next((value for value in storage_specs(self.manifest) if value["name"] == name), None)
         kind, stem = ("storage", spec["stem"]) if spec else (name, name + "_main")
-        if spec and storage_process_count(self.manifest) == 12:
+        if spec and storage_process_count(self.manifest) > 1:
             path = self.root / "logs" / (spec["name"] + ".log")
             if path.is_symlink():
                 raise RuntimeError("Refusing redirected Storage log")
@@ -296,15 +344,15 @@ class NativeCluster(inherited_runner()):
             "--cfg", self.config / f"{stem}.toml"])
 
     def startup_memory_guard(self):
-        if storage_process_count(self.manifest) != 12:
+        if storage_process_count(self.manifest) == 1:
             return
         memory = Path("/proc/meminfo").read_text()
         available = re.search(r"^MemAvailable:\s+(\d+)", memory, re.MULTILINE)
         if not available or int(available[1]) < 2 * 1024**2:
-            raise RuntimeError("Twelve-process startup exhausted its 2 GiB guest reserve; stop owned services normally")
+            raise RuntimeError("Multi-process startup exhausted its 2 GiB guest reserve; stop owned services normally")
 
     def startup_resource_snapshot(self, node):
-        if storage_process_count(self.manifest) != 12:
+        if storage_process_count(self.manifest) == 1:
             return
         records = []
         for name, process in self.processes:
@@ -324,10 +372,10 @@ class NativeCluster(inherited_runner()):
         write_new(self.run_dir / f"startup-resources-{node}.json", json_text({
             "scope": "point_in_time_startup_only_not_benchmark", "processes": records,
             "guest_meminfo": Path("/proc/meminfo").read_text(),
-            "physical_machine_failure_domains": 1, "configured_storage_processes": 12}))
+            "physical_machine_failure_domains": 1, "configured_storage_processes": storage_process_count(self.manifest)}))
 
     def record_pinned_config_observations(self):
-        if storage_process_count(self.manifest) != 12:
+        if storage_process_count(self.manifest) == 1:
             return
         self.admin(["get-config", "-t", "STORAGE", "-o", self.run_dir / "global-storage-config.toml"],
                    "global-storage-config-version.log")
@@ -429,7 +477,7 @@ class NativeCluster(inherited_runner()):
             lines = self.admin(["list-chains", "--table-id", "1"], "chains.log").splitlines()
             return all(any(re.match(rf"^{endpoint['chain']}\s", line) and line.count("(SERVING-UPTODATE)") == 1
                            for line in lines) for endpoint in self.manifest["endpoints"])
-        self.wait("twelve single-member EC chains", chains_ready, timeout=240)
+        self.wait("prepared single-member EC chains", chains_ready, timeout=240)
         self.stage = "authenticated-instance-discovery"
         observations = []
         for endpoint in self.manifest["endpoints"]:
@@ -463,9 +511,20 @@ class NativeCluster(inherited_runner()):
                 write_new(gc_stored, json_text(inventory))
             elif json.loads(gc_stored.read_text(encoding="utf-8")) != inventory:
                 raise RuntimeError("Persistent GC instance/format changed; historical inventory is not replaced")
+        placement = pool
+        if self.manifest["profile"] == SPARE_GC_PROFILE:
+            placement_path = self.root / "state/placement.json"
+            if self.mode == "initialize":
+                placement = initial_placement(self.manifest, pool)
+                write_new(placement_path, json_text({"schema": 1, "pool": placement, "action_id": None}))
+            else:
+                retained = json.loads(placement_path.read_text(encoding="utf-8"))
+                if type(retained.get("schema")) is not int or retained["schema"] != 1:
+                    raise RuntimeError("Invalid retained placement")
+                placement = validate_placement(self.manifest, pool, retained["pool"])
         meta_path = self.config / "meta_main.toml"
         meta = tomllib.loads(meta_path.read_text())
-        meta["server"]["meta"].update(enable_ec_v2=True, ec_targets=pool)
+        meta["server"]["meta"].update(enable_ec_v2=True, ec_targets=placement)
         if gc:
             meta["server"]["meta"].update(enable_ec_exact_gc=True, enable_ec_revision_retirement=True)
         if file_api_enabled(self.manifest):
@@ -494,7 +553,7 @@ class NativeCluster(inherited_runner()):
             if self.sampler.is_alive():
                 raise RuntimeError("Startup sampler did not finish; refusing measurement-ready state")
         write_new(self.run_dir / "ready.json", json_text(self.status()))
-        print(f"READY: {self.manifest['profile']}; {storage_process_count(self.manifest)} Storage processes, 12 logical targets; "
+        print(f"READY: {self.manifest['profile']}; {storage_process_count(self.manifest)} Storage processes, {target_count(self.manifest)} logical targets, twelve placement slots; "
               f"client config {self.root / 'client/stripe-client.toml'}", flush=True)
         print("Services are ready; write/read/repair experiments have not been run.", flush=True)
 
@@ -516,7 +575,8 @@ def request_control(root, command):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(5)
         client.connect(str(root / "state/control.sock"))
-        client.sendall((command + "\n").encode("ascii"))
+        client.sendall(((json.dumps(command, separators=(",", ":")) if isinstance(command, dict) else command) +
+                        "\n").encode("ascii"))
         result = bytearray()
         while True:
             part = client.recv(4096)
@@ -530,26 +590,69 @@ def request_control(root, command):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["prepare", "doctor", "start", "status", "stop"])
+    parser.add_argument("command", choices=["prepare", "doctor", "start", "status", "stop", "fault-storage", "restart-storage", "replace-placement", "action-status"])
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[3])
     parser.add_argument("--port-base", type=int, default=13500)
     parser.add_argument("--profile", choices=tuple(PROFILES),
-                        help="prepare only: v2/gc (one process), v2-12/gc-12 (twelve); fresh roots only")
+                        help="prepare only: v2/gc (one), v2-12/gc-12 (twelve), gc-14 (twelve plus two spares); fresh roots only")
     parser.add_argument("--mode", choices=["initialize", "resume"], default="resume")
     parser.add_argument("--file-api", action="store_true",
-                        help="prepare only: enable EC file sessions and RMW on a fresh gc/gc-12 profile")
+                        help="prepare only: enable EC file sessions and RMW on a fresh gc/gc-12/gc-14 profile")
+    parser.add_argument("--run", help="fault action: exact live supervisor run from status")
+    parser.add_argument("--action-id", help="fault action: caller-saved nonzero UUID; never regenerated on retry")
+    parser.add_argument("--wait-seconds", type=int, default=600,
+                        help="fault action observation limit; timeout never cancels or reissues the action")
+    parser.add_argument("--nodes", help="fault/restart: one or two explicit node IDs, comma separated")
+    parser.add_argument("--replace", help="placement: explicit old:new mappings, comma separated")
     args = parser.parse_args()
     if sys.platform != "linux":
         parser.error("Use Python 3.11+ inside Linux/WSL; no Windows filesystem database support")
     os.umask(0o077)
     root = args.root.absolute()
     if args.command == "prepare":
+        if args.run or args.action_id or args.nodes or args.replace:
+            parser.error("Fault action arguments cannot be used with prepare")
         prepare(root, args.source, args.port_base, args.profile or "v2", file_api=args.file_api)
         return 0
     if args.profile is not None or args.file_api:
         parser.error("--profile/--file-api are prepare-only; start/resume uses the immutable prepared profile")
     load_manifest(root)
+    if args.command in {"fault-storage", "restart-storage", "replace-placement", "action-status"}:
+        if not args.run or not args.action_id:
+            parser.error("--run and --action-id are mandatory")
+        request = {"operation": args.command, "run": args.run, "action_id": args.action_id}
+        if args.command in {"fault-storage", "restart-storage"}:
+            if not args.nodes or args.replace:
+                parser.error("Require --nodes and no --replace")
+            if not re.fullmatch(r"[1-9][0-9]*(?:,[1-9][0-9]*)?", args.nodes):
+                parser.error("Invalid exact node integers")
+            request["nodes"] = [int(n) for n in args.nodes.split(",")]
+        elif args.command == "replace-placement":
+            if (not args.replace or args.nodes or
+                    not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*(?:,[1-9][0-9]*:[1-9][0-9]*)?", args.replace)):
+                parser.error("Require explicit --replace old:new[,old:new]")
+            request["replacements"] = [[int(n) for n in pair.split(":")] for pair in args.replace.split(",")]
+        elif args.nodes or args.replace:
+            parser.error("Status takes no node mutation fields")
+        if not 1 <= args.wait_seconds <= 1800:
+            parser.error("--wait-seconds must be 1..1800")
+        result = request_control(root, request)
+        print(json_text(result), flush=True)
+        if args.command != "action-status":
+            deadline = time.monotonic() + args.wait_seconds
+            query = {"operation": "action-status", "run": args.run, "action_id": args.action_id}
+            while "error" not in result and result.get("state") in {"queued", "running"}:
+                if time.monotonic() >= deadline:
+                    print("Action remains unconfirmed; query the same run and action UUID, never generate a retry identity",
+                          file=sys.stderr)
+                    return 2
+                time.sleep(0.25)
+                result = request_control(root, query)
+            print(json_text(result), flush=True)
+        return 0 if result.get("state") == "completed" else (1 if "error" in result or result.get("state") == "failed" else 2)
+    if args.run or args.action_id or args.nodes or args.replace:
+        parser.error("Fault action arguments require an explicit fault command")
     if args.command == "doctor":
         report = doctor(root)
         print(json_text(report))
@@ -564,7 +667,7 @@ def main():
             return 1
         print(json_text(snapshot))
         if args.command == "stop":
-            shutdown_seconds = 240 if storage_process_count(load_manifest(root)) == 1 else 45 * 15 + 30
+            shutdown_seconds = 240 if storage_process_count(load_manifest(root)) == 1 else 45 * (storage_process_count(load_manifest(root)) + 3) + 30
             deadline = time.monotonic() + shutdown_seconds
             while time.monotonic() < deadline:
                 path = root / "state/last-supervisor.json"
@@ -583,11 +686,13 @@ def main():
         cluster = NativeCluster(root, args.mode)
         signal.signal(signal.SIGTERM, lambda *_: cluster.halt.set())
         signal.signal(signal.SIGINT, lambda *_: cluster.halt.set())
+        signal.signal(signal.SIGHUP, lambda *_: cluster.halt.set())
         try:
             cluster.control()
             cluster.preflight()
             cluster.launch()
             while not cluster.halt.wait(1):
+                cluster.fault_control.execute_one()
                 cluster.healthy()
         except BaseException as error:
             cluster.failure = {"type": type(error).__name__, "message": str(error), "stage": cluster.stage}
