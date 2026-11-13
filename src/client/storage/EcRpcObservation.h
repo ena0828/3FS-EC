@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "common/serde/MessagePacket.h"
+#include "common/serde/RpcCallSizes.h"
 
 namespace hf3fs::storage::client {
 
@@ -32,6 +33,9 @@ struct EcRpcMethodSample {
   uint64_t entered = 0, finished = 0, active = 0;
   uint64_t outerOk = 0, outerError = 0, withoutResult = 0;
   uint64_t messengerInvocations = 0, withoutMessenger = 0;
+  uint64_t observedEncodedRequestFrames = 0, requestFrameBytes = 0, missingEncodedRequestFrames = 0;
+  uint64_t observedEncodedResponseFrames = 0, responseFrameBytes = 0, missingEncodedResponseFrames = 0;
+  uint64_t compressedRequestFrames = 0, compressedResponseFrames = 0;
   // Helper uses separate non-waiting admission, not these stage limiters.
   std::array<EcRpcLimiterSample, size_t(EcRpcLimiter::Count)> limiters{};
   EcRpcClockSample client, server;
@@ -57,6 +61,9 @@ class EcRpcObservation {
     std::atomic<uint64_t> entered{}, finished{}, active{};
     std::atomic<uint64_t> outerOk{}, outerError{}, withoutResult{};
     std::atomic<uint64_t> messengerInvocations{}, withoutMessenger{};
+    std::atomic<uint64_t> observedEncodedRequestFrames{}, requestFrameBytes{}, missingEncodedRequestFrames{};
+    std::atomic<uint64_t> observedEncodedResponseFrames{}, responseFrameBytes{}, missingEncodedResponseFrames{};
+    std::atomic<uint64_t> compressedRequestFrames{}, compressedResponseFrames{};
     std::array<LimiterCounter, size_t(EcRpcLimiter::Count)> limiters{};
     ClockCounter client, server;
   };
@@ -178,6 +185,7 @@ class EcRpcObservation {
     Counter *counter_ = nullptr;
     bool recorded_ = false;
     bool messengerInvoked_ = false;
+    serde::RpcCallSizes sizes_{};
 
    public:
     Scope(EcRpcObservation *owner, EcRpcMethod method) noexcept {
@@ -191,6 +199,22 @@ class EcRpcObservation {
     Scope &operator=(const Scope &) = delete;
     ~Scope() noexcept {
       if (!owner_) return;
+      // Gather once on every exit, independently of business Result/timestamps.
+      // These values were written only by our joined descendant call frames.
+      if (sizes_.request.available) {
+        owner_->add(counter_->observedEncodedRequestFrames, 1);
+        owner_->add(counter_->requestFrameBytes, sizes_.request.bytes);
+        if (sizes_.request.compressed) owner_->add(counter_->compressedRequestFrames, 1);
+      } else {
+        owner_->add(counter_->missingEncodedRequestFrames, 1);
+      }
+      if (sizes_.response.available) {
+        owner_->add(counter_->observedEncodedResponseFrames, 1);
+        owner_->add(counter_->responseFrameBytes, sizes_.response.bytes);
+        if (sizes_.response.compressed) owner_->add(counter_->compressedResponseFrames, 1);
+      } else {
+        owner_->add(counter_->missingEncodedResponseFrames, 1);
+      }
       if (!messengerInvoked_) owner_->add(counter_->withoutMessenger, 1);
       if (!recorded_) {
         // Local rejection or exception before the await expression produced a
@@ -202,6 +226,7 @@ class EcRpcObservation {
       owner_->add(counter_->finished, 1);
       counter_->active.fetch_sub(1, std::memory_order_relaxed);
     }
+    serde::RpcCallSizes *callSizes() noexcept { return owner_ ? &sizes_ : nullptr; }
     // Immediately before the actual std::invoke expression, inside the
     // non-injected branch. This is an API call, NOT serialization, dispatch,
     // retry, bytes accepted by a socket, or proof of a remote operation.
@@ -240,6 +265,14 @@ class EcRpcObservation {
       s.withoutResult = c.withoutResult.load(std::memory_order_relaxed);
       s.messengerInvocations = c.messengerInvocations.load(std::memory_order_relaxed);
       s.withoutMessenger = c.withoutMessenger.load(std::memory_order_relaxed);
+      s.observedEncodedRequestFrames = c.observedEncodedRequestFrames.load(std::memory_order_relaxed);
+      s.requestFrameBytes = c.requestFrameBytes.load(std::memory_order_relaxed);
+      s.missingEncodedRequestFrames = c.missingEncodedRequestFrames.load(std::memory_order_relaxed);
+      s.observedEncodedResponseFrames = c.observedEncodedResponseFrames.load(std::memory_order_relaxed);
+      s.responseFrameBytes = c.responseFrameBytes.load(std::memory_order_relaxed);
+      s.missingEncodedResponseFrames = c.missingEncodedResponseFrames.load(std::memory_order_relaxed);
+      s.compressedRequestFrames = c.compressedRequestFrames.load(std::memory_order_relaxed);
+      s.compressedResponseFrames = c.compressedResponseFrames.load(std::memory_order_relaxed);
       for (size_t j = 0; j != s.limiters.size(); ++j) {
         const auto &l = c.limiters[j];
         s.limiters[j] = {l.entered.load(std::memory_order_relaxed), l.acquired.load(std::memory_order_relaxed),

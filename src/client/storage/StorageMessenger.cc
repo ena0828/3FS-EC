@@ -1,12 +1,29 @@
 #include "StorageMessenger.h"
 
 #include <boost/core/ignore_unused.hpp>
+#include <type_traits>
 
 #include "common/serde/ClientContext.h"
 #include "common/serde/Service.h"
 #include "fbs/storage/Service.h"
 
 namespace hf3fs::storage::client {
+
+namespace {
+// A per-call forwarding view, not a coroutine or a shared Client setting. The
+// existing generated sender keeps its three-argument Context::call contract.
+struct EcFrameSizeContext {
+  serde::ClientContext &inner;
+  serde::RpcCallSizes *sizes;
+
+  template <NameWrapper ServiceName, NameWrapper MethodName, class Req, class Rsp,
+            uint16_t ServiceID, uint16_t MethodID>
+  CoTryTask<Rsp> call(const Req &request, const net::UserRequestOptions *options, serde::Timestamp *timestamp) {
+    return inner.template call<ServiceName, MethodName, Req, Rsp, ServiceID, MethodID>(
+        request, options, timestamp, sizes);
+  }
+};
+}  // namespace
 
 StorageMessenger::StorageMessenger(const hf3fs::net::Client::Config &config)
     : client_(config) {}
@@ -16,10 +33,19 @@ CoTryTask<Rsp> callSerdeRpcMethod(hf3fs::net::Client &client,
                                   const hf3fs::net::Address &address,
                                   const Req &request,
                                   const net::UserRequestOptions *options,
-                                  serde::Timestamp *timestamp) {
+                                  serde::Timestamp *timestamp,
+                                  serde::RpcCallSizes *sizes = nullptr) {
   auto clientCtx = client.serdeCtx(address);
-
-  auto packedRsp = co_await rpcMethod(clientCtx, request, options, timestamp);
+  EcFrameSizeContext observedCtx{clientCtx, sizes};
+  const auto invoke = [&] {
+    if constexpr (std::is_invocable_v<decltype(rpcMethod), EcFrameSizeContext &, const Req &,
+                                      const net::UserRequestOptions *, serde::Timestamp *>) {
+      return rpcMethod(observedCtx, request, options, timestamp);
+    } else {
+      return rpcMethod(clientCtx, request, options, timestamp);
+    }
+  };
+  auto packedRsp = co_await invoke();
 
   if (!packedRsp) {
     auto timeout = options && options->timeout ? options->timeout.value() : client.options()->timeout;
@@ -396,92 +422,99 @@ CoTryTask<EcScopeControlRsp> StorageMessenger::queryEcScopeDrain(const net::Addr
 CoTryTask<EcReadBlockV2Rsp> StorageMessenger::readEcBlockV2(const net::Address &address,
                                                             const EcReadBlockV2Req &request,
                                                             const net::UserRequestOptions *options,
-                                                            serde::Timestamp *timestamp) {
+                                                            serde::Timestamp *timestamp,
+                                                            serde::RpcCallSizes *sizes) {
   co_return co_await callSerdeRpcMethod<EcReadBlockV2Req,
                                         EcReadBlockV2Rsp,
-                                        StorageSerde<>::readEcBlockV2<serde::ClientContext>>(client_,
+                                        StorageSerde<>::readEcBlockV2<EcFrameSizeContext>>(client_,
                                                                                              address,
                                                                                              request,
                                                                                              options,
-                                                                                             timestamp);
+                                                                                             timestamp, sizes);
 }
 
 CoTryTask<EcStageV2Rsp> StorageMessenger::beginEcStageV2(const net::Address &address,
                                                          const EcBeginStageV2Req &request,
                                                          const net::UserRequestOptions *options,
-                                                         serde::Timestamp *timestamp) {
+                                                         serde::Timestamp *timestamp,
+                                                         serde::RpcCallSizes *sizes) {
   co_return co_await callSerdeRpcMethod<EcBeginStageV2Req,
                                         EcStageV2Rsp,
-                                        StorageSerde<>::beginEcStageV2<serde::ClientContext>>(client_,
+                                        StorageSerde<>::beginEcStageV2<EcFrameSizeContext>>(client_,
                                                                                               address,
                                                                                               request,
                                                                                               options,
-                                                                                              timestamp);
+                                                                                              timestamp, sizes);
 }
 
 CoTryTask<EcStageV2Rsp> StorageMessenger::appendEcStageV2(const net::Address &address,
                                                           const EcAppendStageV2Req &request,
                                                           const net::UserRequestOptions *options,
-                                                          serde::Timestamp *timestamp) {
+                                                          serde::Timestamp *timestamp,
+                                                          serde::RpcCallSizes *sizes) {
   co_return co_await callSerdeRpcMethod<EcAppendStageV2Req,
                                         EcStageV2Rsp,
-                                        StorageSerde<>::appendEcStageV2<serde::ClientContext>>(client_,
+                                        StorageSerde<>::appendEcStageV2<EcFrameSizeContext>>(client_,
                                                                                                address,
                                                                                                request,
                                                                                                options,
-                                                                                               timestamp);
+                                                                                               timestamp, sizes);
 }
 
 CoTryTask<EcStageV2Rsp> StorageMessenger::queryEcStageV2(const net::Address &address,
                                                          const EcQueryStageV2Req &request,
                                                          const net::UserRequestOptions *options,
-                                                         serde::Timestamp *timestamp) {
+                                                         serde::Timestamp *timestamp,
+                                                         serde::RpcCallSizes *sizes) {
   co_return co_await callSerdeRpcMethod<EcQueryStageV2Req,
                                         EcStageV2Rsp,
-                                        StorageSerde<>::queryEcStageV2<serde::ClientContext>>(client_,
+                                        StorageSerde<>::queryEcStageV2<EcFrameSizeContext>>(client_,
                                                                                               address,
                                                                                               request,
                                                                                               options,
-                                                                                              timestamp);
+                                                                                              timestamp, sizes);
 }
 
 CoTryTask<EcStageV2Rsp> StorageMessenger::reconcileEcStageV2(const net::Address &address,
                                                              const EcReconcileStageV2Req &request,
                                                              const net::UserRequestOptions *options,
-                                                             serde::Timestamp *timestamp) {
+                                                             serde::Timestamp *timestamp,
+                                                             serde::RpcCallSizes *sizes) {
   co_return co_await callSerdeRpcMethod<EcReconcileStageV2Req,
                                         EcStageV2Rsp,
-                                        StorageSerde<>::reconcileEcStageV2<serde::ClientContext>>(client_,
+                                        StorageSerde<>::reconcileEcStageV2<EcFrameSizeContext>>(client_,
                                                                                                   address,
                                                                                                   request,
                                                                                                   options,
-                                                                                                  timestamp);
+                                                                                                  timestamp, sizes);
 }
 
 CoTryTask<EcSealStageV2Rsp> StorageMessenger::sealEcStageV2(const net::Address &address,
                                                             const EcSealStageV2Req &request,
                                                             const net::UserRequestOptions *options,
-                                                            serde::Timestamp *timestamp) {
+                                                            serde::Timestamp *timestamp,
+                                                            serde::RpcCallSizes *sizes) {
   co_return co_await callSerdeRpcMethod<EcSealStageV2Req,
                                         EcSealStageV2Rsp,
-                                        StorageSerde<>::sealEcStageV2<serde::ClientContext>>(client_,
+                                        StorageSerde<>::sealEcStageV2<EcFrameSizeContext>>(client_,
                                                                                              address,
                                                                                              request,
                                                                                              options,
-                                                                                             timestamp);
+                                                                                             timestamp, sizes);
 }
 
 CoTryTask<EcHelperHopRsp> StorageMessenger::executeEcHelper(const net::Address &address,
                                                             const EcHelperHopReq &request,
                                                             const net::UserRequestOptions *options,
-                                                            serde::Timestamp *timestamp) {
+                                                            serde::Timestamp *timestamp,
+                                                            serde::RpcCallSizes *sizes) {
   co_return co_await callSerdeRpcMethod<EcHelperHopReq,
                                         EcHelperHopRsp,
-                                        StorageSerde<>::executeEcHelper<serde::ClientContext>>(client_,
+                                        StorageSerde<>::executeEcHelper<EcFrameSizeContext>>(client_,
                                                                                                address,
                                                                                                request,
                                                                                                options,
-                                                                                               timestamp);
+                                                                                               timestamp, sizes);
 }
 
 }  // namespace hf3fs::storage::client

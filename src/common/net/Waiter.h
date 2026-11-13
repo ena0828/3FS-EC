@@ -12,6 +12,7 @@
 #include "common/net/RDMAControl.h"
 #include "common/net/Transport.h"
 #include "common/serde/MessagePacket.h"
+#include "common/serde/RpcCallSizes.h"
 #include "common/utils/Duration.h"
 #include "common/utils/RobinHood.h"
 #include "common/utils/Shards.h"
@@ -34,6 +35,10 @@ class Waiter {
     TransportPtr transport;
     RDMATransmissionLimiterPtr limiter;
     RelativeTime timestamp = RelativeTime::now();
+    // Only values cross the receive/wait boundary; no caller-owned output or
+    // observer pointer can outlive the awaiting frame through this Item.
+    bool collectFrameSizes = false;
+    serde::RpcFrameSize responseFrame{};
   };
 
   size_t bind(Item &item) {
@@ -76,11 +81,12 @@ class Waiter {
         uuid);
   }
 
-  void post(const serde::MessagePacket<> &packet, IOBufPtr buff) {
+  void post(const serde::MessagePacket<> &packet, IOBufPtr buff, serde::RpcFrameSize frame = {}) {
     auto item = find(packet.uuid);
     if (item) {
       item->buf = std::move(buff);
       item->packet = packet;
+      if (item->collectFrameSizes) item->responseFrame = frame;
       if (item->limiter) {
         item->limiter->signal(RelativeTime::now() - item->timestamp);
       }

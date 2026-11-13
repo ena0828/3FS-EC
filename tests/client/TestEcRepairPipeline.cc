@@ -536,6 +536,7 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
     size_t calls = 0;
     const auto actual = [&] {
       frame.messengerInvocation();
+      frame.callSizes()->request = {64, true, false};
       ++calls;
       return 7;
     };
@@ -562,10 +563,17 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
 #ifndef NDEBUG
   EXPECT_EQ(append.messengerInvocations, 0);
   EXPECT_EQ(append.withoutMessenger, 2);
+  EXPECT_EQ(append.observedEncodedRequestFrames, 0);
+  EXPECT_EQ(append.missingEncodedRequestFrames, 2);
 #else
   EXPECT_EQ(append.messengerInvocations, 1);
   EXPECT_EQ(append.withoutMessenger, 1);
+  EXPECT_EQ(append.observedEncodedRequestFrames, 1);
+  EXPECT_EQ(append.requestFrameBytes, 64);
+  EXPECT_EQ(append.missingEncodedRequestFrames, 1);
 #endif
+  EXPECT_EQ(append.observedEncodedResponseFrames, 0);
+  EXPECT_EQ(append.missingEncodedResponseFrames, 2);
 
   using storage::client::EcRpcLimiter;
   Semaphore semaphore(1, 1);
@@ -649,6 +657,66 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
   EXPECT_EQ(sum.at(EcRpcMethod::Helper).active, 0);
   EcRpcObservation nextCall;
   for (const auto &method : nextCall.snapshot().methods) EXPECT_EQ(method.entered, 0);
+}
+
+TEST(TestEcRepairPipeline, RpcFrameObservationCountsMissingErrorsExceptionsAndSaturates) {
+  using storage::client::EcRpcMethod;
+  using storage::client::EcRpcObservation;
+  EcRpcObservation observation;
+  {
+    EcRpcObservation::Scope disabled(nullptr, EcRpcMethod::Read);
+    EcRpcObservation::Scope invalid(&observation, EcRpcMethod::Count);
+    EXPECT_EQ(disabled.callSizes(), nullptr);
+    EXPECT_EQ(invalid.callSizes(), nullptr);
+  }
+  { EcRpcObservation::Scope localReject(&observation, EcRpcMethod::Read); }
+  {
+    EcRpcObservation::Scope requestOnly(&observation, EcRpcMethod::Read);
+    requestOnly.messengerInvocation();
+    requestOnly.callSizes()->request = {100, true, true};
+    requestOnly.returned(false, {});
+  }
+  {
+    EcRpcObservation::Scope errorResponse(&observation, EcRpcMethod::Read);
+    errorResponse.messengerInvocation();
+    *errorResponse.callSizes() = {{120, true, false}, {40, true, true}};
+    errorResponse.returned(false, {});
+    errorResponse.returned(false, {});  // Result observation is idempotent; sizes gather on exit only.
+  }
+  for (bool encoded : {false, true}) {
+    try {
+      EcRpcObservation::Scope failed(&observation, EcRpcMethod::Read);
+      failed.messengerInvocation();
+      if (encoded) failed.callSizes()->request = {130, true, false};
+      throw std::runtime_error("joined call exception");
+    } catch (const std::runtime_error &) {
+    }
+  }
+  auto read = observation.snapshot().at(EcRpcMethod::Read);
+  EXPECT_EQ(read.finished, 5);
+  EXPECT_EQ(read.active, 0);
+  EXPECT_EQ(read.outerError, 2);
+  EXPECT_EQ(read.withoutResult, 3);
+  EXPECT_EQ(read.messengerInvocations, 4);
+  EXPECT_EQ(read.withoutMessenger, 1);
+  EXPECT_EQ(read.observedEncodedRequestFrames, 3);
+  EXPECT_EQ(read.missingEncodedRequestFrames, 2);
+  EXPECT_EQ(read.requestFrameBytes, 350);
+  EXPECT_EQ(read.compressedRequestFrames, 1);
+  EXPECT_EQ(read.observedEncodedResponseFrames, 1);
+  EXPECT_EQ(read.missingEncodedResponseFrames, 4);
+  EXPECT_EQ(read.responseFrameBytes, 40);
+  EXPECT_EQ(read.compressedResponseFrames, 1);
+  for (auto bytes : {std::numeric_limits<uint64_t>::max(), uint64_t{1}}) {
+    EcRpcObservation::Scope frame(&observation, EcRpcMethod::Helper);
+    *frame.callSizes() = {{bytes, true, false}, {bytes, true, false}};
+  }
+  const auto saturated = observation.snapshot();
+  EXPECT_TRUE(saturated.overflow);
+  EXPECT_EQ(saturated.at(EcRpcMethod::Helper).requestFrameBytes, std::numeric_limits<uint64_t>::max());
+  EXPECT_EQ(saturated.at(EcRpcMethod::Helper).responseFrameBytes, std::numeric_limits<uint64_t>::max());
+  EXPECT_EQ(saturated.at(EcRpcMethod::Helper).observedEncodedRequestFrames, 2);
+  EXPECT_EQ(saturated.at(EcRpcMethod::Helper).observedEncodedResponseFrames, 2);
 }
 
 }  // namespace

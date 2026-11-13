@@ -25,6 +25,7 @@ CLIENT_FILTER = "TestEcStripeRead.*:TestEcBlockRead.*:TestEcRepairPipeline.*:Tes
 STORAGE_FILTER += ":TestEcTargetRetirementControl.*:TestEcTargetRetirementExecutor.*"
 SERVICE_FILTER += ":TestEcTargetRetirementService.*:TestEcTargetRetirementDisabledService.*"
 CLIENT_FILTER += ":TestEcTargetRetirementCommands.*"
+CLIENT_FILTER += ":TestEcRpcFrameSizes.*"
 LEGACY_FILTER = "TestChunkEngine.ReadWrite:TestStorageTarget.ReadWrite:TestStorageTarget.Uncommitted"
 # TestChunkEngine.ReadWrite retains default 4 MiB/64 MiB buffers and 32 AIO
 # workers: (4 * 4 + 64) * 32 = 2560 MiB of repeated ring registration accounting.

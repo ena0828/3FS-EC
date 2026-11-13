@@ -50,6 +50,7 @@ jobs:
         run: |
           python3 -B scripts/ec/ci/test-build-native.py -v
           python3 -B scripts/ec/ci/test-system-entrypoints.py -v
+          python3 -B scripts/ec/ci/test-rpc-frame-entrypoints.py -v
 
       - name: Build one ISA-L configuration and the affected native targets
         # Also compile Meta and FUSE test targets against the new interface.
