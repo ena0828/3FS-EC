@@ -8,6 +8,10 @@ rust-version.workspace = true
 [lib]
 crate-type = ["lib", "staticlib"]
 
+[features]
+# Selects the native bridge's computation for the whole build, not its format.
+isal-backend = ["hf3fs-ec/isal-backend"]
+
 [dependencies]
 anyhow = "1"
 byteorder = "1"

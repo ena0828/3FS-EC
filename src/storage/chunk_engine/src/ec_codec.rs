@@ -15,10 +15,21 @@ const INVALID: u16 = 3;
 const CORRUPT: u16 = 2;
 const NO_MEMORY: u16 = 26;
 const FOUND_BUG: u16 = 998;
+#[cfg(not(feature = "isal-backend"))]
 const BACKEND: Backend = Backend::Scalar;
+#[cfg(feature = "isal-backend")]
+const BACKEND: Backend = Backend::Isal;
 const REPAIR_CACHE_CAPACITY: usize = 64;
 const CONTRIBUTION_CACHE_CAPACITY: usize = 128;
 type BridgeResult<T> = Result<T, (u16, String)>;
+
+pub(crate) fn ec_codec_backend() -> &'static str {
+    match BACKEND {
+        Backend::Scalar => "scalar",
+        #[cfg(feature = "isal-backend")]
+        Backend::Isal => "isal",
+    }
+}
 
 fn invalid(message: &str) -> (u16, String) {
     (INVALID, message.into())
@@ -515,6 +526,86 @@ mod tests {
         );
         assert_eq!(rejected.error_code, INVALID);
         assert!(rejected.shards.is_empty());
+    }
+
+    #[test]
+    fn configured_backend_matches_scalar_across_bridge_operations() {
+        let selected = codec(&format()).unwrap().backend();
+        #[cfg(feature = "isal-backend")]
+        {
+            assert_eq!(selected, Backend::Isal);
+            assert_eq!(ec_codec_backend(), "isal");
+        }
+        #[cfg(not(feature = "isal-backend"))]
+        {
+            assert_eq!(selected, Backend::Scalar);
+            assert_eq!(ec_codec_backend(), "scalar");
+        }
+        println!("EC_CODEC_BACKEND={}", ec_codec_backend());
+        // Exercise both sides of the existing 64-byte ISA-L threshold, with
+        // nonaligned tails, zero padding, reverse input order and two targets.
+        let scalar = Codec::new(K, N - K).unwrap();
+        for size in [1, 63, 64, 65, 257] {
+            let logical: Vec<u8> = (0..K * size - 1).map(|i| (i * 29 + 3) as u8).collect();
+            let mut padded = logical.clone();
+            padded.resize(K * size, 0);
+            let data: Vec<Vec<u8>> = padded.chunks(size).map(|part| part.to_vec()).collect();
+            let expected = scalar.encode(&data).unwrap();
+            let encoded = ec_codec_encode(&format(), &logical, size as u32);
+            assert_eq!(encoded.error_code, 0);
+            assert_eq!(encoded.shards.len(), N);
+            for (index, shard) in encoded.shards.iter().enumerate() {
+                assert_eq!(shard.index as usize, index);
+                assert_eq!(shard.data, expected[index]);
+            }
+            let inputs: Vec<_> = encoded
+                .shards
+                .iter()
+                .map(|shard| EcCodecInput {
+                    index: shard.index,
+                    data: &shard.data,
+                })
+                .collect();
+            assert_eq!(
+                ec_codec_verify(&format(), &inputs, logical.len() as u64, size as u32).error_code,
+                0
+            );
+            let healthy: Vec<u16> = (1..=10).rev().collect();
+            let sources: Vec<_> = healthy
+                .iter()
+                .map(|&index| EcCodecInput {
+                    index,
+                    data: &expected[index as usize],
+                })
+                .collect();
+            let recovered = ec_codec_recover(&format(), &sources, logical.len() as u64, size as u32);
+            assert_eq!(recovered.error_code, 0);
+            assert_eq!(recovered.shards.len(), N);
+            for (index, shard) in recovered.shards.iter().enumerate() {
+                assert_eq!(shard.index as usize, index);
+                assert_eq!(shard.data, expected[index]);
+            }
+            let mut sum = vec![vec![0u8; size]; 2];
+            for &helper in &healthy {
+                let result = ec_codec_contribute(
+                    &format(),
+                    &healthy,
+                    &[11, 0],
+                    helper,
+                    &expected[helper as usize],
+                );
+                assert_eq!(result.error_code, 0);
+                assert_eq!(result.shards.len(), 2);
+                for (row, shard) in result.shards.iter().enumerate() {
+                    assert_eq!(shard.index, [11, 0][row]);
+                    assert_eq!(shard.data.len(), size);
+                    for (out, &byte) in sum[row].iter_mut().zip(&shard.data) {
+                        *out ^= byte;
+                    }
+                }
+            }
+            assert_eq!(sum, vec![expected[11].clone(), expected[0].clone()]);
+        }
     }
 
     #[test]

@@ -32,6 +32,10 @@ class EcCodec {
   static constexpr uint32_t kMaxShardBytes = 1u << 20;
   using Shards = std::array<std::string, 12>;
 
+  // Fixed computation selected for this binary, independent of stored format.
+  // "isal" retains the existing scalar path for slices shorter than 64 bytes.
+  static std::string_view backendName() noexcept;
+
   // Consecutive logical bytes fill data shards 0..9; the remaining tail is zero.
   // Empty input is valid arithmetic and produces a zero codeword. A publish
   // policy may reject empty stripes. Shard capacity must still be 1..1MiB.

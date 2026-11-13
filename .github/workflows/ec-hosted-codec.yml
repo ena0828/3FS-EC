@@ -43,7 +43,7 @@ jobs:
           rustup toolchain install 1.99.1 --profile minimal
           python3 --version
 
-      - name: Build the production crate and run all nine EC bridge tests
+      - name: Build the production crate and run all native EC bridge tests
         # This checks the actual Rust crate and CXX declarations, not the final
         # C++ executables, services, FUSE lifecycle or performance.
         timeout-minutes: 100

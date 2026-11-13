@@ -4,7 +4,9 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::ec_codec::{ec_codec_contribute, ec_codec_encode, ec_codec_recover, ec_codec_verify};
+use crate::ec_codec::{
+    ec_codec_backend, ec_codec_contribute, ec_codec_encode, ec_codec_recover, ec_codec_verify,
+};
 use crate::ec_scope_bridge::*;
 use crate::ec_stage_bridge::*;
 use crate::*;
@@ -640,6 +642,7 @@ pub mod ffi {
     }
 
     extern "Rust" {
+        fn ec_codec_backend() -> &'static str;
         fn ec_codec_encode(format: &EcCodecFormat, data: &[u8], shard_bytes: u32) -> EcCodecResult;
         fn ec_codec_verify(
             format: &EcCodecFormat,

@@ -1,0 +1,60 @@
+name: Native EC Scalar and ISA-L CXX acceptance
+
+on:
+  push:
+    branches: [feat/ec-native-isal]
+    paths:
+      - .github/workflows/ec-hosted-codec-backends.yml
+      - scripts/ec/ci/run-codec-tests.py
+      - scripts/ec/ci/codec-probe/**
+      - scripts/ec/reference/downloads.json
+      - cmake/AddCrate.cmake
+      - cmake/EcCodecBackend.cmake
+      - src/storage/chunk_engine/**
+      - src/storage/ec/**
+      - src/storage/ec_codec/**
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ec-hosted-codec-backends-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  backend:
+    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-native-isal' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [scalar, isal]
+    steps:
+      - name: Check out one fresh workspace per backend
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+          persist-credentials: false
+
+      - name: Install tools for the real Rust and CXX build
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          test "$(id -u)" -ne 0
+          sudo -n apt-get update -qq
+          sudo -n apt-get install -y --no-install-recommends build-essential gcc-12 g++-12 libclang-18-dev cmake pkg-config python3 ca-certificates
+          rustup toolchain install 1.99.1 --profile minimal
+
+      - name: Verify Rust tests and the actual generated CXX bridge
+        # Different runners, workspaces and targets isolate the two backends.
+        # No full 3FS service/FUSE or performance claim follows from this probe.
+        timeout-minutes: 100
+        shell: bash
+        run: |
+          exec /usr/bin/python3 -B scripts/ec/ci/run-codec-tests.py --backend '${{ matrix.backend }}' --cxx-probe --work "$RUNNER_TEMP/ec-codec-backend" --revision "$GITHUB_SHA"

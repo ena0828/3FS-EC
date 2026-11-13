@@ -64,6 +64,11 @@ std::array<chunk_engine::EcCodecInput, 12> rawSources(std::span<const EcCodecSha
 
 }  // namespace
 
+std::string_view EcCodec::backendName() noexcept {
+  const auto name = chunk_engine::ec_codec_backend();
+  return {name.data(), name.size()};
+}
+
 Result<EcCodec::Shards> EcCodec::encode(std::string_view logicalData,
                                         uint32_t shardBytes,
                                         const EcCodecFormat &format) {
