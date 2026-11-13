@@ -37,6 +37,7 @@ GTEST_ENV = {
     "GTEST_ALSO_RUN_DISABLED_TESTS", "GTEST_OUTPUT", "GTEST_LIST_TESTS",
     "GTEST_BREAK_ON_FAILURE", "GTEST_THROW_ON_FAILURE", "GTEST_FAIL_FAST",
 }
+DIAGNOSTIC_CASE_LIMIT = 16
 
 
 def utc():
@@ -165,6 +166,17 @@ def print_summary(report):
         print(f"{suite['suite']}: {suite['status'].upper()} — "
               f"{suite['executed_count']}/{suite['selected_count']} executed/selected", flush=True)
         if suite["status"] != "passed":
+            diagnostic_count = 0
+            for case in suite.get("xml_results", {}).get("cases", []):
+                if case.get("failed") and "failure_diagnostics" in case:
+                    diagnostic_count += 1
+                    if diagnostic_count <= DIAGNOSTIC_CASE_LIMIT:
+                        print("NATIVE_CASE_FAILURE " + json.dumps(
+                            {"name": case["name"], "diagnostics": case["failure_diagnostics"]},
+                            sort_keys=True, ensure_ascii=True), flush=True)
+            if diagnostic_count > DIAGNOSTIC_CASE_LIMIT:
+                print("NATIVE_CASE_FAILURE_LIMIT " + json.dumps(
+                    {"omitted_cases": diagnostic_count - DIAGNOSTIC_CASE_LIMIT}), flush=True)
             for reason in suite["failures"]:
                 print("  reason: " + (reason if len(reason) <= 200 else reason[:197] + "..."), flush=True)
             for stage in ("listing", "execution"):
@@ -251,16 +263,115 @@ def listed_tests(log):
     return tests
 
 
+def failure_location(message):
+    """Publish a checked repository-relative source location, never its build prefix."""
+    first = message.split("\n", 1)[0].rstrip("\r")
+    match = re.fullmatch(r"(.+):([1-9][0-9]{0,7})", first)
+    if not match:
+        return None
+    raw = match[1].replace("\\", "/")
+    if any(part in (".", "..") for part in raw.split("/")):
+        return None
+    # A path is useful only if its suffix is an actual file in this source tree.
+    # No caller-provided path is opened, and '..' or unfamiliar filename syntax
+    # is never normalized into an accepted location.
+    suffix = re.search(r"(?:^|/)((?:tests|src)/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:cc|cpp|c|h|hpp|inc))$", raw)
+    if not suffix:
+        return None
+    relative = suffix[1]
+    if any(part in (".", "..") for part in relative.split("/")):
+        return None
+    source = Path(__file__).resolve().parents[2]
+    candidate = source / relative
+    if not candidate.is_file() or candidate.resolve() != candidate:
+        return None
+    return {"file": relative, "line": int(match[2])}
+
+
+def failure_scalar(text):
+    """Only complete scalar values from standard assertion lines are public."""
+    if text in ("true", "false"):
+        return text == "true"
+    if len(text) > 32 or not re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", text):
+        return None
+    value = float(text) if any(char in text for char in ".eE") else int(text)
+    if isinstance(value, float):
+        return value if math.isfinite(value) and abs(value) <= 1e18 else None
+    return value if -(1 << 63) <= value < 1 << 63 else None
+
+
+def assertion_diagnostic(node):
+    # The full XML remains private. Bounded parsing is diagnostic only, not a
+    # second assertion interpreter or a reason to accept an otherwise failed case.
+    raw = node.get("message") or node.text or ""
+    message = raw[:8192]
+    lines = message.splitlines()[:64]
+    result = {"kind": node.tag, "classification": "unclassified",
+              "input_truncated": len(raw) > 8192 or len(message.splitlines()) > 64,
+              "details_redacted": True}
+    location = failure_location(message)
+    if location is not None:
+        result["source"] = location
+    for line in lines:
+        if line.startswith("Expected equality of these values:"):
+            result["classification"] = "equality"
+            break
+        if line.startswith("Value of:"):
+            result["classification"] = "boolean"
+            break
+        if line.startswith("The difference between "):
+            result["classification"] = "near"
+            break
+        if line.startswith("Expected:") and re.search(r" (?:<|<=|>|>=|!=) ", line):
+            result["classification"] = "comparison"
+            break
+    values = []
+    for line in lines:
+        match = re.fullmatch(r"[ \t]*(Which is|Actual|Expected):[ \t]*(\S+)[ \t]*", line)
+        if match:
+            value = failure_scalar(match[2])
+            if value is not None and len(values) < 4:
+                values.append({"role": {"Which is": "operand", "Actual": "actual",
+                                        "Expected": "expected"}[match[1]], "value": value})
+    if values:
+        result["scalar_values"] = values
+    return result
+
+
+def failure_diagnostics(case):
+    count = 0
+    summaries = []
+    for node in case:
+        if node.tag in ("failure", "error"):
+            count += 1
+            if len(summaries) < 3:
+                summaries.append(assertion_diagnostic(node))
+    return {"status": "available", "assertion_count": count,
+            "assertions_omitted": max(0, count - len(summaries)), "assertions": summaries,
+            "scope": "source_location_and_scalar_assertions_only_not_raw_log"}
+
+
 def xml_tests(path):
     root = ET.parse(path).getroot()
     if root.tag not in ("testsuites", "testsuite"):
         raise ValueError(f"unexpected GoogleTest XML root: {root.tag}")
     cases = []
+    diagnostic_count = 0
     for case in root.iter("testcase"):
-        cases.append({"name": case.get("classname", "") + "." + case.get("name", ""),
-                      "executed": case.get("status") == "run",
-                      "failed": bool(case.findall("failure") or case.findall("error")),
-                      "skipped": bool(case.findall("skipped")) or case.get("result") == "skipped"})
+        row = {"name": case.get("classname", "") + "." + case.get("name", ""),
+               "executed": case.get("status") == "run",
+               "failed": bool(case.findall("failure") or case.findall("error")),
+               "skipped": bool(case.findall("skipped")) or case.get("result") == "skipped"}
+        if row["failed"]:
+            diagnostic_count += 1
+            if diagnostic_count > DIAGNOSTIC_CASE_LIMIT:
+                row["failure_diagnostics"] = {"status": "case_limit", "details_redacted": True}
+            else:
+                try:
+                    row["failure_diagnostics"] = failure_diagnostics(case)
+                except Exception:
+                    row["failure_diagnostics"] = {"status": "unavailable", "details_redacted": True}
+        cases.append(row)
     return {"cases": cases, "declared_tests": root.get("tests"),
             "declared_failures": root.get("failures"), "declared_errors": root.get("errors")}
 
