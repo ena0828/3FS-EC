@@ -37,6 +37,41 @@ def receipt(binary, output, cases=RUNNER.META_CASES, test_filter=RUNNER.META_FIL
 
 
 class TestCoreAcceptanceContract(unittest.TestCase):
+    def test_failed_meta_keeps_cleanup_evidence_without_accepting_stage(self):
+        for cleanup in (None, {"signals": ["SIGTERM"], "leader_reaped": True},
+                        {"signals": ["SIGTERM", "SIGKILL"], "leader_reaped": False}):
+            with self.subTest(cleanup=cleanup), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                output = work / "meta"
+                output.mkdir()
+                binary = work / "build/tests/test_meta"
+                sample = receipt(binary, output)
+                sample.update(status="failed", exitcode=1, failures=["XML failure"], passed_tests=0)
+                sample["server"].update(private_config="must not appear in console")
+                if cleanup is None:
+                    sample["server"].pop("cleanup")
+                else:
+                    sample["server"]["cleanup"] = cleanup
+                (output / "results.json").write_text(json.dumps(sample), encoding="utf-8")
+                common = SimpleNamespace(listed_tests=mock.Mock(), sha256=lambda _: "b" * 64)
+                module = SimpleNamespace(main=lambda: 1)
+                report = {}
+                with mock.patch.object(RUNNER, "load_module", return_value=module):
+                    with self.assertRaisesRegex(ValueError, "Meta driver returned nonzero"):
+                        RUNNER.run_meta(work / "source", work / "build", work / "fdb", work,
+                                        common, SimpleNamespace(received=[]), report)
+                stage = report["meta"]
+                self.assertNotIn("status", stage)
+                self.assertNotIn("passed_tests", stage)
+                self.assertEqual(stage["receipt_sha256"], "b" * 64)
+                observed = stage["driver_observation"]
+                self.assertEqual(observed["status"], "failed")
+                self.assertEqual(observed["exitcode"], 1)
+                self.assertIsNone(observed["server"]["exitcode_before_cleanup"])
+                self.assertEqual(observed["server"]["exitcode_after_cleanup"], -15)
+                self.assertEqual(observed["server"]["cleanup"], cleanup or {})
+                self.assertNotIn("private_config", observed["server"])
+
     def test_repair_driver_uses_exact_filter_and_restores_listing_hook(self):
         # The external FDB owner is faked; exercise the real wrapper's argv,
         # pre-dispatch selection, receipt/XML checks and hook restoration.

@@ -281,6 +281,17 @@ def run_meta(source, build, fdb, work, common, interrupts, report,
     stage["driver_failures"] = receipt.get("failures", [])
     stage["command_exitcodes"] = [record.get("exitcode") for record in receipt.get("commands", [])]
     stage["binary_sha256"] = receipt.get("binaries", {}).get("test_meta", {}).get("sha256")
+    # Preserve directly observed cleanup even when the test process failed.
+    # This is diagnostic evidence, separate from this stage's acceptance status.
+    stage["driver_observation"] = {key: receipt[key] for key in (
+        "status", "exitcode", "bootstrap", "passed_tests") if key in receipt}
+    server = receipt.get("server", {})
+    observed_server = {key: server[key] for key in (
+        "exitcode_before_cleanup", "exitcode_after_cleanup") if key in server}
+    cleanup = server.get("cleanup", {})
+    observed_server["cleanup"] = {key: cleanup[key] for key in (
+        "signals", "leader_reaped") if key in cleanup}
+    stage["driver_observation"]["server"] = observed_server
     require(not interrupts.received, "Meta phase interrupted")
     require(stage["driver_exitcode"] == 0, "Meta driver returned nonzero")
     check_meta_receipt(receipt, build / "tests/test_meta", output, cases, test_filter)
@@ -417,7 +428,8 @@ def main(argv=None):
                     stage = report.get(name, {})
                     print(name + ": " + json.dumps(
                         {key: stage[key] for key in ("status", "passed_tests", "skipped_tests",
-                         "driver_exitcode", "command_exitcodes", "binary_sha256", "xml_sha256") if key in stage},
+                         "driver_exitcode", "command_exitcodes", "binary_sha256", "xml_sha256",
+                         "receipt_sha256", "driver_observation") if key in stage},
                         sort_keys=True), flush=True)
                     for key in ("listing", "execution"):
                         if key in stage:

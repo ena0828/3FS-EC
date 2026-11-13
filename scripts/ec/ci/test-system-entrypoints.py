@@ -166,7 +166,7 @@ class SystemEntrypoints(unittest.TestCase):
                 NANO=1_000_000_000, digest=lambda _: "digest", read_private=mock.Mock(return_value=b"body"),
                 parse_json=lambda _: row, require=regression.require, clock=lambda: 77,
                 remaining=mock.Mock())
-            for stage, minutes in (("file", 90), ("spare", 40)):
+            for stage, minutes, step in (("repair", 80, 75), ("file", 90, 45), ("spare", 40, 35)):
                 for delta, expected in ((0, 0), (-1, 1)):
                     base.remaining.return_value = minutes * 60 * base.NANO + delta
                     with contextlib.redirect_stdout(io.StringIO()) as output:
@@ -174,6 +174,7 @@ class SystemEntrypoints(unittest.TestCase):
                     base.remaining.assert_called_with(row, b"body", identity, 77)
                     printed = json.loads(output.getvalue())
                     self.assertEqual(printed["required_seconds"], minutes * 60)
+                    self.assertEqual(printed["step_minutes"], step)
                     self.assertEqual(printed["stage"], stage)
             row["driver_sha256"] = "changed"
             with self.assertRaises(ValueError):

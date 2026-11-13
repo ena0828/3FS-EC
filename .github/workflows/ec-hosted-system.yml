@@ -102,6 +102,26 @@ jobs:
             --source "$GITHUB_WORKSPACE" --build "$RUNNER_TEMP/ec-native/build" \
             --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
             --work "$RUNNER_TEMP/ec-native/acceptance"
+      - name: Run three-strategy native repair and per-call observation checks
+        timeout-minutes: 75
+        shell: bash
+        run: |
+          # The internal 70-minute deadline retains cleanup time within this
+          # separate step. Check remaining job time before starting private FDB.
+          python3 -B scripts/ec/ci/system-job-budget.py check --stage repair
+          uid=$(id -u)
+          gid=$(id -g)
+          runner_user=$(id -un)
+          runner_home=$HOME
+          test "$uid" -ne 0
+          sudo -n prlimit --memlock=3221225472:3221225472 --nofile=65536:65536 -- \
+            setpriv --reuid="$uid" --regid="$gid" --init-groups \
+            env HOME="$runner_home" USER="$runner_user" LOGNAME="$runner_user" \
+            LD_LIBRARY_PATH=/usr/local/lib /usr/bin/python3 -B \
+            "$GITHUB_WORKSPACE/scripts/ec/ci/run-core-tests.py" \
+            --source "$GITHUB_WORKSPACE" --build "$RUNNER_TEMP/ec-native/build" \
+            --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
+            --work "$RUNNER_TEMP/ec-native/repair-acceptance" --profile repair
 
       - name: Run file CLI and same-state POSIX and USRBIO remount
         timeout-minutes: 45
