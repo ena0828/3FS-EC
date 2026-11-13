@@ -75,6 +75,8 @@ class EcTreeSourcePinCatalog {
                                               const storage::EcScopeControlKey &,
                                               const storage::EcScopeControlRequest &,
                                               const storage::EcScopeControlAck &);
+  static CoTryTask<EcV2DrainRecord> recordRetirement(Tx &, const EcTreeSourcePinIntent &, size_t index,
+                                                     const storage::EcScopeControlKey &);
   static CoTryTask<EcTreeSourcePinRecord> finishRelease(Tx &,
                                                         const EcTreeSourcePinIntent &,
                                                         const storage::EcScopeControlKey &);

@@ -48,6 +48,7 @@
 #include "meta/store/EcOwnedMutationCatalog.h"
 #include "meta/store/EcRangeCatalog.h"
 #include "meta/store/EcRevisionRetirementCatalog.h"
+#include "meta/store/EcTargetRetirementCatalog.h"
 #include "meta/store/EcV2GcCatalog.h"
 #include "meta/store/EcV2PublishedCatalog.h"
 #include "meta/store/Inode.h"
@@ -381,6 +382,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   virtual bool enableHelperIssuance() const { return false; }
   virtual bool enableExactGc() const { return false; }
   virtual bool enableMetaGcAdmin() const { return false; }
+  virtual bool enableTargetRetirement() const { return false; }
   virtual bool enableFileRmw() const { return false; }
   struct Mutation {
     std::string logical;
@@ -654,6 +656,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     storage.set_allow_unsafe_ec_fragment_rpc_for_testing(false);
     storage.set_ec_capability_key_file(keyPath_);
     storage.set_enable_ec_scope_control(true);
+    storage.set_enable_ec_target_retirement(enableTargetRetirement());
     storage.set_ec_scope_control_key_file(controlKeyPath_);
     storage.set_ec_scope_control_authority(authority_.toHexString());
     if (enableFileRmw()) {
@@ -769,6 +772,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   void startMeta() {
     metaConfig_.set_enable_ec_catalog(true);
     metaConfig_.set_enable_ec_v2(true);
+    metaConfig_.set_enable_ec_target_retirement(enableTargetRetirement());
     if (enableFileRmw()) {
       metaConfig_.set_enable_ec_rmw(true);
       metaConfig_.set_ec_rmw_key_file(rmwKeyPath_);
@@ -4013,6 +4017,7 @@ TEST_F(TestEcV2NativeOwnedMutation, MissingBirthTamperedHistoricalProofAndWrongC
   ASSERT_OK(blockingWait(metaClient_->queryEcOwnedMutationV2(preparingReq)));
 }
 
+#include "EcTargetRetirementNativeTests.inc"
 #include "EcFileClientNativeTests.inc"
 #include "EcReadDispatcherNativeTests.inc"
 #include "EcRecoveryWriteNativeTests.inc"

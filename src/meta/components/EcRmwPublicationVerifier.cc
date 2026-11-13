@@ -161,7 +161,8 @@ CoTryTask<std::shared_ptr<const EcRmwPublicationProof>> EcRmwPublicationVerifier
       observed.record.drain = std::move(*drain);
       observed.record.state = EcFileExecutionState::Closing;
     }
-    if (!observed.record.drain || !observed.record.drain->verifiedManifest || !observed.record.allocations)
+    if (!observed.record.drain || observed.record.drain->version != kEcV2LifecycleVersion ||
+        !observed.record.drain->verifiedManifest || !observed.record.allocations)
       co_return makeError(StatusCode::kTokenStale);
     irreversible = true;
     if (observed.record.state == EcFileExecutionState::Closing) {
@@ -200,7 +201,8 @@ CoTryTask<std::shared_ptr<const EcRmwPublicationProof>> EcRmwPublicationVerifier
     RMW_TRY(co_await finalTx.commit());
     const auto &record = finished->record;
     if ((record.state != EcFileExecutionState::Drained && record.state != EcFileExecutionState::Published) ||
-        !record.drain || !record.allocations || !record.drain->verifiedManifest ||
+        !record.drain || record.drain->version != kEcV2LifecycleVersion ||
+        !record.allocations || !record.drain->verifiedManifest ||
         (record.state == EcFileExecutionState::Drained && record.drain->state != EcV2DrainState::Closing) ||
         (record.state == EcFileExecutionState::Published && record.drain->state != EcV2DrainState::Published) ||
         record.drain->verifiedContentSha256 != record.contentSha256)

@@ -36,6 +36,17 @@ MANDATORY = {
     )
 } | {"TestChunkEngine.ReadWrite", "TestStorageTarget.ReadWrite", "TestStorageTarget.Uncommitted"}
 
+CLIENT_MANDATORY = {
+    "TestEcTargetRetirementCommands." + name for name in (
+        "UnknownPrepareAndNewClientQueryPreserveExactIntent",
+        "PreparedDoesNotClaimStorageDrainOrPhysicalReclamation",
+        "MismatchedOrContradictoryResponsesNeverConfirmRetirement",
+        "InvalidIdentityAndExistingArchivePreventDispatch",
+        "WrongActualNamespaceAndGetterExceptionRetainPreparedIdentity",
+        "QueryErrorsNeverPrepareAndDirectClientRejectsNilRequestIds",
+    )
+}
+
 # Exact names prevent unrelated green suites from satisfying the control profile.
 TARGET_RETIREMENT_REQUIRED = {
     "storage": {
@@ -124,6 +135,8 @@ def check_suites(record, build, built):
                     "regression command was incomplete or required forced cleanup")
     names = {case["name"] for case in suites[0]["xml_results"]["cases"]}
     require(MANDATORY <= names, "codec/RMW/legacy storage coverage is incomplete")
+    client_names = {case["name"] for case in suites[2]["xml_results"]["cases"]}
+    require(CLIENT_MANDATORY <= client_names, "target retirement CLI coverage is incomplete")
 
 
 def check_target_retirement(record):
@@ -177,7 +190,8 @@ def main():
     (work / "tmp").mkdir(mode=0o700)
     inputs = {str(path): digest(path) for path in (
         Path(__file__), source / "scripts/ec/test-native-fragments.py", record_path,
-        source / "tests/storage/store/TestEcCodec.cc", source / "tests/storage/store/TestEcRmw.cc")}
+        source / "tests/storage/store/TestEcCodec.cc", source / "tests/storage/store/TestEcRmw.cc",
+        source / "tests/client/TestEcTargetRetirementCommands.cc")}
     if args.require_target_retirement:
         inputs.update({str(source / path): digest(source / path) for path in (
             "tests/storage/store/TestEcTargetRetirementControl.cc",
@@ -187,6 +201,7 @@ def main():
     report = {"schema": 1, "revision": revision, "backend": args.backend, "status": "incomplete",
               "native_build_sha256": digest(record_path), "inputs_sha256": inputs,
               "target_retirement_required": args.require_target_retirement,
+              "required_client_cases": sorted(CLIENT_MANDATORY),
               "scope": "native functional regressions; not a benchmark or real Storage process fault"}
     result = 1
     try:

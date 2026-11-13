@@ -58,6 +58,8 @@ IMPL_META_STUB_METHOD(collectEcFragmentV2, CollectEcFragmentV2Req, EcGcAdminRsp)
 IMPL_META_STUB_METHOD(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
 IMPL_META_STUB_METHOD(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
 IMPL_META_STUB_METHOD(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
+IMPL_META_STUB_METHOD(prepareEcTargetRetirement, PrepareEcTargetRetirementReq, EcTargetRetirementRsp);
+IMPL_META_STUB_METHOD(queryEcTargetRetirement, QueryEcTargetRetirementReq, EcTargetRetirementRsp);
 IMPL_META_STUB_METHOD(describeEcFileV2, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
 IMPL_META_STUB_METHOD(acquireEcRangeV2, AcquireEcRangeV2Req, EcRangeRsp);
 IMPL_META_STUB_METHOD(queryEcRangeV2, QueryEcRangeV2Req, EcRangeRsp);

@@ -3,6 +3,7 @@
 #include <limits>
 
 #include "meta/store/EcV2GcCatalog.h"
+#include "meta/store/EcTerminalEvidence.h"
 #include "meta/store/EcV2LifecycleUtils.h"
 
 namespace hf3fs::meta::server {
@@ -28,15 +29,6 @@ Result<Void> issuedMatches(const EcV2DrainRecord &record, size_t index, const st
 Result<Void> authorityMatches(const EcV2DrainRecord &record, const Uuid &authority) {
   if (authority.is_nil() || authority != record.identity.clusterAuthority) {
     return makeError(StatusCode::kTokenMismatch, "drain authority cannot change across retry");
-  }
-  return Void{};
-}
-Result<Void> completeEvidence(const EcV2DrainRecord &record, const storage::EcScopeControlKey &key) {
-  RETURN_ON_ERROR(drainValid(record));
-  for (size_t i = 0; i != record.identity.endpoints.count; ++i) {
-    if (!record.observations[i]) return makeError(StatusCode::kTokenStale, "not every fixed instance has drained");
-    const auto &observation = *record.observations[i];
-    RETURN_ON_ERROR(EcVerifiedDrainAck::verify(key, record, i, observation.request, observation.ack));
   }
   return Void{};
 }
@@ -164,6 +156,7 @@ CoTryTask<std::optional<EcV2DrainRecord>> EcV2DrainCatalog::get(Transaction &txn
   CO_RETURN_ON_ERROR(record);
   if (!*record) co_return std::nullopt;
   CO_RETURN_ON_ERROR(drainValid(**record));
+  CO_RETURN_ON_ERROR(co_await verifyEcStoredRetirementReferences(txn, **record));
   const auto &id = (**record).identity;
   if (id.object != object || id.kind != kind || id.scopeId != scope)
     co_return makeError(StatusCode::kDataCorruption, "V2 drain key mismatch");
@@ -245,6 +238,8 @@ CoTryTask<EcV2DrainRecord> EcV2DrainCatalog::startPublish(Transaction &txn,
   auto existing = co_await get(txn, object, Kind::WriteOperation, operation, owner);
   CO_RETURN_ON_ERROR(existing);
   if (*existing) {
+    if ((**existing).version != kEcV2LifecycleVersion)
+      co_return makeError(StatusCode::kTokenStale, "abort-only scope cannot publish");
     CO_RETURN_ON_ERROR(authorityMatches(**existing, authority));
     if (!(**existing).verifiedManifest || (**existing).verifiedManifest != evidence.manifest() ||
         (**existing).verifiedContentSha256 != evidence.contentSha256()) {
@@ -279,12 +274,37 @@ CoTryTask<EcV2DrainRecord> EcV2DrainCatalog::recordAck(Transaction &txn, const E
   CO_RETURN_ON_ERROR(record);
   if (!same(record->identity, id) || evidence.index_ >= id.endpoints.count)
     co_return makeError(StatusCode::kTokenMismatch, "drain scope changed before storing observation");
-  if (record->observations[evidence.index_]) co_return record;
+  if (ecTerminalAt(*record, evidence.index_)) co_return record;
   if (record->state != EcV2DrainState::Closing)
     co_return makeError(StatusCode::kDataCorruption, "terminal drain is missing an ACK");
   record->observations[evidence.index_] = evidence.observation_;
   CO_RETURN_ON_ERROR(co_await save(txn, drainKey(id.object, id.kind, id.scopeId), *record));
   co_return record;
+}
+
+CoTryTask<EcV2DrainRecord> EcV2DrainCatalog::recordRetirement(Transaction &txn,
+                                                              const EcObjectRef &object,
+                                                              Kind kind,
+                                                              const Uuid &scope,
+                                                              const EcOwner &owner,
+                                                              size_t index,
+                                                              const storage::EcScopeControlKey &key) {
+  auto record = co_await required(txn, object, kind, scope, owner);
+  CO_RETURN_ON_ERROR(record);
+  if (kind == Kind::WriteOperation) {
+    // This normal read conflicts with publish. Do not call EcCatalog::cancel at
+    // T0: it releases the repair source before the complete endpoint union.
+    auto op = co_await EcCatalog::getOperation(txn, object, scope);
+    CO_RETURN_ON_ERROR(op);
+    CO_RETURN_ON_ERROR(ownerMatches(op->owner, owner));
+    if (op->state == EcOperationState::Published || record->state == EcV2DrainState::Published)
+      co_return makeError(StatusCode::kTokenStale, "published output cannot use retirement evidence");
+  }
+  auto attached = co_await attachEcCompletedRetirement(txn, *record, index,
+      kind == Kind::ReadPin ? EcV2DrainUse::ReadRelease : EcV2DrainUse::AbortOnly, key);
+  CO_RETURN_ON_ERROR(attached);
+  if (*attached) CO_RETURN_ON_ERROR(co_await save(txn, drainKey(object, kind, scope), *record));
+  co_return *record;
 }
 
 CoTryTask<EcPinRecord> EcV2DrainCatalog::finishRead(Transaction &txn,
@@ -295,7 +315,7 @@ CoTryTask<EcPinRecord> EcV2DrainCatalog::finishRead(Transaction &txn,
   using namespace ec_v2_lifecycle;
   auto record = co_await required(txn, object, Kind::ReadPin, pin, owner);
   CO_RETURN_ON_ERROR(record);
-  CO_RETURN_ON_ERROR(completeEvidence(*record, key));
+  CO_RETURN_ON_ERROR(co_await verifyEcTerminalEvidence(txn, *record, key, EcTerminalPurpose::ReadRelease));
   auto original = co_await EcCatalog::getPin(txn, object, pin);
   CO_RETURN_ON_ERROR(original);
   CO_RETURN_ON_ERROR(ownerMatches(original->owner, owner));
@@ -329,7 +349,7 @@ CoTryTask<EcOperationRecord> EcV2DrainCatalog::finishCancel(Transaction &txn,
   using namespace ec_v2_lifecycle;
   auto record = co_await required(txn, object, Kind::WriteOperation, operation, owner);
   CO_RETURN_ON_ERROR(record);
-  CO_RETURN_ON_ERROR(completeEvidence(*record, key));
+  CO_RETURN_ON_ERROR(co_await verifyEcTerminalEvidence(txn, *record, key, EcTerminalPurpose::FencedAbort));
   auto reservation = co_await EcV2ReservationCatalog::get(txn, object, operation, owner);
   CO_RETURN_ON_ERROR(reservation);
   CO_RETURN_ON_ERROR(writeMatches(*record, *reservation));
@@ -360,7 +380,7 @@ CoTryTask<EcOperationRecord> EcV2DrainCatalog::finishPublish(Transaction &txn,
   using namespace ec_v2_lifecycle;
   auto record = co_await required(txn, object, Kind::WriteOperation, operation, owner);
   CO_RETURN_ON_ERROR(record);
-  CO_RETURN_ON_ERROR(completeEvidence(*record, key));
+  CO_RETURN_ON_ERROR(co_await verifyEcTerminalEvidence(txn, *record, key, EcTerminalPurpose::Publication));
   if (!record->verifiedManifest || record->state == EcV2DrainState::Aborted) {
     co_return makeError(StatusCode::kTokenStale, "scope has no durable publication evidence or is aborted");
   }

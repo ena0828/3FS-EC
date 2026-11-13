@@ -1,4 +1,5 @@
 #include "meta/store/EcV2RepairPlanCatalog.h"
+#include "meta/store/EcTargetRetirementCatalog.h"
 
 #include <bit>
 
@@ -210,6 +211,8 @@ CoTryTask<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::prepare(Transaction &txn,
     if (!same(**previous, *expected))
       co_return makeError(StatusCode::kDataCorruption, "persistent repair plan differs from durable provenance");
   } else {
+    for (auto index : selection.sourceOrder)
+      CO_RETURN_ON_ERROR(co_await EcTargetRetirementCatalog::requireAssignable(txn, bases[index].endpoint()));
     CO_RETURN_ON_ERROR(co_await save(txn, key, *expected));
   }
   CO_RETURN_ON_ERROR(co_await EcV2ReservationCatalog::checkIssuanceOpen(txn,

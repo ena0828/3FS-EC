@@ -79,6 +79,7 @@ struct Config : ConfigBase<Config> {
   // Explicit root-only, exact-allocation GC. No scan, TTL or automatic retire.
   CONFIG_ITEM(enable_ec_exact_gc, false);
   CONFIG_ITEM(enable_ec_revision_retirement, false);
+  CONFIG_ITEM(enable_ec_target_retirement, false);
   // Bounded file-range metadata only; not POSIX file lifecycle support.
   CONFIG_ITEM(enable_ec_file_ranges, false);
   // Independent trusted Storage RMW, disabled unless explicitly configured.

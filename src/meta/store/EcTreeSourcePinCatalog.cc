@@ -1,4 +1,5 @@
 #include "EcTreeSourcePinCatalog.h"
+#include "meta/store/EcTerminalEvidence.h"
 
 #include <limits>
 #include <set>
@@ -110,7 +111,7 @@ Result<Void> validRecord(const EcTreeSourcePinRecord &r, const EcTreeBirth &b) {
       return makeError(StatusCode::kDataCorruption, "source/drain state differs");
     if (r.state == State::Released)
       for (size_t n = 0; n < r.endpoints.count; ++n)
-        if (!r.drain->observations[n]) return makeError(StatusCode::kDataCorruption, "released source lost an ACK");
+        if (!ecTerminalAt(*r.drain, n)) return makeError(StatusCode::kDataCorruption, "released source lost an ACK");
   } else
     return makeError(StatusCode::kDataCorruption, "invalid source state");
   return Void{};
@@ -184,6 +185,7 @@ CoTryTask<EcTreeSourcePinRecord> EcTreeSourcePinCatalog::query(Tx &txn, const Ec
   if (!same(r->intent.owner, intent.owner)) co_return makeError(MetaCode::kNoPermission);
   if (!same(r->intent, intent)) co_return makeError(StatusCode::kTokenMismatch, "exact source intent changed");
   CO_RETURN_ON_ERROR(validRecord(*r, *b));
+  if (r->drain) CO_RETURN_ON_ERROR(co_await verifyEcStoredRetirementReferences(txn, *r->drain));
   auto m = co_await EcCatalog::getManifest(txn, intent.object, intent.slot.stripe, intent.slot.revision);
   CO_RETURN_ON_ERROR(m);
   if (!same(m->manifest, r->manifest) || (r->state != State::Released && (!m->pins || m->referencesReleased)))
@@ -298,10 +300,24 @@ CoTryTask<EcV2DrainRecord> EcTreeSourcePinCatalog::recordAck(Tx &txn,
   if (!r->drain) co_return makeError(StatusCode::kTokenStale, "source T0 is not durable");
   auto verified = EcVerifiedDrainAck::verify(key, *r->drain, index, request, ack);
   CO_RETURN_ON_ERROR(verified);
-  if (r->drain->observations[index]) co_return *r->drain;
+  if (ecTerminalAt(*r->drain, index)) co_return *r->drain;
   if (r->state != State::Closing) co_return makeError(StatusCode::kDataCorruption);
   r->drain->observations[index] = EcV2DrainObservation{request, ack};
   CO_RETURN_ON_ERROR(co_await store(txn, pinKey(intent), *r));
+  co_return *r->drain;
+}
+
+CoTryTask<EcV2DrainRecord> EcTreeSourcePinCatalog::recordRetirement(Tx &txn,
+                                                                    const EcTreeSourcePinIntent &intent,
+                                                                    size_t index,
+                                                                    const storage::EcScopeControlKey &key) {
+  auto r = co_await query(txn, intent);
+  CO_RETURN_ON_ERROR(r);
+  if (!r->drain || r->state == State::Active)
+    co_return makeError(StatusCode::kTokenStale, "source requires committed T0 before retirement evidence");
+  auto attached = co_await attachEcCompletedRetirement(txn, *r->drain, index, EcV2DrainUse::ReadRelease, key);
+  CO_RETURN_ON_ERROR(attached);
+  if (*attached) CO_RETURN_ON_ERROR(co_await store(txn, pinKey(intent), *r));
   co_return *r->drain;
 }
 
@@ -311,13 +327,7 @@ CoTryTask<EcTreeSourcePinRecord> EcTreeSourcePinCatalog::finishRelease(Tx &txn,
   auto r = co_await query(txn, intent);
   CO_RETURN_ON_ERROR(r);
   if (!r->drain) co_return makeError(StatusCode::kTokenStale, "source has not closed");
-  for (size_t i = 0; i < r->endpoints.count; ++i) {
-    if (!r->drain->observations[i])
-      co_return makeError(StatusCode::kTokenStale, "source requires every fixed drained ACK");
-    const auto &o = *r->drain->observations[i];
-    auto verified = EcVerifiedDrainAck::verify(key, *r->drain, i, o.request, o.ack);
-    CO_RETURN_ON_ERROR(verified);
-  }
+  CO_RETURN_ON_ERROR(co_await verifyEcTerminalEvidence(txn, *r->drain, key, EcTerminalPurpose::ReadRelease));
   if (r->state == State::Released) co_return *r;
   auto m = co_await EcCatalog::getManifest(txn, intent.object, intent.slot.stripe, intent.slot.revision);
   CO_RETURN_ON_ERROR(m);

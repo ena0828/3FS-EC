@@ -175,8 +175,9 @@ Result<Void> validateFileOwnedObservation(const EcFileRunRecord &run,
     const auto expected = op.state == meta::EcOperationState::Published ? meta::EcV2DrainState::Published
                           : op.state == meta::EcOperationState::Aborted ? meta::EcV2DrainState::Aborted
                                                                         : meta::EcV2DrainState::Closing;
-    if (d.revocation.is_nil() || d.state != expected || d.expectedEndpoints != 12 || d.acknowledgedEndpoints > 12 ||
-        (op.state != meta::EcOperationState::Preparing && d.acknowledgedEndpoints != 12))
+    if ((op.state == meta::EcOperationState::Published && d.retiredEndpoints != 0) ||
+        d.revocation.is_nil() || d.state != expected || d.expectedEndpoints != 12 || d.terminalEndpoints() > 12 ||
+        (op.state != meta::EcOperationState::Preparing && d.terminalEndpoints() != 12))
       return corrupt();
   } else if (op.state != meta::EcOperationState::Preparing)
     return corrupt();

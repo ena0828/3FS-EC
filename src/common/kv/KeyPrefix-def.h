@@ -88,4 +88,7 @@ DEFINE_PREFIX(EcFileRepair, "ECFP")
 DEFINE_PREFIX(EcFileRepairChild, "ECFC")
 DEFINE_PREFIX(EcFileRenameRequest, "ECRN")
 
+DEFINE_PREFIX(EcTargetRetirement, "ETRI")
+DEFINE_PREFIX(EcTargetRetirementRequest, "ETRQ")
+
 #undef DEFINE_PREFIX

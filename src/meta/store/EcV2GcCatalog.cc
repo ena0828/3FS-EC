@@ -1,4 +1,5 @@
 #include "meta/store/EcV2GcCatalog.h"
+#include "meta/store/EcTerminalEvidence.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -223,11 +224,10 @@ CoTryTask<EcV2DrainRecord> terminalEvidence(Tx &txn,
   if (record.state == EcV2DrainState::Closing || record.identity.generation != scope.generation ||
       record.identity.revision != scope.revision || !same(record.identity.endpoints, scope.endpoints))
     co_return makeError(StatusCode::kTokenStale, "GC protection lacks its exact terminal drain");
-  for (size_t i = 0; i < record.identity.endpoints.count; ++i) {
-    if (!record.observations[i]) co_return makeError(StatusCode::kTokenStale, "GC protection lacks a fixed ACK");
-    const auto &observed = *record.observations[i];
-    CO_RETURN_ON_ERROR(EcVerifiedDrainAck::verify(key, record, i, observed.request, observed.ack));
-  }
+  CO_RETURN_ON_ERROR(co_await verifyEcTerminalEvidence(txn, record, key,
+      scope.kind == Kind::ReadPin ? EcTerminalPurpose::ReadRelease
+      : record.state == EcV2DrainState::Published ? EcTerminalPurpose::Publication
+                                                 : EcTerminalPurpose::FencedAbort));
   if (scope.kind == Kind::ReadPin) {
     auto pin = co_await EcCatalog::getPin(txn, scope.object, scope.scopeId);
     CO_RETURN_ON_ERROR(pin);
@@ -406,7 +406,7 @@ CoTryTask<Void> EcV2GcCatalog::finishScope(Transaction &txn,
   CO_RETURN_ON_ERROR(scope);
   auto terminal = co_await terminalEvidence(txn, *scope, controlKey);
   CO_RETURN_ON_ERROR(terminal);
-  auto evidence = hashRecord("3FSECGC-T2-v1", *terminal);
+  auto evidence = hashRecord(terminal->version == kEcV2LifecycleVersion ? "3FSECGC-T2-v1" : "3FSECGC-T2-v2", *terminal);
   CO_RETURN_ON_ERROR(evidence);
   const bool released = scope->state == EcGcScopeState::Released;
   if (released && scope->releaseEvidence != *evidence)
@@ -476,6 +476,20 @@ CoTryTask<std::optional<EcGcClaim>> EcV2GcCatalog::getClaim(Transaction &txn,
       proof.releasedScopes != allocation->released || proof.registeredScopes != proof.releasedScopes ||
       proof.releaseHistory != allocation->releaseHistory || proof.originDrainEvidence == storage::EcSha256{})
     co_return makeError(StatusCode::kDataCorruption, "GC claim disagrees with irreversible allocation state");
+  auto origin = co_await requiredScope(txn, object, Kind::WriteOperation,
+                                       binding->fragment.operation, binding->writer);
+  CO_RETURN_ON_ERROR(origin);
+  if (origin->state != EcGcScopeState::Released) co_return makeError(StatusCode::kDataCorruption);
+  auto drain = co_await EcV2DrainCatalog::get(txn, object, Kind::WriteOperation,
+                                            binding->fragment.operation, binding->writer);
+  CO_RETURN_ON_ERROR(drain);
+  if (!*drain || ((**drain).state != EcV2DrainState::Published && (**drain).state != EcV2DrainState::Aborted))
+    co_return makeError(StatusCode::kDataCorruption, "claim lost terminal origin");
+  auto terminalHash = hashRecord((**drain).version == kEcV2LifecycleVersion ? "3FSECGC-T2-v1" : "3FSECGC-T2-v2",
+                                **drain);
+  CO_RETURN_ON_ERROR(terminalHash);
+  if (*terminalHash != origin->releaseEvidence || *terminalHash != proof.originDrainEvidence)
+    co_return makeError(StatusCode::kDataCorruption, "claim origin evidence changed");
   co_return **loaded;
 }
 
@@ -511,7 +525,7 @@ CoTryTask<EcGcClaim> EcV2GcCatalog::claim(Transaction &txn,
   CO_RETURN_ON_ERROR(co_await requiredMember(txn, *origin, identity));
   auto terminal = co_await terminalEvidence(txn, *origin, controlKey);
   CO_RETURN_ON_ERROR(terminal);
-  auto terminalHash = hashRecord("3FSECGC-T2-v1", *terminal);
+  auto terminalHash = hashRecord(terminal->version == kEcV2LifecycleVersion ? "3FSECGC-T2-v1" : "3FSECGC-T2-v2", *terminal);
   CO_RETURN_ON_ERROR(terminalHash);
   if (*terminalHash != origin->releaseEvidence) co_return makeError(StatusCode::kDataCorruption);
   auto reservation = co_await EcV2ReservationCatalog::get(txn, object, originId, binding->writer);

@@ -58,6 +58,8 @@ class MockMetaService : public serde::ServiceWrapper<MockMetaService, MetaSerde>
   META_MOCK_SERVICE_METHOD(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
   META_MOCK_SERVICE_METHOD(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
   META_MOCK_SERVICE_METHOD(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
+  META_MOCK_SERVICE_METHOD(prepareEcTargetRetirement, PrepareEcTargetRetirementReq, EcTargetRetirementRsp);
+  META_MOCK_SERVICE_METHOD(queryEcTargetRetirement, QueryEcTargetRetirementReq, EcTargetRetirementRsp);
   META_MOCK_SERVICE_METHOD(describeEcFileV2, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
   META_MOCK_SERVICE_METHOD(acquireEcRangeV2, AcquireEcRangeV2Req, EcRangeRsp);
   META_MOCK_SERVICE_METHOD(queryEcRangeV2, QueryEcRangeV2Req, EcRangeRsp);

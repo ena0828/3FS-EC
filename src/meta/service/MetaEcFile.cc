@@ -1,3 +1,4 @@
+#include "meta/store/EcTerminalEvidence.h"
 #include <chrono>
 
 #include "MetaOperator.h"
@@ -192,7 +193,12 @@ CoTryTask<Void> cleanup(kv::IKVEngine &db,
   if (*candidate && (**candidate).state == EcV2DrainState::Closing) {
     const auto frozen = **candidate;
     for (size_t i = 0; i < frozen.identity.endpoints.count; ++i) {
-      if (frozen.observations[i]) continue;
+      if (ecTerminalAt(frozen, i)) continue;
+      auto retired = co_await transaction<EcV2DrainRecord>(db, [&](Tx &txn) {
+        return EcFileExecutionCatalog::recordRetirement(txn, owner, req.object, req.child, i, coordinator.controlKey());
+      });
+      CO_RETURN_ON_ERROR(retired);
+      if (ecTerminalAt(*retired, i)) continue;
       CO_RETURN_ON_ERROR(ready(control));
       auto request = EcV2DrainCatalog::makeRequest(frozen,
                                                    i,
@@ -235,7 +241,12 @@ CoTryTask<Void> cleanup(kv::IKVEngine &db,
     });
     CO_RETURN_ON_ERROR(closing);
     for (size_t i = 0; i < closing->identity.endpoints.count; ++i) {
-      if (closing->observations[i]) continue;
+      if (ecTerminalAt(*closing, i)) continue;
+      auto retired = co_await transaction<EcV2DrainRecord>(db, [&](Tx &txn) {
+        return EcTreeSourcePinCatalog::recordRetirement(txn, pin, i, coordinator.controlKey());
+      });
+      CO_RETURN_ON_ERROR(retired);
+      if (ecTerminalAt(*retired, i)) continue;
       CO_RETURN_ON_ERROR(ready(control));
       auto request = EcV2DrainCatalog::makeRequest(*closing,
                                                    i,

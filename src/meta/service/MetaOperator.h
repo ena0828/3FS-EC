@@ -35,6 +35,7 @@
 #include "meta/components/Distributor.h"
 #include "meta/components/EcCoordinator.h"
 #include "meta/components/EcGcAdminCoordinator.h"
+#include "meta/components/EcTargetRetirementCoordinator.h"
 #include "meta/components/EcRmwPlanIssuer.h"
 #include "meta/components/EcRmwPublicationVerifier.h"
 #include "meta/components/EcV2Coordinator.h"
@@ -99,6 +100,8 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<EcGcAdminRsp> queryEcFragmentGcV2(QueryEcFragmentGcV2Req req);
   CoTryTask<EcRevisionRetirementRsp> retireEcRevisionV2(RetireEcRevisionV2Req req);
   CoTryTask<EcRevisionRetirementRsp> queryEcRevisionRetirementV2(QueryEcRevisionRetirementV2Req req);
+  CoTryTask<EcTargetRetirementRsp> prepareEcTargetRetirement(PrepareEcTargetRetirementReq req);
+  CoTryTask<EcTargetRetirementRsp> queryEcTargetRetirement(QueryEcTargetRetirementReq req);
   CoTryTask<DescribeEcFileV2Rsp> describeEcFileV2(DescribeEcFileV2Req req);
   CoTryTask<EcRangeRsp> acquireEcRangeV2(AcquireEcRangeV2Req req);
   CoTryTask<EcRangeRsp> queryEcRangeV2(QueryEcRangeV2Req req);
@@ -243,6 +246,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<void> authenticateEcV2(ReqBase &req);
   CoTryTask<void> authenticateEcGcAdmin(ReqBase &req);
   CoTryTask<void> authenticateEcRevisionRetirement(EcRevisionRetirementReq &req);
+  CoTryTask<void> authenticateEcTargetRetirement(EcTargetRetirementReq &req);
   CoTryTask<void> authenticateEcFileRange(ReqBase &req);
   CoTryTask<void> authenticateEcFileSession(ReqBase &req);
   CoTryTask<EcV2DrainRecord> advanceEcV2Drain(const EcOperationReq &, EcV2DrainRecord);
@@ -265,6 +269,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   std::unique_ptr<EcCoordinator> ecCoordinator_;
   std::unique_ptr<EcV2Coordinator> ecV2Coordinator_;
   std::unique_ptr<EcGcAdminCoordinator> ecGcAdmin_;
+  std::unique_ptr<EcTargetRetirementCoordinator> ecTargetRetirement_;
   std::shared_ptr<storage::client::StorageClient> ecRmwStorage_;
   std::shared_ptr<storage::client::EcRmwTransport> ecRmwTransport_;
   std::shared_ptr<EcRmwPlanIssuer> ecRmwIssuer_;

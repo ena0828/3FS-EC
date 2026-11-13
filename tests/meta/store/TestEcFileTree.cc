@@ -11,8 +11,13 @@
 
 #include "common/kv/mem/MemKVEngine.h"
 #include "fbs/meta/EcRequestDigest.h"
+#include "fbs/meta/EcV2Grants.h"
 #include "fdb/FDBKVEngine.h"
 #include "meta/store/EcExactGcCatalog.h"
+#include "meta/store/EcTargetRetirementCatalog.h"
+#include "meta/store/EcTerminalEvidence.h"
+#include "meta/store/EcV2LifecycleUtils.h"
+#include "storage/ec_scope/EcTargetRetirementExecutor.h"
 #include "meta/store/EcFileExecutionCatalog.h"
 #include "meta/store/EcFileRepairCatalog.h"
 #include "meta/store/EcFileTreeCatalog.h"
@@ -1376,6 +1381,7 @@ TEST_F(TestEcFileTree, MissingNodeIsCorruptionRatherThanAZeroHole) {
 #include "TestEcTreeSourcePin.inc"
 #include "TestEcTreeCut.inc"
 #include "TestEcTreeRead.inc"
+#include "TestEcTargetRetirementEvidence.inc"
 // clang-format on
 }  // namespace
 }  // namespace hf3fs::meta::server

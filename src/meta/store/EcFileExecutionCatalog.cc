@@ -1,4 +1,5 @@
 #include "EcFileExecutionCatalog.h"
+#include "meta/store/EcTerminalEvidence.h"
 
 #include <limits>
 #include <set>
@@ -257,6 +258,9 @@ CoTryTask<EcFileExecutionObservation> EcFileExecutionCatalog::get(Tx &txn,
     co_return makeError(StatusCode::kDataCorruption, "execution drain state mismatch");
   if (r->drain) {
     CO_RETURN_ON_ERROR(life::drainValid(*r->drain));
+    CO_RETURN_ON_ERROR(co_await verifyEcStoredRetirementReferences(txn, *r->drain));
+    if (r->drain->version == kEcV2RetirementDrainVersion && current->state != EcFileChildState::Fenced)
+      co_return makeError(StatusCode::kDataCorruption, "retirement lost the typed child fence");
     if (!same(drainFor(*r, r->drain->identity.clusterAuthority, r->drain->identity.revocationId).identity,
               r->drain->identity) ||
         (r->drain->verifiedManifest &&
@@ -266,9 +270,12 @@ CoTryTask<EcFileExecutionObservation> EcFileExecutionCatalog::get(Tx &txn,
                             : r->state == State::Aborted ? EcV2DrainState::Aborted
                                                          : EcV2DrainState::Closing))
       co_return makeError(StatusCode::kDataCorruption, "execution drain differs from fixed publication");
+    if ((r->state == State::Drained || r->state == State::Published) &&
+        r->drain->version != kEcV2LifecycleVersion)
+      co_return makeError(StatusCode::kDataCorruption, "retirement cannot complete a publication drain");
     if (r->state == State::Drained || r->state == State::Published || r->state == State::Aborted)
       for (size_t i = 0; i < r->endpoints.count; ++i)
-        if (!r->drain->observations[i])
+        if (!ecTerminalAt(*r->drain, i))
           co_return makeError(StatusCode::kDataCorruption, "terminal execution lost an ACK");
   }
   auto plan = co_await makePlan(txn, *r);
@@ -346,6 +353,8 @@ CoTryTask<EcFileExecutionObservation> EcFileExecutionCatalog::reserveExecution(T
   }
   if (kind == EcFileExecutionOwner::Repair)
     CO_RETURN_ON_ERROR(co_await EcFileRepairCatalog::addHelperEndpoints(txn, r.child, r.endpoints));
+  for (size_t n = 0; n < r.endpoints.count; ++n)
+    CO_RETURN_ON_ERROR(co_await EcTargetRetirementCatalog::requireAssignable(txn, r.endpoints.endpoints[n]));
   auto digest = life::setDigest(r.endpoints);
   CO_RETURN_ON_ERROR(digest);
   r.endpoints.digest = *digest;
@@ -529,6 +538,8 @@ CoTryTask<EcV2DrainRecord> EcFileExecutionCatalog::startPublishClosing(Tx &txn,
   if (!o->record.allocations || !same(manifest(o->record), verified) || content != o->record.contentSha256)
     co_return makeError(StatusCode::kTokenMismatch, "actual verified bytes differ from bound computation");
   if (o->record.drain) {
+    if (o->record.drain->version != kEcV2LifecycleVersion)
+      co_return makeError(StatusCode::kTokenStale, "retirement cannot authorize publication");
     const auto &d = *o->record.drain;
     if (d.identity.clusterAuthority != authority || d.identity.revocationId != revocation || !d.verifiedManifest ||
         !same(*d.verifiedManifest, verified) || d.verifiedContentSha256 != content)
@@ -557,10 +568,30 @@ CoTryTask<EcV2DrainRecord> EcFileExecutionCatalog::recordAck(Tx &txn,
   if (!o->record.drain) co_return makeError(StatusCode::kTokenStale);
   auto verified = EcVerifiedDrainAck::verify(control, *o->record.drain, index, request, ack);
   CO_RETURN_ON_ERROR(verified);
-  if (o->record.drain->observations[index]) co_return *o->record.drain;
+  if (ecTerminalAt(*o->record.drain, index)) co_return *o->record.drain;
   if (o->record.state != State::Closing) co_return makeError(StatusCode::kDataCorruption);
   o->record.drain->observations[index] = EcV2DrainObservation{request, ack};
   CO_RETURN_ON_ERROR(co_await store(txn, key(object, child), o->record));
+  co_return *o->record.drain;
+}
+
+CoTryTask<EcV2DrainRecord> EcFileExecutionCatalog::recordRetirement(Tx &txn,
+                                                                    const EcOwner &owner,
+                                                                    const EcObjectRef &object,
+                                                                    const Uuid &child,
+                                                                    size_t index,
+                                                                    const storage::EcScopeControlKey &control) {
+  auto o = co_await get(txn, owner, object, child);
+  CO_RETURN_ON_ERROR(o);
+  if (!o->record.drain || o->record.state == State::Published)
+    co_return makeError(StatusCode::kTokenStale, "execution requires an abort T0");
+  auto typed = co_await loadChild(txn, owner, object, child, o->record.ownerKind);
+  CO_RETURN_ON_ERROR(typed);
+  if (typed->state != EcFileChildState::Fenced)
+    co_return makeError(StatusCode::kTokenStale, "retirement requires the actual typed child fence");
+  auto attached = co_await attachEcCompletedRetirement(txn, *o->record.drain, index, EcV2DrainUse::AbortOnly, control);
+  CO_RETURN_ON_ERROR(attached);
+  if (*attached) CO_RETURN_ON_ERROR(co_await store(txn, key(object, child), o->record));
   co_return *o->record.drain;
 }
 
@@ -572,13 +603,15 @@ CoTryTask<EcFileExecutionObservation> EcFileExecutionCatalog::finishDrain(Tx &tx
   auto o = co_await get(txn, owner, object, child);
   CO_RETURN_ON_ERROR(o);
   if (!o->record.drain) co_return makeError(StatusCode::kTokenStale);
-  for (size_t i = 0; i < o->record.endpoints.count; ++i) {
-    if (!o->record.drain->observations[i])
-      co_return makeError(StatusCode::kTokenStale, "every exact authorized endpoint ACK is required");
-    const auto &e = *o->record.drain->observations[i];
-    auto v = EcVerifiedDrainAck::verify(control, *o->record.drain, i, e.request, e.ack);
-    CO_RETURN_ON_ERROR(v);
+  if (o->record.drain->version == kEcV2RetirementDrainVersion) {
+    auto typed = co_await loadChild(txn, owner, object, child, o->record.ownerKind);
+    CO_RETURN_ON_ERROR(typed);
+    if (typed->state != EcFileChildState::Fenced)
+      co_return makeError(StatusCode::kDataCorruption, "retirement lost its actual typed abort fence");
   }
+  CO_RETURN_ON_ERROR(co_await verifyEcTerminalEvidence(txn, *o->record.drain, control,
+      o->record.drain->version == kEcV2RetirementDrainVersion ? EcTerminalPurpose::FencedAbort
+                                                           : EcTerminalPurpose::Publication));
   if (o->record.state == State::Published || o->record.state == State::Aborted) co_return o;
   auto childState = co_await loadChild(txn, owner, object, child, o->record.ownerKind);
   CO_RETURN_ON_ERROR(childState);
@@ -623,7 +656,8 @@ CoTryTask<EcFileExecutionCatalog::PublicationValidation> EcFileExecutionCatalog:
   CO_RETURN_ON_ERROR(current);
   const auto &r = current->record;
   if (r.ownerKind != expectedKind || (r.state != State::Drained && r.state != State::Published) || !r.drain ||
-      !r.allocations || !r.drain->verifiedManifest || current->plan->digest() != proof.plan().digest() ||
+      !r.allocations || !r.drain->verifiedManifest || r.drain->version != kEcV2LifecycleVersion ||
+      current->plan->digest() != proof.plan().digest() ||
       !same(*r.allocations, proof.allocations()) || !same(*r.drain->verifiedManifest, proof.manifest()))
     co_return makeError(StatusCode::kTokenMismatch, "publication proof differs from permanent verified execution");
   auto supplied = proof.drain();
@@ -640,7 +674,8 @@ CoTryTask<Void> EcFileExecutionCatalog::finishValidatedPublication(Tx &txn,
     co_return makeError(StatusCode::kTokenStale, "publication validation changed transaction or was consumed");
   validation.consumed_ = true;
   auto &r = validation.observed_.record;
-  if (r.state != State::Drained || !r.drain || !r.drain->verifiedManifest)
+  if (r.state != State::Drained || !r.drain || !r.drain->verifiedManifest ||
+      r.drain->version != kEcV2LifecycleVersion)
     co_return makeError(StatusCode::kTokenStale, "candidate has no complete verified drain");
   const auto &object = r.child.intent.object;
   const auto &child = r.child.intent.child;

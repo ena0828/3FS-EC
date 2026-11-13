@@ -28,6 +28,7 @@
 #include "fbs/meta/EcFileTruncateRpc.h"
 #include "fbs/meta/EcRmw.h"
 #include "fbs/meta/EcTreeGc.h"
+#include "fbs/meta/EcTargetRetirement.h"
 #include "fbs/meta/EcV2Grants.h"
 #include "fbs/meta/EcV2Repair.h"
 #include "fbs/meta/Schema.h"
@@ -908,6 +909,31 @@ struct EcRevisionRetirementRsp : RspBase {
   SERDE_STRUCT_FIELD(referencesReleased, false);
 };
 
+// Root-authenticated administrative intent. The authority is selected by Meta.
+// Query actively confirms an existing intent, never creates or prepares one.
+struct EcTargetRetirementReq : ReqBase {
+  SERDE_STRUCT_FIELD(endpoint, EcV2PhysicalEndpoint{});
+  SERDE_STRUCT_FIELD(retirementId, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (retirementId.is_nil() || endpoint.engineUuid.is_nil() || endpoint.targetIncarnation.is_nil() ||
+        endpoint.placement.node == flat::NodeId{} || endpoint.placement.chain == storage::ChainId{} ||
+        endpoint.placement.target == storage::TargetId{})
+      return INVALID("fixed exact target retirement identity is required");
+    return VALID;
+  }
+};
+struct PrepareEcTargetRetirementReq : EcTargetRetirementReq {};
+struct QueryEcTargetRetirementReq : EcTargetRetirementReq {};
+struct EcTargetRetirementRsp : RspBase {
+  SERDE_STRUCT_FIELD(intent, EcTargetRetirementIntent{});
+  SERDE_STRUCT_FIELD(stage, EcTargetRetirementStage::Prepared);
+  // All-zero while Prepared; immutable first completion digest when Completed.
+  SERDE_STRUCT_FIELD(completionDigest, storage::EcSha256{});
+};
+
 // File metadata/range RPCs deliberately have their own disabled-by-default gate.
 struct DescribeEcFileV2Req : ReqBase {
   SERDE_STRUCT_FIELD(object, EcObjectRef{});
@@ -1334,6 +1360,8 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(queryEcFileRepair, 65, QueryEcFileRepairReq, EcFileRepairRsp);
   META_SERVICE_METHOD(advanceEcFileRepair, 66, AdvanceEcFileRepairReq, EcFileRepairRsp);
   META_SERVICE_METHOD(closeEcFileRepairDebt, 67, CloseEcFileRepairDebtReq, EcFileRepairRsp);
+  META_SERVICE_METHOD(prepareEcTargetRetirement, 68, PrepareEcTargetRetirementReq, EcTargetRetirementRsp);
+  META_SERVICE_METHOD(queryEcTargetRetirement, 69, QueryEcTargetRetirementReq, EcTargetRetirementRsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
   META_SERVICE_METHOD(bindEcRmwOutput, 52, BindEcRmwOutputReq, BindEcRmwOutputRsp);

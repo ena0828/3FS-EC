@@ -57,7 +57,9 @@ CoTryTask<std::optional<T>> load(Tx &txn, std::string key) {
   if (!*bytes) co_return std::nullopt;
   if ((**bytes).size() > (64u << 10)) co_return makeError(StatusCode::kDataCorruption, "oversized V2 lifecycle record");
   T value;
-  if (!serde::deserialize(value, **bytes) || value.version != kEcV2LifecycleVersion) {
+  if (!serde::deserialize(value, **bytes) ||
+      (value.version != kEcV2LifecycleVersion &&
+       !(std::is_same_v<T, EcV2DrainRecord> && value.version == kEcV2RetirementDrainVersion))) {
     co_return makeError(StatusCode::kDataCorruption, "invalid V2 lifecycle record format");
   }
   co_return value;
@@ -128,7 +130,8 @@ inline Result<Void> drainValid(const EcV2DrainRecord &record) {
   const auto &id = record.identity;
   RETURN_ON_ERROR(scopeValid(id.kind, id.scopeId));
   RETURN_ON_ERROR(setValid(id.endpoints));
-  if (record.version != kEcV2LifecycleVersion || id.object.incarnation.is_nil() || id.owner.client.is_nil() ||
+  if ((record.version != kEcV2LifecycleVersion && record.version != kEcV2RetirementDrainVersion) ||
+      id.object.incarnation.is_nil() || id.owner.client.is_nil() ||
       id.clusterAuthority.is_nil() || id.revocationId.is_nil() || !id.objectEpoch || !id.generation || !id.revision ||
       (record.state != EcV2DrainState::Closing && record.state != EcV2DrainState::ReadReleased &&
        record.state != EcV2DrainState::Published && record.state != EcV2DrainState::Aborted)) {
@@ -142,8 +145,19 @@ inline Result<Void> drainValid(const EcV2DrainRecord &record) {
       (record.state == EcV2DrainState::Published && !record.verifiedManifest)) {
     return makeError(StatusCode::kDataCorruption, "V2 drain terminal/evidence kind mismatch");
   }
-  for (size_t i = id.endpoints.count; i != record.observations.size(); ++i) {
-    if (record.observations[i]) return makeError(StatusCode::kDataCorruption, "observation beyond fixed endpoint set");
+  if ((record.version == kEcV2LifecycleVersion && record.terminalUse != EcV2DrainUse::AckOnly) ||
+      (record.version == kEcV2RetirementDrainVersion &&
+       ((id.kind == storage::EcGrantScope::ReadPin && record.terminalUse != EcV2DrainUse::ReadRelease) ||
+        (id.kind == storage::EcGrantScope::WriteOperation && record.terminalUse != EcV2DrainUse::AbortOnly) ||
+        record.state == EcV2DrainState::Published)))
+    return makeError(StatusCode::kDataCorruption, "invalid terminal evidence purpose");
+  for (size_t i = 0; i != record.observations.size(); ++i) {
+    const auto &retired = record.retirements[i];
+    if ((record.observations[i] && retired) ||
+        (i >= id.endpoints.count && (record.observations[i] || retired)) ||
+        (retired && (record.version != kEcV2RetirementDrainVersion || retired->retirementId.is_nil() ||
+                     retired->completionDigest == storage::EcSha256{})))
+      return makeError(StatusCode::kDataCorruption, "invalid or ambiguous endpoint terminal evidence");
   }
   return Void{};
 }

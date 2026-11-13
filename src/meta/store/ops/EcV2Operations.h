@@ -15,6 +15,7 @@ enum class EcV2Phase {
   StartPublish,
   StartCancel,
   RecordAck,
+  RecordRetirement,
   FinishPublish,
   FinishCancel,
   AcquireRead,
@@ -29,6 +30,7 @@ struct EcV2PhaseRequest : EcOperationReq {
   EcV2RepairSelection repairSelection;
   std::array<storage::EcIntegrityDescriptor, 12> descriptors{};
   uint64_t stripe = 0;
+  size_t retirementIndex = 0;
   Uuid revocation = Uuid::random();
   const EcV2Coordinator *coordinator = nullptr;
   std::shared_ptr<const EcV2PublishEvidence> publication;

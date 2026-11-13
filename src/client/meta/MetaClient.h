@@ -126,6 +126,8 @@ class MetaClient {
   CoTryTask<EcGcAdminRsp> queryEcFragmentGcV2(QueryEcFragmentGcV2Req req);
   CoTryTask<EcRevisionRetirementRsp> retireEcRevisionV2(RetireEcRevisionV2Req req);
   CoTryTask<EcRevisionRetirementRsp> queryEcRevisionRetirementV2(QueryEcRevisionRetirementV2Req req);
+  CoTryTask<EcTargetRetirementRsp> prepareEcTargetRetirement(PrepareEcTargetRetirementReq req);
+  CoTryTask<EcTargetRetirementRsp> queryEcTargetRetirement(QueryEcTargetRetirementReq req);
   CoTryTask<DescribeEcFileV2Rsp> describeEcFileV2(DescribeEcFileV2Req req);
   CoTryTask<EcRangeRsp> acquireEcRangeV2(AcquireEcRangeV2Req req);
   CoTryTask<EcRangeRsp> queryEcRangeV2(QueryEcRangeV2Req req);

@@ -44,7 +44,7 @@ CoTryTask<Void> EcReadDispatcherCore::confirmTerminal(const EcReadSpool::Run &ru
     CO_RETURN_ON_ERROR(released);
     const auto &drain = released->drain;
     if (released->pin != slot.pin || drain.revocation.is_nil() || drain.state != meta::EcV2DrainState::ReadReleased ||
-        drain.expectedEndpoints != 12 || drain.acknowledgedEndpoints != 12)
+        drain.expectedEndpoints != 12 || drain.terminalEndpoints() != 12)
       co_return makeError(StatusCode::kDataCorruption, "retirement did not observe the complete original T2 tuple");
   }
   check = active(c);

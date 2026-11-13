@@ -1,3 +1,4 @@
+#include "meta/store/EcTerminalEvidence.h"
 #include "meta/store/ops/EcV2Operations.h"
 
 #include <algorithm>
@@ -116,8 +117,10 @@ EcV2DrainProgress progress(const EcV2DrainRecord &record) {
   value.state = record.state;
   value.revocation = record.identity.revocationId;
   value.expectedEndpoints = record.identity.endpoints.count;
-  for (size_t i = 0; i != record.identity.endpoints.count; ++i)
+  for (size_t i = 0; i != record.identity.endpoints.count; ++i) {
     value.acknowledgedEndpoints += record.observations[i].has_value();
+    value.retiredEndpoints += record.retirements[i].has_value();
+  }
   return value;
 }
 class EcV2PhaseOp : public Operation<EcV2PhaseRsp> {
@@ -135,6 +138,14 @@ class EcV2PhaseOp : public Operation<EcV2PhaseRsp> {
     const auto owner = ownerOf(req_);
     std::optional<EcV2RepairPlanRecord> repairPlan;
     CO_RETURN_ON_ERROR(co_await EcV2BindingCatalog::requireV2Mode(txn, req_.object));
+    if (req_.phase == EcV2Phase::RecordRetirement) {
+      auto record = co_await EcV2DrainCatalog::recordRetirement(txn, req_.object, req_.scopeKind,
+          req_.operation, owner, req_.retirementIndex, req_.coordinator->controlKey());
+      CO_RETURN_ON_ERROR(record);
+      EcV2PhaseRsp rsp;
+      rsp.drain = std::move(*record);
+      co_return rsp;
+    }
     if (req_.phase == EcV2Phase::RecordAck) {
       if (!req_.observation) co_return makeError(StatusCode::kInvalidArg);
       // The evidence has a private verifier-only constructor. Check the
@@ -252,7 +263,7 @@ class EcV2PhaseOp : public Operation<EcV2PhaseRsp> {
                                                                                   storage::EcGrantScope::WriteOperation,
                                                                                   req_.operation,
                                                                                   owner));
-          } else if (!(**closing).verifiedManifest || (**closing).state == EcV2DrainState::Aborted) {
+          } else if ((**closing).version != kEcV2LifecycleVersion || !(**closing).verifiedManifest || (**closing).state == EcV2DrainState::Aborted) {
             co_return makeError(StatusCode::kTokenStale, "V2 scope closed without a publication proof");
           }
           break;
@@ -341,7 +352,10 @@ class EcV2PhaseOp : public Operation<EcV2PhaseRsp> {
         co_await EcV2DrainCatalog::get(txn, req_.object, storage::EcGrantScope::WriteOperation, req_.operation, owner);
     CO_RETURN_ON_ERROR(drain);
     rsp.drain = std::move(*drain);
-    if (rsp.drain) rsp.mutation.drain = progress(*rsp.drain);
+    if (rsp.drain) {
+      CO_RETURN_ON_ERROR(co_await verifyEcRetirementReferences(txn, *rsp.drain, req_.coordinator->controlKey()));
+      rsp.mutation.drain = progress(*rsp.drain);
+    }
     co_return rsp;
   }
   CoTryTask<EcV2PhaseRsp> readPhase(IReadWriteTransaction &txn, const EcOwner &owner) {

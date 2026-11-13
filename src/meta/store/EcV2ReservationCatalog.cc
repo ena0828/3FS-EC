@@ -1,4 +1,5 @@
 #include "meta/store/EcV2ReservationCatalog.h"
+#include "meta/store/EcTargetRetirementCatalog.h"
 
 #include <limits>
 
@@ -146,6 +147,9 @@ CoTryTask<EcV2Reservation> EcV2ReservationCatalog::reserve(Transaction &txn,
     CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::protectOperation(txn, **existing));
     co_return **existing;
   }
+  for (size_t i = 0; i < 12; ++i)
+    if (op->intent.replacementMask & (1u << i))
+      CO_RETURN_ON_ERROR(co_await EcTargetRetirementCatalog::requireAssignable(txn, next.candidates[i].endpoint));
   CO_RETURN_ON_ERROR(co_await save(txn, key, next));
   CO_RETURN_ON_ERROR(co_await EcV2GcCatalog::protectOperation(txn, next));
   co_return next;

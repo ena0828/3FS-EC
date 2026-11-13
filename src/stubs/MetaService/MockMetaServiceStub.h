@@ -70,6 +70,8 @@ class DummyMetaServiceStub : public IMetaServiceStub {
   NOT_IMPLEMENTED_FUNC(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
   NOT_IMPLEMENTED_FUNC(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
   NOT_IMPLEMENTED_FUNC(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
+  NOT_IMPLEMENTED_FUNC(prepareEcTargetRetirement, PrepareEcTargetRetirementReq, EcTargetRetirementRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcTargetRetirement, QueryEcTargetRetirementReq, EcTargetRetirementRsp);
   NOT_IMPLEMENTED_FUNC(describeEcFileV2, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
   NOT_IMPLEMENTED_FUNC(acquireEcRangeV2, AcquireEcRangeV2Req, EcRangeRsp);
   NOT_IMPLEMENTED_FUNC(queryEcRangeV2, QueryEcRangeV2Req, EcRangeRsp);
@@ -202,6 +204,8 @@ class MetaServiceStub<hf3fs::stubs::StubMockContext<IMetaServiceStub>> : public 
   FORWARD_RPC_FUNC(queryEcFragmentGcV2, QueryEcFragmentGcV2Req, EcGcAdminRsp);
   FORWARD_RPC_FUNC(retireEcRevisionV2, RetireEcRevisionV2Req, EcRevisionRetirementRsp);
   FORWARD_RPC_FUNC(queryEcRevisionRetirementV2, QueryEcRevisionRetirementV2Req, EcRevisionRetirementRsp);
+  FORWARD_RPC_FUNC(prepareEcTargetRetirement, PrepareEcTargetRetirementReq, EcTargetRetirementRsp);
+  FORWARD_RPC_FUNC(queryEcTargetRetirement, QueryEcTargetRetirementReq, EcTargetRetirementRsp);
   FORWARD_RPC_FUNC(describeEcFileV2, DescribeEcFileV2Req, DescribeEcFileV2Rsp);
   FORWARD_RPC_FUNC(acquireEcRangeV2, AcquireEcRangeV2Req, EcRangeRsp);
   FORWARD_RPC_FUNC(queryEcRangeV2, QueryEcRangeV2Req, EcRangeRsp);

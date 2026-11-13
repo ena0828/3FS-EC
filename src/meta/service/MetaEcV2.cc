@@ -1,3 +1,4 @@
+#include "meta/store/EcTerminalEvidence.h"
 #include <algorithm>
 #include <folly/experimental/coro/Sleep.h>
 
@@ -51,8 +52,10 @@ EcV2DrainProgress drainProgress(const EcV2DrainRecord &record) {
   out.state = record.state;
   out.revocation = record.identity.revocationId;
   out.expectedEndpoints = record.identity.endpoints.count;
-  for (size_t i = 0; i != record.identity.endpoints.count; ++i)
+  for (size_t i = 0; i != record.identity.endpoints.count; ++i) {
     out.acknowledgedEndpoints += record.observations[i].has_value();
+    out.retiredEndpoints += record.retirements[i].has_value();
+  }
   return out;
 }
 }  // namespace
@@ -125,7 +128,7 @@ CoTryTask<EcV2DrainRecord> MetaOperator::advanceEcV2Drain(const EcOperationReq &
   while (true) {
     bool complete = true;
     for (size_t i = 0; i != record.identity.endpoints.count; ++i) {
-      if (record.observations[i]) continue;
+      if (ecTerminalAt(record, i)) continue;
       complete = false;
       if (SteadyClock::now() >= deadline)
         co_return makeError(MetaCode::kOperationTimeout, "V2 drain remains Closing; no pin was released");
@@ -203,6 +206,19 @@ CoTryTask<EcV2MutationRsp> MetaOperator::cancelEcMutationV2(CancelEcMutationV2Re
                                   V2WritePolicy::ReferenceMaintenance);
   CO_RETURN_ON_ERROR(started);
   if (!started->drain) co_return makeError(StatusCode::kDataCorruption);
+  if (started->drain->state == EcV2DrainState::Closing) {
+    for (size_t i = 0; i < started->drain->identity.endpoints.count; ++i) {
+      if (ecTerminalAt(*started->drain, i)) continue;
+      auto retired = context;
+      retired.phase = EcV2Phase::RecordRetirement;
+      retired.retirementIndex = i;
+      auto saved = co_await driveV2(makeEcV2PhaseOp(*metaStore_, retired), retired, *kvEngine_, config_,
+                                   createRetryConfig(), V2WritePolicy::ReferenceMaintenance);
+      CO_RETURN_ON_ERROR(saved);
+      if (!saved->drain) co_return makeError(StatusCode::kDataCorruption);
+      started->drain = std::move(saved->drain);
+    }
+  }
   auto drained = co_await advanceEcV2Drain(req, std::move(*started->drain));
   CO_RETURN_ON_ERROR(drained);
   CO_RETURN_ON_ERROR(co_await authenticateEcV2(req));
@@ -243,6 +259,19 @@ CoTryTask<ReleaseEcReadV2Rsp> MetaOperator::releaseEcReadV2(ReleaseEcReadV2Req r
                                   V2WritePolicy::ReferenceMaintenance);
   CO_RETURN_ON_ERROR(started);
   if (!started->drain) co_return makeError(StatusCode::kDataCorruption);
+  if (started->drain->state == EcV2DrainState::Closing) {
+    for (size_t i = 0; i < started->drain->identity.endpoints.count; ++i) {
+      if (ecTerminalAt(*started->drain, i)) continue;
+      auto retired = context;
+      retired.phase = EcV2Phase::RecordRetirement;
+      retired.retirementIndex = i;
+      auto saved = co_await driveV2(makeEcV2PhaseOp(*metaStore_, retired), retired, *kvEngine_, config_,
+                                   createRetryConfig(), V2WritePolicy::ReferenceMaintenance);
+      CO_RETURN_ON_ERROR(saved);
+      if (!saved->drain) co_return makeError(StatusCode::kDataCorruption);
+      started->drain = std::move(saved->drain);
+    }
+  }
   auto drained = co_await advanceEcV2Drain(context, std::move(*started->drain));
   CO_RETURN_ON_ERROR(drained);
   CO_RETURN_ON_ERROR(co_await authenticateEcV2(req));

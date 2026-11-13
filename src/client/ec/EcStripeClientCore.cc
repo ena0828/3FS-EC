@@ -92,9 +92,9 @@ CoTryTask<meta::ReleaseEcReadV2Rsp> EcStripeClientCore::releaseOwned(EcStripePin
   auto result = co_await meta->releaseEcReadV2(std::move(req));
   CO_RETURN_ON_ERROR(result);
   if (result->pin != value.pin || result->drain.expectedEndpoints == 0 ||
-      result->drain.acknowledgedEndpoints > result->drain.expectedEndpoints ||
+      result->drain.terminalEndpoints() > result->drain.expectedEndpoints ||
       (result->drain.state == meta::EcV2DrainState::ReadReleased &&
-       result->drain.acknowledgedEndpoints != result->drain.expectedEndpoints)) {
+       result->drain.terminalEndpoints() != result->drain.expectedEndpoints)) {
     co_return makeError(StatusCode::kDataCorruption, "inconsistent remote pin drain result");
   }
   // Closing is a real pending result, never reported as released or GC-safe.

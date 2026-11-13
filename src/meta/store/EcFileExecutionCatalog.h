@@ -90,6 +90,9 @@ class EcFileExecutionCatalog {
                                               const storage::EcScopeControlKey &,
                                               const storage::EcScopeControlRequest &,
                                               const storage::EcScopeControlAck &);
+  static CoTryTask<EcV2DrainRecord> recordRetirement(Tx &, const EcOwner &, const EcObjectRef &,
+                                                     const Uuid &child, size_t index,
+                                                     const storage::EcScopeControlKey &);
   static CoTryTask<EcFileExecutionObservation> finishDrain(Tx &,
                                                            const EcOwner &,
                                                            const EcObjectRef &,

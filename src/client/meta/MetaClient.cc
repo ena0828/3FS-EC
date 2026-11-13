@@ -324,7 +324,8 @@ CoTryTask<Void> MetaClient::waitRoutingInfo(const Rsp &rsp, const RetryConfig &r
   if constexpr (std::is_same_v<Rsp, CreateEcFileRsp> || std::is_same_v<Rsp, EcOperationRsp> ||
                 std::is_same_v<Rsp, AcquireEcReadRsp> || std::is_same_v<Rsp, ReleaseEcReadRsp> ||
                 std::is_same_v<Rsp, EcV2MutationRsp> || std::is_same_v<Rsp, AcquireEcReadV2Rsp> ||
-                std::is_same_v<Rsp, ReleaseEcReadV2Rsp> || std::is_same_v<Rsp, PrepareEcRepairV2Rsp>) {
+                std::is_same_v<Rsp, ReleaseEcReadV2Rsp> || std::is_same_v<Rsp, PrepareEcRepairV2Rsp> ||
+                std::is_same_v<Rsp, EcTargetRetirementRsp>) {
     co_return Void{};
   }
   auto begin = SteadyClock::now();
@@ -360,6 +361,13 @@ auto MetaClient::retry(Func &&func, Req &&req, RetryConfig retryConfig, std::fun
                                   retryConfig.retry_total_time().asMs());
   auto options = net::UserRequestOptions();
   options.timeout = retryConfig.rpc_timeout();
+  if constexpr (std::is_same_v<std::remove_cvref_t<Req>, PrepareEcTargetRetirementReq> ||
+                std::is_same_v<std::remove_cvref_t<Req>, QueryEcTargetRetirementReq>) {
+    // Disable the network sender's own retransmission as well as the explicit
+    // caller's zero-backoff policy. Recovery belongs to the original request ID.
+    options.sendRetryTimes = 0;
+  }
+
 
   OperationRecorder::Guard record(OperationRecorder::client(), opName, req.user.uid);
   std::optional<ServerNode> server;
@@ -559,6 +567,19 @@ CoTryTask<EcGcAdminRsp> MetaClient::queryEcFragmentGcV2(QueryEcFragmentGcV2Req r
   once.set_retry_init_wait(0_ms);
   co_return co_await retry(&IMetaServiceStub::queryEcFragmentGcV2, req, std::move(once));
 }
+CoTryTask<EcTargetRetirementRsp> MetaClient::prepareEcTargetRetirement(PrepareEcTargetRetirementReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "retirement requires an explicit request UUID");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::prepareEcTargetRetirement, req, std::move(once));
+}
+CoTryTask<EcTargetRetirementRsp> MetaClient::queryEcTargetRetirement(QueryEcTargetRetirementReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "query requires the original retirement UUID");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcTargetRetirement, req, std::move(once));
+}
+
 CoTryTask<EcRevisionRetirementRsp> MetaClient::retireEcRevisionV2(RetireEcRevisionV2Req req) {
   // The caller persists this identity before dispatch; never create a new UUID.
   if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "retirement request UUID is required");

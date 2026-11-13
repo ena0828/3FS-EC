@@ -1,3 +1,4 @@
+#include "meta/store/EcTerminalEvidence.h"
 #include <algorithm>
 #include <folly/experimental/coro/Sleep.h>
 #include <new>
@@ -107,7 +108,14 @@ CoTryTask<EcTreeReadRsp> MetaOperator::releaseEcTreeRead(ReleaseEcTreeReadReq re
     std::array<bool, 24> revokeSent{};
     while (true) {
       for (size_t endpoint = 0; endpoint < current->identity.endpoints.count; ++endpoint) {
-        if (current->observations[endpoint]) continue;
+        if (ecTerminalAt(*current, endpoint)) continue;
+        auto retired = co_await treeReadTransaction<EcV2DrainRecord>(kvEngine_,
+            [intent = req.intent, stripe, endpoint, key = ecV2Coordinator_->sharedControlKey()](Catalog::Tx &txn) {
+              return Catalog::recordRetirement(txn, intent, stripe, endpoint, *key);
+            });
+        CO_RETURN_ON_ERROR(retired);
+        current = std::move(retired);
+        if (ecTerminalAt(*current, endpoint)) continue;
         if (SteadyClock::now() >= deadline)
           co_return makeError(MetaCode::kOperationTimeout, "tree range remains Closing; retry its original identities");
         CO_RETURN_ON_ERROR(co_await authenticateEcFileRange(req));
@@ -130,9 +138,7 @@ CoTryTask<EcTreeReadRsp> MetaOperator::releaseEcTreeRead(ReleaseEcTreeReadReq re
         CO_RETURN_ON_ERROR(saved);
         current = std::move(saved);
       }
-      if (std::all_of(current->observations.begin(),
-                      current->observations.begin() + current->identity.endpoints.count,
-                      [](const auto &ack) { return ack.has_value(); }))
+      if (ecAllTerminal(*current))
         break;
       if (SteadyClock::now() >= deadline)
         co_return makeError(MetaCode::kOperationTimeout, "tree source has pending storage readers");

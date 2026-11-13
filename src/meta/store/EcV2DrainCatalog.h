@@ -88,6 +88,13 @@ class EcV2DrainCatalog {
                                                  const Uuid &authority,
                                                  const Uuid &revocation);
   static CoTryTask<EcV2DrainRecord> recordAck(Transaction &, const EcVerifiedDrainAck &);
+  static CoTryTask<EcV2DrainRecord> recordRetirement(Transaction &,
+                                                    const EcObjectRef &,
+                                                    storage::EcGrantScope,
+                                                    const Uuid &scope,
+                                                    const EcOwner &,
+                                                    size_t index,
+                                                    const storage::EcScopeControlKey &);
   static CoTryTask<EcPinRecord> finishRead(Transaction &,
                                            const EcObjectRef &,
                                            const Uuid &pin,

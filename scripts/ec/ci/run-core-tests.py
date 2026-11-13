@@ -31,6 +31,17 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
 REPAIR_CASES = (
     "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
 )
+TARGET_META_CASES = (
+    "TestEcTargetRetirementCatalog.RealFdbImmutableIntentAndRequestIdentity",
+    "TestEcTargetRetirementCatalog.RealFdbAcceptedIntentConflictsWithAssignmentSnapshot",
+    "TestEcTargetRetirementCatalog.RealFdbMissingIndexAndInvalidVersionFailClosed",
+    "TestEcTargetRetirementNative.LostPrepareReplySameIdQueryAndFirstCompletionSurviveRestart",
+    "TestEcTargetRetirementNative.AcceptedButUnsentIntentQueryCannotPrepareAndRootAuthenticationIsMandatory",
+    "TestEcTargetRetirementNative.FlatReadAndFencedAbortUseOneRetirementButNeverPublish",
+    "TestEcFileTree.DrainEvidenceVersionsPreserveV1BytesAndRejectPublication",
+    "TestEcFileTree.RealFdbEightDataRetirementRangeRevalidatesAndFitsSingleBudget",
+    "TestEcFileTree.RealFdbRepairTwentyTwoRetirementsFencePublicationAndRevalidateGc",
+)
 FUSE_CASES = (
     "TestEcFuseRead.FlagsAndCopiedIdentityUseActualAuthentication",
     "TestEcFuseRead.WindowBoundsAndZeroEofPreserveReceiptAndOutputLease",
@@ -57,8 +68,9 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     for name in ("source", "build", "fdb-bin-dir", "work"):
         result.add_argument("--" + name, required=True, type=Path)
-    result.add_argument("--profile", choices=("core", "repair"), default="core",
-                        help="core: original 7 Meta + 14 FUSE; repair: one real three-strategy Meta fixture")
+    result.add_argument("--profile", choices=("core", "repair", "target-meta"), default="core",
+                        help="core: 7 Meta + 14 FUSE; repair: three-strategy fixture; "
+                             "target-meta: 9 retirement catalogue, RPC and evidence cases")
     return result
 
 
@@ -67,6 +79,8 @@ def selection(profile):
         return META_CASES, META_FILTER, FUSE_CASES
     if profile == "repair":
         return REPAIR_CASES, REPAIR_CASES[0], ()
+    if profile == "target-meta":
+        return TARGET_META_CASES, ":".join(TARGET_META_CASES), ()
     raise ValueError("unknown fixed acceptance profile")
 
 

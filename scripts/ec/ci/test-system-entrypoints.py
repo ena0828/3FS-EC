@@ -28,9 +28,10 @@ budget = load("checked_system_budget", "system-job-budget.py")
 class SystemEntrypoints(unittest.TestCase):
     def test_required_target_retirement_cases_are_selected_by_real_driver(self):
         driver = regression.module(Path(__file__).parent.parent / "test-native-fragments.py", "retirement_native_driver")
-        filters = {"storage": driver.STORAGE_FILTER, "service": driver.SERVICE_FILTER}
+        filters = {"storage": driver.STORAGE_FILTER, "service": driver.SERVICE_FILTER, "client": driver.CLIENT_FILTER}
         self.assertTrue(all(regression.TARGET_RETIREMENT_REQUIRED.values()))
-        for kind, names in regression.TARGET_RETIREMENT_REQUIRED.items():
+        required = {**regression.TARGET_RETIREMENT_REQUIRED, "client": regression.CLIENT_MANDATORY}
+        for kind, names in required.items():
             for name in names:
                 with self.subTest(suite=kind, case=name):
                     self.assertTrue(any(fnmatch.fnmatchcase(name, pattern) for pattern in filters[kind].split(":")))
@@ -123,7 +124,8 @@ class SystemEntrypoints(unittest.TestCase):
         built = {"binaries": {name: str(index) * 64 for index, name in enumerate(regression.TARGETS)}}
         suites = []
         for kind, target in zip(("storage", "service", "client"), regression.TARGETS):
-            names = sorted(regression.MANDATORY) if kind == "storage" else [kind + ".Case"]
+            names = sorted(regression.MANDATORY) if kind == "storage" else (
+                sorted(regression.CLIENT_MANDATORY) if kind == "client" else [kind + ".Case"])
             suites.append({"suite": kind, "status": "passed", "failures": [],
                            "binary": str(build / "tests" / target), "binary_sha256": built["binaries"][target],
                            "binary_sha256_after": built["binaries"][target],
@@ -140,6 +142,7 @@ class SystemEntrypoints(unittest.TestCase):
             lambda r: r["suites"][0]["execution"].update(termination={"leader_reaped": True}),
             lambda r: r["suites"][0]["xml_results"]["cases"][0].update(skipped=True),
             lambda r: (r["suites"][0]["listed_tests"].pop(), r["suites"][0]["xml_results"]["cases"].pop()),
+            lambda r: (r["suites"][2]["listed_tests"].pop(), r["suites"][2]["xml_results"]["cases"].pop()),
         ]
         for change in changes:
             value = copy.deepcopy(original)
@@ -155,6 +158,14 @@ class SystemEntrypoints(unittest.TestCase):
         self.assertEqual(system.REF, "refs/heads/feat/ec-system-acceptance")
         self.assertEqual((system.REQUIRED_MINUTES, system.LAB_STEP_MINUTES), (90, 80))
         self.assertNotEqual(native.RECORD_NAME, system.RECORD_NAME)
+        target = budget.budget_module("target-meta")
+        self.assertEqual(target.REF, "refs/heads/feat/ec-target-meta")
+        self.assertEqual(target.JOB_MINUTES, 350)
+        self.assertNotEqual(target.RECORD_NAME, system.RECORD_NAME)
+        self.assertNotEqual(target.BODY_NAME, system.BODY_NAME)
+        self.assertEqual(system.REF, "refs/heads/feat/ec-system-acceptance")
+        with self.assertRaises(ValueError):
+            budget.budget_module("arbitrary")
 
     def test_file_and_spare_gates_keep_the_verified_anchor_and_exact_boundaries(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -166,7 +177,8 @@ class SystemEntrypoints(unittest.TestCase):
                 NANO=1_000_000_000, digest=lambda _: "digest", read_private=mock.Mock(return_value=b"body"),
                 parse_json=lambda _: row, require=regression.require, clock=lambda: 77,
                 remaining=mock.Mock())
-            for stage, minutes, step in (("repair", 80, 75), ("file", 90, 45), ("spare", 40, 35)):
+            for stage, minutes, step in (("repair", 80, 75), ("file", 90, 45), ("spare", 40, 35),
+                                         ("regression", 40, 35), ("target-meta", 80, 75), ("core", 100, 95)):
                 for delta, expected in ((0, 0), (-1, 1)):
                     base.remaining.return_value = minutes * 60 * base.NANO + delta
                     with contextlib.redirect_stdout(io.StringIO()) as output:

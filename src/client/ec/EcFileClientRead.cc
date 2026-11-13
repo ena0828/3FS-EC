@@ -145,9 +145,9 @@ CoTask<EcFileReleaseOutcome> EcFileClientCore::releaseOwned(std::shared_ptr<EcFi
     }
     const auto &drain = result->drain;
     if (result->pin != slot.pin || drain.revocation.is_nil() || drain.expectedEndpoints != 12 ||
-        drain.acknowledgedEndpoints > 12 ||
+        drain.terminalEndpoints() > 12 ||
         (drain.state != meta::EcV2DrainState::Closing && drain.state != meta::EcV2DrainState::ReadReleased) ||
-        (drain.state == meta::EcV2DrainState::ReadReleased && drain.acknowledgedEndpoints != 12)) {
+        (drain.state == meta::EcV2DrainState::ReadReleased && drain.terminalEndpoints() != 12)) {
       if (!out.failure) out.failure.emplace(StatusCode::kDataCorruption);
       continue;
     }

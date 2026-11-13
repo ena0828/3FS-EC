@@ -37,6 +37,50 @@ def receipt(binary, output, cases=RUNNER.META_CASES, test_filter=RUNNER.META_FIL
 
 
 class TestCoreAcceptanceContract(unittest.TestCase):
+    def test_target_meta_profile_requires_all_nine_cases_and_exact_commands(self):
+        cases, test_filter, fuse = RUNNER.selection("target-meta")
+        self.assertEqual(len(cases), 9)
+        self.assertEqual(len(set(cases)), 9)
+        self.assertEqual(test_filter, ":".join(cases))
+        self.assertEqual(fuse, ())
+        binary, output = Path("/build/tests/test_meta"), Path("/work/meta")
+        sample = receipt(binary, output, cases, test_filter)
+        RUNNER.check_meta_receipt(sample, binary, output, cases, test_filter)
+        for mutation in ("missing", "skip", "wrong_filter", "other_profile", "unjoined"):
+            value = copy.deepcopy(sample)
+            if mutation == "missing":
+                value["selected"].pop()
+                value["test_results"]["cases"].pop()
+                value["test_results"]["declared_tests"] = "8"
+                value["passed_tests"] = 8
+            elif mutation == "skip":
+                value["test_results"]["cases"][-1]["skipped"] = True
+            elif mutation == "wrong_filter":
+                value["commands"][0]["argv"][1] = "--gtest_filter=TestEcTargetRetirementNative.*"
+            elif mutation == "other_profile":
+                value = receipt(binary, output)
+            else:
+                value["server"]["cleanup"]["leader_reaped"] = False
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                RUNNER.check_meta_receipt(value, binary, output, cases, test_filter)
+
+    def test_target_meta_inventory_matches_compiled_fixture_sources(self):
+        import re
+        source = Path(__file__).resolve().parents[3]
+        files = ("tests/meta/store/TestEcTargetRetirementCatalog.cc",
+                 "tests/meta/EcTargetRetirementNativeTests.inc",
+                 "tests/meta/store/TestEcTargetRetirementEvidence.inc")
+        names = []
+        for filename in files:
+            body = (source / filename).read_text(encoding="utf-8")
+            names.extend(suite + "." + name for suite, name in re.findall(
+                r"TEST_F\(\s*(\w+)\s*,\s*(\w+)\s*\)", body))
+        RUNNER.exact_names(names, RUNNER.TARGET_META_CASES)
+        self.assertIn('#include "EcTargetRetirementNativeTests.inc"',
+                      (source / "tests/meta/TestEcV2NativeLifecycle.cc").read_text(encoding="utf-8"))
+        self.assertIn('#include "TestEcTargetRetirementEvidence.inc"',
+                      (source / "tests/meta/store/TestEcFileTree.cc").read_text(encoding="utf-8"))
+
     def test_failed_meta_keeps_cleanup_evidence_without_accepting_stage(self):
         for cleanup in (None, {"signals": ["SIGTERM"], "leader_reaped": True},
                         {"signals": ["SIGTERM", "SIGKILL"], "leader_reaped": False}):

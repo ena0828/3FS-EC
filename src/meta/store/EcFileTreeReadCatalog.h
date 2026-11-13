@@ -35,6 +35,8 @@ class EcFileTreeReadCatalog {
                                                       size_t stripeIndex,
                                                       const storage::EcScopeControlKey &,
                                                       const EcVerifiedDrainAck &);
+  static CoTryTask<EcV2DrainRecord> recordRetirement(Tx &, const EcTreeReadIntent &, size_t stripeIndex,
+                                                     size_t endpointIndex, const storage::EcScopeControlKey &);
   static CoTryTask<EcTreeReadRecord> finishRelease(Tx &, const EcTreeReadIntent &, const storage::EcScopeControlKey &);
 };
 }  // namespace hf3fs::meta::server

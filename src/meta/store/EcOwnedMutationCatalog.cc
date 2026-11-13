@@ -1,3 +1,4 @@
+#include "meta/store/EcTerminalEvidence.h"
 #include "meta/store/EcOwnedMutationCatalog.h"
 
 #include <set>
@@ -108,7 +109,10 @@ CoTryTask<EcOwnedMutationRsp> EcOwnedMutationCatalog::query(kv::IReadWriteTransa
       CO_RETURN_ON_ERROR(EcVerifiedDrainAck::verify(key, record, i, observation.request, observation.ack));
       ++progress.acknowledgedEndpoints;
     }
-    if (op->state != EcOperationState::Preparing && progress.acknowledgedEndpoints != progress.expectedEndpoints)
+    CO_RETURN_ON_ERROR(co_await verifyEcRetirementReferences(txn, record, key));
+    for (size_t i = 0; i < id.endpoints.count; ++i)
+      progress.retiredEndpoints += record.retirements[i].has_value();
+    if (op->state != EcOperationState::Preparing && progress.terminalEndpoints() != progress.expectedEndpoints)
       co_return makeError(StatusCode::kDataCorruption, "terminal mutation has incomplete durable drain evidence");
     rsp.drain = progress;
   } else if (op->state != EcOperationState::Preparing) {

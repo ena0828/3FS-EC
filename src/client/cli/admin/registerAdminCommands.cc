@@ -17,6 +17,7 @@
 #include "DumpInodes.h"
 #include "EcGcCommands.h"
 #include "EcRevisionRetirementCommands.h"
+#include "EcTargetRetirementCommands.h"
 #include "EcTargets.h"
 #include "FillZero.h"
 #include "FindOrphanedChunks.h"
@@ -107,6 +108,7 @@ CoTryTask<void> registerAdminCommands(Dispatcher &dispatcher) {
   CO_RETURN_ON_ERROR(co_await registerEcTargetsHandlers(dispatcher));
   CO_RETURN_ON_ERROR(co_await registerEcGcHandlers(dispatcher));
   CO_RETURN_ON_ERROR(co_await registerEcRevisionRetirementHandlers(dispatcher));
+  CO_RETURN_ON_ERROR(co_await registerEcTargetRetirementHandlers(dispatcher));
   CO_RETURN_ON_ERROR(co_await registerOfflineTargetHandler(dispatcher));
   CO_RETURN_ON_ERROR(co_await registerRemoveTargetHandler(dispatcher));
   CO_RETURN_ON_ERROR(co_await registerQueryChunkHandler(dispatcher));

@@ -11,19 +11,23 @@ from pathlib import Path
 import sys
 
 
-STAGES = {"repair": (80, 75), "file": (90, 45), "spare": (40, 35)}
+STAGES = {"repair": (80, 75), "file": (90, 45), "spare": (40, 35),
+          "regression": (40, 35), "target-meta": (80, 75), "core": (100, 95)}
 
 
-def budget_module():
+def budget_module(profile="system"):
+    if profile not in ("system", "target-meta"):
+        raise ValueError("unknown fixed job budget profile")
     path = Path(__file__).with_name("job-budget.py")
     spec = importlib.util.spec_from_file_location("system_budget_base", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.REF = "refs/heads/feat/ec-system-acceptance"
+    module.REF = ("refs/heads/feat/ec-system-acceptance" if profile == "system"
+                  else "refs/heads/feat/ec-target-meta")
     module.REQUIRED_MINUTES = 90
     module.LAB_STEP_MINUTES = 80  # File 45 + spare 35; both remain separately capped.
-    module.RECORD_NAME = "ec-system-job-budget.json"
-    module.BODY_NAME = "ec-system-job-budget-api.json"
+    module.RECORD_NAME = "ec-" + profile + "-job-budget.json"
+    module.BODY_NAME = "ec-" + profile + "-job-budget-api.json"
     return module
 
 
@@ -49,10 +53,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("record", "check"))
     parser.add_argument("--stage", choices=tuple(STAGES))
+    parser.add_argument("--profile", choices=("system", "target-meta"), default="system")
     args = parser.parse_args()
     if (args.command == "record" and args.stage is not None) or (args.command == "check" and args.stage is None):
-        parser.error("record takes no stage; check requires --stage repair|file|spare")
-    base = budget_module()
+        parser.error("record takes no stage; check requires --stage")
+    if args.profile == "system" and args.stage in ("regression", "target-meta", "core"):
+        parser.error("this stage requires --profile target-meta")
+    base = budget_module(args.profile)
     parent, identity = base.context()
     identity["system_driver_sha256"] = base.digest(Path(__file__).read_bytes())
     return base.record(parent, identity) if args.command == "record" else check(base, parent, identity, args.stage)

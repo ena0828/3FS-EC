@@ -292,6 +292,18 @@ CoTryTask<EcV2DrainRecord> EcFileTreeReadCatalog::recordAck(Tx &txn,
                                                        ack);
 }
 
+CoTryTask<EcV2DrainRecord> EcFileTreeReadCatalog::recordRetirement(Tx &txn,
+                                                                   const EcTreeReadIntent &intent,
+                                                                   size_t stripeIndex,
+                                                                   size_t endpointIndex,
+                                                                   const storage::EcScopeControlKey &key) {
+  auto r = co_await retainedRange(txn, intent);
+  CO_RETURN_ON_ERROR(r);
+  CO_RETURN_ON_ERROR(dataIndex(*r, stripeIndex));
+  if (r->state == State::Active) co_return makeError(StatusCode::kTokenStale, "range T0 has not committed");
+  co_return co_await EcTreeSourcePinCatalog::recordRetirement(txn, sourceIntent(*r, stripeIndex), endpointIndex, key);
+}
+
 CoTryTask<EcTreeReadRecord> EcFileTreeReadCatalog::finishRelease(Tx &txn,
                                                                  const EcTreeReadIntent &intent,
                                                                  const storage::EcScopeControlKey &key) {

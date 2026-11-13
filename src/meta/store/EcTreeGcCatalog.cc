@@ -1,4 +1,5 @@
 #include "EcTreeGcCatalog.h"
+#include "EcTerminalEvidence.h"
 
 #include <limits>
 #include <memory>
@@ -136,9 +137,13 @@ CoTryTask<storage::EcSha256> executionOrigin(TreeTxn &t, const EcFileExecutionRe
   expected.digest = *setHash;
   if (!same(expected, r.endpoints) || !same(expected, r.drain->identity.endpoints))
     co_return makeError(StatusCode::kDataCorruption, "GC origin ACK scope is not the exact complete operation set");
-  if (repairEvidence) co_return digest("3FS-TREE-GC-REPAIR-EXECUTION-v2", *repairEvidence);
+  if (repairEvidence)
+    co_return digest(r.drain->version == kEcV2LifecycleVersion ? "3FS-TREE-GC-REPAIR-EXECUTION-v2"
+                                                            : "3FS-TREE-GC-REPAIR-EXECUTION-v3",
+                     *repairEvidence);
   // Preserve existing Pwrite/Truncate G2 certificate bytes and the twelve-only gate.
-  co_return digest("3FS-TREE-GC-EXECUTION-v2", r);
+  co_return digest(r.drain->version == kEcV2LifecycleVersion ? "3FS-TREE-GC-EXECUTION-v2"
+                                                          : "3FS-TREE-GC-EXECUTION-v3", r);
 }
 CoTryTask<std::pair<TreeEligibility, EcV2DrainRecord>> eligible(TreeTxn &t,
                                                                 const EcObjectRef &o,
@@ -228,7 +233,9 @@ Result<EcGcClaim> project(const TreeEligibility &e, const EcV2DrainRecord &drain
   c.registeredScopes = c.releasedScopes = 1 + source;
   CHECK_RESULT(history, digest("3FS-TREE-GC-PROTECTIONS-v2", e));
   c.releaseHistory = history;
-  CHECK_RESULT(origin, digest("3FS-TREE-GC-ORIGIN-T2-v2", drain));
+  CHECK_RESULT(origin,
+               digest(drain.version == kEcV2LifecycleVersion ? "3FS-TREE-GC-ORIGIN-T2-v2"
+                                                           : "3FS-TREE-GC-ORIGIN-T2-v3", drain));
   c.originDrainEvidence = origin;
   CHECK_RESULT(eligibility, digest("3FS-TREE-GC-CLAIM-v2", c));
   c.eligibilityDigest = eligibility;
@@ -297,11 +304,9 @@ CoTryTask<EcGcClaim> EcTreeGcCatalog::claim(kv::IReadWriteTransaction &raw,
   CO_RETURN_ON_ERROR(actual);
   // executionOrigin proved the exact typed set; verify every actual endpoint,
   // including selected helpers beyond the new output instances.
-  for (size_t n = 0; n < actual->second.identity.endpoints.count; ++n) {
-    if (!actual->second.observations[n]) co_return makeError(StatusCode::kTokenStale);
-    const auto &e = *actual->second.observations[n];
-    CO_RETURN_ON_ERROR(EcVerifiedDrainAck::verify(key, actual->second, n, e.request, e.ack));
-  }
+  CO_RETURN_ON_ERROR(co_await verifyEcTerminalEvidence(t, actual->second, key,
+      actual->second.state == EcV2DrainState::Published ? EcTerminalPurpose::Publication
+                                                       : EcTerminalPurpose::FencedAbort));
   auto next = project(actual->first, actual->second, id);
   CO_RETURN_ON_ERROR(next);
   TreeClaimEvidence proof;
