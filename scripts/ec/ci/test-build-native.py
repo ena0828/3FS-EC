@@ -71,7 +71,10 @@ class BuildInputs(unittest.TestCase):
                    '--local-revision', 'a' * 40], 'scalar false false 1'),
                  (['--local-container-build-only', '--local-source', '/fixed/source',
                    '--local-work', '/fixed/native', '--local-revision', 'a' * 40,
-                   '--build-jobs', '12'], 'scalar false false 12')]
+                   '--build-jobs', '12'], 'scalar false false 12'),
+                 (['--local-container-build-only', '--local-source', '/fixed/source',
+                   '--local-work', '/fixed/native', '--local-revision', 'a' * 40,
+                   '--container-fdb-cache', '/fixed/cache'], 'scalar false false 1')]
         for argv, expected in cases:
             with self.subTest(argv=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
@@ -91,12 +94,47 @@ class BuildInputs(unittest.TestCase):
                      ['--local-work', '/a', '--local-work', '/b'],
                      ['--local-container-build-only'],
                      ['--local-container-build-only', '--local-container-build-only'],
+                     ['--container-fdb-cache', '/fixed/cache'],
+                     ['--container-fdb-cache'],
+                     ['--local-container-build-only', '--container-fdb-cache', '/fixed/cache'],
+                     ['--local-source', '/a', '--local-work', '/b', '--local-revision', 'a' * 40,
+                      '--container-fdb-cache', '/fixed/cache'],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-fdb-cache', 'relative'],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-fdb-cache', '/cache',
+                      '--container-fdb-cache', '/cache2'],
                      ['--local-source', '/a', '--local-work', '/b', '--local-revision', 'a' * 40,
                       '--build-jobs', '12']):
             with self.subTest(rejected=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 2)
                 self.assertNotIn('true false', result.stdout)
+
+    def test_real_fdb_fetch_default_and_explicit_cache_argv(self):
+        bash = bash_path()
+        if bash is None:
+            self.skipTest('Native Bash unavailable; no WSL fallback')
+        text = SCRIPT.read_text(encoding='utf-8')
+        block = text.split('# BEGIN FDB FETCH\n', 1)[1].split('# END FDB FETCH', 1)[0]
+        prefix = '''set -euo pipefail
+source_root=/fixed/source
+work=/fixed/native
+bash() { printf '%s\\n' "$@"; }
+'''
+        for cache in ('', '/fixed/cache'):
+            result = subprocess.run([bash, '-s'],
+                                    input=prefix + 'container_fdb_cache=' + shlex.quote(cache) + '\n' + block,
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = ['/fixed/source/scripts/ec/cluster/fetch-fdb.sh', '/fixed/native/fdb']
+            if cache:
+                expected += ['--container-fdb-cache', cache, '--source', '/fixed/source', '--work', '/fixed/native']
+            self.assertEqual(result.stdout.splitlines(), expected)
+        fetch = HERE.parent / 'cluster/fetch-fdb.sh'
+        result = subprocess.run([bash, '-n'], input=fetch.read_text(encoding='utf-8'),
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def resource_functions(self):
         blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", SCRIPT.read_text(encoding='utf-8'), re.S)
