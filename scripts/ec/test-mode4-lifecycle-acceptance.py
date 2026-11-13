@@ -43,6 +43,26 @@ class FakeLifecycle:
 
 
 class TestMode4Lifecycle(unittest.TestCase):
+    def test_mount_identity_binds_prepared_client_and_actual_uid_gid(self):
+        user = {"uid": 2345, "gid": 3456}
+        client = {"user_info": dict(user)}
+        preparation = {"uid": 2345}
+        DRIVER.same_user(user, client, preparation, 2345, 2345, 3456, 3456)
+        DRIVER.same_user({"uid": 1000, "gid": 1000}, {"user_info": {"uid": 1000, "gid": 1000}},
+                         {"uid": 1000}, 1000, 1000, 1000, 1000)
+        for values in ((0, 0, 3456, 3456), (2345, 0, 3456, 3456), (2345, 2345, 3456, 0),
+                       (True, True, 3456, 3456), (2345, 2345, False, False)):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                DRIVER.same_user(user, client, preparation, *values)
+        for changed_user, changed_client, changed_prep in (
+                ({"uid": 1000, "gid": 3456}, client, preparation),
+                ({"uid": 2345, "gid": 1000}, client, preparation),
+                (user, {"user_info": {"uid": 1000, "gid": 3456}}, preparation),
+                (user, {"user_info": {"uid": 2345, "gid": 1000}}, preparation),
+                (user, client, {"uid": 1000})):
+            with self.subTest(user=changed_user, client=changed_client, prep=changed_prep), self.assertRaises(ValueError):
+                DRIVER.same_user(changed_user, changed_client, changed_prep, 2345, 2345, 3456, 3456)
+
     def test_order_requires_close_and_join_before_same_state_verify(self):
         life = FakeLifecycle()
         DRIVER.run_sequence(life)

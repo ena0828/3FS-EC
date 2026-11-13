@@ -65,6 +65,7 @@ class Mode4MountPreparation(unittest.TestCase):
             (m if scope == "manifest" else c)[key] = value
             with self.subTest(scope=scope, key=key), self.assertRaises(ValueError):
                 prepare.render(m, f, l, c, **options)
+
         for value in (True, 1.5, "128", 0, 4097):
             m, f, l, c, options = self.inputs()
             with self.subTest(value=value), self.assertRaises(ValueError):
@@ -78,6 +79,21 @@ class Mode4MountPreparation(unittest.TestCase):
             mutation(f, c)
             with self.assertRaises(ValueError):
                 prepare.render(m, f, l, c, **options)
+
+    def test_nondefault_authenticated_mount_uid_keeps_original_recipe(self):
+        m, f, l, c, options = self.inputs()
+        m["authenticated_user"] = {"uid": 2345, "gid": 3456}
+        c["user_info"].update(uid=2345, gid=3456)
+        options["effective_uid"] = 2345
+        result = prepare.render(m, f, l, c, **options, create_new=True)
+        self.assertFalse(result["launcher.toml"]["allow_other"])
+        self.assertEqual(result["launcher.toml"]["token_file"], str(options["token"]))
+        expected = copy.deepcopy(result["fuse-first.toml"])
+        expected["ec_file"]["create_state"] = False
+        self.assertEqual(result["fuse-resume.toml"], expected)
+        options["effective_uid"] = 1000
+        with self.assertRaises(ValueError):
+            prepare.render(m, f, l, c, **options, create_new=True)
 
     def test_packaging_opt_in_preserves_defaults_and_requires_file_api(self):
         m, *_ = self.inputs()

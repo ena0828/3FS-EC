@@ -116,12 +116,14 @@ class PortableExperiments(unittest.TestCase):
             with self.assertRaises(ValueError):
                 prepare(root, ROOT, 19000, "v2", file_api=True)
             self.assertFalse(root.exists())
-            prepare(root, ROOT, 19000, "gc", file_api=True)
+            prepare(root, ROOT, 19000, "gc", file_api=True, user_uid=2345, user_gid=3456)
             manifest = json.loads((root / "cluster.json").read_text())
+            self.assertEqual(manifest["authenticated_user"], {"uid": 2345, "gid": 3456})
             self.assertTrue(file_api_enabled(manifest))
             self.assertEqual(key_roles(manifest), ("data", "control", "helper", "gc", "rmw"))
             self.assertIn("ec_file_cli", required_services(manifest))
             file_client = tomllib.loads((root / "client/file-client.toml").read_text())
+            self.assertEqual((file_client["user_info"]["uid"], file_client["user_info"]["gid"]), (2345, 3456))
             self.assertEqual(file_client["cluster_id"], manifest["cluster_id"])
             self.assertEqual(file_client["user_info"]["token_file"], str(root / "client/user.token"))
             self.assertNotIn("max_operations", file_client)
@@ -129,7 +131,8 @@ class PortableExperiments(unittest.TestCase):
             keys = [(root / "secrets" / (role + ".key")).read_bytes() for role in key_roles(manifest)]
             self.assertEqual(len(set(keys)), 5)
             self.assertEqual({len(key) for key in keys}, {32})
-            configs = {path.name: tomllib.loads(path.read_text()) for path in (root / "config").glob("*.toml")}
+            configs = {path.name: tomllib.loads(path.read_text()) for directory in ("config", "client")
+                       for path in (root / directory).glob("*.toml")}
             self.assertEqual(profile_config_problems(manifest, configs), [])
             meta = configs["meta_main.toml"]["server"]["meta"]
             self.assertIs(meta["enable_ec_rmw"], False)
@@ -153,6 +156,8 @@ class PortableExperiments(unittest.TestCase):
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent).resolve() / "3fs-ec-native-portable"
             prepare(root, ROOT, 19000, "gc")
+            self.assertEqual(json.loads((root / "cluster.json").read_text())["authenticated_user"],
+                             {"uid": 1000, "gid": 1000})
             for name in ("experiment-runner.py", "experiment-menu.py", "file-command.py", "ack-service-acceptance.py",
                          "ack-expected-scripts.json", "gc-acceptance.py"):
                 self.assertEqual((root / "scripts" / name).read_bytes(), (SCRIPTS / name).read_bytes())

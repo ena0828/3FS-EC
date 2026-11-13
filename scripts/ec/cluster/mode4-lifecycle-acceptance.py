@@ -25,6 +25,22 @@ def require(value, message):
         raise ValueError(message)
 
 
+def same_user(user, client, preparation, uid, euid, gid, egid):
+    """Use the prepared authenticated user; never remap FUSE request ownership."""
+    require(type(uid) is int and uid > 0 and uid == euid and type(euid) is int
+            and type(gid) is int and gid >= 0 and gid == egid and type(egid) is int,
+            "mode4 requires the same ordinary real/effective UID and GID")
+    require(type(user) is dict and set(user) == {"uid", "gid"}
+            and type(user["uid"]) is int and user["uid"] == uid
+            and type(user["gid"]) is int and user["gid"] == gid,
+            "prepared authenticated user differs from the mount user")
+    configured = client.get("user_info", {})
+    require(type(configured.get("uid")) is int and configured["uid"] == uid
+            and type(configured.get("gid")) is int and configured["gid"] == gid
+            and type(preparation.get("uid")) is int and preparation["uid"] == uid,
+            "authenticated client/preparation differs from the mount user")
+
+
 def module(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     result = importlib.util.module_from_spec(spec)
@@ -217,7 +233,8 @@ class Lifecycle:
         self.posix_file = mountpoint / "ec-lab" / (label + "-posix.bin")
         self.usr_file = mountpoint / "ec-lab" / (label + "-usrbio.bin")
         self.report = {"schema": 1, "status": "started", "root": str(root), "work": str(work),
-                       "preparation": str(args.preparation), "uid": os.geteuid(), "mounts": [], "probes": [],
+                       "preparation": str(args.preparation), "uid": os.geteuid(), "gid": os.getegid(),
+                       "authenticated_user": config["authenticated_user"], "mounts": [], "probes": [],
                        "errors": [], "services": [], "services_started_or_stopped": False,
                        "performance_validated": False, "files": {"posix": str(self.posix_file), "usrbio": str(self.usr_file)},
                        "source_sha256": locks, "driver_argv": sys.argv}
@@ -469,8 +486,8 @@ class Lifecycle:
 
 def preflight(args):
     import tomllib
-    require(sys.platform == "linux" and os.getuid() == os.geteuid() == 1000,
-            "use the prepared file-api contract's ordinary UID 1000")
+    require(sys.platform == "linux" and os.getuid() == os.geteuid() and os.geteuid() > 0
+            and os.getgid() == os.getegid(), "use one ordinary real/effective UID and GID")
     require(1 <= args.ready_timeout <= 600 and 1 <= args.command_timeout <= 3600
             and 1 <= args.join_timeout <= 600, "timeouts out of range")
     root = args.root
@@ -512,11 +529,18 @@ def preflight(args):
     try:
         sys.path.insert(0, str(scripts))
         preparation = module(scripts / "prepare-fuse-file.py", "mode4_lifecycle_preparation")
+        from native_v2_config import authenticated_user, validate_initialized_user
+        user = authenticated_user(cluster)
+        client = tomllib.loads(helper.read_file(inputs["client_cfg"], 1 << 20).decode())
+        same_user(user, client, prep, os.getuid(), os.geteuid(), os.getgid(), os.getegid())
+        initialized_path = helper.absolute(str(root / "state/initialized.json"))
+        helper.private(initialized_path)
+        validate_initialized_user(cluster, usr.load_json(helper, initialized_path))
         ec = first["ec_file"]
         rendered = preparation.render(
             cluster, tomllib.loads(helper.read_file(inputs["fuse_default"], 1 << 20).decode()),
             tomllib.loads(helper.read_file(inputs["launcher_default"], 1 << 20).decode()),
-            tomllib.loads(helper.read_file(inputs["client_cfg"], 1 << 20).decode()),
+            client,
             effective_uid=os.geteuid(), root=root, output=prep_path.parent, mountpoint=mountpoint,
             token=Path(launcher["token_file"]), create_new=True, shard_bytes=ec["shard_bytes"],
             maximum_operation_seconds=ec["maximum_operation_seconds"], retained_sessions=ec["retained_sessions"],
@@ -542,10 +566,11 @@ def preflight(args):
             "new local WORK outside the mount required")
     helper.private(work.parent)
     config_path = helper.absolute(str(root / "config/mgmtd_main.toml"))
-    config = {"cluster": cluster, "mgmtd": tomllib.loads(helper.read_file(config_path, 1 << 20).decode())}
+    config = {"cluster": cluster, "authenticated_user": user,
+              "mgmtd": tomllib.loads(helper.read_file(config_path, 1 << 20).decode())}
     require(cluster.get("storage_count") in (1, 12), "unsupported native process count")
     configured_timeout(config["mgmtd"]["server"]["service"]["client_session_timeout"])
-    paths = [Path(__file__).resolve(), prep_path, config_path, binary, unmount,
+    paths = [Path(__file__).resolve(), prep_path, config_path, initialized_path, binary, unmount,
              helper.absolute(str(root / "bin/ec_mount_read_probe")), *inputs.values(),
              *(prep_path.parent / name for name in configs),
              *(scripts / name for name in ("fuse-read-acceptance.py", "mode4-mount-acceptance.py",

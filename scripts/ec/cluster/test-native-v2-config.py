@@ -1,13 +1,126 @@
 #!/usr/bin/env python3
 """Pure configuration checks; no services, databases, keys or target directories."""
+import argparse
+import ast
+import contextlib
 import copy
-from pathlib import Path
+import io
+from pathlib import Path, PurePosixPath
+import re
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 import uuid
 
-from native_v2_config import (GC_PROFILE, PROFILE, gc_inventory_from_observations, gc_settings,
+from native_v2_config import (GC_PROFILE, PROFILE, PROFILES, authenticated_user, validate_initialized_user,
+                              gc_inventory_from_observations, gc_settings,
                               generate_configs, key_roles, pool_from_observations,
                               profile_config_problems, to_toml)
+
+
+class AuthenticatedLabUser(unittest.TestCase):
+    def test_defaults_and_rejects_ambiguous_or_reserved_user_identity(self):
+        self.assertEqual(authenticated_user({}), {"uid": 1000, "gid": 1000})
+        self.assertEqual(authenticated_user({"authenticated_user": {"uid": 2345, "gid": 3456}}),
+                         {"uid": 2345, "gid": 3456})
+        for user in (None, [], {}, {"uid": 2345}, {"uid": 2345, "gid": 3456, "other": 1},
+                     {"uid": True, "gid": 1000}, {"uid": 0, "gid": 1000},
+                     {"uid": "2345", "gid": 1000}, {"uid": 1 << 32, "gid": 1000},
+                     {"uid": (1 << 32) - 1, "gid": 1000}, {"uid": 2345, "gid": False},
+                     {"uid": 2345, "gid": -1}, {"uid": 2345, "gid": (1 << 32) - 1}):
+            with self.subTest(user=user), self.assertRaises(ValueError):
+                authenticated_user({"authenticated_user": user})
+
+    def test_generated_file_and_stripe_configs_only_change_explicit_user(self):
+        source = Path(__file__).resolve().parents[3]
+        authority, gc_authority, key, namespace = (str(uuid.UUID(int=n)) for n in range(80, 84))
+        gc = dict(authority=gc_authority, key_id=key, client_namespace=namespace,
+                  data_protocol=2, disk_format=3, gc_protocol=2)
+        root = "/tmp/3fs-ec-native-user-test"
+        manifest = dict(profile=GC_PROFILE, root=root, authority=authority, gc=gc, file_api=True,
+                        authenticated_user={"uid": 2345, "gid": 3456})
+        default, default_hashes = generate_configs(source, root, 13500, authority, "user-test",
+                                                  profile="gc", gc=gc, file_api=True)
+        actual, hashes = generate_configs(source, root, 13500, authority, "user-test",
+                                         profile="gc", gc=gc, file_api=True, user_uid=2345, user_gid=3456)
+        self.assertEqual(hashes, default_hashes)
+        for name in ("stripe-client.toml", "file-client.toml"):
+            self.assertEqual(default[name]["user_info"]["uid"], 1000)
+            self.assertEqual(default[name]["user_info"]["gid"], 1000)
+            default[name]["user_info"].update(uid=2345, gid=3456)
+        self.assertEqual(actual, default)
+        # These are Linux configuration strings; only the pure path comparison
+        # uses a POSIX flavour when this test runs on Windows.
+        with mock.patch("native_v2_config.Path", PurePosixPath):
+            self.assertEqual(profile_config_problems(manifest, actual), [])
+            for name in ("stripe-client.toml", "file-client.toml"):
+                for key in ("uid", "gid"):
+                    wrong = copy.deepcopy(actual)
+                    wrong[name]["user_info"][key] = 1000
+                    with self.subTest(name=name, key=key):
+                        self.assertTrue(profile_config_problems(manifest, wrong))
+            legacy = dict(manifest)
+            legacy.pop("authenticated_user")
+            self.assertTrue(profile_config_problems(legacy, actual))
+
+    def test_existing_initialization_never_migrates_user_or_cluster(self):
+        legacy = dict(schema=1, cluster_id="fixed")
+        validate_initialized_user(legacy, legacy)
+        current = dict(legacy, authenticated_user={"uid": 2345, "gid": 3456})
+        validate_initialized_user(current, copy.deepcopy(current))
+        for manifest, state in ((current, legacy), (legacy, current),
+                                (current, dict(current, authenticated_user={"uid": 2345, "gid": 3457})),
+                                (current, dict(current, cluster_id="changed")),
+                                (current, dict(current, schema=True))):
+            with self.subTest(manifest=manifest, state=state), self.assertRaises(ValueError):
+                validate_initialized_user(manifest, state)
+
+    def test_real_prepare_parser_forwards_pair_and_rejects_nonprepare_overrides(self):
+        # Execute the real main's parsing/prepare branch, with no Linux imports,
+        # disk preparation or service entry. An unexpected later path must fail.
+        path = Path(__file__).with_name("native-v2.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        create = mock.Mock()
+        load = mock.Mock(side_effect=AssertionError("must not inspect an existing root"))
+        system = SimpleNamespace(platform="linux", argv=[])
+        namespace = dict(argparse=argparse, Path=Path, sys=system, os=SimpleNamespace(umask=mock.Mock()),
+                         __file__=str(path), __doc__="parser test", PROFILES=PROFILES,
+                         authenticated_user=authenticated_user, prepare=create, load_manifest=load)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+        for flags, expected in (([], {"uid": 1000, "gid": 1000}),
+                                (["--user-uid", "2345", "--user-gid", "3456"], {"uid": 2345, "gid": 3456})):
+            system.argv = [str(path), "prepare", "--root", "/unused", "--profile", "gc", "--file-api", *flags]
+            with mock.patch("sys.argv", system.argv):
+                self.assertEqual(namespace["main"](), 0)
+            self.assertEqual(create.call_args.kwargs,
+                             dict(file_api=True, user_uid=expected["uid"], user_gid=expected["gid"]))
+        for command, flags in [("prepare", ["--user-uid", "2345"]), ("prepare", ["--user-gid", "3456"])] + [
+                (command, ["--user-uid", "2345", "--user-gid", "3456"])
+                for command in ("start", "doctor", "status", "stop", "fault-storage")]:
+            system.argv = [str(path), command, "--root", "/unused", *flags]
+            with self.subTest(command=command), mock.patch("sys.argv", system.argv), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                namespace["main"]()
+        self.assertEqual(create.call_count, 2)
+        load.assert_not_called()
+
+    def test_user_bootstrap_forwards_primary_gid_to_real_admin_command_builder(self):
+        path = Path(__file__).with_name("native-v2.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        cluster = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "NativeCluster")
+        node = next(n for n in cluster.body if isinstance(n, ast.FunctionDef) and n.name == "add_user")
+        namespace = {"re": re}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+        token = "A" * 24
+        owner = SimpleNamespace(run_id="fixed-run", admin=mock.Mock(return_value=f"Token {token}(Expired at N/A)"))
+        cases = [(2345, "ordinary", False, {"gid": 3456}, ["user-add", "--gid", "3456", "2345", "ordinary"]),
+                 (1000, "legacy", False, {}, ["user-add", "1000", "legacy"]),
+                 (0, "administrator", True, {}, ["user-add", "--root", "--admin", "0", "administrator"])]
+        for uid, name, administrator, options, expected in cases:
+            with self.subTest(uid=uid):
+                self.assertEqual(namespace["add_user"](owner, uid, name, administrator, **options), token)
+                owner.admin.assert_called_with(expected, f"fixed-run-create-user-{uid}.log", secret=True)
 
 
 class NativeV2Configuration(unittest.TestCase):

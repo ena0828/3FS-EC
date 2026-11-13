@@ -31,6 +31,8 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
 REPAIR_CASES = (
     "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
 )
+AUTH_USER_CASES = tuple(f"TestAuth/{backend}.{case}" for backend in (0, 1)
+                        for case in ("Basic", "ExplicitPrimaryGroup"))
 TARGET_META_CASES = (
     "TestEcTargetRetirementCatalog.RealFdbImmutableIntentAndRequestIdentity",
     "TestEcTargetRetirementCatalog.RealFdbAcceptedIntentConflictsWithAssignmentSnapshot",
@@ -68,9 +70,10 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     for name in ("source", "build", "fdb-bin-dir", "work"):
         result.add_argument("--" + name, required=True, type=Path)
-    result.add_argument("--profile", choices=("core", "repair", "target-meta"), default="core",
+    result.add_argument("--profile", choices=("core", "repair", "target-meta", "auth-user"), default="core",
                         help="core: 7 Meta + 14 FUSE; repair: three-strategy fixture; "
-                             "target-meta: 9 retirement catalogue, RPC and evidence cases")
+                             "target-meta: 9 retirement catalogue, RPC and evidence cases; "
+                             "auth-user: default and explicit primary GID with MemKV and FDB")
     return result
 
 
@@ -81,6 +84,8 @@ def selection(profile):
         return REPAIR_CASES, REPAIR_CASES[0], ()
     if profile == "target-meta":
         return TARGET_META_CASES, ":".join(TARGET_META_CASES), ()
+    if profile == "auth-user":
+        return AUTH_USER_CASES, ":".join(AUTH_USER_CASES), ()
     raise ValueError("unknown fixed acceptance profile")
 
 

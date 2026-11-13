@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Compose the existing native-GC file CLI and two-mount acceptance on fresh CI.
+"""Compose native-GC file CLI and two-mount acceptance on a fresh private tree.
 
 The ordinary hosted runner packages one new tree, hands only that tree to UID
-1000, then execs the ordinary-UID runtime. No RPC, FUSE ownership or recovery
+1000, then execs the ordinary-UID runtime. Explicit local mode keeps the actual
+ordinary UID/GID and inherited resource limits without sudo or chown.
+No RPC, FUSE ownership or recovery
 protocol is implemented here. Private logs/keys remain on the disposable host.
 Owner.command and final wait retain ownership without a local wall-clock cap;
 the enclosing workflow cap may interrupt them and is not a clean-stop proof.
@@ -14,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -25,8 +28,8 @@ TARGETS = ('storage_main', 'mgmtd_main', 'meta_main', 'admin_cli', 'ec_stripe_cl
 SERVICE_NAMES = {'fdb', 'mgmtd', 'storage', 'meta'}
 PHASE = 'arguments'
 PHASES = {'arguments', 'source', 'core', 'lab-build', 'prepare', 'package', 'copy-fdb',
-          'inventory', 'handoff', 'uid-handoff', 'exec-uid1000', 'runtime-preflight',
-          'doctor', 'bootstrap', 'cli-basic', 'cli-repair', 'dump-fuse-default.toml',
+          'inventory', 'handoff', 'uid-handoff', 'exec-uid1000', 'exec-same-user', 'runtime-preflight',
+          'doctor', 'packaged-loader', 'bootstrap', 'cli-basic', 'cli-repair', 'dump-fuse-default.toml',
           'dump-launcher-default.toml', 'prepare-fuse', 'mode4-lifecycle', 'cleanup',
           'cleanup-unknown', 'receipt'}
 
@@ -275,7 +278,85 @@ def core_gate(source, build, fdb, path):
         require(meta['binaries'][name]['sha256'] == sha(fdb / name), 'accepted FDB binary changed')
     core.command_ok(record['fuse']['listing'])
     core.command_ok(record['fuse']['execution'])
-    return {'path': str(path), 'sha256': sha(path), 'passed_tests': 21}
+    return {'path': str(path), 'sha256': sha(path), 'passed_tests': 21,
+            'binaries': {binary: record[stage]['binary_sha256']
+                         for stage, binary in (('meta', 'test_meta'), ('fuse', 'test_fuse_ec'))}}
+
+
+def build_gate(built, native, source, build, revision):
+    """Require the same formal build producer and backend as the spare lab."""
+    require(type(built.get('schema')) is int and built['schema'] == 1
+            and tuple(built.get('targets', [])) == TARGETS
+            and set(built.get('binaries', {})) == set(TARGETS), 'explicit eight-target lab build required')
+    for item in (built, native):
+        require(type(item.get('schema')) is int and item['schema'] == 1
+                and item.get('source') == str(source) and item.get('build') == str(build)
+                and item.get('revision') == revision and item.get('backend') in ('scalar', 'isal')
+                and item.get('acceptance_executed') is False, 'same-source backend build identity differs')
+    require(native.get('lab_targets_requested') is True
+            and all(built.get(key) == native.get(key) for key in
+                    ('backend', 'isal', 'build_script_sha256', 'cmake_cache_sha256'))
+            and all(native.get('binaries', {}).get(name) == digest for name, digest in built['binaries'].items()),
+            'native and lab build receipts differ')
+    if built['backend'] == 'scalar':
+        require(built.get('isal') is None, 'Scalar receipt unexpectedly selects ISA-L')
+    else:
+        provider = built.get('isal', {}).get('provider', {})
+        require(provider.get('sha256') == '40ccd5e5abaff0451feff750d2b011370a546ac4706d1b06b9285ac26eda2c3c',
+                'unexpected ISA-L provider digest')
+
+
+def local_identity(request, uid, euid, gid, egid):
+    require(type(uid) is int and uid > 0 and uid == euid and type(gid) is int and gid >= 0 and gid == egid,
+            'local mode requires unchanged ordinary real/effective UID and GID')
+    require(request.get('execution_mode') == 'local-same-user'
+            and type(request.get('creator_uid')) is int and request['creator_uid'] == uid
+            and type(request.get('target_uid')) is int and request['target_uid'] == uid
+            and type(request.get('target_gid')) is int and request['target_gid'] == gid,
+            'local OS identity differs from preparation')
+
+
+def local_shape(parent, request):
+    local_identity(request, os.getuid(), os.geteuid(), os.getgid(), os.getegid())
+    private(parent, os.geteuid())
+    private(parent.parent, os.geteuid())
+    require(type(request.get('schema')) is int and request['schema'] == 1
+            and request.get('parent') == str(parent)
+            and request.get('parent_identity') == [parent.stat().st_dev, parent.stat().st_ino],
+            'local preparation identity differs')
+
+
+def mount_host_gate():
+    """Check prerequisites without mounting or changing host permissions."""
+    import resource
+    for which, minimum in ((resource.RLIMIT_NOFILE, 65536), (resource.RLIMIT_MEMLOCK, 3 << 30)):
+        require(all(value == resource.RLIM_INFINITY or value >= minimum for value in resource.getrlimit(which)),
+                'runtime resource limit insufficient')
+    tool = shutil.which('fusermount3')
+    require(tool is not None, 'system fusermount3 is required')
+    unmount = Path(tool).resolve(strict=True)
+    require(unmount.is_file() and os.access(unmount, os.X_OK), 'fusermount3 is not executable')
+    fd = os.open('/dev/fuse', os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        require(stat.S_ISCHR(os.fstat(fd).st_mode), '/dev/fuse is not a character device')
+    finally:
+        os.close(fd)
+    return {'fusermount3': str(unmount), 'sha256': sha(unmount), 'device_opened': True,
+            'mount_permission_proven': False}
+
+
+def resolution_gate(backend, text, lab, *, fuse=False):
+    require('not found' not in text, 'packaged runtime library unresolved')
+    observed = {}
+    for name in ('libisal.so.2', 'libfdb_c.so', 'libfuse3.so.3'):
+        matches = re.findall(r'^\s*' + re.escape(name) + r'\s+=>\s+(\S+)\s+\(', text, re.M)
+        if matches:
+            require(matches == [str(lab / 'lib' / name)], 'loader resolved a provider outside the package')
+            observed[name] = matches[0]
+    require((backend == 'isal' and 'libisal.so.2' in observed)
+            or (backend == 'scalar' and 'libisal' not in text), 'loader differs from the selected codec backend')
+    require(not fuse or 'libfuse3.so.3' in observed, 'FUSE loader provider is missing')
+    return observed
 
 
 def require_cli_result(value):
@@ -363,15 +444,23 @@ def stop_signals(owner):
 
 def runtime(parent):
     phase('runtime-preflight')
-    require(os.getuid() == os.geteuid() == 1000 and os.getgid() == 1000, 'runtime requires actual UID/GID1000')
-    private(parent, 1000)
+    private(parent, os.geteuid())
     request = read_json(parent / 'handoff-request.json')
-    handoff_shape(parent, request)
+    local = request.get('execution_mode') == 'local-same-user'
+    if local:
+        local_shape(parent, request)
+    else:
+        require(os.getuid() == os.geteuid() == os.getgid() == os.getegid() == 1000,
+                'hosted runtime requires actual UID/GID1000')
+        handoff_shape(parent, request)
     marker = read_json(parent / 'handoff-complete.json')
+    require(marker.get('uid') == os.geteuid() and marker.get('gid') == os.getegid(), 'prepared owner differs')
+    require(not local or marker.get('ownership_changed') is False, 'local mode cannot change ownership')
     require(marker['request_sha256'] == sha(parent / 'handoff-request.json')
             and marker['parent_identity'] == request['parent_identity']
-            and request['parent_identity'] == [parent.stat().st_dev, parent.stat().st_ino], 'handoff proof differs')
-    require([row for row in tree_rows(parent, 1000) if row['path'] not in
+            and request['parent_identity'] == [parent.stat().st_dev, parent.stat().st_ino]
+            and sha(Path(__file__).resolve()) == request['driver_sha256'], 'handoff/source proof differs')
+    require([row for row in tree_rows(parent, os.geteuid()) if row['path'] not in
              ('handoff-request.json', 'handoff-complete.json')] == request['inventory'], 'post-handoff inputs changed')
     lab = parent / '3fs-ec-native-file'
     sys.path.insert(0, str(lab / 'scripts'))
@@ -381,21 +470,22 @@ def runtime(parent):
     output.mkdir(mode=0o700)
     owner = helper.Owner(output)
     previous = stop_signals(owner)
-    report = {'schema': 1, 'status': 'running', 'revision': request['revision'], 'uid': 1000,
+    report = {'schema': 1, 'status': 'running', 'revision': request['revision'], 'uid': os.geteuid(),
+              'gid': os.getegid(), 'execution_mode': request.get('execution_mode', 'hosted-handoff'),
+              'preparation_sha256': sha(parent / 'handoff-request.json'),
+              'native_build_sha256': request['native_build_sha256'], 'lab_build_sha256': request['lab_build_sha256'],
+              'backend_validation': request['backend_validation'],
               'core': request['core'], 'receipts': [], 'services_started': False, 'exitcode': 1}
     supervisor = None
     failure = None
     lifecycle_started = False
     try:
-        import resource
-        for which, minimum in ((resource.RLIMIT_NOFILE, 65536), (resource.RLIMIT_MEMLOCK, 3 << 30)):
-            require(resource.getrlimit(which)[0] in (resource.RLIM_INFINITY,) or
-                    resource.getrlimit(which)[0] >= minimum, 'runtime resource limit insufficient')
-        fd = os.open('/dev/fuse', os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            require(stat.S_ISCHR(os.fstat(fd).st_mode), '/dev/fuse is not a character device')
-        finally:
-            os.close(fd)
+        report['mount_host'] = mount_host_gate()
+        manifest = read_json(lab / 'cluster.json')
+        remote_user = manifest.get('authenticated_user', {'uid': 1000, 'gid': 1000})
+        require(remote_user == {'uid': os.geteuid(), 'gid': os.getegid()},
+                'fresh remote file identity differs from runtime UID/GID')
+        report['authenticated_user'] = remote_user
         os.environ.pop('LD_PRELOAD', None)
         os.environ['LD_LIBRARY_PATH'] = str(lab / 'lib')
         def command(name, argv):
@@ -405,6 +495,11 @@ def runtime(parent):
             owner.checkpoint()
             return result
         command('doctor', [sys.executable, '-B', lab / 'scripts/native-v2.py', 'doctor', '--root', lab])
+        report['packaged_loader'] = {}
+        for name in ('storage_main', 'hf3fs_fuse_main'):
+            listing = command('packaged-loader', ['ldd', lab / 'bin' / name]).decode('utf-8')
+            report['packaged_loader'][name] = resolution_gate(
+                request['backend_validation']['backend'], listing, lab, fuse=name == 'hf3fs_fuse_main')
         phase('bootstrap')
         log = (output / 'supervisor.log').open('xb')
         try:
@@ -542,35 +637,56 @@ def runtime(parent):
 
 def prepare(args):
     phase('source')
-    require(os.getuid() == os.geteuid() == 1001, 'preparation requires the observed ordinary hosted UID1001')
-    require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('RUNNER_OS') == 'Linux', 'hosted Linux job required')
-    run_id, attempt = os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']
-    require(all(re.fullmatch(r'[1-9][0-9]*', x) for x in (run_id, attempt)), 'invalid hosted run identity')
+    local = args.local_work is not None
     source, build, fdb, core_path = map(canonical, (args.source, args.build, args.fdb_bin_dir, args.core_record))
-    work = canonical(Path(os.environ['RUNNER_TEMP']) / 'ec-native')
-    require(source == canonical(Path(os.environ['GITHUB_WORKSPACE'])) and build == work / 'build'
-            and fdb == work / 'fdb/bin' and core_path == work / 'acceptance/results.json', 'unexpected source/build/core paths')
+    if local:
+        require(os.getuid() == os.geteuid() and os.getuid() > 0 and os.getgid() == os.getegid(),
+                'local mode requires unchanged ordinary real/effective UID and GID')
+        work = canonical(build.parent)
+        require(build.name == 'build' and fdb == work / 'fdb/bin', 'local build/FDB layout differs')
+        private(args.local_work.parent, os.geteuid())
+        require(args.local_work.is_absolute() and '..' not in args.local_work.parts
+                and not os.path.lexists(args.local_work), 'fresh canonical local work required')
+        require(all(not args.local_work.is_relative_to(path) and not path.is_relative_to(args.local_work)
+                    for path in (source, work, core_path.parent)), 'local lab overlaps source/build/core work')
+        require(len(os.fsencode(args.local_work / '3fs-ec-native-file/state/control.sock')) < 104,
+                'local work path is too long for the control socket')
+        mount_host_gate()
+        run_id, attempt = None, None
+    else:
+        require(os.getuid() == os.geteuid() == 1001, 'preparation requires the observed ordinary hosted UID1001')
+        require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('RUNNER_OS') == 'Linux', 'hosted Linux job required')
+        run_id, attempt = os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']
+        require(all(re.fullmatch(r'[1-9][0-9]*', x) for x in (run_id, attempt)), 'invalid hosted run identity')
+        work = canonical(Path(os.environ['RUNNER_TEMP']) / 'ec-native')
+        require(source == canonical(Path(os.environ['GITHUB_WORKSPACE'])) and build == work / 'build'
+                and fdb == work / 'fdb/bin' and core_path == work / 'acceptance/results.json', 'unexpected source/build/core paths')
     require(Path(__file__).resolve() == source / 'scripts/ec/ci/run-file-lab.py', 'use the checked-out formal driver')
     revision = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
-    require(revision == os.environ['GITHUB_SHA'], 'source is not the triggering revision')
+    require(local or revision == os.environ['GITHUB_SHA'], 'source is not the triggering revision')
     subprocess.run(['git', '-C', str(source), 'diff', '--exit-code', 'HEAD', '--ignore-submodules=all'], check=True,
                    stdout=subprocess.DEVNULL)
     phase('core')
     core = core_gate(source, build, fdb, core_path)
     phase('lab-build')
     built = read_json(work / 'provenance/lab-build.json')
-    require(built['schema'] == 1 and built['source'] == str(source) and built['build'] == str(build)
-            and built['revision'] == revision and tuple(built['targets']) == TARGETS
-            and set(built['binaries']) == set(TARGETS)
-            and built['build_script_sha256'] == sha(source / 'scripts/ec/ci/build-native.sh'), 'explicit lab build receipt differs')
+    native_path = work / 'provenance/native-build.json'
+    native_build = read_json(native_path)
+    build_gate(built, native_build, source, build, revision)
+    require(all(native_build['binaries'].get(name) == digest for name, digest in core['binaries'].items()),
+            'accepted core binaries differ from the same native build')
+    require(built['build_script_sha256'] == sha(source / 'scripts/ec/ci/build-native.sh')
+            and built.get('cmake_cache_sha256') == sha(build / 'CMakeCache.txt')
+            and built.get('native_build_receipt_sha256') == sha(native_path), 'backend/native build input binding differs')
     require(all(built['binaries'][name] == sha(build / 'bin' / name) for name in TARGETS), 'lab binary changed')
-    output = work / 'lab-preparation'
+    output = args.local_work.with_name(args.local_work.name + '-preparation') if local else work / 'lab-preparation'
     output.mkdir(mode=0o700)
     helper = module(source / 'scripts/ec/cluster/fuse-read-acceptance.py', 'lab_prepare_owner')
     owner = helper.Owner(output)
     previous = stop_signals(owner)
-    parent = Path('/tmp') / ('ec-h-' + run_id + '-' + attempt)
-    require(not os.path.lexists(parent) and canonical(parent.parent) == Path('/tmp'), 'fresh fixed handoff path required')
+    parent = args.local_work if local else Path('/tmp') / ('ec-h-' + run_id + '-' + attempt)
+    require(not os.path.lexists(parent) and (local or canonical(parent.parent) == Path('/tmp')),
+            'fresh preparation root required')
     parent.mkdir(mode=0o700)
     lab = parent / '3fs-ec-native-file'
     try:
@@ -580,8 +696,11 @@ def prepare(args):
             data = owner.command(name, argv)
             owner.checkpoint()
             return data
-        command('prepare', [sys.executable, '-B', source / 'scripts/ec/cluster/native-v2.py', 'prepare',
-                           '--root', lab, '--source', source, '--profile', 'gc', '--file-api', '--port-base', '13500'])
+        prepare_argv = [sys.executable, '-B', source / 'scripts/ec/cluster/native-v2.py', 'prepare',
+                        '--root', lab, '--source', source, '--profile', 'gc', '--file-api', '--port-base', '13500']
+        if local:
+            prepare_argv.extend(['--user-uid', str(os.geteuid()), '--user-gid', str(os.getegid())])
+        command('prepare', prepare_argv)
         command('package', [sys.executable, '-B', source / 'scripts/ec/package-services.py', '--build', build,
                            '--output', lab, '--native-gc', '--ec-file-mount'])
         manifests = list((lab / 'provenance').glob('services-*/manifest.json'))
@@ -608,29 +727,45 @@ def prepare(args):
         driver_sha = copy_new(Path(__file__).resolve(), parent / 'tools/run-file-lab.py')
         phase('inventory')
         request = {'schema': 1, 'parent': str(parent), 'parent_identity': [parent.stat().st_dev, parent.stat().st_ino],
-                   'creator_uid': 1001, 'target_uid': 1000, 'run_id': run_id, 'run_attempt': attempt,
+                   'creator_uid': os.geteuid() if local else 1001, 'target_uid': os.geteuid() if local else 1000,
+                   'target_gid': os.getegid() if local else 1000, 'run_id': run_id, 'run_attempt': attempt,
+                   'execution_mode': 'local-same-user' if local else 'hosted-handoff',
                    'revision': revision, 'core': core, 'driver_sha256': driver_sha,
                    'backend_validation': backend_validation,
                    'package_manifest_sha256': sha(manifests[0]), 'lab_build_sha256': sha(work / 'provenance/lab-build.json'),
-                   'inventory': tree_rows(parent, 1001)}
+                   'native_build_sha256': sha(native_path),
+                   'inventory': tree_rows(parent, os.geteuid())}
         write_new(parent / 'handoff-request.json', request)
         request_sha = sha(parent / 'handoff-request.json')
-        marker = json.loads(command('handoff', ['sudo', '-n', '/usr/bin/python3', '-I', parent / 'tools/run-file-lab.py',
-                                               '--handoff', parent, '--request-sha256', request_sha]))
-        require(marker['request_sha256'] == request_sha and marker['uid'] == 1000, 'handoff response differs')
+        if local:
+            import pwd
+            marker = {'schema': 1, 'request_sha256': request_sha, 'uid': os.geteuid(), 'gid': os.getegid(),
+                      'user': pwd.getpwuid(os.geteuid()).pw_name, 'parent_identity': request['parent_identity'],
+                      'services_started': False, 'ownership_changed': False}
+            write_new(parent / 'handoff-complete.json', marker)
+        else:
+            marker = json.loads(command('handoff', ['sudo', '-n', '/usr/bin/python3', '-I', parent / 'tools/run-file-lab.py',
+                                                   '--handoff', parent, '--request-sha256', request_sha]))
+        require(marker['request_sha256'] == request_sha and marker['uid'] == (os.geteuid() if local else 1000),
+                'handoff response differs')
         write_new(output / 'prepared.json', {'schema': 1, 'parent': str(parent), 'revision': revision,
                   'request_sha256': request_sha, 'handoff': marker, 'services_started': False})
         owner.checkpoint()
-        phase('exec-uid1000')
+        phase('exec-same-user' if local else 'exec-uid1000')
         argv = ['/usr/bin/sudo', '-n', 'prlimit', '--memlock=3221225472:3221225472', '--nofile=65536:65536', '--',
                 'setpriv', '--reuid=1000', '--regid=1000', '--clear-groups', 'env', '--chdir=' + str(parent),
                 'HOME=' + str(parent / 'home'), 'USER=' + marker['user'], 'LOGNAME=' + marker['user'],
                 'TMPDIR=' + str(parent / 'tmp'), 'LD_LIBRARY_PATH=' + str(lab / 'lib'),
                 'PATH=/usr/local/bin:/usr/bin:/bin', '/usr/bin/python3', '-I', parent / 'tools/run-file-lab.py',
                 '--run-owned', parent]
-        # Transfer the foreground command to sudo, whose normal signal forwarding
-        # and exit propagation own the UID1000 runtime. No cross-UID background
-        # Popen is discarded or later signalled from an unprivileged parent.
+        if local:
+            argv = ['/usr/bin/env', '--chdir=' + str(parent), 'HOME=' + str(parent / 'home'),
+                    'USER=' + marker['user'], 'LOGNAME=' + marker['user'], 'TMPDIR=' + str(parent / 'tmp'),
+                    'LD_LIBRARY_PATH=' + str(lab / 'lib'), 'PATH=/usr/local/bin:/usr/bin:/bin',
+                    '/usr/bin/python3', '-I', parent / 'tools/run-file-lab.py', '--run-owned', parent]
+        # Replace this foreground command with its runtime. Hosted sudo forwards
+        # signals/exit to UID1000; local exec keeps the same user and limits.
+        # No cross-UID background Popen is discarded or adopted later.
         for sig in previous:
             signal.signal(sig, signal.SIG_DFL)
         os.execv(argv[0], list(map(str, argv)))
@@ -643,11 +778,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('source', 'build', 'fdb-bin-dir', 'core-record'):
         parser.add_argument('--' + name, type=Path)
+    parser.add_argument('--local-work', type=Path, help='fresh private same-user work; no hosted environment or chown')
     internal = parser.add_mutually_exclusive_group()
     internal.add_argument('--handoff', type=Path, help=argparse.SUPPRESS)
     internal.add_argument('--run-owned', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--request-sha256', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    require(sys.version_info >= (3, 11), 'Python 3.11 or newer required')
     require(sys.platform == 'linux', 'Linux only; no WSL/VM launcher is implemented')
     os.umask(0o077)
     sys.dont_write_bytecode = True

@@ -21,7 +21,7 @@ import tomllib
 
 from native_fault_control import FaultController, initial_placement, validate_placement
 from native_v2_config import (PROFILES, SERVICES, SPARE_GC_PROFILE, target_count, file_api_enabled, required_services,
-                              gc_inventory_from_observations, gc_settings, json_text,
+                              authenticated_user, validate_initialized_user, gc_inventory_from_observations, gc_settings, json_text,
                               key_roles, pool_from_observations, prepare, profile_config_problems,
                               replace_private, storage_process_count, storage_specs, topology_problems, to_toml, write_new)
 
@@ -45,6 +45,7 @@ def load_manifest(root):
         raise RuntimeError("Not a matching explicitly prepared native process topology")
     gc_settings(data)
     file_api_enabled(data)
+    authenticated_user(data)
     for directory in ("config", "secrets", "client", "state", "logs", "scripts", "data", "bin", "lib"):
         path = root / directory
         if path.is_symlink() or not path.is_dir():
@@ -93,6 +94,11 @@ def doctor(root, check_ports=True):
     for path in list((root / "config").glob("*.toml")) + list((root / "client").glob("*.toml")):
         configs[path.name] = tomllib.loads(path.read_text(encoding="utf-8"))
     problems.extend(profile_config_problems(manifest, configs))
+    initialized = root / "state/initialized.json"
+    if initialized.exists():
+        if initialized.is_symlink():
+            raise RuntimeError("Refusing redirected initialization record")
+        validate_initialized_user(manifest, json.loads(initialized.read_text(encoding="utf-8")))
     # This flag exits before IB, FDB or server initialization. The three
     # launchers have fixed top-level objects. Do not treat the full default
     # dump as a schema: unset optional nested fields (e.g. network_type) are
@@ -290,6 +296,8 @@ class NativeCluster(inherited_runner()):
                 raise RuntimeError("initialize requires empty task data directories; never reuse or clear an old database")
         elif not initialized.is_file():
             raise RuntimeError("resume requires successful initialization; partial bootstrap needs administrator diagnosis")
+        else:
+            validate_initialized_user(self.manifest, json.loads(initialized.read_text(encoding="utf-8")))
         for path in data_paths:
             if path.is_symlink():
                 raise RuntimeError("Refusing redirected database directory")
@@ -419,8 +427,9 @@ class NativeCluster(inherited_runner()):
         text = self.admin(["list-nodes"], f"node-{node}.log")
         return bool(re.search(rf"^{node}\s+{kind}\s+HEARTBEAT_CONNECTED\b", text, re.MULTILINE))
 
-    def add_user(self, uid, name, administrator=False):
-        args = ["user-add"] + (["--root", "--admin"] if administrator else []) + [str(uid), name]
+    def add_user(self, uid, name, administrator=False, *, gid=None):
+        args = (["user-add"] + (["--root", "--admin"] if administrator else [])
+                + (["--gid", str(gid)] if gid is not None else []) + [str(uid), name])
         output = self.admin(args, f"{self.run_id}-create-user-{uid}.log", secret=True)
         found = re.findall(r"^Token\s+([A-Za-z0-9+/]{24})\(Expired", output, flags=re.MULTILINE)
         if len(found) != 1:
@@ -446,7 +455,8 @@ class NativeCluster(inherited_runner()):
             admin = tomllib.loads((self.config / "admin_cli.toml").read_text())
             admin["user_info"]["token"] = self.add_user(0, "native-lab-admin", True)
             replace_private(self.config / "admin_cli.toml", to_toml(admin))
-            user_token = self.add_user(1000, "native-lab-user")
+            user = authenticated_user(self.manifest)
+            user_token = self.add_user(user["uid"], "native-lab-user", gid=user["gid"])
             write_new(self.root / "client/user.token", user_token + "\n")
             # This initializes only the metadata root and configuration records;
             # no ordinary replicated data target or FUSE process is created.
@@ -540,9 +550,11 @@ class NativeCluster(inherited_runner()):
         self.startup_memory_guard()
         if self.mode == "initialize":
             self.admin(["mkdir", "/ec-lab", "--perm", "0700"], "mkdir-user-workspace.log")
-            self.admin(["set-perm", "/ec-lab", "-u", "1000", "-g", "1000", "-p", "0700"], "chown-user-workspace.log")
+            user = authenticated_user(self.manifest)
+            self.admin(["set-perm", "/ec-lab", "-u", str(user["uid"]), "-g", str(user["gid"]), "-p", "0700"],
+                       "chown-user-workspace.log")
             write_new(self.root / "state/initialized.json", json_text({"schema": 1, "run": self.run_id,
-                "cluster_id": self.manifest["cluster_id"], "physical_pool": pool}))
+                "cluster_id": self.manifest["cluster_id"], "physical_pool": pool, "authenticated_user": user}))
         self.stage = "ready"
         self.healthy()
         # Startup resource sampling is outside the experiment's timed region.
@@ -599,6 +611,8 @@ def main():
     parser.add_argument("--mode", choices=["initialize", "resume"], default="resume")
     parser.add_argument("--file-api", action="store_true",
                         help="prepare only: enable EC file sessions and RMW on a fresh gc/gc-12/gc-14 profile")
+    parser.add_argument("--user-uid", type=int, help="prepare only: authenticated ordinary UID; supply with --user-gid")
+    parser.add_argument("--user-gid", type=int, help="prepare only: authenticated GID; both default to 1000")
     parser.add_argument("--run", help="fault action: exact live supervisor run from status")
     parser.add_argument("--action-id", help="fault action: caller-saved nonzero UUID; never regenerated on retry")
     parser.add_argument("--wait-seconds", type=int, default=600,
@@ -613,10 +627,15 @@ def main():
     if args.command == "prepare":
         if args.run or args.action_id or args.nodes or args.replace:
             parser.error("Fault action arguments cannot be used with prepare")
-        prepare(root, args.source, args.port_base, args.profile or "v2", file_api=args.file_api)
+        if (args.user_uid is None) != (args.user_gid is None):
+            parser.error("--user-uid and --user-gid must be supplied together")
+        user = authenticated_user({"authenticated_user": {"uid": 1000 if args.user_uid is None else args.user_uid,
+                                                         "gid": 1000 if args.user_gid is None else args.user_gid}})
+        prepare(root, args.source, args.port_base, args.profile or "v2", file_api=args.file_api,
+                user_uid=user["uid"], user_gid=user["gid"])
         return 0
-    if args.profile is not None or args.file_api:
-        parser.error("--profile/--file-api are prepare-only; start/resume uses the immutable prepared profile")
+    if args.profile is not None or args.file_api or args.user_uid is not None or args.user_gid is not None:
+        parser.error("--profile/--file-api/--user-uid/--user-gid are prepare-only; start/resume uses the immutable prepared profile")
     load_manifest(root)
     if args.command in {"fault-storage", "restart-storage", "replace-placement", "action-status"}:
         if not args.run or not args.action_id:

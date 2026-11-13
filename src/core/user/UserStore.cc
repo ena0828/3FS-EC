@@ -57,7 +57,8 @@ CoTryTask<UserAttr> UserStore::addUser(IReadWriteTransaction &txn,
                                        std::vector<Gid> groups,
                                        bool isRootUser,
                                        bool isAdmin,
-                                       std::string_view token) {
+                                       std::string_view token,
+                                       std::optional<Gid> gid) {
   auto key = packUid(uid);
   auto getResult = co_await txn.snapshotGet(key);
   CO_RETURN_ON_ERROR(getResult);
@@ -66,7 +67,7 @@ CoTryTask<UserAttr> UserStore::addUser(IReadWriteTransaction &txn,
   UserAttr attr;
   attr.name = std::move(name);
   attr.uid = uid;
-  attr.gid = flat::Gid(uid);
+  attr.gid = gid.value_or(flat::Gid(uid));
   attr.groups = std::move(groups);
   attr.root = isRootUser;
   attr.admin = isAdmin;

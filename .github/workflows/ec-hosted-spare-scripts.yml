@@ -1,8 +1,8 @@
-name: EC spare Storage script checks
+name: EC native experiment script checks
 
 on:
   push:
-    branches: [feat/ec-spare-faults]
+    branches: [feat/ec-spare-faults, feat/ec-local-file]
     paths:
       - .github/workflows/ec-hosted-spare-scripts.yml
       - scripts/ec/**
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   scripts:
-    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-spare-faults' && github.event.repository.private == false
+    if: github.repository == 'ena0828/3FS-EC' && (github.ref == 'refs/heads/feat/ec-spare-faults' || github.ref == 'refs/heads/feat/ec-local-file') && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -53,14 +53,21 @@ jobs:
           scripts = source / "scripts/ec/cluster"
           sys.path.insert(0, str(scripts))
           suites = {
-              "test-native-v2-config.py": 13,
-              "test-native-multiprocess-config.py": 6,
-              "test-native-spare-storage.py": 7,
-              "test-portable-experiments.py": 4,
+              "cluster/test-native-v2-config.py": 18,
+              "cluster/test-native-multiprocess-config.py": 6,
+              "cluster/test-native-spare-storage.py": 7,
+              "cluster/test-portable-experiments.py": 5,
+              "cluster/test-prepare-fuse-file.py": 4,
+              "ci/test-run-file-lab.py": 18,
+              "ci/test-run-core-tests.py": 16,
+              "ci/test-run-spare-lab.py": 10,
+              "ci/test-run-fault-matrix.py": 6,
+              "test-mode4-lifecycle-acceptance.py": 14,
           }
           rows = []
           for filename, expected in suites.items():
-              spec = importlib.util.spec_from_file_location(filename[:-3].replace("-", "_"), scripts / filename)
+              path = source / "scripts/ec" / filename
+              spec = importlib.util.spec_from_file_location("ec_script_check_" + str(len(rows)), path)
               module = importlib.util.module_from_spec(spec)
               sys.modules[spec.name] = module
               spec.loader.exec_module(module)
@@ -68,7 +75,7 @@ jobs:
               if suite.countTestCases() != expected:
                   raise SystemExit(f"Unexpected test inventory in {filename}")
               result = unittest.TextTestRunner(verbosity=2).run(suite)
-              rows.append({"file": filename, "sha256": hashlib.sha256((scripts / filename).read_bytes()).hexdigest(),
+              rows.append({"file": filename, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                            "run": result.testsRun, "expected": expected, "skipped": len(result.skipped),
                            "failures": len(result.failures), "errors": len(result.errors),
                            "passed": result.wasSuccessful() and not result.skipped and result.testsRun == expected})

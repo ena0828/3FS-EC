@@ -22,6 +22,25 @@ PROFILES = {"v2": PROFILE, "gc": GC_PROFILE, "v2-12": MULTI_PROFILE,
             "gc-12": MULTI_GC_PROFILE, "gc-14": SPARE_GC_PROFILE}
 
 
+def authenticated_user(manifest):
+    """Missing metadata means the historical 1000/1000 user, never this OS user."""
+    user = manifest.get("authenticated_user", {"uid": 1000, "gid": 1000})
+    if type(user) is not dict or set(user) != {"uid", "gid"} or \
+            type(user["uid"]) is not int or not 1 <= user["uid"] < (1 << 32) - 1 or \
+            type(user["gid"]) is not int or not 0 <= user["gid"] < (1 << 32) - 1:
+        raise ValueError("Require an explicit ordinary UID and GID; no root, booleans or reserved IDs")
+    return dict(user)
+
+
+def validate_initialized_user(manifest, initialized):
+    """An existing database cannot acquire a different user through configuration."""
+    if type(manifest.get("cluster_id")) is not str or not manifest["cluster_id"] or \
+            type(initialized) is not dict or type(initialized.get("schema")) is not int or initialized["schema"] != 1 or \
+            initialized.get("cluster_id") != manifest.get("cluster_id") or \
+            authenticated_user(initialized) != authenticated_user(manifest):
+        raise ValueError("Initialized cluster/user differs; prepare a fresh lab instead of migrating old state")
+
+
 def storage_process_count(manifest):
     profile = manifest.get("profile")
     if profile in (PROFILE, GC_PROFILE):
@@ -130,6 +149,11 @@ def profile_config_problems(manifest, configs):
     # use actual per-node paths; no generic STORAGE template can replace them.
     names = ["storage_main.toml"] if count == 1 else [f"storage-{10001+i}.toml" for i in range(count)]
     problems = []
+    user = authenticated_user(manifest)
+    for name in ("stripe-client.toml", "file-client.toml") if file_api else ("stripe-client.toml",):
+        configured = configs.get(name, {}).get("user_info", {})
+        if any(type(configured.get(key)) is not int or configured[key] != value for key, value in user.items()):
+            problems.append(f"{name} authenticated UID/GID differs from the prepared user")
     for name in names:
         storage = configs[name]["server"]
         targets, service = storage["targets"], storage["storage"]
@@ -225,8 +249,10 @@ def tcp_only(value):
                 tcp_only(item)
 
 
-def generate_configs(source, root, port_base, authority, cluster_id, *, profile="v2", gc=None, file_api=False):
+def generate_configs(source, root, port_base, authority, cluster_id, *, profile="v2", gc=None, file_api=False,
+                     user_uid=1000, user_gid=1000):
     """Pure configuration generation, shared by prepare and configuration tests."""
+    user = authenticated_user({"authenticated_user": {"uid": user_uid, "gid": user_gid}})
     if profile not in PROFILES:
         raise ValueError("Unknown native profile")
     requested = {"profile": PROFILES[profile], "authority": authority}
@@ -369,7 +395,7 @@ def generate_configs(source, root, port_base, authority, cluster_id, *, profile=
     client = tomllib.loads(client_path.read_text(encoding="utf-8"))
     client.update(cluster_id=cluster_id, worker_threads=2, max_operations=1,
                   max_application_bytes=33554432, write_fragments=2, read_blocks=1)
-    client["user_info"].update(uid=1000, gid=1000, token_file=f"{root}/client/user.token")
+    client["user_info"].update(**user, token_file=f"{root}/client/user.token")
     client["mgmtd_client"]["mgmtd_server_addresses"] = [mgmtd_address]
     configs["stripe-client.toml"] = client
     if file_api:
@@ -397,7 +423,7 @@ def generate_configs(source, root, port_base, authority, cluster_id, *, profile=
     return configs, hashes
 
 
-def prepare(root, source, port_base, profile="v2", *, file_api=False):
+def prepare(root, source, port_base, profile="v2", *, file_api=False, user_uid=1000, user_gid=1000):
     if os.name != "posix":
         raise RuntimeError("prepare requires the target Linux filesystem and permission semantics")
     original = root.absolute()
@@ -406,6 +432,7 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False):
         raise RuntimeError("Use a new absolute, non-symlink task directory named 3fs-ec-native-*")
     if not root.parent.is_dir() or root.exists():
         raise RuntimeError("Parent must exist; the task directory must not exist (no overwrite or adoption)")
+    user = authenticated_user({"authenticated_user": {"uid": user_uid, "gid": user_gid}})
     count = storage_process_count({"profile": PROFILES.get(profile)})
     if type(port_base) is not int or not 1024 <= port_base <= 65535 - (count + 2):
         raise RuntimeError("port-base leaves insufficient consecutive ports for this profile")
@@ -415,7 +442,8 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False):
         gc = {"authority": str(uuid.uuid4()), "key_id": str(uuid.uuid4()), "client_namespace": str(uuid.uuid4()),
               "data_protocol": 2, "disk_format": 3, "gc_protocol": 2 if file_api else 1}
     configs, hashes = generate_configs(source.resolve(strict=True), root, port_base, authority, cluster_id,
-                                       profile=profile, gc=gc, file_api=file_api)
+                                       profile=profile, gc=gc, file_api=file_api,
+                                       user_uid=user["uid"], user_gid=user["gid"])
     root.mkdir(mode=0o700)
     for name in ("config", "secrets", "client", "state", "logs", "scripts", "data", "bin", "lib", "provenance"):
         (root / name).mkdir(mode=0o700)
@@ -433,6 +461,7 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False):
     write_new(root / "config/chains.csv", "ChainId,TargetId\n" + "".join(f"{e['chain']},{e['target']}\n" for e in endpoints))
     write_new(root / "config/chain-table.csv", "ChainId\n" + "".join(f"{e['chain']}\n" for e in endpoints))
     manifest = {"schema": 1, "profile": PROFILES[profile], "root": str(root), "cluster_id": cluster_id,
+        "authenticated_user": user,
         "authority": authority, "port_base": port_base, "storage_count": count, "logical_target_count": len(endpoints),
         "independent_storage_failure_domains": 1, "endpoints": endpoints, "source_config_sha256": hashes,
         "fdb_version": "7.3.63", "state": "prepared_not_started", "performance_validated": False}

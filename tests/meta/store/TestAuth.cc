@@ -103,5 +103,56 @@ TYPED_TEST(TestAuth, Basic) {
   }());
 }
 
+TYPED_TEST(TestAuth, ExplicitPrimaryGroup) {
+  folly::coro::blockingWait([&]() -> CoTask<void> {
+    MockCluster::Config config;
+    config.mock_meta().set_authenticate(true);
+    auto cluster = this->createMockCluster(config);
+    auto &meta = cluster.meta().getOperator();
+    core::UserStore store;
+    const flat::Uid uid(2345), historicalUid(1001);
+    const flat::Gid gid(3456);
+    const std::vector<flat::Gid> groups{flat::Gid(4567)};
+    UserAttr user, historical;
+    READ_WRITE_TRANSACTION_OK({
+      auto added = co_await store.addUser(*txn, uid, "distinct-primary-group", groups, false, false, {}, gid);
+      CO_ASSERT_OK(added);
+      user = *added;
+      auto legacy = co_await store.addUser(*txn, historicalUid, "default-primary-group", {}, false);
+      CO_ASSERT_OK(legacy);
+      historical = *legacy;
+    });
+    READ_ONLY_TRANSACTION({
+      auto loaded = co_await store.getUser(*txn, uid);
+      CO_ASSERT_OK(loaded);
+      CO_ASSERT_TRUE(loaded->has_value());
+      CO_ASSERT_EQ(loaded->value().uid, uid);
+      CO_ASSERT_EQ(loaded->value().gid, gid);
+      CO_ASSERT_EQ(loaded->value().groups, groups);
+      CO_ASSERT_FALSE(loaded->value().root);
+      CO_ASSERT_FALSE(loaded->value().admin);
+      CO_ASSERT_EQ(loaded->value().token, user.token);
+      auto legacy = co_await store.getUser(*txn, historicalUid);
+      CO_ASSERT_OK(legacy);
+      CO_ASSERT_TRUE(legacy->has_value());
+      CO_ASSERT_EQ(legacy->value().gid, flat::Gid(historicalUid));
+    });
+
+    auto accepted = co_await meta.authenticate(AuthReq(UserInfo(uid, gid, user.token)));
+    CO_ASSERT_OK(accepted);
+    CO_ASSERT_EQ(accepted->user, UserInfo(uid, gid, groups, user.token));
+    auto oldDefault = co_await meta.authenticate(
+        AuthReq(UserInfo(historicalUid, flat::Gid(historicalUid), historical.token)));
+    CO_ASSERT_OK(oldDefault);
+    for (const auto &wrong : std::vector<UserInfo>{{uid, flat::Gid(uid), user.token},
+                                                  {historicalUid, gid, user.token},
+                                                  {uid, gid, historical.token},
+                                                  {uid, gid, ""}}) {
+      auto rejected = co_await meta.authenticate(AuthReq(wrong));
+      CO_ASSERT_ERROR(rejected, StatusCode::kAuthenticationFail);
+    }
+  }());
+}
+
 }  // namespace
 }  // namespace hf3fs::meta::server

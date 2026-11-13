@@ -67,6 +67,7 @@ struct UserAddHandler {
     argparse::ArgumentParser cmd("user-add");
     cmd.add_argument("uid").scan<'u', uint32_t>();
     cmd.add_argument("name");
+    cmd.add_argument("--gid").scan<'u', uint32_t>().help("primary group id (defaults to uid)");
     cmd.add_argument("--root").help("is root or not").default_value(false).implicit_value(true);
     cmd.add_argument("--admin").help("is admin or not").default_value(false).implicit_value(true);
     cmd.add_argument("--groups").help("group ids separated by comma (',')");
@@ -82,6 +83,7 @@ struct UserAddHandler {
     Dispatcher::OutputTable output;
 
     auto uid = Uid(parser.get<uint32_t>("uid"));
+    auto gid = optionalMap(parser.present<uint32_t>("--gid"), [](uint32_t value) { return Gid(value); });
     auto name = parser.get<std::string>("name");
     auto isRootUser = parser.get<bool>("--root");
     auto isAdmin = parser.get<bool>("--admin");
@@ -101,7 +103,7 @@ struct UserAddHandler {
       } else {
         CO_RETURN_ON_ERROR(co_await ensureAdmin(txn, store, env.userInfo.token));
       }
-      co_return co_await store.addUser(txn, uid, name, gids, isRootUser, isAdmin, token);
+      co_return co_await store.addUser(txn, uid, name, gids, isRootUser, isAdmin, token, gid);
     };
     auto commitRes = co_await kv::WithTransaction(getRetryStrategy())
                          .run(env.kvEngineGetter()->createReadWriteTransaction(), std::move(handler));

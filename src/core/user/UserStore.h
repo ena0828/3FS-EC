@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "common/kv/ITransaction.h"
 #include "core/user/UserCache.h"
 #include "fbs/core/user/User.h"
@@ -24,7 +26,8 @@ class UserStore {
                               std::vector<Gid> groups,
                               bool isRootUser,
                               bool isAdmin = false,
-                              std::string_view token = {});
+                              std::string_view token = {},
+                              std::optional<Gid> gid = std::nullopt);
 
   CoTryTask<void> removeUser(IReadWriteTransaction &txn, Uid uid);
 

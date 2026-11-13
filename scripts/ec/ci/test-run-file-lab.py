@@ -11,6 +11,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('file_lab_under_test', Path(__file__).with_name('run-file-lab.py'))
 lab = importlib.util.module_from_spec(spec)
@@ -30,6 +31,121 @@ def passed_mount():
 
 
 class FileLabGates(unittest.TestCase):
+    def test_local_identity_requires_same_nonroot_user_and_binds_distinct_gid(self):
+        request = {'execution_mode': 'local-same-user', 'creator_uid': 1234,
+                   'target_uid': 1234, 'target_gid': 2345}
+        lab.local_identity(request, 1234, 1234, 2345, 2345)
+        for ids in ((0, 0, 0, 0), (1234, 0, 2345, 2345), (1234, 1234, 2345, 0)):
+            with self.subTest(ids=ids), self.assertRaises(lab.GateError):
+                lab.local_identity(request, *ids)
+        for changes in ({'creator_uid': 1001}, {'target_uid': 1000}, {'target_gid': 1234},
+                        {'target_uid': True}, {'execution_mode': 'hosted-handoff'}):
+            with self.subTest(changes=changes), self.assertRaises(lab.GateError):
+                lab.local_identity(dict(request, **changes), 1234, 1234, 2345, 2345)
+
+    def test_local_root_remains_bound_to_prepared_inode_and_actual_owner(self):
+        parent = Path('/private/file-case')
+        request = {'schema': 1, 'parent': str(parent), 'parent_identity': [4, 20],
+                   'execution_mode': 'local-same-user', 'creator_uid': 1234,
+                   'target_uid': 1234, 'target_gid': 2345}
+        with mock.patch.object(lab.os, 'getuid', return_value=1234, create=True), \
+             mock.patch.object(lab.os, 'geteuid', return_value=1234, create=True), \
+             mock.patch.object(lab.os, 'getgid', return_value=2345, create=True), \
+             mock.patch.object(lab.os, 'getegid', return_value=2345, create=True), \
+             mock.patch.object(lab, 'private') as private, \
+             mock.patch.object(Path, 'stat', return_value=mock.Mock(st_dev=4, st_ino=20)):
+            lab.local_shape(parent, request)
+            private.assert_has_calls([mock.call(parent, 1234), mock.call(parent.parent, 1234)])
+            for changes in ({'parent_identity': [4, 21]}, {'parent_identity': [5, 20]},
+                            {'parent': '/other'}, {'schema': True}, {'target_gid': 1000}):
+                with self.subTest(changes=changes), self.assertRaises(lab.GateError):
+                    lab.local_shape(parent, dict(request, **changes))
+
+    def test_formal_build_requires_matching_revision_backend_and_all_eight_targets(self):
+        built = {'schema': 1, 'source': str(Path('/source')), 'build': str(Path('/build')), 'revision': 'revision',
+                 'backend': 'isal', 'isal': {'provider': {'path': '/private/libisal.so.2',
+                 'sha256': '40ccd5e5abaff0451feff750d2b011370a546ac4706d1b06b9285ac26eda2c3c'}},
+                 'acceptance_executed': False, 'targets': list(lab.TARGETS),
+                 'binaries': {name: 'a' * 64 for name in lab.TARGETS},
+                 'build_script_sha256': 'b' * 64, 'cmake_cache_sha256': 'c' * 64}
+        native = dict(copy.deepcopy(built), lab_targets_requested=True)
+        lab.build_gate(built, native, Path('/source'), Path('/build'), 'revision')
+        for field, changed in (('schema', True), ('source', '/other'), ('build', '/other'),
+                               ('revision', 'other'), ('backend', 'scalar'), ('isal', None),
+                               ('acceptance_executed', True), ('lab_targets_requested', False),
+                               ('binaries', {}), ('build_script_sha256', 'd' * 64),
+                               ('cmake_cache_sha256', 'd' * 64)):
+            with self.subTest(field=field), self.assertRaises(lab.GateError):
+                lab.build_gate(built, dict(native, **{field: changed}), Path('/source'), Path('/build'), 'revision')
+        for changes in ({'targets': list(lab.TARGETS[:-1])}, {'binaries': {}}, {'schema': True}):
+            with self.subTest(changes=changes), self.assertRaises(lab.GateError):
+                lab.build_gate(dict(built, **changes), native, Path('/source'), Path('/build'), 'revision')
+        for backend in ('scalar', 'isal'):
+            changed = copy.deepcopy(built)
+            changed['backend'] = backend
+            changed['isal'] = None if backend == 'scalar' else {'provider': {'sha256': 'd' * 64}}
+            if backend == 'scalar':
+                lab.build_gate(changed, dict(changed, lab_targets_requested=True), Path('/source'), Path('/build'), 'revision')
+            else:
+                with self.assertRaises(lab.GateError):
+                    lab.build_gate(changed, dict(changed, lab_targets_requested=True), Path('/source'), Path('/build'), 'revision')
+
+    def test_mount_prerequisites_refuse_missing_helper_limits_and_noncharacter_device(self):
+        resource = mock.Mock(RLIMIT_NOFILE=1, RLIMIT_MEMLOCK=2, RLIM_INFINITY=-1)
+        resource.getrlimit.return_value = (3 << 30, 3 << 30)
+        with mock.patch.dict(sys.modules, {'resource': resource}), \
+             mock.patch.object(lab.shutil, 'which', return_value=None), \
+             mock.patch.object(lab.os, 'open') as opened:
+            with self.assertRaisesRegex(lab.GateError, 'fusermount3'):
+                lab.mount_host_gate()
+            opened.assert_not_called()
+            resource.getrlimit.return_value = (65536, 8 << 20)
+            with self.assertRaisesRegex(lab.GateError, 'resource limit'):
+                lab.mount_host_gate()
+            opened.assert_not_called()
+        resource.getrlimit.return_value = (-1, -1)
+        with tempfile.TemporaryDirectory() as temp:
+            tool = Path(temp) / 'fusermount3'
+            tool.write_bytes(b'only a prerequisite fixture, never executed')
+            # Linux descriptor semantics are mocked here; the real FD tree tests
+            # below remain Linux-only and are not replaced by this fixture.
+            with mock.patch.dict(sys.modules, {'resource': resource}), \
+                 mock.patch.object(lab.shutil, 'which', return_value=str(tool)), \
+                 mock.patch.object(lab.os, 'access', return_value=True), \
+                 mock.patch.object(lab.os, 'O_NOFOLLOW', 0, create=True), \
+                 mock.patch.object(lab.os, 'O_CLOEXEC', 0, create=True), \
+                 mock.patch.object(lab.os, 'open', return_value=42) as opened, \
+                 mock.patch.object(lab.os, 'close') as closed, \
+                 mock.patch.object(lab.os, 'fstat') as info:
+                info.return_value.st_mode = stat.S_IFREG
+                with self.assertRaisesRegex(lab.GateError, 'character device'):
+                    lab.mount_host_gate()
+                closed.assert_called_once_with(42)
+                closed.reset_mock()
+                info.return_value.st_mode = stat.S_IFCHR
+                result = lab.mount_host_gate()
+                self.assertTrue(result['device_opened'])
+                self.assertFalse(result['mount_permission_proven'])
+                self.assertEqual(result['sha256'], hashlib.sha256(tool.read_bytes()).hexdigest())
+                self.assertEqual(opened.call_count, 2)
+                closed.assert_called_once_with(42)
+
+    def test_loader_checks_copied_provider_paths_and_real_fuse_dependency(self):
+        root = Path('/private/lab')
+        isal = 'libisal.so.2 => ' + str(root / 'lib/libisal.so.2') + ' (0xabc)\n'
+        fuse = 'libfuse3.so.3 => ' + str(root / 'lib/libfuse3.so.3') + ' (0xdef)\n'
+        fdb = 'libfdb_c.so => ' + str(root / 'lib/libfdb_c.so') + ' (0x123)\n'
+        self.assertEqual(set(lab.resolution_gate('isal', isal + fuse + fdb, root, fuse=True)),
+                         {'libisal.so.2', 'libfuse3.so.3', 'libfdb_c.so'})
+        lab.resolution_gate('scalar', fuse + fdb, root, fuse=True)
+        for text in (isal, fuse, isal + fuse + 'libx.so => not found\n', isal + isal + fuse,
+                     isal + fuse.replace(str(root / 'lib/libfuse3.so.3'), '/other/libfuse3.so.3'),
+                     isal.replace(str(root / 'lib/libisal.so.2'), '/other/libisal.so.2') + fuse):
+            with self.subTest(text=text), self.assertRaises(lab.GateError):
+                lab.resolution_gate('isal', text, root, fuse=True)
+        with self.assertRaises(lab.GateError):
+            lab.resolution_gate('scalar', isal + fuse, root, fuse=True)
+
     def test_shutdown_accepts_only_normal_fdb_zero_or_sigterm(self):
         final = {'run': 'fixed-run', 'stage': 'stopped', 'failure': None}
         for fdb_code in (0, -15):

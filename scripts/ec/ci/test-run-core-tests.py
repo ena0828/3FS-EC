@@ -37,6 +37,30 @@ def receipt(binary, output, cases=RUNNER.META_CASES, test_filter=RUNNER.META_FIL
 
 
 class TestCoreAcceptanceContract(unittest.TestCase):
+    def test_auth_user_profile_requires_both_backends_default_and_explicit_gid(self):
+        cases, test_filter, fuse = RUNNER.selection("auth-user")
+        expected = ("TestAuth/0.Basic", "TestAuth/0.ExplicitPrimaryGroup",
+                    "TestAuth/1.Basic", "TestAuth/1.ExplicitPrimaryGroup")
+        self.assertEqual(cases, expected)
+        self.assertEqual(test_filter, ":".join(expected))
+        self.assertEqual(fuse, ())
+        binary, output = Path("/build/tests/test_meta"), Path("/work/meta")
+        sample = receipt(binary, output, cases, test_filter)
+        RUNNER.check_meta_receipt(sample, binary, output, cases, test_filter)
+        for field in ("selected", "test_results", "commands", "server"):
+            bad = copy.deepcopy(sample)
+            if field == "selected":
+                bad[field] = list(cases[:2])
+            elif field == "test_results":
+                bad[field]["cases"][-1]["skipped"] = True
+            elif field == "commands":
+                bad[field][0]["argv"][1] = "--gtest_filter=TestAuth/*.Basic"
+            else:
+                bad[field]["cleanup"]["leader_reaped"] = False
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                RUNNER.check_meta_receipt(bad, binary, output, cases, test_filter)
+        self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 21)
+
     def test_target_meta_profile_requires_all_nine_cases_and_exact_commands(self):
         cases, test_filter, fuse = RUNNER.selection("target-meta")
         self.assertEqual(len(cases), 9)
