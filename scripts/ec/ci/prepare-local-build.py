@@ -102,12 +102,18 @@ def cargo_ancestor_configs(source):
                     'Inherited Cargo configuration is unsupported: ' + str(parent / '.cargo' / name))
 
 
+def check_filesystem(kind, container_build_only):
+    require(kind in (('ext4', 'xfs') if container_build_only else ('ext4',)),
+            'Container build-only paths require ext4/xfs; ordinary local paths require ext4')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', required=True, type=Path)
     parser.add_argument('--work', required=True, type=Path)
     parser.add_argument('--revision', required=True)
     parser.add_argument('--backend', choices=('scalar', 'isal'), required=True)
+    parser.add_argument('--container-build-only', action='store_true')
     args = parser.parse_args()
     require(sys.platform == 'linux' and platform.machine() == 'x86_64', 'Linux x86_64 required')
     require(sys.version_info >= (3, 11) and Path(sys.executable).resolve() == Path('/usr/bin/python3').resolve(),
@@ -123,9 +129,11 @@ def main():
     require(Path(__file__).resolve() == args.source / 'scripts/ec/ci/prepare-local-build.py',
             'Run the helper from the requested source checkout')
     submodules = git_state(args.source, args.revision)
+    filesystems = []
     for path in (args.source, args.work.parent):
         kind = subprocess.check_output(['findmnt', '-n', '-o', 'FSTYPE', '-T', str(path)], text=True).strip()
-        require(kind == 'ext4', 'Source and work must use ext4 for the existing acceptance contract')
+        check_filesystem(kind, args.container_build_only)
+        filesystems.append({'path': str(path), 'filesystem': kind})
     disk = os.statvfs(args.work.parent)
     require(disk.f_bavail * disk.f_frsize >= 80 * GIB and disk.f_favail >= 250000,
             'Need at least 80 GiB and 250000 free inodes before the cold build (not a peak-use guarantee)')
@@ -166,8 +174,10 @@ def main():
     require(nofile == resource.RLIM_INFINITY or nofile >= 65536, 'Hard nofile limit must allow 65536')
     print(json.dumps({'schema': 1, 'status': 'local-preflight-only-no-build', 'source': str(args.source),
                       'revision': args.revision, 'work': str(args.work), 'uid': os.geteuid(), 'gid': os.getegid(),
-                      'backend': args.backend,
-                      'python': sys.version, 'filesystem': 'ext4', 'disk_free_bytes': disk.f_bavail * disk.f_frsize,
+                      'backend': args.backend, 'container_build_only': args.container_build_only,
+                      'acceptance_executed': False, 'filesystems': filesystems,
+                      'python': sys.version, 'filesystem': filesystems[1]['filesystem'],
+                      'disk_free_bytes': disk.f_bavail * disk.f_frsize,
                       'free_inodes': disk.f_favail, 'packages': installed, 'tools': tools,
                       'submodules': submodules, 'system_install_performed': False}, sort_keys=True))
 

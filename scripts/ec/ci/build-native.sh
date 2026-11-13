@@ -11,11 +11,17 @@ build_jobs_seen=false
 local_source=
 local_work=
 local_revision=
+local_container=false
 usage() {
-    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs 1|2|4] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA]' >&2
+    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs N] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA [--local-container-build-only]]; N=1|2|4 except explicit container builds' >&2
 }
 while (($#)); do
     case "$1" in
+        --local-container-build-only)
+            if "$local_container"; then usage; exit 2; fi
+            local_container=true
+            shift
+            ;;
         --local-source|--local-work|--local-revision)
             if (($# < 2)) || [[ -z "$2" ]]; then usage; exit 2; fi
             case "$1" in
@@ -34,7 +40,7 @@ while (($#)); do
             shift 2
             ;;
         --build-jobs)
-            if "$build_jobs_seen" || (($# < 2)) || [[ "$2" != 1 && "$2" != 2 && "$2" != 4 ]]; then
+            if "$build_jobs_seen" || (($# < 2)) || [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
                 usage; exit 2
             fi
             build_jobs="$2"
@@ -60,6 +66,11 @@ if [[ -n "$local_source$local_work$local_revision" ]]; then
     [[ -n "$local_source" && -n "$local_work" && -n "$local_revision" ]] || { usage; exit 2; }
     local_mode=true
 fi
+if "$local_container"; then
+    "$local_mode" || { usage; exit 2; }
+elif [[ "$build_jobs" != 1 && "$build_jobs" != 2 && "$build_jobs" != 4 ]]; then
+    usage; exit 2
+fi
 # END ARGUMENT PARSER
 if "$local_mode"; then
     # No environment impersonation: the requested revision is checked against Git.
@@ -67,8 +78,10 @@ if "$local_mode"; then
     work="$local_work"
     source_revision="$local_revision"
     [[ "$(realpath -e -- "${BASH_SOURCE[0]}")" == "$source_root/scripts/ec/ci/build-native.sh" ]]
+    local_profile_args=()
+    if "$local_container"; then local_profile_args=(--container-build-only); fi
     local_preflight=$(/usr/bin/python3 -I "$source_root/scripts/ec/ci/prepare-local-build.py" \
-        --source "$source_root" --work "$work" --revision "$source_revision" --backend "$backend")
+        --source "$source_root" --work "$work" --revision "$source_revision" --backend "$backend" "${local_profile_args[@]}")
     dependency_prefix="$work/deps"
 else
     [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_OS:-}" == Linux ]] || {
@@ -116,6 +129,7 @@ sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
     patches/apply.sh patches/folly.patch patches/rocksdb.patch patches/rocksdb.patch.2 \
     cmake/AddCrate.cmake cmake/ApacheArrow.cmake cmake/Jemalloc.cmake \
     scripts/ec/ci/build-native.sh scripts/ec/ci/prepare-local-build.py scripts/ec/ci/run-core-tests.py \
+    scripts/ec/ci/container-build-resources.py \
     scripts/ec/ci/prepare-isal.py scripts/ec/reference/downloads.json cmake/EcCodecBackend.cmake \
     .github/workflows/ec-hosted-native.yml .github/workflows/ec-hosted-system.yml \
     .github/workflows/ec-hosted-target-control.yml \
@@ -124,7 +138,7 @@ sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
 
 # Only top-level Ninja concurrency changes. Nested Cargo, Make and Arrow remain
 # at one job. This admission policy is not a proof of peak RSS or completion time.
-python3 - "$work" "$build_jobs" "$local_mode" <<'PY'
+python3 - "$work" "$build_jobs" "$local_mode" "$local_container" "$source_root" <<'PY'
 from pathlib import Path
 import json
 import os
@@ -220,10 +234,18 @@ for line in Path('/proc/meminfo').read_text().splitlines():
         require(unit == 'kB', 'unexpected memory unit')
         memory[key] = int(amount) * 1024
 try:
-    groups = cgroup_rows(Path('/sys/fs/cgroup'), Path('/proc/self/cgroup').read_text(),
-                         Path('/proc/self/mountinfo').read_text())
-    record = resource_plan(jobs, memory, len(os.sched_getaffinity(0)), groups)
-    if sys.argv[3] == 'true':
+    if sys.argv[4] == 'true':
+        import importlib.util
+        helper = Path(sys.argv[5]) / 'scripts/ec/ci/container-build-resources.py'
+        spec = importlib.util.spec_from_file_location('container_build_resources', helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        record = module.observe(jobs, memory)
+    else:
+        groups = cgroup_rows(Path('/sys/fs/cgroup'), Path('/proc/self/cgroup').read_text(),
+                             Path('/proc/self/mountinfo').read_text())
+        record = resource_plan(jobs, memory, len(os.sched_getaffinity(0)), groups)
+    if sys.argv[3] == 'true' and sys.argv[4] == 'false':
         floor = resource_plan(2, memory, len(os.sched_getaffinity(0)), groups)
         record['local_conservative_floor'] = floor['j2_thresholds']
         if floor['effective_jobs'] is None:
@@ -536,14 +558,14 @@ sha256sum "$work/build/CMakeCache.txt" "$work/build/compile_commands.json" \
 du -sh -- "$work/build" "$work/cargo-target" "$work/cargo-home" "$work/fdb"
 # Keep the existing eight-binary lab receipt contract; additionally bind every
 # requested test target and the selected backend in an always-written receipt.
-python3 - "$source_root" "$work" "$backend" "$with_lab" "$with_regression" "$source_revision" "$local_mode" "$dependency_prefix" <<'PY'
+python3 - "$source_root" "$work" "$backend" "$with_lab" "$with_regression" "$source_revision" "$local_mode" "$dependency_prefix" "$local_container" <<'PY'
 from pathlib import Path
 import hashlib
 import json
 import os
 import sys
 source, work = map(Path, sys.argv[1:3])
-backend, with_lab, with_regression, revision, local_mode, dependency_prefix = sys.argv[3:]
+backend, with_lab, with_regression, revision, local_mode, dependency_prefix, local_container = sys.argv[3:]
 lab_names = ('storage_main', 'mgmtd_main', 'meta_main', 'admin_cli', 'ec_stripe_cli',
              'ec_file_cli', 'hf3fs_fuse_main', 'ec_mount_read_probe')
 tests = ['test_meta', 'test_fuse_ec']
@@ -618,7 +640,8 @@ if local_mode == 'true':
     if isal is not None and not any('libisal.so.2' in row for row in runtime_providers.values()):
         raise SystemExit('Required ISA-L executable provider evidence is absent')
 common = {'schema': 1, 'source': str(source), 'revision': revision,
-          'execution_environment': 'ordinary-linux-local' if local_mode == 'true' else 'github-hosted',
+          'execution_environment': ('local-linux-container-build-only' if local_container == 'true' else
+                                    'ordinary-linux-local' if local_mode == 'true' else 'github-hosted'),
           'dependency_prefix': dependency_prefix, 'runtime_providers_without_ld_override': runtime_providers,
           'local_preflight_sha256': sha(work / 'provenance/local-preflight.json') if local_mode == 'true' else None,
           'local_package_ld_library_path_checked': '/usr/local/lib' if local_mode == 'true' else None,
@@ -630,6 +653,9 @@ common = {'schema': 1, 'source': str(source), 'revision': revision,
           'build_resources_sha256': sha(work / 'provenance/build-resources.json'),
           'build_command': json.loads((work / 'provenance/build-command.json').read_text()),
           'build_command_sha256': sha(work / 'provenance/build-command.json')}
+if local_container == 'true':
+    common.update(build_only=True, filesystems=preflight['filesystems'],
+                  container_resource_helper_sha256=sha(source / 'scripts/ec/ci/container-build-resources.py'))
 record = dict(common, targets=list(paths), binaries={name: sha(path) for name, path in paths.items()},
               ec_regression_targets_requested=with_regression == 'true', lab_targets_requested=with_lab == 'true')
 path = work / 'provenance/native-build.json'
