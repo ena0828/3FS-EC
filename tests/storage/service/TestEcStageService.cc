@@ -216,7 +216,8 @@ class StageReplyDropStorageService : public StorageService {
     {
       std::lock_guard lock(fault_.mutex);
       if (fault_.concurrentWindow && fault_.concurrentWindow->helper && request.packet.blockIndex == 1 &&
-          request.packet.nextHelper < 10 && serde::equals(request.plan, fault_.concurrentWindow->plan)) {
+          request.packet.nextHelper < 10 &&
+          serde::serialize(request.plan) == serde::serialize(fault_.concurrentWindow->plan)) {
         window = fault_.concurrentWindow;
       }
     }
