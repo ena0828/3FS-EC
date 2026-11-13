@@ -77,6 +77,10 @@ std::string repairMetricsJson(const EcRepairSample &m) {
       "helper_limiters", "not_applicable; helper has separate non-waiting admission, not measured here")(
       "server_received_to_waked_scope", "outer_decode_complete_to_payload_decode_start")(
       "helper_downstream", "included_in_outer_server_span_not_individually_observed")(
+      "encoded_frame_header_bytes", 8)("encoded_frames_use_actual_compression", true)(
+      "encoded_request_scope", "actual first-hop frame constructed; not send, socket delivery or remote commit")(
+      "encoded_response_scope", "complete validated outer packet correlated by UUID; missing and late replies censored")(
+      "selected_repair_and_healthy_copy_rpc_slots_merged", true)("helper_downstream_bytes", nullptr)(
       "overflow", m.storageRpc.overflow)("clock_anomaly", m.storageRpc.clockAnomaly)(
       "wire_bytes", nullptr)("encoded_bytes", nullptr)("transport_retry_attempts", nullptr)(
       "complete_server_queue", nullptr)("methods", folly::dynamic::object());
@@ -91,6 +95,14 @@ std::string repairMetricsJson(const EcRepairSample &m) {
         "without_outer_result_decimal", std::to_string(sample.withoutResult))(
         "messenger_invocations_decimal", std::to_string(sample.messengerInvocations))(
         "frames_without_messenger_decimal", std::to_string(sample.withoutMessenger))(
+        "observed_encoded_request_frames_decimal", std::to_string(sample.observedEncodedRequestFrames))(
+        "request_frame_bytes_decimal", std::to_string(sample.requestFrameBytes))(
+        "missing_encoded_request_frames_decimal", std::to_string(sample.missingEncodedRequestFrames))(
+        "compressed_request_frames_decimal", std::to_string(sample.compressedRequestFrames))(
+        "observed_encoded_response_frames_decimal", std::to_string(sample.observedEncodedResponseFrames))(
+        "response_frame_bytes_decimal", std::to_string(sample.responseFrameBytes))(
+        "missing_encoded_response_frames_decimal", std::to_string(sample.missingEncodedResponseFrames))(
+        "compressed_response_frames_decimal", std::to_string(sample.compressedResponseFrames))(
         "limiters", nullptr)(
         "client", clockSample(sample.client, {"called_to_serialized_ns_decimal", "serialized_to_received_ns_decimal",
                                              "received_to_waked_ns_decimal"}))(
