@@ -29,6 +29,81 @@ EXPECTED = {
     )
 }
 
+SCOPE_EXPECTED = {
+    "ec_scope::tests::" + name
+    for name in (
+        "engine_and_target_identity_survive_reopen_and_engine_clones_share_gate",
+        "missing_or_corrupt_identity_is_not_reinitialized",
+        "existing_engine_without_scope_schema_fails_closed_even_when_create_was_requested",
+        "namespace_sync_failure_does_not_publish_a_registry_or_change_identity_on_retry",
+        "record_extents_versions_crc_and_target_incarnation_are_checked",
+        "target_identity_read_requires_successful_wal_confirmation",
+        "queued_and_executing_jobs_hold_drain_until_both_complete",
+        "admission_and_closing_race_accounts_for_every_success_once",
+        "closing_blocks_new_admission_before_the_durable_write",
+        "stale_negative_lookup_cannot_reopen_a_revoked_scope",
+        "failure_before_or_after_persist_never_manufactures_a_durable_ack",
+        "changed_owner_or_revocation_never_bypasses_the_original_scope",
+        "cold_cache_preserves_original_revoke_and_corrupt_records_never_open",
+        "bounded_cache_never_evicts_tickets_and_reloads_persistent_denial",
+        "ticket_unwind_completes_but_poisoned_gate_never_acks",
+        "scope_crash_child",
+        "durable_denial_survives_killed_process_with_an_outstanding_ticket",
+        "staging_empty_preflight_accepts_only_exact_startup_baselines",
+        "staging_empty_preflight_rejects_live_or_noncanonical_keys_without_cleanup",
+        "staging_joint_commit_retries_keep_candidate_before_and_after_unknown_outcome",
+        "staging_pair_missing_side_wrong_identity_or_bad_baseline_is_never_repaired",
+        "staging_existing_prefix_zero_can_omit_prefix_key_but_not_version",
+        "staging_joint_commit_rechecks_empty_state_and_never_overwrites_another_pair",
+        "staging_provision_crash_child",
+        "staging_initialization_recovers_after_killed_process_at_each_transaction_boundary",
+        "ticket_retains_exclusive_store_instance_until_completion",
+        "concurrent_cold_scope_singleflight_reuses_one_real_load",
+        "cold_scope_loader_failure_never_promotes_waiting_follower",
+        "revoke_wakes_loading_followers_before_old_loader_completes",
+        "cold_scope_wait_timeout_is_bounded_under_spurious_notifications",
+        "cold_scope_wait_rejects_invalid_cap_and_zero_keeps_nonwaiting_load",
+    )
+}
+SCOPE_EXPECTED.update(
+    "ec_scope::target_retirement_tests::" + name
+    for name in (
+        "target_retirement_counts_two_scopes_and_preserves_maintenance_and_other_targets",
+        "target_retirement_wins_stale_cold_load_and_scope_cache_eviction",
+        "target_retirement_unknown_write_and_wal_failure_never_reopen_or_ack",
+        "target_retirement_closes_before_persistence_without_holding_admission_locks",
+        "target_retirement_reopens_with_same_identity_and_old_reader_rejects",
+        "target_retirement_ticket_keeps_original_writer_lease_until_real_drop",
+        "target_retirement_rejects_ordinary_unloaded_identity_and_request_mismatch",
+        "target_retirement_dual_count_overflow_is_atomic_and_poison_never_drains",
+        "target_retirement_scope_underflow_keeps_target_broken_and_nonzero",
+    )
+)
+
+
+def test_inventory(suite):
+    if suite == "scope":
+        return "ec_scope::", SCOPE_EXPECTED
+    if suite == "codec":
+        return "ec_codec::tests::", EXPECTED
+    raise ValueError("Unknown acceptance suite")
+
+
+def validate_listing(output, expected):
+    names = re.findall(r"^(\S+): test$", output, re.MULTILINE)
+    require(len(names) == len(expected) and set(names) == expected,
+            "Actual test inventory differs from the required tests")
+
+
+def validate_results(output, expected):
+    passed = re.findall(r"^test (\S+) \.\.\. ok$", output, re.MULTILINE)
+    require(len(passed) == len(expected) and set(passed) == expected, "Missing or non-passing test")
+    summaries = re.findall(r"^test result: (.+)$", output, re.MULTILINE)
+    require(len(summaries) == 1 and re.fullmatch(
+        rf"ok\. {len(expected)} passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in .+",
+        summaries[0]), "Unexpected test summary")
+    return sorted(passed)
+
 
 def digest(path):
     value = hashlib.sha256()
@@ -49,7 +124,11 @@ def main():
     parser.add_argument("--revision", required=True)
     parser.add_argument("--backend", choices=("scalar", "isal"), default="scalar")
     parser.add_argument("--cxx-probe", action="store_true")
+    parser.add_argument("--suite", choices=("codec", "scope"), default="codec")
     args = parser.parse_args()
+    require(args.suite == "codec" or (args.backend == "scalar" and not args.cxx_probe),
+            "Scope acceptance uses the scalar crate without an unrelated CXX codec probe")
+    test_filter, expected = test_inventory(args.suite)
     require(platform.system() == "Linux" and platform.machine() == "x86_64",
             "This validation entry point requires Linux x86_64")
     require(os.getuid() != 0, "Run as an ordinary build user")
@@ -112,10 +191,23 @@ def main():
         "src/storage/ec_codec/EcCodec.cc", "scripts/ec/ci/codec-probe/main.cc",
         "scripts/ec/ci/codec-probe/CMakeLists.txt", "scripts/ec/ci/codec-probe/crate/CMakeLists.txt",
     )
+    if args.suite == "scope":
+        inputs += (
+            "src/storage/chunk_engine/src/ec_scope.rs",
+            "src/storage/chunk_engine/src/ec_scope_tests.rs",
+            "src/storage/chunk_engine/src/ec_target_retirement_tests.rs",
+            "src/storage/chunk_engine/src/ec_scope_bridge.rs",
+            "src/storage/chunk_engine/src/meta/mod.rs",
+            "src/storage/chunk_engine/src/meta/meta_store.rs",
+            "src/storage/chunk_engine/src/meta/rocksdb.rs",
+            ".github/workflows/ec-hosted-target-retirement.yml",
+            "scripts/ec/ci/test-run-codec-tests.py",
+        )
     before = {path: digest(root / path) for path in inputs}
     receipt = {"schema": 1, "revision": args.revision, "inputs_sha256": before,
                "profile": "test, opt-level=0, debug=0", "backend": args.backend,
-               "commands": commands, "status": "incomplete"}
+               "commands": commands, "status": "incomplete", "suite": args.suite,
+               "test_filter": test_filter, "expected_tests": sorted(expected)}
     owned_target = False
     try:
         rust = ["rustup", "run", TOOLCHAIN]
@@ -185,19 +277,15 @@ def main():
         executable = Path(executables.pop()).resolve(strict=True)
         require(executable.is_relative_to(work / "cargo-target"), "Executable escaped fresh target")
         receipt["executable_sha256"] = digest(executable)
-        listing = run("list", [str(executable), "ec_codec::tests::", "--list", "--format", "terse"], show=True)
-        names = re.findall(r"^(ec_codec::tests::\S+): test$", listing, re.MULTILINE)
-        require(len(names) == len(EXPECTED) and set(names) == EXPECTED,
-                "Actual test inventory differs from the required bridge tests")
-        result = run("test", [str(executable), "ec_codec::tests::", "--test-threads=1", "--show-output"], show=True)
-        passed = re.findall(r"^test (ec_codec::tests::\S+) \.\.\. ok$", result, re.MULTILINE)
-        require(len(passed) == len(EXPECTED) and set(passed) == EXPECTED, "Missing or non-passing test")
+        listing = run("list", [str(executable), test_filter, "--list", "--format", "terse"], show=True)
+        validate_listing(listing, expected)
+        result = run("test", [str(executable), test_filter, "--test-threads=1", "--show-output"], show=True)
+        passed = validate_results(result, expected)
         # Captured successful output follows the intact per-test result lines.
         # Check the same metadata through the generated CXX bridge below.
-        marker = "EC_CODEC_BACKEND=" + args.backend
-        require(marker in result, "Actual Rust backend marker differs from the requested backend")
-        require(re.search(r"^test result: ok\. 10 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out;",
-                          result, re.MULTILINE), "Unexpected test summary")
+        if args.suite == "codec":
+            marker = "EC_CODEC_BACKEND=" + args.backend
+            require(marker in result, "Actual Rust backend marker differs from the requested backend")
         if args.cxx_probe:
             (work / "cargo-target").mkdir(exist_ok=True)
             source_target.symlink_to(work / "cargo-target", target_is_directory=True)
@@ -245,7 +333,8 @@ def main():
         finally:
             path = work / "receipt.json"
             path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
-            print(json.dumps({"codec_bridge_acceptance": receipt, "receipt_sha256": digest(path)}), flush=True)
+            key = "codec_bridge_acceptance" if args.suite == "codec" else "scope_retirement_acceptance"
+            print(json.dumps({key: receipt, "receipt_sha256": digest(path)}), flush=True)
 
 
 if __name__ == "__main__":

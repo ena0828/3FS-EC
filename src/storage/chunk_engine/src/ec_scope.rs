@@ -18,6 +18,8 @@ const VERSION: u16 = 1;
 const MAX_GATES: usize = 16_384;
 const ENGINE_RECORD_BYTES: usize = 26;
 const TARGET_RECORD_BYTES: usize = 54;
+const RETIRED_TARGET_VERSION: u16 = 2;
+const RETIRED_TARGET_RECORD_BYTES: usize = 70;
 const FENCE_RECORD_BYTES: usize = 155;
 const STAGING_FORMAT_PREFIX: u8 = 15;
 const STAGING_FORMAT_RECORD_BYTES: usize = 32;
@@ -142,6 +144,31 @@ impl EcScopeRevocation {
 pub enum EcDrainStatus {
     Pending { inflight: u64, durable: bool },
     Drained,
+}
+
+/// Trusted local control input, not an authenticated request or a certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EcTargetRetirement {
+    pub target: EcTargetIdentity,
+    pub id: EcIdentity,
+}
+
+impl EcTargetRetirement {
+    fn validate(self) -> EcScopeResult<()> {
+        validate_target_numbers(self.target.chain, self.target.target)?;
+        if self.target.engine == [0; 16] || self.target.incarnation == [0; 16] || self.id == [0; 16] {
+            return Err(EcScopeError::Invalid("zero target retirement identity"));
+        }
+        Ok(())
+    }
+}
+
+/// Local data-ticket observation only. Never a scope ACK, remote-effects
+/// certificate, or proof that maintenance I/O/GC has stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EcTargetRetirementStatus {
+    Pending { inflight: u64, durable: bool },
+    DataDrained,
 }
 
 /// Created only by the raw, same-writer-handle preflight. It must remain bound
@@ -403,8 +430,7 @@ impl Engine {
                 // Commit the protocol pair only after the fully opened V2
                 // physical namespace has established directory reachability.
                 sync_namespace()?;
-                let identity = joint_provision_staging(&self.meta_store, provision)?;
-                EcScopeRegistry::from_identity(self.meta_store.clone(), identity, MAX_GATES)
+                EcScopeRegistry::from_staging(self.meta_store.clone(), provision, MAX_GATES)?
             }
         };
         // A synchronous WAL alone does not establish a newly created parent
@@ -419,8 +445,14 @@ impl Engine {
 pub struct EcScopeRegistry {
     store: Arc<MetaStore>,
     identity: EcIdentity,
-    // Only serializes target registration, never data admission or drain.
+    // Disk mutation/load serialization, never held by data admission/Drop.
+    // Lock order: mutation -> targets map (released) -> target state.
+    // No target/scope state lock is held across disk I/O.
     target_registration: Mutex<()>,
+    staging: bool,
+    // Strong for the registry lifetime, unlike the evictable scope cache.
+    // One immutable identity per logical target; no reincarnation alias gate.
+    targets: Mutex<HashMap<(u32, u64), Arc<TargetGate>>>,
     gates: Mutex<HashMap<Vec<u8>, Arc<Gate>>>,
     max_gates: usize,
 }
@@ -446,9 +478,22 @@ impl EcScopeRegistry {
             store,
             identity,
             target_registration: Mutex::new(()),
+            staging: false,
+            targets: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
             max_gates,
         }
+    }
+
+    fn from_staging(
+        store: Arc<MetaStore>,
+        provision: &EcStagingProvision,
+        max_gates: usize,
+    ) -> EcScopeResult<Self> {
+        let identity = joint_provision_staging(&store, provision)?;
+        let mut registry = Self::from_identity(store, identity, max_gates);
+        registry.staging = true;
+        Ok(registry)
     }
 
     pub fn engine_identity(&self) -> EcIdentity {
@@ -483,11 +528,20 @@ impl EcScopeRegistry {
     /// replacement API is provided. A repeated registration preserves identity.
     pub fn register_target(&self, chain: u32, target: u64) -> EcScopeResult<EcTargetIdentity> {
         validate_target_numbers(chain, target)?;
-        let _registration = lock(&self.target_registration)?;
+        let _mutation = lock(&self.target_registration)?;
+        // Even a failed pre-write retirement must not be undone by registration.
+        let existing = { lock(&self.targets)?.get(&(chain, target)).cloned() };
+        if let Some(gate) = existing {
+            lock(&gate.state)?.ensure_serving()?;
+        }
         let key = target_key(chain, target);
-        let identity = match exact_get(&self.store, &key)? {
-            Some(bytes) => decode_target(&bytes)?,
+        let record = match exact_get(&self.store, &key)? {
+            Some(bytes) => decode_target_record(&bytes)?,
             None => {
+                // A loaded identity cannot disappear and be replaced in place.
+                if lock(&self.targets)?.contains_key(&(chain, target)) {
+                    return Err(EcScopeError::MissingIdentity);
+                }
                 let identity = EcTargetIdentity {
                     engine: self.identity,
                     incarnation: new_identity(),
@@ -495,14 +549,19 @@ impl EcScopeRegistry {
                     target,
                 };
                 put_sync(&self.store, &key, &encode_target(identity))?;
-                identity
+                TargetRecord { identity, retirement: None }
             }
         };
-        self.check_target(identity, chain, target)?;
+        self.check_target(record.identity, chain, target)?;
+        let gate = self.merge_target_record(record, false)?;
         self.store.sync_wal()?;
-        Ok(identity)
+        self.merge_target_record(record, true)?;
+        lock(&gate.state)?.ensure_serving()?;
+        Ok(record.identity)
     }
 
+    /// Maintenance identity read. A retired identity remains readable; this
+    /// method never grants data admission or resets an in-memory Closing state.
     pub fn load_target(&self, chain: u32, target: u64) -> EcScopeResult<EcTargetIdentity> {
         self.load_target_with(chain, target, |store| {
             store.sync_wal().map_err(EcScopeError::from)
@@ -516,15 +575,159 @@ impl EcScopeRegistry {
         confirm: impl FnOnce(&MetaStore) -> EcScopeResult<()>,
     ) -> EcScopeResult<EcTargetIdentity> {
         validate_target_numbers(chain, target)?;
+        let _mutation = lock(&self.target_registration)?;
+        let record = self.read_target_record(chain, target)?;
+        // Install denial before WAL confirmation, including the unknown branch.
+        self.merge_target_record(record, false)?;
+        confirm(&self.store)?;
+        self.merge_target_record(record, true)?;
+        Ok(record.identity)
+    }
+
+    fn read_target_record(&self, chain: u32, target: u64) -> EcScopeResult<TargetRecord> {
         let bytes = exact_get(&self.store, &target_key(chain, target))?
             .ok_or(EcScopeError::MissingIdentity)?;
-        let identity = decode_target(&bytes)?;
-        self.check_target(identity, chain, target)?;
-        // Registration can have an unknown sync outcome while its value is
-        // already visible. Loading that value must reconfirm its durability
-        // before exporting the incarnation or admitting a fresh scope.
-        confirm(&self.store)?;
-        Ok(identity)
+        let record = decode_target_record(&bytes)?;
+        self.check_target(record.identity, chain, target)?;
+        if record.retirement.is_some() && !self.staging {
+            return Err(EcScopeError::Corrupt("retired target requires staging registry"));
+        }
+        Ok(record)
+    }
+
+    // Caller holds mutation serialization; no I/O while target state is locked.
+    fn merge_target_record(&self, record: TargetRecord, confirmed: bool) -> EcScopeResult<Arc<TargetGate>> {
+        let gate = {
+            let mut targets = lock(&self.targets)?;
+            targets.entry((record.identity.chain, record.identity.target))
+                .or_insert_with(|| Arc::new(TargetGate {
+                    identity: record.identity,
+                    state: Mutex::new(TargetState::default()),
+                })).clone()
+        };
+        if gate.identity != record.identity {
+            return Err(EcScopeError::IdentityMismatch);
+        }
+        {
+            let mut state = lock(&gate.state)?;
+            state.ensure_live()?;
+            match (state.retirement, record.retirement) {
+                (Some(old), Some(id)) if old != id => {
+                    state.broken = true;
+                    return Err(EcScopeError::RevocationMismatch);
+                }
+                (Some(_), None) if state.durable => {
+                    state.broken = true;
+                    return Err(EcScopeError::Corrupt("durable target denial disappeared"));
+                }
+                (_, Some(id)) => {
+                    state.retirement = Some(id);
+                    state.durable |= confirmed;
+                }
+                _ => {} // Never reopen Closing on a still-v1 disk observation.
+            }
+            state.identity_confirmed |= confirmed;
+        }
+        Ok(gate)
+    }
+
+    // Memory only. Never creates a gate from caller-supplied identity.
+    fn target_gate(&self, identity: EcTargetIdentity) -> EcScopeResult<Arc<TargetGate>> {
+        let gate = lock(&self.targets)?.get(&(identity.chain, identity.target))
+            .cloned().ok_or(EcScopeError::MissingIdentity)?;
+        if gate.identity != identity {
+            return Err(EcScopeError::IdentityMismatch);
+        }
+        Ok(gate)
+    }
+
+    fn check_target_serving(&self, identity: EcTargetIdentity) -> EcScopeResult<()> {
+        let target = self.target_gate(identity)?;
+        let result = lock(&target.state)?.ensure_serving();
+        result
+    }
+
+    /// Disk-executor operation for an already loaded V2/3 target. Closing is
+    /// linearized before persistence. Errors keep admission closed; retry only
+    /// the same request. This does not authenticate authority or sign evidence.
+    pub fn prepare_target_retirement(&self, request: EcTargetRetirement) -> EcScopeResult<EcTargetRetirementStatus> {
+        self.retire_target_with(request, |registry, request| registry.persist_target_retirement(request))
+    }
+
+    fn retirement_gate(&self, request: EcTargetRetirement) -> EcScopeResult<Arc<TargetGate>> {
+        request.validate()?;
+        if !self.staging {
+            return Err(EcScopeError::Invalid("target retirement requires V2/3 staging"));
+        }
+        self.target_gate(request.target)
+    }
+
+    fn retire_target_with(
+        &self,
+        request: EcTargetRetirement,
+        persist: impl FnOnce(&Self, EcTargetRetirement) -> EcScopeResult<()>,
+    ) -> EcScopeResult<EcTargetRetirementStatus> {
+        let gate = self.retirement_gate(request)?;
+        let _mutation = lock(&self.target_registration)?;
+        {
+            let mut state = lock(&gate.state)?;
+            state.ensure_live()?;
+            if !state.identity_confirmed {
+                return Err(EcScopeError::Busy);
+            }
+            state.check_request(request.id)?;
+            state.retirement = Some(request.id);
+        }
+        persist(self, request)?;
+        let mut state = lock(&gate.state)?;
+        state.ensure_live()?;
+        state.durable = true;
+        Ok(state.observation())
+    }
+
+    fn persist_target_retirement(&self, request: EcTargetRetirement) -> EcScopeResult<()> {
+        let record = self.read_target_record(request.target.chain, request.target.target)?;
+        if record.identity != request.target {
+            return Err(EcScopeError::IdentityMismatch);
+        }
+        if let Some(id) = record.retirement {
+            if id != request.id {
+                return Err(EcScopeError::RevocationMismatch);
+            }
+        } else {
+            put_sync(&self.store, &target_key(request.target.chain, request.target.target),
+                     &encode_retired_target(request))?;
+        }
+        self.store.sync_wal()?;
+        Ok(())
+    }
+
+    /// Disk confirmation/query, not a second prepare. A missing retirement
+    /// record may report only an existing local unknown Closing observation.
+    pub fn query_target_retirement(&self, request: EcTargetRetirement) -> EcScopeResult<EcTargetRetirementStatus> {
+        let gate = self.retirement_gate(request)?;
+        let _mutation = lock(&self.target_registration)?;
+        lock(&gate.state)?.check_request(request.id)?;
+        let record = self.read_target_record(request.target.chain, request.target.target)?;
+        if record.identity != request.target {
+            return Err(EcScopeError::IdentityMismatch);
+        }
+        self.merge_target_record(record, false)?;
+        {
+            let state = lock(&gate.state)?;
+            state.ensure_live()?;
+            state.check_request(request.id)?;
+            if state.retirement.is_none() {
+                return Err(EcScopeError::MissingFence);
+            }
+        }
+        if record.retirement.is_some() {
+            self.store.sync_wal()?;
+            self.merge_target_record(record, true)?;
+        }
+        let state = lock(&gate.state)?;
+        state.ensure_live()?;
+        Ok(state.observation())
     }
 
     fn check_target(
@@ -576,6 +779,19 @@ impl EcScopeRegistry {
     }
 
     fn prepare_with_wait(
+        &self,
+        binding: EcScopeBinding,
+        wait: std::time::Duration,
+        load: impl FnOnce(&Self, EcScopeBinding) -> EcScopeResult<Option<EcScopeRevocation>>,
+        on_wait: impl FnOnce(),
+    ) -> EcScopeResult<()> {
+        self.prepare_scope_state_with_wait(binding, wait, load, on_wait)?;
+        // All scope locks have been released. Maintenance fence loading above
+        // remains possible after retirement, but data preparation fails closed.
+        self.check_target_serving(binding.target)
+    }
+
+    fn prepare_scope_state_with_wait(
         &self,
         binding: EcScopeBinding,
         wait: std::time::Duration,
@@ -654,7 +870,11 @@ impl EcScopeRegistry {
     /// that closes a scope. Call before waiting for chunk locks or job queues.
     pub fn try_admit(&self, binding: EcScopeBinding) -> EcScopeResult<EcAdmissionTicket> {
         let gate = self.get_gate(binding)?;
+        let target = self.target_gate(binding.target)?;
         {
+            // Fixed nested order: target -> scope. No map lock or I/O here.
+            let mut target_state = lock(&target.state)?;
+            target_state.ensure_serving()?;
             let mut state = lock(&gate.state)?;
             state.ensure_live()?;
             match state.phase {
@@ -662,10 +882,14 @@ impl EcScopeRegistry {
                 Phase::Closing | Phase::Denied => return Err(EcScopeError::Revoked),
                 Phase::Unloaded | Phase::Loading => return Err(EcScopeError::Busy),
             }
-            state.inflight = state.inflight.checked_add(1).ok_or(EcScopeError::Busy)?;
+            let scope_next = state.inflight.checked_add(1).ok_or(EcScopeError::Busy)?;
+            let target_next = target_state.inflight.checked_add(1).ok_or(EcScopeError::Busy)?;
+            state.inflight = scope_next;
+            target_state.inflight = target_next;
         }
         Ok(EcAdmissionTicket {
             gate,
+            target,
             _store_lease: self.store.clone(),
         })
     }
@@ -781,7 +1005,8 @@ impl EcScopeRegistry {
             return Ok(gate.clone());
         }
         if gates.len() >= self.max_gates {
-            // Registry -> gate is the only nested lock order. Retiring before
+            // Scope-map -> scope is separate from target -> scope; no path
+            // takes a map or target lock while holding a scope lock. Retiring before
             // removal prevents an outstanding Arc from admitting on an old
             // gate while a cache miss creates another gate for the same key.
             let mut victim = None;
@@ -810,6 +1035,59 @@ impl EcScopeRegistry {
         });
         gates.insert(key, gate.clone());
         Ok(gate)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TargetRecord {
+    identity: EcTargetIdentity,
+    retirement: Option<EcIdentity>,
+}
+
+struct TargetGate {
+    identity: EcTargetIdentity,
+    state: Mutex<TargetState>,
+}
+
+#[derive(Default)]
+struct TargetState {
+    identity_confirmed: bool,
+    retirement: Option<EcIdentity>,
+    durable: bool,
+    inflight: u64,
+    broken: bool,
+}
+
+impl TargetState {
+    fn ensure_live(&self) -> EcScopeResult<()> {
+        if self.broken {
+            return Err(EcScopeError::Corrupt("target admission counter invariant"));
+        }
+        Ok(())
+    }
+    fn ensure_serving(&self) -> EcScopeResult<()> {
+        self.ensure_live()?;
+        if self.retirement.is_some() {
+            return Err(EcScopeError::Revoked);
+        }
+        if !self.identity_confirmed {
+            return Err(EcScopeError::Busy);
+        }
+        Ok(())
+    }
+    fn check_request(&self, id: EcIdentity) -> EcScopeResult<()> {
+        self.ensure_live()?;
+        if self.retirement.is_some_and(|old| old != id) {
+            return Err(EcScopeError::RevocationMismatch);
+        }
+        Ok(())
+    }
+    fn observation(&self) -> EcTargetRetirementStatus {
+        if self.durable && self.inflight == 0 {
+            EcTargetRetirementStatus::DataDrained
+        } else {
+            EcTargetRetirementStatus::Pending { inflight: self.inflight, durable: self.durable }
+        }
     }
 }
 
@@ -879,6 +1157,7 @@ impl GateState {
 /// Drop only after the worker and all borrowed request references have ended.
 pub struct EcAdmissionTicket {
     gate: Arc<Gate>,
+    target: Arc<TargetGate>,
     // Keep this physical instance exclusively open until its last old ticket
     // completes. Gate alone would let Engine/registry drop release the RocksDB
     // writer lock; a reopened registry could then falsely report zero inflight.
@@ -894,6 +1173,8 @@ impl EcAdmissionTicket {
     /// Worker-side recheck. No new admission is counted. A queued job can be
     /// rejected after revoke, while its ticket remains until completion.
     pub fn check_execution(&self) -> EcScopeResult<()> {
+        let target = lock(&self.target.state)?;
+        target.ensure_serving()?;
         let state = lock(&self.gate.state)?;
         state.ensure_live()?;
         if state.phase == Phase::Open {
@@ -918,13 +1199,19 @@ impl fmt::Debug for EcAdmissionTicket {
 
 impl Drop for EcAdmissionTicket {
     fn drop(&mut self) {
-        // Poisoning remains an explicit fail-closed error on all later calls.
-        // Never panic while unwinding a caller's failed worker operation.
-        if let Ok(mut state) = self.gate.state.lock() {
-            if let Some(next) = state.inflight.checked_sub(1) {
-                state.inflight = next;
+        // Never unwind. Poison/underflow must not manufacture target zero.
+        // The original store lease drops only after both guarded transitions.
+        if let Ok(mut target) = self.target.state.lock() {
+            if let Ok(mut scope) = self.gate.state.lock() {
+                match (scope.inflight.checked_sub(1), target.inflight.checked_sub(1)) {
+                    (Some(scope_next), Some(target_next)) if !scope.broken && !target.broken => {
+                        scope.inflight = scope_next;
+                        target.inflight = target_next;
+                    }
+                    _ => { scope.broken = true; target.broken = true; }
+                }
             } else {
-                state.broken = true;
+                target.broken = true;
             }
         }
     }
@@ -1099,6 +1386,37 @@ fn decode_target(bytes: &[u8]) -> EcScopeResult<EcTargetIdentity> {
     reader.target()
 }
 
+// A new legitimate ECTG version on the same key, not a legacy-ignored side
+// key. Keep decode_target unchanged as the fixed v1 reader.
+fn encode_retired_target(request: EcTargetRetirement) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RETIRED_TARGET_RECORD_BYTES);
+    bytes.extend_from_slice(b"ECTG");
+    bytes.extend_from_slice(&RETIRED_TARGET_VERSION.to_be_bytes());
+    encode_target_into(&mut bytes, request.target);
+    bytes.extend_from_slice(&request.id);
+    checksum(bytes)
+}
+
+fn decode_target_record(bytes: &[u8]) -> EcScopeResult<TargetRecord> {
+    if bytes.get(4..6) == Some(VERSION.to_be_bytes().as_slice()) {
+        return Ok(TargetRecord { identity: decode_target(bytes)?, retirement: None });
+    }
+    if bytes.len() != RETIRED_TARGET_RECORD_BYTES
+        || &bytes[..4] != b"ECTG"
+        || bytes[4..6] != RETIRED_TARGET_VERSION.to_be_bytes()
+        || bytes[bytes.len()-4..] != crc32c::crc32c(&bytes[..bytes.len()-4]).to_be_bytes()
+    {
+        return Err(EcScopeError::Corrupt("target retirement version, extent, magic or checksum"));
+    }
+    let mut reader = Reader(&bytes[6..bytes.len()-4]);
+    let request = EcTargetRetirement { target: reader.target()?, id: reader.take()? };
+    request.validate()?;
+    if !reader.0.is_empty() {
+        return Err(EcScopeError::Corrupt("trailing target retirement bytes"));
+    }
+    Ok(TargetRecord { identity: request.target, retirement: Some(request.id) })
+}
+
 fn encode_fence(request: EcScopeRevocation) -> Vec<u8> {
     let mut bytes = record(b"ECRV");
     encode_target_into(&mut bytes, request.binding.target);
@@ -1174,3 +1492,7 @@ impl Reader<'_> {
 #[cfg(test)]
 #[path = "ec_scope_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ec_target_retirement_tests.rs"]
+mod target_retirement_tests;

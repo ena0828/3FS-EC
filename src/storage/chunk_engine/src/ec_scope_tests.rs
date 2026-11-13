@@ -628,6 +628,7 @@ fn durable_denial_survives_killed_process_with_an_outstanding_ticket() {
             ])
             .env(CHILD_ROOT, dir.path())
             .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .spawn()
             .unwrap(),
     );
@@ -993,6 +994,7 @@ fn staging_initialization_recovers_after_killed_process_at_each_transaction_boun
                 .env(PROVISION_CHILD_ROOT, dir.path())
                 .env(PROVISION_CHILD_PHASE, phase)
                 .stdin(Stdio::null())
+                .stdout(Stdio::null())
                 .spawn()
                 .unwrap(),
         );
