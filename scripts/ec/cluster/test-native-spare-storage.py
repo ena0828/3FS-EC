@@ -255,6 +255,8 @@ class SpareStorageTests(unittest.TestCase):
             cluster.halt = threading.Event()
             cluster.socket_halt = threading.Event()
             cluster.status_lock = threading.Lock()
+            cluster.managed_lock = threading.Lock()
+            cluster.managed_pending = None
             cluster.control_path = root / 'state/control.sock'
             cluster.fault_control, _ = controller(cluster)
             cluster.control()

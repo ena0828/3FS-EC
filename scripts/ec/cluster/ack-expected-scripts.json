@@ -2,7 +2,8 @@
   "experiment-runner.py": "5678f503616d79b7f36e93ce87c4d8192eca7a8dd8e18bfdeeb8a9ad142beaf4",
   "run-cluster.py": "baad4f20addd5e4c788b2bcabbe0dfbc266fa44821750e381d659cfc70e8822c",
   "generate.py": "0847c990c675440d0ec0f9059eb7655369013dd6604098f6af47e092e3b13bba",
-  "native-v2.py": "d5de76e725f7c560bc0800b556c029fbc3ffd3749c8614ce03370629aa3ce7f3",
-  "native_v2_config.py": "9e658a84a324d27aaf03f0e5990ecee6267ccdf573ff909039f5c58fd5f7766f",
-  "native_fault_control.py": "b409e69d65283f2cf75d0305940b5850968047b3758eec99430a229d7590cf87"
+  "native-v2.py": "5379e32e1ee6dd4917f99d3ed4f0c8dfef42b5748c8cef84e30ea6ef9ff3646b",
+  "native_v2_config.py": "3d003da7ecf8a7af2a92cb5f36f5b8f1b112308e38549a6c17ad19d3de21598a",
+  "native_fault_control.py": "b409e69d65283f2cf75d0305940b5850968047b3758eec99430a229d7590cf87",
+  "native_managed_domain.py": "5e8a91992d6bf8f2f54f30089d2145a100465885b8d356f70f89d69911527128"
 }

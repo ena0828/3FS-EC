@@ -478,7 +478,7 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False, user_uid=1
     write_new(root / "cluster.json", json_text(manifest))
     for name in ("generate.py", "run-cluster.py", "native_v2_config.py", "native-v2.py", "fetch-fdb.sh",
                  "experiment-runner.py", "experiment-menu.py", "file-command.py", "ack-service-acceptance.py",
-                 "ack-expected-scripts.json", "gc-acceptance.py", "native_fault_control.py"):
+                 "ack-expected-scripts.json", "gc-acceptance.py", "native_fault_control.py", "native_managed_domain.py"):
         shutil.copy2(Path(__file__).parent / name, root / "scripts" / name)
     print(f"Prepared {root}: private keys and configuration only; no services, targets or database opened.")
 

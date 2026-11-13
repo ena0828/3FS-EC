@@ -2,7 +2,7 @@ name: EC native experiment script checks
 
 on:
   push:
-    branches: [feat/ec-spare-faults, feat/ec-local-file, fix/ec-mode4-preflight, fix/ec-local-native-acceptance, fix/ec-posix-error-evidence]
+    branches: [feat/ec-spare-faults, feat/ec-local-file, fix/ec-mode4-preflight, fix/ec-local-native-acceptance, feat/ec-managed-start-deny, fix/ec-posix-error-evidence]
     paths:
       - .github/workflows/ec-hosted-spare-scripts.yml
       - scripts/ec/**
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   scripts:
-    if: github.repository == 'ena0828/3FS-EC' && (github.ref == 'refs/heads/feat/ec-spare-faults' || github.ref == 'refs/heads/feat/ec-local-file' || github.ref == 'refs/heads/fix/ec-mode4-preflight' || github.ref == 'refs/heads/fix/ec-local-native-acceptance' || github.ref == 'refs/heads/fix/ec-posix-error-evidence') && github.event.repository.private == false
+    if: github.repository == 'ena0828/3FS-EC' && (github.ref == 'refs/heads/feat/ec-spare-faults' || github.ref == 'refs/heads/feat/ec-local-file' || github.ref == 'refs/heads/fix/ec-mode4-preflight' || github.ref == 'refs/heads/fix/ec-local-native-acceptance' || github.ref == 'refs/heads/feat/ec-managed-start-deny' || github.ref == 'refs/heads/fix/ec-posix-error-evidence') && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -56,6 +56,7 @@ jobs:
               "cluster/test-native-v2-config.py": 18,
               "cluster/test-native-multiprocess-config.py": 6,
               "cluster/test-native-spare-storage.py": 7,
+              "cluster/test-native-managed-domain.py": 14,
               "cluster/test-portable-experiments.py": 5,
               "cluster/test-prepare-fuse-file.py": 4,
               "ci/test-run-file-lab.py": 29,
@@ -86,6 +87,6 @@ jobs:
               "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
               "python": sys.version, "checks": rows, "passed": passed,
               "native_services_started": False, "real_storage_faults": False,
-              "scope": "Python configuration and supervisor checks; includes a private Unix control socket"}, sort_keys=True))
+              "scope": "Python configuration and supervisor checks; includes a private Unix control socket and owned Python child processes, no native Storage"}, sort_keys=True))
           raise SystemExit(0 if passed else 1)
           PY

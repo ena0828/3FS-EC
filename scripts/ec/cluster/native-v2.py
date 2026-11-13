@@ -18,8 +18,11 @@ import sys
 import threading
 import time
 import tomllib
+import uuid
 
 from native_fault_control import FaultController, initial_placement, validate_placement
+from native_managed_domain import (KEY as MANAGED_KEY, ManagedDomain, artifact_identity,
+                                   identifier as managed_id, make_binding, observe_owned_executable)
 from native_v2_config import (PROFILES, SERVICES, SPARE_GC_PROFILE, target_count, file_api_enabled, required_services,
                               authenticated_user, validate_initialized_user, gc_inventory_from_observations, gc_settings, json_text,
                               key_roles, pool_from_observations, prepare, profile_config_problems,
@@ -210,6 +213,13 @@ class NativeCluster(inherited_runner()):
         self.storage_log_start = {}
         self.fault_control = FaultController(self)
         self.env.pop("LD_PRELOAD", None)
+        self.managed = ManagedDomain.attach(root, self.manifest, self.run_id)
+        self.managed_uncertain = False
+        self.managed_launch_inputs = {}
+        self.managed_lock = threading.Lock()
+        self.managed_pending = None
+        self.managed_actions = {}
+        self.managed_enrollment_owner = None
 
     def status(self):
         with self.status_lock:
@@ -264,7 +274,16 @@ class NativeCluster(inherited_runner()):
                                 self.halt.set()
                             response = self.status()
                         else:
-                            response = self.fault_control.submit(json.loads(command))
+                            request = json.loads(command)
+                            if type(request) is not dict or not isinstance(request.get('operation'), str):
+                                raise ValueError('Invalid control operation')
+                            if request['operation'].startswith('managed-'):
+                                response = self.managed_submit(request)
+                            else:
+                                with self.managed_lock:
+                                    if self.managed_pending is not None or self.stage.startswith('managed_'):
+                                        raise ValueError('Managed maintenance excludes fault maintenance')
+                                    response = self.fault_control.submit(request)
                         conn.sendall(json_text(response).encode())
                     except (OSError, UnicodeError, ValueError, RuntimeError) as error:
                         try:
@@ -285,6 +304,10 @@ class NativeCluster(inherited_runner()):
         return super().admin(*args, **kwargs)
 
     def preflight(self):
+        # A registered domain is mandatory; no start flag can omit this gate.
+        # Check before FDB/other services as well as immediately at Storage Popen.
+        if self.managed is not None:
+            self.managed.assert_startable()
         checks = doctor(self.root)
         if checks["problems"]:
             raise RuntimeError(json_text(checks))
@@ -310,9 +333,29 @@ class NativeCluster(inherited_runner()):
         self.start_sampler()
 
     def start(self, name, command):
+        spec = next((row for row in storage_specs(self.manifest) if row['name'] == name), None)
+        if spec is not None:
+            if self.managed_uncertain:
+                raise RuntimeError('Managed enrollment persistence is unknown; no Storage launch')
+            if self.managed is not None and self.managed.locator['binding']['service'] == name:
+                return self.managed.launch(command, lambda: self._start_owned(name, command))
+        return self._start_owned(name, command)
+
+    def _start_owned(self, name, command):
+        spec = next((row for row in storage_specs(self.manifest) if row['name'] == name), None)
+        launch_inputs = None
+        if spec is not None and self.manifest['profile'] == SPARE_GC_PROFILE:
+            launch_inputs = {'argv': list(map(str, command)), 'binary': artifact_identity(Path(command[0])),
+                             'configs': [artifact_identity(Path(command[index])) for index in (2, 4, 6)],
+                             'launch_id': str(uuid.uuid4())}
         generation = sum(child == name for child, _ in self.processes)
         if not generation and self.manifest["profile"] != SPARE_GC_PROFILE:
-            return super().start(name, command)
+            super().start(name, command)
+            proc = self.processes[-1][1]
+            if launch_inputs is not None:
+                launch_inputs['owned'] = observe_owned_executable(proc, launch_inputs['binary'])
+                self.managed_launch_inputs[id(proc)] = launch_inputs
+            return proc
         if generation:
             spec = next((v for v in storage_specs(self.manifest) if v["name"] == name), None)
             if name != "meta" and spec is None:
@@ -336,6 +379,116 @@ class NativeCluster(inherited_runner()):
                 proc.wait()
             raise
         print(f"Started {name} pid={proc.pid} generation={generation}", flush=True)
+        if launch_inputs is not None:
+            launch_inputs['owned'] = observe_owned_executable(proc, launch_inputs['binary'])
+            self.managed_launch_inputs[id(proc)] = launch_inputs
+        return proc
+
+    def managed_submit(self, request):
+        """Socket thread only queues; the foreground owner performs all effects."""
+        if self.manifest['profile'] != SPARE_GC_PROFILE or type(request) is not dict:
+            raise ValueError('Managed adapter requires the explicit gc-14 profile')
+        action = managed_id(request.get('action_id'))
+        if request.get('run') != self.run_id:
+            raise ValueError('Managed action belongs to another supervisor run')
+        operation = request.get('operation')
+        with self.managed_lock:
+            if operation == 'managed-action-status':
+                if set(request) != {'operation', 'action_id', 'run'}:
+                    raise ValueError('Invalid managed status fields')
+                return self.managed_actions.get(action, {'state': 'not_observed', 'action_id': action,
+                                                          'scope': 'managed_launch_only_not_external_fence'})
+            fields = {'operation', 'action_id', 'run', 'domain'}
+            if operation == 'managed-enroll':
+                fields |= {'node', 'control', 'resource_generation'}
+                managed_id(request.get('resource_generation'))
+                if type(request.get('node')) is not int or request['node'] not in {s['node'] for s in storage_specs(self.manifest)}:
+                    raise ValueError('Require one exact prepared Storage node')
+            elif operation != 'managed-retire':
+                raise ValueError('Invalid managed operation')
+            managed_id(request.get('domain'))
+            if set(request) != fields:
+                raise ValueError('Invalid managed request fields')
+            prior = self.managed_actions.get(action)
+            if prior is not None:
+                if prior['request'] != request:
+                    raise ValueError('Managed action UUID payload conflict')
+                if prior['state'] != 'failed':
+                    return prior
+                if operation == 'managed-enroll' and self.managed_enrollment_owner is None:
+                    return prior
+            if self.halt.is_set() or self.managed_pending is not None or self.stage not in {'ready', 'managed_retired', 'managed_unknown'}:
+                raise ValueError('Managed action requires an idle live supervisor')
+            if prior is None and self.stage == 'managed_unknown':
+                raise ValueError('Unknown state only accepts the original action identity')
+            with self.fault_control.lock:
+                if self.fault_control.pending or self.fault_control.running or self.fault_control.failed:
+                    raise ValueError('Another maintenance action is outstanding')
+            record = {'request': request, 'state': 'queued', 'action_id': action,
+                      'scope': 'managed_launch_only_not_external_fence', 'external_fence': False, 'scope_T2': False}
+            self.managed_actions[action] = record
+            self.managed_pending = request
+            self.stage = 'managed_queued'
+            return record
+
+    def managed_execute_one(self):
+        with self.managed_lock:
+            request = self.managed_pending
+            if request is None:
+                return
+            self.managed_pending = None
+            record = self.managed_actions[request['action_id']]
+            record['state'] = 'running'
+            record = dict(record)  # Status thread never serializes an actively mutated result.
+            self.stage = 'managed_processing'
+        try:
+            with self.fault_control.lock:
+                if self.fault_control.pending or self.fault_control.running or self.fault_control.failed:
+                    raise RuntimeError('Concurrent maintenance is not accepted')
+            if request['operation'] == 'managed-enroll':
+                self.stage = 'managed_enrollment'
+                self.managed_uncertain = True
+                spec = next(s for s in storage_specs(self.manifest) if s['node'] == request['node'])
+                proc = self.fault_control._owned(spec['name'])
+                if self.managed_enrollment_owner is None:
+                    self.managed_enrollment_owner = (dict(request), proc)
+                elif self.managed_enrollment_owner != (request, proc):
+                    raise RuntimeError('Partial enrollment can only retain its original live owner')
+                inventory = json.loads((self.root / 'state/physical-pool.json').read_text(encoding='utf-8'))
+                endpoint = next(row for row in inventory if row['node'] == request['node'])
+                # This is a fresh authenticated RPC observation, not enrollment
+                # of a caller-supplied engine/incarnation or an old PID file.
+                self.fault_control._discover_one(endpoint, {'request': {'action_id': str(uuid.uuid4())}})
+                self.manifest = load_manifest(self.root)  # Includes any persisted partial marker.
+                binding = make_binding(self.root, self.manifest, endpoint, spec, request['resource_generation'])
+                self.managed = ManagedDomain.enroll(self.root, self.manifest, Path(request['control']),
+                    request['domain'], request['action_id'], binding, self.run_id, proc,
+                    self.managed_launch_inputs[id(proc)])
+                self.managed_uncertain = False
+                self.stage = 'ready'
+            else:
+                if self.managed is None or self.managed.locator['domain'] != request['domain']:
+                    raise RuntimeError('Managed domain is not enrolled by this owner')
+                self.stage = 'managed_retiring'
+                proc = self.managed.prepare_deny(request['action_id'])
+                # The durable deny precedes the first signal. This expected exit
+                # is deliberately NOT added to the restartable faulted-node set.
+                with self.fault_control.lock:
+                    self.fault_control.expected[id(proc)] = (proc, {
+                        'name': self.managed.locator['binding']['service'], 'pid': proc.pid,
+                        'reason': 'managed_launch_deny_then_owned_stop'})
+                if proc.poll() is None:
+                    proc.terminate()
+                proc.wait(timeout=45)
+                self.managed.observe_join(proc)
+                self.stage = 'managed_retired'
+            record.update(state='completed', observation=self.managed.query())
+        except BaseException as error:
+            record.update(state='failed', error_type=type(error).__name__, outcome_unknown=True)
+            self.stage = 'managed_unknown'
+        finally:
+            with self.managed_lock:
+                self.managed_actions[request['action_id']] = record
 
     def start_service(self, name):
         spec = next((value for value in storage_specs(self.manifest) if value["name"] == name), None)
@@ -571,6 +724,11 @@ class NativeCluster(inherited_runner()):
 
     def finish(self):
         clean = super().stop()
+        if self.managed is not None and self.managed.handle is not None:
+            try:
+                self.managed.observe_join(self.managed.handle)
+            except (OSError, ValueError):
+                clean = False  # Never make a lost/unknown handle restartable.
         self.stage = "stopped" if clean else "cleanup_incomplete"
         replace_private(self.root / "state/last-supervisor.json", json_text(self.status()))
         self.socket_halt.set()
@@ -602,7 +760,8 @@ def request_control(root, command):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["prepare", "doctor", "start", "status", "stop", "fault-storage", "restart-storage", "replace-placement", "action-status"])
+    parser.add_argument("command", choices=["prepare", "doctor", "start", "status", "stop", "fault-storage", "restart-storage", "replace-placement", "action-status",
+                                           "managed-enroll", "managed-retire", "managed-query"])
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[3])
     parser.add_argument("--port-base", type=int, default=13500)
@@ -619,11 +778,18 @@ def main():
                         help="fault action observation limit; timeout never cancels or reissues the action")
     parser.add_argument("--nodes", help="fault/restart: one or two explicit node IDs, comma separated")
     parser.add_argument("--replace", help="placement: explicit old:new mappings, comma separated")
+    parser.add_argument('--domain-id', help='managed operations: fixed nonzero domain UUID')
+    parser.add_argument('--control-dir', type=Path, help='enroll: existing empty private directory outside this lab')
+    parser.add_argument('--resource-generation', help='enroll: fixed resource binding UUID, not a device isolation proof')
+    parser.add_argument('--node', type=int, help='enroll: one already-running gc14 Storage node')
     args = parser.parse_args()
     if sys.platform != "linux":
         parser.error("Use Python 3.11+ inside Linux/WSL; no Windows filesystem database support")
     os.umask(0o077)
     root = args.root.absolute()
+    managed_args = (args.domain_id, args.control_dir, args.resource_generation, args.node)
+    if not args.command.startswith('managed-') and any(v is not None for v in managed_args):
+        parser.error('Managed arguments require a managed command')
     if args.command == "prepare":
         if args.run or args.action_id or args.nodes or args.replace:
             parser.error("Fault action arguments cannot be used with prepare")
@@ -637,6 +803,47 @@ def main():
     if args.profile is not None or args.file_api or args.user_uid is not None or args.user_gid is not None:
         parser.error("--profile/--file-api/--user-uid/--user-gid are prepare-only; start/resume uses the immutable prepared profile")
     load_manifest(root)
+    if args.command.startswith('managed-'):
+        if args.nodes or args.replace or not args.domain_id:
+            parser.error('Managed commands require --domain-id and no fault selection flags')
+        managed_id(args.domain_id)
+        if args.command == 'managed-query':
+            if args.run or args.action_id or any(v is not None for v in (args.control_dir, args.resource_generation, args.node)):
+                parser.error('managed-query takes only --root/--domain-id; it may re-sync persistence but never starts/stops processes')
+            manifest = load_manifest(root)
+            if MANAGED_KEY not in manifest or manifest[MANAGED_KEY]['domain'] != args.domain_id:
+                parser.error('No matching mandatory managed-domain marker')
+            try:
+                gate = ManagedDomain.attach(root, manifest, 'offline-query-no-process-ownership')
+                result = gate.query()
+                print(json_text(result))
+                return 0
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                print(json_text({'scope': 'managed_launch_only_not_external_fence', 'state': 'unknown',
+                                 'error_type': type(error).__name__, 'external_fence': False, 'scope_T2': False}))
+                return 2
+        if not args.run or not args.action_id or not 1 <= args.wait_seconds <= 1800:
+            parser.error('Managed mutation requires fixed --run/--action-id and wait 1..1800')
+        managed_id(args.action_id)
+        request = {'operation': args.command, 'action_id': args.action_id, 'run': args.run, 'domain': args.domain_id}
+        if args.command == 'managed-enroll':
+            if args.control_dir is None or args.resource_generation is None or args.node is None:
+                parser.error('Enrollment requires --control-dir/--resource-generation/--node')
+            request.update(control=str(args.control_dir.absolute()), resource_generation=managed_id(args.resource_generation),
+                           node=args.node)
+        elif any(v is not None for v in (args.control_dir, args.resource_generation, args.node)):
+            parser.error('Retirement uses the enrolled binding; no replacement paths/identity')
+        result = request_control(root, request)
+        print(json_text(result), flush=True)
+        deadline = time.monotonic() + args.wait_seconds
+        while 'error' not in result and result.get('state') in {'queued', 'running'}:
+            if time.monotonic() >= deadline:
+                return 2  # Never reissue, cancel or invent a new retirement ID.
+            time.sleep(0.25)
+            result = request_control(root, {'operation': 'managed-action-status', 'run': args.run,
+                                            'action_id': args.action_id})
+        print(json_text(result), flush=True)
+        return 0 if result.get('state') == 'completed' else 1
     if args.command in {"fault-storage", "restart-storage", "replace-placement", "action-status"}:
         if not args.run or not args.action_id:
             parser.error("--run and --action-id are mandatory")
@@ -711,6 +918,7 @@ def main():
             cluster.preflight()
             cluster.launch()
             while not cluster.halt.wait(1):
+                cluster.managed_execute_one()
                 cluster.fault_control.execute_one()
                 cluster.fault_control.healthy()
         except BaseException as error:
