@@ -178,7 +178,8 @@ class SystemEntrypoints(unittest.TestCase):
                 parse_json=lambda _: row, require=regression.require, clock=lambda: 77,
                 remaining=mock.Mock())
             for stage, minutes, step in (("repair", 80, 75), ("file", 90, 45), ("spare", 40, 35),
-                                         ("regression", 40, 35), ("target-meta", 80, 75), ("core", 100, 95)):
+                                         ("regression", 40, 35), ("service-contracts", 80, 75),
+                                         ("target-meta", 80, 75), ("core", 100, 95)):
                 for delta, expected in ((0, 0), (-1, 1)):
                     base.remaining.return_value = minutes * 60 * base.NANO + delta
                     with contextlib.redirect_stdout(io.StringIO()) as output:
@@ -193,6 +194,14 @@ class SystemEntrypoints(unittest.TestCase):
                 budget.check(base, Path(temp), identity, "file")
 
     def test_retirement_fix_branch_is_explicit_and_keeps_public_job_identity_gate(self):
+        reflection_ref = "refs/heads/fix/ec-meta-reflection"
+        self.assertEqual(budget.budget_module("target-meta", ref=reflection_ref).REF, reflection_ref)
+        with self.assertRaises(ValueError):
+            budget.budget_module("system", ref=reflection_ref)
+        with mock.patch.object(budget.sys, "argv", ["budget", "check", "--profile", "system",
+                                                     "--stage", "service-contracts"]), \
+             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            budget.main()
         ref = "refs/heads/fix/ec-retirement-keys"
         fixed = budget.budget_module("target-meta", ref=ref)
         self.assertEqual(fixed.REF, ref)

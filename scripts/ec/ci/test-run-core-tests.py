@@ -60,6 +60,15 @@ class TestCoreAcceptanceContract(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 RUNNER.check_meta_receipt(bad, binary, output, cases, test_filter)
         self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 21)
+        combined, combined_filter, combined_fuse = RUNNER.selection("service-contracts")
+        self.assertEqual(combined, expected + (
+            "TestMetaServiceReflection.RegistersAll69IncludingBeyondDefaultFieldRank",))
+        self.assertEqual(combined_filter, ":".join(combined))
+        self.assertEqual(combined_fuse, ())
+        RUNNER.check_meta_receipt(receipt(binary, output, combined, combined_filter), binary, output,
+                                  combined, combined_filter)
+        with self.assertRaises(ValueError):
+            RUNNER.check_meta_receipt(sample, binary, output, combined, combined_filter)
 
     def test_target_meta_profile_requires_all_nine_cases_and_exact_commands(self):
         cases, test_filter, fuse = RUNNER.selection("target-meta")

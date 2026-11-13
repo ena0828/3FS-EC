@@ -33,6 +33,9 @@ REPAIR_CASES = (
 )
 AUTH_USER_CASES = tuple(f"TestAuth/{backend}.{case}" for backend in (0, 1)
                         for case in ("Basic", "ExplicitPrimaryGroup"))
+SERVICE_CONTRACT_CASES = AUTH_USER_CASES + (
+    "TestMetaServiceReflection.RegistersAll69IncludingBeyondDefaultFieldRank",
+)
 TARGET_META_CASES = (
     "TestEcTargetRetirementCatalog.RealFdbImmutableIntentAndRequestIdentity",
     "TestEcTargetRetirementCatalog.RealFdbAcceptedIntentConflictsWithAssignmentSnapshot",
@@ -70,10 +73,11 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     for name in ("source", "build", "fdb-bin-dir", "work"):
         result.add_argument("--" + name, required=True, type=Path)
-    result.add_argument("--profile", choices=("core", "repair", "target-meta", "auth-user"), default="core",
+    result.add_argument("--profile", choices=("core", "repair", "target-meta", "auth-user", "service-contracts"), default="core",
                         help="core: 7 Meta + 14 FUSE; repair: three-strategy fixture; "
                              "target-meta: 9 retirement catalogue, RPC and evidence cases; "
-                             "auth-user: default and explicit primary GID with MemKV and FDB")
+                             "auth-user: default and explicit primary GID with MemKV and FDB; "
+                             "service-contracts: auth-user plus all Meta dispatch IDs")
     return result
 
 
@@ -86,6 +90,8 @@ def selection(profile):
         return TARGET_META_CASES, ":".join(TARGET_META_CASES), ()
     if profile == "auth-user":
         return AUTH_USER_CASES, ":".join(AUTH_USER_CASES), ()
+    if profile == "service-contracts":
+        return SERVICE_CONTRACT_CASES, ":".join(SERVICE_CONTRACT_CASES), ()
     raise ValueError("unknown fixed acceptance profile")
 
 

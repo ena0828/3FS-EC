@@ -13,10 +13,11 @@ import sys
 
 
 STAGES = {"repair": (80, 75), "file": (90, 45), "spare": (40, 35),
-          "regression": (40, 35), "target-meta": (80, 75), "core": (100, 95)}
+          "regression": (40, 35), "service-contracts": (80, 75), "target-meta": (80, 75), "core": (100, 95)}
 PROFILE_REFS = {
     "system": ("refs/heads/feat/ec-system-acceptance",),
-    "target-meta": ("refs/heads/feat/ec-target-meta", "refs/heads/fix/ec-retirement-keys"),
+    "target-meta": ("refs/heads/feat/ec-target-meta", "refs/heads/fix/ec-retirement-keys",
+                    "refs/heads/fix/ec-meta-reflection"),
 }
 
 
@@ -65,7 +66,7 @@ def main():
     args = parser.parse_args()
     if (args.command == "record" and args.stage is not None) or (args.command == "check" and args.stage is None):
         parser.error("record takes no stage; check requires --stage")
-    if args.profile == "system" and args.stage in ("regression", "target-meta", "core"):
+    if args.profile == "system" and args.stage in ("regression", "service-contracts", "target-meta", "core"):
         parser.error("this stage requires --profile target-meta")
     base = budget_module(args.profile, ref=os.environ.get("GITHUB_REF"))
     parent, identity = base.context()
