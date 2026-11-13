@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -61,6 +62,7 @@ class BuildInputs(unittest.TestCase):
                  (['--with-ec-regression-targets', '--backend', 'isal', '--with-lab-targets'], 'isal true true 1'),
                  (['--with-lab-targets', '--backend', 'scalar', '--with-ec-regression-targets'], 'scalar true true 1'),
                  (['--build-jobs', '2', '--backend', 'isal'], 'isal false false 2'),
+                 (['--build-jobs', '4', '--backend', 'isal'], 'isal false false 4'),
                  (['--build-jobs', '1'], 'scalar false false 1'),
                  (['--local-source', '/fixed/source', '--local-work', '/fixed/native',
                    '--local-revision', 'a' * 40], 'scalar false false 1')]
@@ -73,6 +75,7 @@ class BuildInputs(unittest.TestCase):
                      ['--with-lab-targets', '--with-lab-targets'],
                      ['--with-ec-regression-targets', '--with-ec-regression-targets'],
                      ['--build-jobs'], ['--build-jobs', '0'], ['--build-jobs', '3'],
+                     ['--build-jobs', '5'], ['--build-jobs', '8'],
                      ['--build-jobs', '02'], ['--build-jobs=2'],
                      ['--build-jobs', '1', '--build-jobs', '2'],
                      ['--local-source', '/fixed/source'], ['--local-work', '/fixed/native'],
@@ -100,6 +103,11 @@ class BuildInputs(unittest.TestCase):
         gib = 1024 ** 3
         memory = {'MemTotal': 15 * gib, 'MemAvailable': 12 * gib}
         self.assertEqual(plan(2, memory, 4, [])['effective_jobs'], 2)
+        four = plan(4, memory, 4, [])
+        self.assertEqual(four['effective_jobs'], 4)
+        self.assertEqual(four['pools'], {'compile': 4, 'link': 1})
+        self.assertEqual(four['j4_thresholds'], {'memtotal_bytes': 15 * gib, 'headroom_bytes': 12 * gib,
+                                                'cpu_floor': 4})
         for mem, cpu, groups in [
             ({**memory, 'MemTotal': 15 * gib - 1}, 4, []),
             ({**memory, 'MemAvailable': 12 * gib - 1}, 4, []),
@@ -109,8 +117,9 @@ class BuildInputs(unittest.TestCase):
         ]:
             with self.subTest(mem=mem, cpu=cpu, groups=groups):
                 self.assertIsNone(plan(2, mem, cpu, groups)['effective_jobs'])
+                self.assertIsNone(plan(4, mem, cpu, groups)['effective_jobs'])
                 self.assertEqual(plan(1, mem, cpu, groups)['effective_jobs'], 1)
-        for jobs in (0, 3, True):
+        for jobs in (0, 3, 5, True):
             with self.assertRaises(ValueError):
                 plan(jobs, memory, 4, [])
 
@@ -147,6 +156,15 @@ class BuildInputs(unittest.TestCase):
             self.skipTest('Native Bash unavailable; no WSL fallback')
         text = SCRIPT.read_text(encoding='utf-8')
         block = text.split('# BEGIN REQUESTED BUILD\n', 1)[1].split('# END REQUESTED BUILD', 1)[0]
+        workflows = HERE.parents[2] / '.github/workflows'
+        for name in ('ec-hosted-native.yml', 'ec-hosted-system.yml', 'ec-hosted-target-control.yml',
+                     'ec-hosted-target-meta.yml'):
+            source = (workflows / name).read_text(encoding='utf-8')
+            calls = re.findall(r'^\s*run: (bash scripts/ec/ci/build-native\.sh[^\n]*)$', source, re.M)
+            self.assertEqual(len(calls), 1, name)
+            args = shlex.split(calls[0])
+            self.assertEqual(args.count('--build-jobs'), 1, name)
+            self.assertEqual(args[args.index('--build-jobs') + 1], '4', name)
         env_block = text.split('export CC=/usr/bin/gcc-12', 1)[1].split('# END BUILD ENVIRONMENT', 1)[0]
         base = ['test_meta', 'test_fuse_ec']
         regression = ['test_storage_store', 'test_storage_service', 'test_client']
@@ -166,8 +184,9 @@ cmake() {
 }
 python3() { cat >/dev/null; }
 '''
-            for jobs, full, mode in [(1, False, False), (2, False, False), (1, True, False),
-                                     (2, True, False), (1, True, True), (2, True, True)]:
+            for jobs, full, mode in [(1, False, False), (2, False, False), (4, False, False),
+                                     (1, True, False), (2, True, False), (4, True, False),
+                                     (1, True, True), (2, True, True), (4, True, True)]:
                 (Path(folder) / 'cmake-argv').write_text('')
                 dependency = '/fixed/work/deps' if mode else '/usr/local'
                 flags = (f'build_jobs={jobs}\nwith_lab={str(full).lower()}\nwith_regression={str(full).lower()}\n'

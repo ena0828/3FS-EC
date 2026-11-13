@@ -12,7 +12,7 @@ local_source=
 local_work=
 local_revision=
 usage() {
-    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs 1|2] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA]' >&2
+    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs 1|2|4] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA]' >&2
 }
 while (($#)); do
     case "$1" in
@@ -34,7 +34,7 @@ while (($#)); do
             shift 2
             ;;
         --build-jobs)
-            if "$build_jobs_seen" || (($# < 2)) || [[ "$2" != 1 && "$2" != 2 ]]; then
+            if "$build_jobs_seen" || (($# < 2)) || [[ "$2" != 1 && "$2" != 2 && "$2" != 4 ]]; then
                 usage; exit 2
             fi
             build_jobs="$2"
@@ -184,7 +184,7 @@ def cgroup_rows(root, membership, mountinfo):
         current = current.parent
 
 def resource_plan(jobs, memory, affinity, groups):
-    require(type(jobs) is int and jobs in (1, 2), 'unknown build concurrency')
+    require(type(jobs) is int and jobs in (1, 2, 4), 'unknown build concurrency')
     require(type(affinity) is int and affinity > 0, 'CPU affinity unavailable')
     total, available = memory['MemTotal'], memory['MemAvailable']
     require(type(total) is int and type(available) is int and 0 <= available <= total,
@@ -197,6 +197,8 @@ def resource_plan(jobs, memory, affinity, groups):
                 cpus = min(cpus, int(quota) // int(period))
         if row['memory_max'] not in (None, 'max'):
             headroom = min(headroom, max(0, int(row['memory_max']) - row['memory_current']))
+    # Explicit four-way builds retain the same visible admission floor. Neither
+    # this floor nor prior two-way results prove four-way peak RSS or duration.
     admitted = jobs == 1 or (total >= 15 * GIB and headroom >= 12 * GIB and cpus >= 4)
     return {'schema': 1, 'status': 'admitted' if admitted else 'insufficient-resources',
             'requested_jobs': jobs, 'effective_jobs': jobs if admitted else None,
@@ -204,6 +206,7 @@ def resource_plan(jobs, memory, affinity, groups):
             'host_memory_bytes': memory, 'visible_memory_headroom_bytes': headroom,
             'cgroup_ancestors': groups,
             'j2_thresholds': {'memtotal_bytes': 15 * GIB, 'headroom_bytes': 12 * GIB, 'cpu_floor': 4},
+            'j4_thresholds': {'memtotal_bytes': 15 * GIB, 'headroom_bytes': 12 * GIB, 'cpu_floor': 4},
             'pools': {'compile': jobs, 'link': 1},
             'nested_jobs': {'cmake_environment': 1, 'cargo': 1, 'make': 1, 'jemalloc': 1},
             'scope': 'visible host/cgroup admission only; hidden ancestors, peak RSS and elapsed time unproven'}

@@ -56,7 +56,7 @@ jobs:
         # This job does not execute their business or mount acceptance suites.
         timeout-minutes: 240
         shell: bash
-        run: bash scripts/ec/ci/build-native.sh --backend isal --build-jobs 2 --with-ec-regression-targets
+        run: bash scripts/ec/ci/build-native.sh --backend isal --build-jobs 4 --with-ec-regression-targets
 
       - name: Verify target control through real Storage and client code
         timeout-minutes: 35

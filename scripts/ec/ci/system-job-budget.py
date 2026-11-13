@@ -7,23 +7,31 @@ workflow cancellation, credential, build or service operation is performed.
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 
 
 STAGES = {"repair": (80, 75), "file": (90, 45), "spare": (40, 35),
           "regression": (40, 35), "target-meta": (80, 75), "core": (100, 95)}
+PROFILE_REFS = {
+    "system": ("refs/heads/feat/ec-system-acceptance",),
+    "target-meta": ("refs/heads/feat/ec-target-meta", "refs/heads/fix/ec-retirement-keys"),
+}
 
 
-def budget_module(profile="system"):
-    if profile not in ("system", "target-meta"):
+def budget_module(profile="system", ref=None):
+    if profile not in PROFILE_REFS:
         raise ValueError("unknown fixed job budget profile")
+    if ref is None:
+        ref = PROFILE_REFS[profile][0]
+    if ref not in PROFILE_REFS[profile]:
+        raise ValueError("ref is outside the fixed job budget profile")
     path = Path(__file__).with_name("job-budget.py")
     spec = importlib.util.spec_from_file_location("system_budget_base", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.REF = ("refs/heads/feat/ec-system-acceptance" if profile == "system"
-                  else "refs/heads/feat/ec-target-meta")
+    module.REF = ref
     module.REQUIRED_MINUTES = 90
     module.LAB_STEP_MINUTES = 80  # File 45 + spare 35; both remain separately capped.
     module.RECORD_NAME = "ec-" + profile + "-job-budget.json"
@@ -59,7 +67,7 @@ def main():
         parser.error("record takes no stage; check requires --stage")
     if args.profile == "system" and args.stage in ("regression", "target-meta", "core"):
         parser.error("this stage requires --profile target-meta")
-    base = budget_module(args.profile)
+    base = budget_module(args.profile, ref=os.environ.get("GITHUB_REF"))
     parent, identity = base.context()
     identity["system_driver_sha256"] = base.digest(Path(__file__).read_bytes())
     return base.record(parent, identity) if args.command == "record" else check(base, parent, identity, args.stage)

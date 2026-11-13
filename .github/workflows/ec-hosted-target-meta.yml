@@ -2,7 +2,7 @@ name: EC target retirement Meta and integrated acceptance
 
 on:
   push:
-    branches: [feat/ec-target-meta]
+    branches: [feat/ec-target-meta, fix/ec-retirement-keys]
     paths:
       - .github/workflows/ec-hosted-target-meta.yml
       - scripts/ec/**
@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   native:
-    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-target-meta' && github.event.repository.private == false
+    if: github.repository == 'ena0828/3FS-EC' && (github.ref == 'refs/heads/feat/ec-target-meta' || github.ref == 'refs/heads/fix/ec-retirement-keys') && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     # Every native phase checks the shared remaining job budget. Any refused
@@ -67,7 +67,7 @@ jobs:
       - name: Build one ISA-L configuration for core regressions and both labs
         timeout-minutes: 240
         shell: bash
-        run: bash scripts/ec/ci/build-native.sh --backend isal --build-jobs 2 --with-lab-targets --with-ec-regression-targets
+        run: bash scripts/ec/ci/build-native.sh --backend isal --build-jobs 4 --with-lab-targets --with-ec-regression-targets
 
       - name: Run native Storage service client and legacy regressions
         timeout-minutes: 35

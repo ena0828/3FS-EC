@@ -61,7 +61,7 @@ jobs:
       - name: Build core tests and the eight native file-lab programs
         timeout-minutes: 240
         shell: bash
-        run: bash scripts/ec/ci/build-native.sh --with-lab-targets
+        run: bash scripts/ec/ci/build-native.sh --build-jobs 4 --with-lab-targets
 
       - name: Run private FDB native cases and FUSE component tests
         # All steps share the 350-minute job cap; these are not additive budgets.

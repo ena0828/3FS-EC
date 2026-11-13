@@ -192,6 +192,28 @@ class SystemEntrypoints(unittest.TestCase):
             with self.assertRaises(ValueError):
                 budget.check(base, Path(temp), identity, "file")
 
+    def test_retirement_fix_branch_is_explicit_and_keeps_public_job_identity_gate(self):
+        ref = "refs/heads/fix/ec-retirement-keys"
+        fixed = budget.budget_module("target-meta", ref=ref)
+        self.assertEqual(fixed.REF, ref)
+        self.assertEqual(fixed.JOB, "native")
+        self.assertEqual(fixed.JOB_MINUTES, 350)
+        self.assertEqual(fixed.RECORD_NAME, "ec-target-meta-job-budget.json")
+        self.assertEqual(budget.budget_module("target-meta").REF, "refs/heads/feat/ec-target-meta")
+        for profile, other in (("system", ref), ("target-meta", "refs/heads/main"),
+                               ("target-meta", "refs/heads/fix/unreviewed"), ("target-meta", "")):
+            with self.subTest(profile=profile, ref=other), self.assertRaises(ValueError):
+                budget.budget_module(profile, ref=other)
+        owned = SimpleNamespace(context=mock.Mock(return_value=(Path("/private"), {})),
+                                digest=lambda _: "wrapper", record=mock.Mock(return_value=0))
+        with mock.patch.dict(budget.os.environ, {"GITHUB_REF": ref}), \
+             mock.patch.object(budget.sys, "argv", ["budget", "record", "--profile", "target-meta"]), \
+             mock.patch.object(budget, "budget_module", return_value=owned) as selected:
+            self.assertEqual(budget.main(), 0)
+            selected.assert_called_once_with("target-meta", ref=ref)
+            owned.context.assert_called_once_with()
+            owned.record.assert_called_once_with(Path("/private"), {"system_driver_sha256": "wrapper"})
+
 
 if __name__ == "__main__":
     unittest.main()
