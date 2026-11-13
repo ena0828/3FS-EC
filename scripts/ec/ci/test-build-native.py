@@ -12,6 +12,7 @@ import re
 import shutil
 import shlex
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -702,6 +703,117 @@ class ContainerBuildResources(unittest.TestCase):
         for kind, container_mode in [('xfs', False), ('overlay', True), ('nfs', True), ('tmpfs', False)]:
             with self.assertRaises(ValueError):
                 local.check_filesystem(kind, container_mode)
+
+
+class ArrowDownload(unittest.TestCase):
+    '''Check the actual native CMake argument lists with offline command fixtures.'''
+
+    @classmethod
+    def setUpClass(cls):
+        cmake = shutil.which('cmake')
+        if cmake is None:
+            raise unittest.SkipTest('Native CMake required; no WSL fallback')
+        text = (HERE.parents[2] / 'cmake/ApacheArrow.cmake').read_text(encoding='utf-8')
+        configure = re.findall(r'\bCONFIGURE_COMMAND\s+(.*?)\n\s+BUILD_COMMAND\b', text, re.S)
+        build = re.findall(r'\bBUILD_COMMAND\s+(.*?)\n\s+BUILD_JOB_SERVER_AWARE\b', text, re.S)
+        parallel = re.findall(r'if\(CMAKE_VERSION VERSION_GREATER_EQUAL 3\.28\).*?endif\(\)', text, re.S)
+        if any(len(items) != 1 for items in (configure, build, parallel)):
+            raise AssertionError('Expected unique actual Arrow command and parallelism blocks')
+        cls.commands = {}
+        # CMake itself expands the actual command lists and version branch. This
+        # script-mode check does not generate or run a native build system.
+        with tempfile.TemporaryDirectory(prefix='arrow-argv-') as directory:
+            root = Path(directory).resolve()
+            parser = root / 'capture.cmake'
+            parser.write_text('''cmake_minimum_required(VERSION 3.16)
+set(CMAKE_VERSION "${TEST_VERSION}")
+function(capture label)
+  math(EXPR count "${ARGC} - 1")
+  file(WRITE "${OUTPUT}/${label}-count" "${count}")
+  foreach(index RANGE 1 ${count})
+    math(EXPR output_index "${index} - 1")
+    file(WRITE "${OUTPUT}/${label}-${output_index}" "${ARGV${index}}")
+  endforeach()
+endfunction()
+''' + parallel[0] + '\ncapture(configure\n' + configure[0]
+                              + '\n)\ncapture(build\n' + build[0] + '\n)\n', encoding='utf-8')
+            for version in ('3.27', '3.28'):
+                output = root / version
+                output.mkdir()
+                result = subprocess.run([cmake, '-DOUTPUT=' + output.as_posix(),
+                                         '-DTEST_VERSION=' + version, '-P', str(parser)],
+                                        text=True, capture_output=True)
+                if result.returncode != 0:
+                    raise AssertionError(result.stdout + result.stderr)
+                cls.commands[version] = {}
+                for phase in ('configure', 'build'):
+                    count = int((output / (phase + '-count')).read_text())
+                    argv = [(output / (phase + '-' + str(i))).read_text(encoding='utf-8')
+                            for i in range(count)]
+                    if not argv or not Path(argv[0]).samefile(cmake):
+                        raise AssertionError('Arrow must invoke CMAKE_COMMAND directly, without a shell')
+                    cls.commands[version][phase] = argv
+
+    def run_fixture(self, argv, exitcode=0):
+        with tempfile.TemporaryDirectory(prefix='arrow-direct-') as directory:
+            root = Path(directory).resolve()
+            thirdparty = root / 'thirdparty'
+            thirdparty.mkdir()
+            # Either source/export or the former all-dependency prefetch would
+            # leave this marker. The existing partial file must remain unused.
+            old = 'printf unexpected > "$ARROW_TEST_MARKER"\nexport ARROW_ABSL_URL=partial\n'
+            export = thirdparty / 'export.sh'
+            export.write_text(old, encoding='utf-8')
+            downloader = thirdparty / 'download_dependencies.sh'
+            downloader.write_text('#!/usr/bin/env bash\nprintf unexpected > "$ARROW_TEST_MARKER"\nexit 91\n',
+                                  encoding='utf-8')
+            downloader.chmod(0o700)
+            fake = root / 'fake-cmake.py'
+            fake.write_text('''import json, os, sys
+from pathlib import Path
+Path('invoked.json').write_text(json.dumps(sys.argv[1:]), encoding='utf-8')
+raise SystemExit(int(os.environ['ARROW_TEST_EXIT']))
+''', encoding='utf-8')
+            environment = dict(os.environ)
+            environment.update(ARROW_TEST_MARKER=(root / 'unexpected').as_posix(),
+                               ARROW_TEST_EXIT=str(exitcode))
+            # Replace only the CMake executable, preserving its actual parsed
+            # arguments. Python makes the fake tool executable on both platforms.
+            result = subprocess.run([sys.executable, str(fake), *argv[1:]], cwd=root,
+                                    env=environment, text=True, capture_output=True)
+            return {'result': result, 'argv': json.loads((root / 'invoked.json').read_text()),
+                    'unexpected': (root / 'unexpected').exists(), 'export': export.read_text(),
+                    'old_export': old}
+
+    def test_native_commands_preserve_options_and_both_parallelism_branches(self):
+        expected = ['-S', '.', '-B', '.', '-DCMAKE_BUILD_TYPE=Release', '-DARROW_USE_CCACHE=OFF',
+                    '-DARROW_USE_SCCACHE=OFF', '-DARROW_DEPENDENCY_SOURCE=BUNDLED', '-DARROW_BUILD_STATIC=ON',
+                    '-DARROW_JEMALLOC=ON', '-DARROW_SIMD_LEVEL=DEFAULT', '-DARROW_BUILD_EXAMPLES=OFF',
+                    '-DARROW_PARQUET=ON', '-DARROW_CSV=ON', '-DARROW_WITH_ZSTD=ON', '-DARROW_WITH_LZ4=ON',
+                    '-DARROW_WITH_ZLIB=ON']
+        for version, commands in self.commands.items():
+            with self.subTest(version=version):
+                self.assertEqual(commands['configure'][1:], expected)
+                self.assertEqual(commands['build'][1:], ['--build', '.'] + (['-j8'] if version == '3.27' else []))
+
+    def test_partial_export_and_all_dependency_script_are_not_executed(self):
+        for phase, argv in self.commands['3.28'].items():
+            with self.subTest(phase=phase):
+                observed = self.run_fixture(argv)
+                self.assertEqual(observed['result'].returncode, 0, observed['result'].stderr)
+                self.assertEqual(observed['argv'], argv[1:])
+                self.assertFalse(observed['unexpected'])
+                self.assertEqual(observed['export'], observed['old_export'])
+
+    def test_configure_and_build_nonzero_results_are_not_masked(self):
+        for phase, exitcode in (('configure', 23), ('build', 29)):
+            with self.subTest(phase=phase):
+                argv = self.commands['3.28'][phase]
+                observed = self.run_fixture(argv, exitcode)
+                self.assertEqual(observed['result'].returncode, exitcode)
+                self.assertEqual(observed['argv'], argv[1:])
+                self.assertFalse(observed['unexpected'])
+                self.assertEqual(observed['export'], observed['old_export'])
 
 
 if __name__ == '__main__':

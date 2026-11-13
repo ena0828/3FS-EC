@@ -29,20 +29,20 @@ ExternalProject_Add(
     SOURCE_SUBDIR "cpp"
     BUILD_IN_SOURCE ON
     INSTALL_DIR ${PREFIX}
-    CONFIGURE_COMMAND bash -x -c "\
-    ( cd thirdparty && [[ -f export.sh ]] || ./download_dependencies.sh | tee export.sh ) && \
-    source thirdparty/export.sh && cmake -S . -B . \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DARROW_USE_CCACHE=OFF \
-        -DARROW_USE_SCCACHE=OFF \
-        -DARROW_DEPENDENCY_SOURCE=BUNDLED \
-        -DARROW_BUILD_STATIC=ON \
-        -DARROW_JEMALLOC=ON \
-        -DARROW_SIMD_LEVEL=DEFAULT \
-        -DARROW_BUILD_EXAMPLES=OFF \
-        -DARROW_PARQUET=ON -DARROW_CSV=ON \
-        -DARROW_WITH_ZSTD=ON -DARROW_WITH_LZ4=ON -DARROW_WITH_ZLIB=ON"
-    BUILD_COMMAND bash -x -c "source thirdparty/export.sh && cmake --build . ${ARROW_BUILD_PARALLEL}"
+    # Arrow resolves only enabled dependencies and checks their pinned URL_HASH.
+    # Do not prefetch all optional packages or source a possibly partial export.sh.
+    CONFIGURE_COMMAND ${CMAKE_COMMAND} -S . -B .
+        -DCMAKE_BUILD_TYPE=Release
+        -DARROW_USE_CCACHE=OFF
+        -DARROW_USE_SCCACHE=OFF
+        -DARROW_DEPENDENCY_SOURCE=BUNDLED
+        -DARROW_BUILD_STATIC=ON
+        -DARROW_JEMALLOC=ON
+        -DARROW_SIMD_LEVEL=DEFAULT
+        -DARROW_BUILD_EXAMPLES=OFF
+        -DARROW_PARQUET=ON -DARROW_CSV=ON
+        -DARROW_WITH_ZSTD=ON -DARROW_WITH_LZ4=ON -DARROW_WITH_ZLIB=ON
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . ${ARROW_BUILD_PARALLEL}
     BUILD_JOB_SERVER_AWARE 1
     INSTALL_COMMAND cmake --install . --prefix "${PREFIX}"
     BUILD_BYPRODUCTS
