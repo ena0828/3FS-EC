@@ -58,14 +58,14 @@ std::string repairMetricsJson(const EcRepairSample &m) {
   }
   const auto clockSample = [](const storage::client::EcRpcClockSample &sample,
                               const std::array<const char *, 3> &names) {
-    auto value = folly::dynamic::object("valid_samples_decimal", std::to_string(sample.valid))(
+    folly::dynamic value = folly::dynamic::object("valid_samples_decimal", std::to_string(sample.valid))(
         "missing_or_nonpositive_samples_decimal", std::to_string(sample.missing))(
         "reversed_samples_decimal", std::to_string(sample.reversed))(
         "out_of_range_samples_decimal", std::to_string(sample.outOfRange));
     for (size_t i = 0; i != names.size(); ++i) value[names[i]] = std::to_string(sample.spanNs[i]);
     return value;
   };
-  auto rpc = folly::dynamic::object("schema", 1)("coverage", "controlled_client_to_storage_first_hop")(
+  folly::dynamic rpc = folly::dynamic::object("schema", 1)("coverage", "controlled_client_to_storage_first_hop")(
       "clock", "per_host_utc_microseconds_checked_then_ns")("missing_samples_are_censored", true)(
       "frame_counts_are_not_dispatch_counts", true)("outer_ok_is_not_business_success", true)(
       "spans_overlap_and_are_not_total_wall_time", true)(
