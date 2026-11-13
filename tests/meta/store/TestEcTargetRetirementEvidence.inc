@@ -3,8 +3,12 @@
 using Retirements = EcTargetRetirementCatalog;
 
 std::string retirementRecordKey(const EcV2PhysicalEndpoint &ep) {
-  return Serializer::serRawArgs(kv::KeyPrefix::EcTargetRetirement, ep.placement.node, ep.placement.chain,
-                                ep.placement.target, ep.engineUuid, ep.targetIncarnation);
+  return Serializer::serRawArgs(kv::KeyPrefix::EcTargetRetirement,
+                                ep.placement.node.toUnderType(),
+                                ep.placement.chain.toUnderType(),
+                                ep.placement.target.toUnderType(),
+                                ep.engineUuid,
+                                ep.targetIncarnation);
 }
 Result<EcTargetRetirementRecord> retireTestTarget(Fixture &f,
                                                   SourcePinTargetFixture &physical,

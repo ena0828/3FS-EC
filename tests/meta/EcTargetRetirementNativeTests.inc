@@ -189,8 +189,10 @@ TEST_F(TestEcTargetRetirementNative, LostPrepareReplySameIdQueryAndFirstCompleti
   ASSERT_EQ(serde::serialize(*first), serde::serialize(*retained));
   ASSERT_OK(blockingWait(txn->commit()));
   const auto targetKey = Serializer::serRawArgs(kv::KeyPrefix::EcTargetRetirement,
-                                               req->endpoint.placement.node, req->endpoint.placement.chain,
-                                               req->endpoint.placement.target, req->endpoint.engineUuid,
+                                               req->endpoint.placement.node.toUnderType(),
+                                               req->endpoint.placement.chain.toUnderType(),
+                                               req->endpoint.placement.target.toUnderType(),
+                                               req->endpoint.engineUuid,
                                                req->endpoint.targetIncarnation);
   auto damaged = *first;
   damaged.completion->observation.claims.requestDigest[0] ^= 1;

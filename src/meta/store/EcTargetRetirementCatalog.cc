@@ -17,9 +17,9 @@ Result<Void> endpointValid(const EcV2PhysicalEndpoint &ep) {
 }
 std::string targetKey(const EcV2PhysicalEndpoint &ep) {
   return Serializer::serRawArgs(kv::KeyPrefix::EcTargetRetirement,
-                                ep.placement.node,
-                                ep.placement.chain,
-                                ep.placement.target,
+                                ep.placement.node.toUnderType(),
+                                ep.placement.chain.toUnderType(),
+                                ep.placement.target.toUnderType(),
                                 ep.engineUuid,
                                 ep.targetIncarnation);
 }

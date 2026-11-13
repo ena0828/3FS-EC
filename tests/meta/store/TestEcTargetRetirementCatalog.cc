@@ -42,11 +42,27 @@ class TestEcTargetRetirementCatalog : public hf3fs::testing::SetupFDB {
   EcTargetRetirementIntent intent;
 };
 TEST_F(TestEcTargetRetirementCatalog, RealFdbImmutableIntentAndRequestIdentity) {
+  intent.endpoint.placement = {storage::ChainId(0x11121314),
+                               storage::TargetId(0x2122232425262728ULL),
+                               flat::NodeId(0x01020304)};
   ASSERT_OK(transaction([&](auto &t) { return EcTargetRetirementCatalog::requireAssignable(t, intent.endpoint); }));
   auto accepted = transaction([&](auto &t) { return EcTargetRetirementCatalog::prepare(t, intent); });
   ASSERT_OK(accepted);
   ASSERT_FALSE(accepted->completion);
   ASSERT_LT(serde::serialize(*accepted).size(), EcTargetRetirementCatalog::kMaximumRecordBytes);
+  // Independent on-disk key oracle for the supported little-endian Linux
+  // layout: ETRI + node uint32 + chain uint32 + target uint64 + two UUIDs.
+  // Do not call Serializer here: using the same key builder would hide a field
+  // order/width regression in the real prepare transaction above.
+  std::string expectedKey = "ETRI\x04\x03\x02\x01\x14\x13\x12\x11\x28\x27\x26\x25\x24\x23\x22\x21";
+  expectedKey.append(intent.endpoint.engineUuid.asStringView());
+  expectedKey.append(intent.endpoint.targetIncarnation.asStringView());
+  ASSERT_EQ(expectedKey.size(), 52u);
+  auto raw = engine->createReadWriteTransaction();
+  auto stored = blockingWait(raw->get(expectedKey));
+  ASSERT_OK(stored);
+  ASSERT_TRUE(*stored);
+  ASSERT_EQ(**stored, serde::serialize(*accepted));
   auto replay = transaction([&](auto &t) { return EcTargetRetirementCatalog::prepare(t, intent); });
   ASSERT_OK(replay);
   ASSERT_EQ(serde::serialize(*accepted), serde::serialize(*replay));
@@ -86,9 +102,9 @@ TEST_F(TestEcTargetRetirementCatalog, RealFdbAcceptedIntentConflictsWithAssignme
 TEST_F(TestEcTargetRetirementCatalog, RealFdbMissingIndexAndInvalidVersionFailClosed) {
   ASSERT_OK(transaction([&](auto &t) { return EcTargetRetirementCatalog::prepare(t, intent); }));
   const auto key = Serializer::serRawArgs(kv::KeyPrefix::EcTargetRetirement,
-                                         intent.endpoint.placement.node,
-                                         intent.endpoint.placement.chain,
-                                         intent.endpoint.placement.target,
+                                         intent.endpoint.placement.node.toUnderType(),
+                                         intent.endpoint.placement.chain.toUnderType(),
+                                         intent.endpoint.placement.target.toUnderType(),
                                          intent.endpoint.engineUuid,
                                          intent.endpoint.targetIncarnation);
   auto txn = engine->createReadWriteTransaction();
