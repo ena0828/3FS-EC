@@ -13,13 +13,19 @@ local_work=
 local_revision=
 local_container=false
 container_fdb_cache=
+container_arrow_cache=
 container_libfuse_bundle=
 container_libfuse_bundle_sha256=
 usage() {
-    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs N] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA [--local-container-build-only [--container-fdb-cache ABS] [--container-libfuse-bundle ABS --container-libfuse-bundle-sha256 SHA256]]]; N=1|2|4 except explicit container builds' >&2
+    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs N] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA [--local-container-build-only [--container-fdb-cache ABS] [--container-arrow-cache ABS] [--container-libfuse-bundle ABS --container-libfuse-bundle-sha256 SHA256]]]; N=1|2|4 except explicit container builds' >&2
 }
 while (($#)); do
     case "$1" in
+        --container-arrow-cache)
+            if [[ -n "$container_arrow_cache" ]] || (($# < 2)) || [[ "$2" != /* ]]; then usage; exit 2; fi
+            container_arrow_cache="$2"
+            shift 2
+            ;;
         --container-libfuse-bundle)
             if [[ -n "$container_libfuse_bundle" ]] || (($# < 2)) || [[ "$2" != /* ]]; then usage; exit 2; fi
             container_libfuse_bundle="$2"
@@ -89,7 +95,7 @@ if "$local_container"; then
 elif [[ "$build_jobs" != 1 && "$build_jobs" != 2 && "$build_jobs" != 4 ]]; then
     usage; exit 2
 fi
-if [[ -n "$container_fdb_cache" ]] && ! "$local_container"; then usage; exit 2; fi
+if [[ -n "$container_fdb_cache$container_arrow_cache" ]] && ! "$local_container"; then usage; exit 2; fi
 if [[ -n "$container_libfuse_bundle$container_libfuse_bundle_sha256" ]]; then
     "$local_container" && [[ -n "$container_libfuse_bundle" && -n "$container_libfuse_bundle_sha256" ]] || { usage; exit 2; }
 fi
@@ -153,7 +159,7 @@ sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
     cmake/AddCrate.cmake cmake/ApacheArrow.cmake cmake/Jemalloc.cmake \
     scripts/ec/ci/build-native.sh scripts/ec/ci/prepare-local-build.py scripts/ec/ci/run-core-tests.py \
     scripts/ec/ci/container-build-resources.py \
-    scripts/ec/ci/prepare-libfuse-cache.py \
+    scripts/ec/ci/prepare-libfuse-cache.py scripts/ec/ci/prepare-arrow-cache.py \
     scripts/ec/ci/prepare-isal.py scripts/ec/reference/downloads.json cmake/EcCodecBackend.cmake \
     .github/workflows/ec-hosted-native.yml .github/workflows/ec-hosted-system.yml \
     .github/workflows/ec-hosted-target-control.yml \
@@ -321,6 +327,24 @@ export LIBCLANG_PATH=/usr/lib/llvm-18/lib
 export PKG_CONFIG_PATH="$dependency_prefix/lib/pkgconfig"
 export LD_LIBRARY_PATH="$dependency_prefix/lib"
 # END BUILD ENVIRONMENT
+
+# BEGIN ARROW CACHE
+if [[ -n "$container_arrow_cache" ]]; then
+    /usr/bin/python3 -I "$source_root/scripts/ec/ci/prepare-arrow-cache.py" \
+        --source "$source_root" --work "$work" --cache "$container_arrow_cache"
+    mapfile -d '' -t arrow_urls < "$work/arrow-cache/urls.nul"
+    [[ "${#arrow_urls[@]}" -eq 7 ]]
+    export ARROW_BOOST_URL="${arrow_urls[0]}"
+    export ARROW_JEMALLOC_URL="${arrow_urls[1]}"
+    export ARROW_LZ4_URL="${arrow_urls[2]}"
+    export ARROW_THRIFT_URL="${arrow_urls[3]}"
+    export ARROW_XSIMD_URL="${arrow_urls[4]}"
+    export ARROW_ZLIB_URL="${arrow_urls[5]}"
+    export ARROW_ZSTD_URL="${arrow_urls[6]}"
+    sha256sum "$work/provenance/arrow-cache.json" > "$work/provenance/arrow-cache-proof.sha256"
+    unset arrow_urls
+fi
+# END ARROW CACHE
 
 # BEGIN FDB FETCH
 fdb_cache_args=()
@@ -591,19 +615,22 @@ git diff --exit-code HEAD --ignore-submodules=all
 [[ "$(git rev-parse HEAD)" == "$source_revision" ]]
 sha256sum --check "$work/provenance/build-inputs.sha256"
 sha256sum --check "$work/provenance/private-libraries.sha256"
+if [[ -n "$container_arrow_cache" ]]; then
+    sha256sum --check "$work/provenance/arrow-cache-proof.sha256"
+fi
 sha256sum "$work/build/CMakeCache.txt" "$work/build/compile_commands.json" \
     "$work/build/tests/test_meta" "$work/build/tests/test_fuse_ec"
 du -sh -- "$work/build" "$work/cargo-target" "$work/cargo-home" "$work/fdb"
 # Keep the existing eight-binary lab receipt contract; additionally bind every
 # requested test target and the selected backend in an always-written receipt.
-python3 - "$source_root" "$work" "$backend" "$with_lab" "$with_regression" "$source_revision" "$local_mode" "$dependency_prefix" "$local_container" <<'PY'
+python3 - "$source_root" "$work" "$backend" "$with_lab" "$with_regression" "$source_revision" "$local_mode" "$dependency_prefix" "$local_container" "$container_arrow_cache" <<'PY'
 from pathlib import Path
 import hashlib
 import json
 import os
 import sys
 source, work = map(Path, sys.argv[1:3])
-backend, with_lab, with_regression, revision, local_mode, dependency_prefix, local_container = sys.argv[3:]
+backend, with_lab, with_regression, revision, local_mode, dependency_prefix, local_container, container_arrow_cache = sys.argv[3:]
 lab_names = ('storage_main', 'mgmtd_main', 'meta_main', 'admin_cli', 'ec_stripe_cli',
              'ec_file_cli', 'hf3fs_fuse_main', 'ec_mount_read_probe')
 tests = ['test_meta', 'test_fuse_ec']
@@ -700,6 +727,15 @@ if local_container == 'true':
     libfuse_cache = work / 'provenance/libfuse-cache.json'
     if libfuse_cache.exists():
         common['libfuse_cache_provenance'] = {'path': str(libfuse_cache), 'sha256': sha(libfuse_cache)}
+if container_arrow_cache:
+    if local_container != 'true':
+        raise SystemExit('Arrow archive cache is container-build-only')
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('arrow_cache', source / 'scripts/ec/ci/prepare-arrow-cache.py')
+    arrow_cache = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(arrow_cache)
+    common['arrow_cache_provenance'] = arrow_cache.verify_preparation(
+        source, work, Path(container_arrow_cache), verify_upstream=True)
 record = dict(common, targets=list(paths), binaries={name: sha(path) for name, path in paths.items()},
               ec_regression_targets_requested=with_regression == 'true', lab_targets_requested=with_lab == 'true')
 path = work / 'provenance/native-build.json'
