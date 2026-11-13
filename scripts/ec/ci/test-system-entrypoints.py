@@ -202,6 +202,7 @@ class SystemEntrypoints(unittest.TestCase):
                 if failure == "action":
                     cancellation_guard()
             cluster = SimpleNamespace(halt=SimpleNamespace(wait=wait), healthy=cancellation_guard,
+                managed_execute_one=lambda: None,
                 fault_control=SimpleNamespace(execute_one=action, healthy=child_health))
             if failure is None:
                 exec(actual, {"cluster": cluster})
