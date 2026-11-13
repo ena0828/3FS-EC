@@ -30,6 +30,7 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
 ))
 REPAIR_CASES = (
     "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
+    "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
 )
 AUTH_USER_CASES = tuple(f"TestAuth/{backend}.{case}" for backend in (0, 1)
                         for case in ("Basic", "ExplicitPrimaryGroup"))
@@ -74,7 +75,7 @@ def parser():
     for name in ("source", "build", "fdb-bin-dir", "work"):
         result.add_argument("--" + name, required=True, type=Path)
     result.add_argument("--profile", choices=("core", "repair", "target-meta", "auth-user", "service-contracts"), default="core",
-                        help="core: 7 Meta + 14 FUSE; repair: three-strategy fixture; "
+                        help="core: 7 Meta + 14 FUSE; repair: three-strategy and pending-copy recovery fixtures; "
                              "target-meta: 9 retirement catalogue, RPC and evidence cases; "
                              "auth-user: default and explicit primary GID with MemKV and FDB; "
                              "service-contracts: auth-user plus all Meta dispatch IDs")
@@ -85,7 +86,7 @@ def selection(profile):
     if profile == "core":
         return META_CASES, META_FILTER, FUSE_CASES
     if profile == "repair":
-        return REPAIR_CASES, REPAIR_CASES[0], ()
+        return REPAIR_CASES, ":".join(REPAIR_CASES), ()
     if profile == "target-meta":
         return TARGET_META_CASES, ":".join(TARGET_META_CASES), ()
     if profile == "auth-user":

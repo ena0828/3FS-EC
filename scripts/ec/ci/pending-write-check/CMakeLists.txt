@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.28)
+project(ec_pending_write_check LANGUAGES CXX)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "The pending-write seam check requires Linux")
+endif()
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_program(RUSTC rustc REQUIRED)
+execute_process(COMMAND "${RUSTC}" --version OUTPUT_VARIABLE RUST_VERSION
+                COMMAND_ERROR_IS_FATAL ANY)
+if(NOT RUST_VERSION MATCHES "^rustc 1\\.99\\.1 ")
+  message(FATAL_ERROR "The native build uses Rust 1.99.1; match that syscall implementation")
+endif()
+get_filename_component(EC_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
+set(RUST_WRITE "${CMAKE_CURRENT_BINARY_DIR}/librust_write.a")
+add_custom_command(OUTPUT "${RUST_WRITE}"
+  COMMAND "${RUSTC}" --edition=2021 --crate-type=staticlib
+          "${CMAKE_CURRENT_SOURCE_DIR}/write.rs" -o "${RUST_WRITE}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/write.rs" VERBATIM)
+add_custom_target(rust_write DEPENDS "${RUST_WRITE}")
+add_executable(pending_write_check main.cc "${EC_SOURCE}/tests/meta/EcPendingWriteFault.cc")
+add_dependencies(pending_write_check rust_write)
+target_include_directories(pending_write_check PRIVATE "${EC_SOURCE}")
+target_link_options(pending_write_check PRIVATE "LINKER:--wrap=pwrite" "LINKER:--wrap=pwrite64")
+target_link_libraries(pending_write_check PRIVATE "${RUST_WRITE}" pthread dl m rt util)

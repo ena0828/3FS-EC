@@ -60,6 +60,7 @@
 #include "tests/fdb/SetupFDB.h"
 #include "tests/lib/UnitTestFabric.h"
 #include "tests/meta/EcNativeTxnObservation.h"
+#include "tests/meta/EcPendingWriteFault.h"
 
 namespace hf3fs::meta::server {
 namespace {
@@ -1255,6 +1256,7 @@ class TestEcV2NativeHelperPlan : public TestEcV2NativeLifecycle {
 // The following fragments require TestEcFileNativeWrite to be defined first.
 #include "EcFileNativeWriteTests.inc"
 #include "EcFileRepairNativeTests.inc"
+#include "EcFileRepairPendingNativeTests.inc"
 #include "EcFileAppendNativeTests.inc"
 #include "EcFileTruncateNativeTests.inc"
 // clang-format on

@@ -226,11 +226,16 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
     state = co_await storage_->reconcileEcStageV2Controlled({begin.request, write}, options(c, observation));
     CO_RETURN_ON_ERROR(state);
     CO_RETURN_ON_ERROR(validateEcStageStateV2(*state, begin.request, write.claims));
-    if (state->needsReconcile || state->pendingBlock || state->prefixBytes < prefix)
+    if (state->needsReconcile || state->prefixBytes < prefix)
       co_return makeError(StorageCode::kEcSealOutcomeUnknown);
     if (state->state == 3) co_return makeError(StatusCode::kTokenStale);
     reconcileMetric.success();
     reconcileMetric.finish();
+    // Reconcile confirms the existing allocation but deliberately retains a
+    // pending block intent. Replay from its confirmed prefix using the same
+    // verified source bytes; Storage checks the original bound block proof.
+    // Rejecting pendingBlock here would make an interrupted healthy copy
+    // impossible to resume, even after every durability barrier succeeded.
     if (state->state == 1)
       for (uint32_t b = state->prefixBytes / kEcIntegrityBlockBytes; b < descriptor->blockCount; ++b) {
         CO_RETURN_ON_ERROR(active(c));

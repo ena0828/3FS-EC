@@ -185,7 +185,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                     else:
                         RUNNER.run_meta(source, build, fdb, work, common, SimpleNamespace(received=[]),
                                         report, cases, test_filter)
-                        self.assertEqual(report["meta"]["passed_tests"], 1)
+                        self.assertEqual(report["meta"]["passed_tests"], 2)
                         self.assertEqual(report["meta"]["status"], "passed")
                 self.assertIs(RUNNER.sys.argv, original_argv)
                 self.assertIs(common.listed_tests, listing)
@@ -196,8 +196,11 @@ class TestCoreAcceptanceContract(unittest.TestCase):
         self.assertEqual(RUNNER.parser().parse_args(base).profile, "core")
         self.assertEqual(RUNNER.parser().parse_args(base + ["--profile", "repair"]).profile, "repair")
         cases, test_filter, fuse = RUNNER.selection("repair")
-        self.assertEqual(cases, ("TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",))
-        self.assertEqual(test_filter, cases[0])
+        self.assertEqual(cases, (
+            "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
+            "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
+        ))
+        self.assertEqual(test_filter, ":".join(cases))
         self.assertEqual(fuse, ())
         binary, output = Path("/build/tests/test_meta"), Path("/work/meta")
         sample = receipt(binary, output, cases, test_filter)
@@ -206,14 +209,16 @@ class TestCoreAcceptanceContract(unittest.TestCase):
             RUNNER.check_meta_receipt(sample, binary, output)
         with self.assertRaises(ValueError):
             RUNNER.check_meta_receipt(receipt(binary, output), binary, output, cases, test_filter)
-        for broken in ("filter", "skip", "unjoined"):
+        for broken in ("filter", "skip", "unjoined", "pending_case_missing"):
             invalid = copy.deepcopy(sample)
             if broken == "filter":
                 invalid["commands"][0]["argv"][1] = "--gtest_filter=TestEcFileNativeRepair.*"
             elif broken == "skip":
                 invalid["test_results"]["cases"][0]["skipped"] = True
-            else:
+            elif broken == "unjoined":
                 invalid["server"]["cleanup"]["leader_reaped"] = False
+            else:
+                invalid["test_results"]["cases"].pop()
             with self.subTest(broken=broken), self.assertRaises(ValueError):
                 RUNNER.check_meta_receipt(invalid, binary, output, cases, test_filter)
 

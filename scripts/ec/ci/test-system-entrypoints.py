@@ -31,6 +31,7 @@ class SystemEntrypoints(unittest.TestCase):
         filters = {"storage": driver.STORAGE_FILTER, "service": driver.SERVICE_FILTER, "client": driver.CLIENT_FILTER}
         self.assertTrue(all(regression.TARGET_RETIREMENT_REQUIRED.values()))
         required = {**regression.TARGET_RETIREMENT_REQUIRED, "client": regression.CLIENT_MANDATORY}
+        required["service"] = required["service"] | regression.SERVICE_MANDATORY
         for kind, names in required.items():
             for name in names:
                 with self.subTest(suite=kind, case=name):
@@ -125,7 +126,7 @@ class SystemEntrypoints(unittest.TestCase):
         suites = []
         for kind, target in zip(("storage", "service", "client"), regression.TARGETS):
             names = sorted(regression.MANDATORY) if kind == "storage" else (
-                sorted(regression.CLIENT_MANDATORY) if kind == "client" else [kind + ".Case"])
+                sorted(regression.CLIENT_MANDATORY) if kind == "client" else sorted(regression.SERVICE_MANDATORY))
             suites.append({"suite": kind, "status": "passed", "failures": [],
                            "binary": str(build / "tests" / target), "binary_sha256": built["binaries"][target],
                            "binary_sha256_after": built["binaries"][target],
@@ -143,6 +144,7 @@ class SystemEntrypoints(unittest.TestCase):
             lambda r: r["suites"][0]["xml_results"]["cases"][0].update(skipped=True),
             lambda r: (r["suites"][0]["listed_tests"].pop(), r["suites"][0]["xml_results"]["cases"].pop()),
             lambda r: (r["suites"][2]["listed_tests"].pop(), r["suites"][2]["xml_results"]["cases"].pop()),
+            lambda r: (r["suites"][1]["listed_tests"].pop(), r["suites"][1]["xml_results"]["cases"].pop()),
         ]
         for change in changes:
             value = copy.deepcopy(original)

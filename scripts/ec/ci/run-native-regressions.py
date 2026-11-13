@@ -47,6 +47,13 @@ CLIENT_MANDATORY = {
     )
 }
 
+SERVICE_MANDATORY = {
+    "TestEcStageService.LostSealReplyIsUnknownAndRetryDoesNotDoubleAccount",
+    "TestEcNativeRepairService.UnknownSealSurvivesCancellationUntilSameStageIsReconciled",
+    "TestEcNativeRepairService.ThreeStrategiesRecoverLostAppendReplyOnOriginalStages",
+    "TestEcNativeRepairService.ThreeStrategiesRecoverLostSealReplyAfterEngineReopen",
+}
+
 # Exact names prevent unrelated green suites from satisfying the control profile.
 TARGET_RETIREMENT_REQUIRED = {
     "storage": {
@@ -137,6 +144,8 @@ def check_suites(record, build, built):
     require(MANDATORY <= names, "codec/RMW/legacy storage coverage is incomplete")
     client_names = {case["name"] for case in suites[2]["xml_results"]["cases"]}
     require(CLIENT_MANDATORY <= client_names, "target retirement CLI coverage is incomplete")
+    service_names = {case["name"] for case in suites[1]["xml_results"]["cases"]}
+    require(SERVICE_MANDATORY <= service_names, "native repair unknown-outcome coverage is incomplete")
 
 
 def check_target_retirement(record):
@@ -191,7 +200,8 @@ def main():
     inputs = {str(path): digest(path) for path in (
         Path(__file__), source / "scripts/ec/test-native-fragments.py", record_path,
         source / "tests/storage/store/TestEcCodec.cc", source / "tests/storage/store/TestEcRmw.cc",
-        source / "tests/client/TestEcTargetRetirementCommands.cc")}
+        source / "tests/client/TestEcTargetRetirementCommands.cc",
+        source / "tests/storage/service/TestEcStageService.cc")}
     if args.require_target_retirement:
         inputs.update({str(source / path): digest(source / path) for path in (
             "tests/storage/store/TestEcTargetRetirementControl.cc",
@@ -202,6 +212,7 @@ def main():
               "native_build_sha256": digest(record_path), "inputs_sha256": inputs,
               "target_retirement_required": args.require_target_retirement,
               "required_client_cases": sorted(CLIENT_MANDATORY),
+              "required_service_cases": sorted(SERVICE_MANDATORY),
               "scope": "native functional regressions; not a benchmark or real Storage process fault"}
     result = 1
     try:

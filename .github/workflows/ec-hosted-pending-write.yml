@@ -1,0 +1,47 @@
+name: EC pending write fault seam
+
+on:
+  push:
+    branches: [fix/ec-repair-recovery]
+    paths:
+      - .github/workflows/ec-hosted-pending-write.yml
+      - scripts/ec/ci/pending-write-check/**
+      - tests/meta/EcPendingWriteFault.cc
+      - tests/meta/EcPendingWriteFault.h
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ec-pending-write-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  syscall-contract:
+    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/fix/ec-repair-recovery' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Compile and exercise the test-only Rust syscall interception
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/ec-pending-write"
+          test ! -e "$work"
+          mkdir -m 700 "$work"
+          export RUSTUP_HOME="$work/rustup" CARGO_HOME="$work/cargo"
+          export RUSTUP_TOOLCHAIN=1.99.1 CMAKE_BUILD_PARALLEL_LEVEL=4
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          rustc --version
+          c++ --version
+          ld --version
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          sha256sum tests/meta/EcPendingWriteFault.{cc,h} scripts/ec/ci/pending-write-check/*
+          cmake -S scripts/ec/ci/pending-write-check -B "$work/build" -G Ninja
+          cmake --build "$work/build" --parallel 4
+          "$work/build/pending_write_check" "$work/files"

@@ -64,14 +64,32 @@ struct StageReplyDropState {
     ~ReadDelay() { unblock(); }
   };
   struct Snapshot {
+    size_t appendCalls = 0;
     size_t sealCalls = 0;
+    std::optional<EcStageStateV2> droppedAppend;
     std::optional<EcFragmentReceiptV2> droppedReceipt;
   };
 
-  void arm() {
+  void arm(std::optional<EcFragmentAccessV2> request = std::nullopt) {
     std::lock_guard lock(mutex);
     armed = true;
+    sealRequest = std::move(request);
+    appendRequest.reset();
     state = {};
+  }
+
+  void armAppend(const EcFragmentAccessV2 &request, uint32_t block) {
+    std::lock_guard lock(mutex);
+    armed = false;
+    sealRequest.reset();
+    appendRequest = request;
+    appendBlock = block;
+    state = {};
+  }
+
+  static bool sameStage(const EcFragmentAccessV2 &left, const EcFragmentAccessV2 &right) {
+    return serde::equals(left.identity, right.identity) && left.operationId == right.operationId &&
+           left.targetId == right.targetId && left.vChainId == right.vChainId;
   }
 
   Snapshot snapshot() const {
@@ -81,6 +99,9 @@ struct StageReplyDropState {
 
   mutable std::mutex mutex;
   bool armed = false;
+  std::optional<EcFragmentAccessV2> sealRequest;
+  std::optional<EcFragmentAccessV2> appendRequest;
+  uint32_t appendBlock = 0;
   Snapshot state;
   std::shared_ptr<ReadDelay> delayedRead;
   std::array<size_t, 10> helperHopCalls{};
@@ -94,8 +115,8 @@ struct StageReplyDropState {
 };
 
 // Every handler still executes the real StorageService. Rebind the serde
-// reflection to this derived type so only this post-success fault intercepts
-// sealEcStageV2; no synthetic storage result is supplied to the client.
+// reflection to this derived type so post-success faults can drop an Append
+// or Seal reply; no synthetic storage result is supplied to the client.
 class StageReplyDropStorageService : public StorageService {
  public:
   StageReplyDropStorageService(StorageOperator &storageOperator, StageReplyDropState &fault)
@@ -172,6 +193,28 @@ class StageReplyDropStorageService : public StorageService {
     co_return co_await StorageService::reconcileEcStageV2(ctx, request);
   }
 
+  CoTryTask<EcStageV2Rsp> appendEcStageV2(serde::CallContext &ctx, const EcAppendStageV2Req &req) {
+    {
+      std::lock_guard lock(fault_.mutex);
+      ++fault_.state.appendCalls;
+    }
+    auto response = co_await StorageService::appendEcStageV2(ctx, req);
+    bool drop = false;
+    if (response && response->result) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.appendRequest && StageReplyDropState::sameStage(*fault_.appendRequest, req.request) &&
+          fault_.appendBlock == req.blockIndex) {
+        // The real Engine has synced data and its progress WAL before success.
+        // A failed/pending handler never consumes this one-shot injection.
+        fault_.state.droppedAppend = *response->result;
+        fault_.appendRequest.reset();
+        drop = true;
+      }
+    }
+    if (drop) ctx.transport()->invalidate(false);
+    co_return response;
+  }
+
   CoTryTask<EcSealStageV2Rsp> sealEcStageV2(serde::CallContext &ctx, const EcSealStageV2Req &req) {
     {
       std::lock_guard lock(fault_.mutex);
@@ -181,7 +224,7 @@ class StageReplyDropStorageService : public StorageService {
     bool drop = false;
     if (response && response->result) {
       std::lock_guard lock(fault_.mutex);
-      if (fault_.armed) {
+      if (fault_.armed && (!fault_.sealRequest || StageReplyDropState::sameStage(*fault_.sealRequest, req.request))) {
         fault_.armed = false;
         fault_.state.droppedReceipt = *response->result;
         drop = true;
@@ -1049,6 +1092,41 @@ class TestEcNativeRepairService : public TestEcStageService {
             {},
             client::EcRequestControl::TransportPolicy::TcpOnly};
   }
+  Result<uint64_t> committedBytes(const EcRepairFragment &fragment) {
+    CHECK_RESULT(target, components_->targetMap.getByTargetId(fragment.endpoint.targetId));
+    return target->storageTarget->usedSize();
+  }
+  void expectRecovered(const Case &value,
+                       const hf3fs::client::ec::EcRepairSealed &sealed,
+                       const std::array<uint64_t, 2> &before) {
+    ASSERT_EQ(value.plan->shardBytes(), kEcIntegrityBlockBytes + 7);
+    EXPECT_EQ(sealed.planDigest, value.plan->digest());
+    ASSERT_EQ(sealed.targetCount, value.plan->input().targetCount);
+    for (uint8_t target = 0; target != sealed.targetCount; ++target) {
+      const auto &fragment = value.plan->input().targets[target];
+      const auto &fixed = value.bindings.targets[target];
+      EXPECT_TRUE(serde::equals(sealed.receipts[target], repair_test::receipt(fragment)));
+      auto state = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+      ASSERT_OK(state);
+      EXPECT_EQ(state->state, 2);
+      EXPECT_EQ(state->prefixBytes, fragment.integrity.wholeLength);
+      EXPECT_FALSE(state->pendingBlock);
+      EXPECT_FALSE(state->needsReconcile);
+      std::string bytes;
+      for (uint32_t block = 0; block != value.plan->blockCount(); ++block) {
+        auto read = blockingWait(client_->readEcBlockV2Controlled({fixed.request, block, fixed.grant}, control()));
+        ASSERT_OK(read);
+        EXPECT_TRUE(serde::equals(read->receipt, sealed.receipts[target]));
+        bytes += read->payload.data;
+      }
+      EXPECT_EQ(bytes, value.data.shards[fragment.identity.shard]);
+      auto used = committedBytes(fragment);
+      ASSERT_OK(used);
+      // Used-size accounting is allocation capacity, not logical payload:
+      // the 65543-byte fixture fits one 128 KiB slot, committed only at Seal.
+      EXPECT_EQ(*used, before[target] + 2 * kEcIntegrityBlockBytes);
+    }
+  }
   std::unique_ptr<EcHelperKey> helperKey_;
   std::array<EcScopeEndpoint, 12> endpoints_;
 };
@@ -1142,6 +1220,203 @@ TEST_F(TestEcNativeRepairService, ThreeStrategiesResumeOriginalPartialStagesAfte
   }
   // This fixture proves reopened Storage recovery plus real TCP/Seal/readback;
   // it does not contain Meta and is not a publication or power-failure test.
+}
+
+TEST_F(TestEcNativeRepairService, ThreeStrategiesRecoverLostAppendReplyOnOriginalStages) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor executor(2);
+  for (auto missing : {std::vector<uint16_t>{0}, std::vector<uint16_t>{0, 11}}) {
+    for (auto mode : {EcRepairMode::CentralSerial, EcRepairMode::ClientPipeline, EcRepairMode::HelperChain}) {
+      SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<unsigned>(mode) << " missing=" << missing.size()
+                                        << " window=1");
+      // Isolate one lost mutation reply from unrelated multiplexed helper
+      // calls. Existing window/held-helper cases cover concurrent ownership;
+      // joining a client call alone never proves every remote hop has stopped.
+      auto value = prepare(missing, kEcIntegrityBlockBytes + 7, 1);
+      ASSERT_OK(value);
+      std::array<uint64_t, 2> before{};
+      for (uint8_t target = 0; target != value->plan->input().targetCount; ++target) {
+        auto used = committedBytes(value->plan->input().targets[target]);
+        ASSERT_OK(used);
+        before[target] = *used;
+      }
+      EcRepairObservation observation;
+      auto transport = NativeEcRepairTransport::create(value->plan, client_, value->bindings, value->helpers, &observation);
+      ASSERT_OK(transport);
+      const auto &fixed = value->bindings.targets[0];
+      replyDrop_.armAppend(fixed.request, 0);
+      auto ctl = control();
+      ctl.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      auto failed = blockingWait(EcRepairPipeline::run(
+          value->plan, *transport, mode, {ctl.deadline, ctl.cancellation}, executor, &observation));
+      ASSERT_ERROR(failed, StorageCode::kEcSealOutcomeUnknown);
+      const auto dropped = replyDrop_.snapshot();
+      ASSERT_EQ(dropped.appendCalls, 1);
+      ASSERT_TRUE(dropped.droppedAppend);
+      EXPECT_EQ(dropped.sealCalls, 0);
+      EXPECT_FALSE(dropped.droppedReceipt);
+      EXPECT_TRUE(serde::equals(dropped.droppedAppend->receipt, repair_test::receipt(value->plan->input().targets[0])));
+      EXPECT_EQ(dropped.droppedAppend->state, 1);
+      EXPECT_EQ(dropped.droppedAppend->prefixBytes, kEcIntegrityBlockBytes);
+      EXPECT_FALSE(dropped.droppedAppend->pendingBlock);
+      EXPECT_FALSE(dropped.droppedAppend->needsReconcile);
+      // These are joined local coroutine frames, not a distributed T2 claim.
+      const auto joined = observation.snapshot();
+      for (const auto &point : joined.points) {
+        EXPECT_EQ(point.active, 0);
+        EXPECT_EQ(point.entered, point.finished);
+      }
+      EXPECT_EQ(joined.at(EcRepairPoint::NativeSeal).entered, 0);
+      CancellationSource cancelled;
+      cancelled.requestCancellation();
+      ASSERT_ERROR(blockingWait((*transport)->begin(value->plan, 0, {ctl.deadline, cancelled.getToken()})),
+                   StorageCode::kEcSealOutcomeUnknown);
+      for (uint8_t target = 0; target != value->plan->input().targetCount; ++target) {
+        const auto &binding = value->bindings.targets[target];
+        auto state = blockingWait(client_->queryEcStageV2Controlled({binding.request, binding.grant}, control()));
+        ASSERT_OK(state);
+        EXPECT_EQ(state->state, 1);  // No Abort, Seal or replacement allocation.
+        EXPECT_TRUE(serde::equals(state->receipt, repair_test::receipt(value->plan->input().targets[target])));
+        EXPECT_EQ(state->prefixBytes, target == 0 ? kEcIntegrityBlockBytes : 0);
+        EXPECT_FALSE(state->pendingBlock);
+        EXPECT_FALSE(state->needsReconcile);
+        auto used = committedBytes(value->plan->input().targets[target]);
+        ASSERT_OK(used);
+        EXPECT_EQ(*used, before[target]);
+      }
+      // An external Query sees committed progress, but cannot resolve this
+      // adapter's unknown mutation. Recovery must execute Query AND Reconcile.
+      ASSERT_ERROR(blockingWait((*transport)->begin(value->plan, 0, {ctl.deadline, cancelled.getToken()})),
+                   StorageCode::kEcSealOutcomeUnknown);
+      size_t queries, reconciles;
+      {
+        std::lock_guard lock(replyDrop_.mutex);
+        queries = replyDrop_.queryCalls;
+        reconciles = replyDrop_.reconcileCalls;
+      }
+      ctl = control();
+      ctl.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      const EcRepairControl live{ctl.deadline, ctl.cancellation};
+      ASSERT_OK(blockingWait((*transport)->begin(value->plan, 0, live)));
+      {
+        std::lock_guard lock(replyDrop_.mutex);
+        EXPECT_EQ(replyDrop_.queryCalls, queries + 1);
+        EXPECT_EQ(replyDrop_.reconcileCalls, reconciles + 1);
+      }
+      // Exact duplicate block replay must retain progress/revision and use
+      // the original reservation, before the full pipeline resumes block 1.
+      auto reconciled = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+      ASSERT_OK(reconciled);
+      auto bytes = repair_test::blockBytes(value->data, value->plan->input().targets[0], 0);
+      ASSERT_OK(blockingWait((*transport)->append(value->plan, 0, 0, std::move(bytes), live)));
+      auto replayed = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+      ASSERT_OK(replayed);
+      EXPECT_TRUE(serde::equals(*replayed, *reconciled));
+      auto repaired = blockingWait(EcRepairPipeline::run(value->plan, *transport, mode, live, executor, &observation));
+      ASSERT_OK(repaired);
+      EXPECT_EQ(replyDrop_.snapshot().sealCalls, value->plan->input().targetCount);
+      ASSERT_NO_FATAL_FAILURE(expectRecovered(*value, *repaired, before));
+      // All original allocations remain replayable; a new operation is never
+      // substituted to hide an unknown result or duplicate additive accounting.
+      auto repeated = blockingWait(EcRepairPipeline::run(value->plan, *transport, mode, live, executor));
+      ASSERT_OK(repeated);
+      ASSERT_NO_FATAL_FAILURE(expectRecovered(*value, *repeated, before));
+    }
+  }
+  RecordProperty("unknown_append_fault_cut",
+                 "real successful Append reply dropped over TCP; two blocks, window=1; three strategies, one/two targets");
+  RecordProperty("unknown_append_join_scope", "local pipeline/adapter frames only; no distributed drain claim");
+}
+
+TEST_F(TestEcNativeRepairService, ThreeStrategiesRecoverLostSealReplyAfterEngineReopen) {
+  using namespace hf3fs::client::ec;
+  folly::CPUThreadPoolExecutor executor(2);
+  for (auto mode : {EcRepairMode::CentralSerial, EcRepairMode::ClientPipeline, EcRepairMode::HelperChain}) {
+    SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<unsigned>(mode) << " missing=2 window=2");
+    auto value = prepare({0, 11});
+    ASSERT_OK(value);
+    std::array<uint64_t, 2> before{};
+    for (uint8_t target = 0; target != 2; ++target) {
+      auto used = committedBytes(value->plan->input().targets[target]);
+      ASSERT_OK(used);
+      before[target] = *used;
+    }
+    EcRepairObservation observation;
+    auto transport = NativeEcRepairTransport::create(value->plan, client_, value->bindings, value->helpers, &observation);
+    ASSERT_OK(transport);
+    replyDrop_.arm(value->bindings.targets[0].request);
+    auto ctl = control();
+    ctl.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    auto failed = blockingWait(EcRepairPipeline::run(
+        value->plan, *transport, mode, {ctl.deadline, ctl.cancellation}, executor, &observation));
+    ASSERT_ERROR(failed, StorageCode::kEcSealOutcomeUnknown);
+    const auto dropped = replyDrop_.snapshot();
+    ASSERT_EQ(dropped.appendCalls, 2 * value->plan->blockCount());
+    ASSERT_EQ(dropped.sealCalls, 1);
+    ASSERT_TRUE(dropped.droppedReceipt);
+    EXPECT_TRUE(serde::equals(*dropped.droppedReceipt, repair_test::receipt(value->plan->input().targets[0])));
+    for (const auto &point : observation.snapshot().points) {
+      EXPECT_EQ(point.active, 0);
+      EXPECT_EQ(point.entered, point.finished);
+    }
+    for (uint8_t target = 0; target != 2; ++target) {
+      const auto &fixed = value->bindings.targets[target];
+      auto state = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+      ASSERT_OK(state);
+      EXPECT_EQ(state->state, target == 0 ? 2 : 1);
+      EXPECT_EQ(state->prefixBytes, value->plan->shardBytes());
+      EXPECT_FALSE(state->pendingBlock);
+      EXPECT_FALSE(state->needsReconcile);
+      auto used = committedBytes(value->plan->input().targets[target]);
+      ASSERT_OK(used);
+      EXPECT_EQ(*used, before[target] + (target == 0 ? 2 * kEcIntegrityBlockBytes : 0));
+    }
+    CancellationSource cancelled;
+    cancelled.requestCancellation();
+    ASSERT_ERROR(blockingWait((*transport)->begin(value->plan, 0, {ctl.deadline, cancelled.getToken()})),
+                 StorageCode::kEcSealOutcomeUnknown);
+    ASSERT_NO_FATAL_FAILURE(reopenStorage());  // Real handler/worker joins, RocksDB close and original-disk reopen.
+    for (uint8_t target = 0; target != 2; ++target) {
+      const auto &fixed = value->bindings.targets[target];
+      auto state = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+      ASSERT_OK(state);
+      EXPECT_EQ(state->state, target == 0 ? 2 : 1);
+      EXPECT_EQ(state->prefixBytes, value->plan->shardBytes());
+      EXPECT_TRUE(state->needsReconcile);
+      EXPECT_TRUE(serde::equals(state->receipt, repair_test::receipt(value->plan->input().targets[target])));
+    }
+    size_t queries, reconciles;
+    {
+      std::lock_guard lock(replyDrop_.mutex);
+      queries = replyDrop_.queryCalls;
+      reconciles = replyDrop_.reconcileCalls;
+    }
+    ctl = control();
+    ctl.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    const EcRepairControl live{ctl.deadline, ctl.cancellation};
+    auto repaired = blockingWait(EcRepairPipeline::run(value->plan, *transport, mode, live, executor, &observation));
+    ASSERT_OK(repaired);
+    {
+      std::lock_guard lock(replyDrop_.mutex);
+      EXPECT_EQ(replyDrop_.queryCalls, queries + 2);
+      EXPECT_EQ(replyDrop_.reconcileCalls, reconciles + 2);
+    }
+    // The original sealed target skips Append but still obtains a fresh Seal;
+    // the second target replays its exact two blocks before its first Seal.
+    EXPECT_EQ(replyDrop_.snapshot().appendCalls, dropped.appendCalls + value->plan->blockCount());
+    EXPECT_EQ(replyDrop_.snapshot().sealCalls, dropped.sealCalls + 2);
+    ASSERT_NO_FATAL_FAILURE(expectRecovered(*value, *repaired, before));
+    const auto appends = replyDrop_.snapshot().appendCalls;
+    auto repeated = blockingWait(EcRepairPipeline::run(value->plan, *transport, mode, live, executor));
+    ASSERT_OK(repeated);
+    EXPECT_EQ(replyDrop_.snapshot().appendCalls, appends);
+    ASSERT_NO_FATAL_FAILURE(expectRecovered(*value, *repeated, before));
+  }
+  // This proves real Storage/TCP recovery, not Meta publication, journal
+  // recovery, a power cut or a distributed no-further-effects certificate.
+  RecordProperty("unknown_seal_fault_cut",
+                 "real successful Seal reply dropped over TCP; two blocks, window=2; three strategies, two targets");
+  RecordProperty("unknown_seal_recovery", "normal Storage stop/join and original-disk reopen; fixed plan and bindings");
 }
 
 TEST_F(TestEcNativeRepairService, UnknownSealSurvivesCancellationUntilSameStageIsReconciled) {
