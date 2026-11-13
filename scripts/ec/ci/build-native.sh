@@ -13,11 +13,23 @@ local_work=
 local_revision=
 local_container=false
 container_fdb_cache=
+container_libfuse_bundle=
+container_libfuse_bundle_sha256=
 usage() {
-    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs N] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA [--local-container-build-only [--container-fdb-cache ABS]]]; N=1|2|4 except explicit container builds' >&2
+    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs N] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA [--local-container-build-only [--container-fdb-cache ABS] [--container-libfuse-bundle ABS --container-libfuse-bundle-sha256 SHA256]]]; N=1|2|4 except explicit container builds' >&2
 }
 while (($#)); do
     case "$1" in
+        --container-libfuse-bundle)
+            if [[ -n "$container_libfuse_bundle" ]] || (($# < 2)) || [[ "$2" != /* ]]; then usage; exit 2; fi
+            container_libfuse_bundle="$2"
+            shift 2
+            ;;
+        --container-libfuse-bundle-sha256)
+            if [[ -n "$container_libfuse_bundle_sha256" ]] || (($# < 2)) || [[ ! "$2" =~ ^[a-f0-9]{64}$ ]]; then usage; exit 2; fi
+            container_libfuse_bundle_sha256="$2"
+            shift 2
+            ;;
         --container-fdb-cache)
             if [[ -n "$container_fdb_cache" ]] || (($# < 2)) || [[ "$2" != /* ]]; then usage; exit 2; fi
             container_fdb_cache="$2"
@@ -78,6 +90,9 @@ elif [[ "$build_jobs" != 1 && "$build_jobs" != 2 && "$build_jobs" != 4 ]]; then
     usage; exit 2
 fi
 if [[ -n "$container_fdb_cache" ]] && ! "$local_container"; then usage; exit 2; fi
+if [[ -n "$container_libfuse_bundle$container_libfuse_bundle_sha256" ]]; then
+    "$local_container" && [[ -n "$container_libfuse_bundle" && -n "$container_libfuse_bundle_sha256" ]] || { usage; exit 2; }
+fi
 # END ARGUMENT PARSER
 if "$local_mode"; then
     # No environment impersonation: the requested revision is checked against Git.
@@ -138,6 +153,7 @@ sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
     cmake/AddCrate.cmake cmake/ApacheArrow.cmake cmake/Jemalloc.cmake \
     scripts/ec/ci/build-native.sh scripts/ec/ci/prepare-local-build.py scripts/ec/ci/run-core-tests.py \
     scripts/ec/ci/container-build-resources.py \
+    scripts/ec/ci/prepare-libfuse-cache.py \
     scripts/ec/ci/prepare-isal.py scripts/ec/reference/downloads.json cmake/EcCodecBackend.cmake \
     .github/workflows/ec-hosted-native.yml .github/workflows/ec-hosted-system.yml \
     .github/workflows/ec-hosted-target-control.yml \
@@ -443,11 +459,19 @@ fi
 
 # Ubuntu 24.04's libfuse 3.14 is below this tree's required >= 3.16.1.
 fuse_revision=7a92727d97c10290b3501d86a194738973edb61d
+# BEGIN LIBFUSE SOURCE
+if [[ -n "$container_libfuse_bundle" ]]; then
+    /usr/bin/python3 -I "$source_root/scripts/ec/ci/prepare-libfuse-cache.py" \
+        --source "$source_root" --work "$work" --bundle "$container_libfuse_bundle" \
+        --bundle-sha256 "$container_libfuse_bundle_sha256"
+else
 git init -q "$work/libfuse"
 git -C "$work/libfuse" remote add origin https://github.com/libfuse/libfuse.git
 git -C "$work/libfuse" fetch --depth 1 origin "$fuse_revision"
 git -C "$work/libfuse" checkout --detach FETCH_HEAD
 [[ "$(git -C "$work/libfuse" rev-parse HEAD)" == "$fuse_revision" ]]
+fi
+# END LIBFUSE SOURCE
 # BEGIN FUSE INSTALL
 fuse_options=()
 if "$local_mode"; then
@@ -673,6 +697,9 @@ if local_container == 'true':
     fdb_cache = work / 'fdb/fdb-cache-provenance.json'
     if fdb_cache.exists():
         common['fdb_cache_provenance'] = {'path': str(fdb_cache), 'sha256': sha(fdb_cache)}
+    libfuse_cache = work / 'provenance/libfuse-cache.json'
+    if libfuse_cache.exists():
+        common['libfuse_cache_provenance'] = {'path': str(libfuse_cache), 'sha256': sha(libfuse_cache)}
 record = dict(common, targets=list(paths), binaries={name: sha(path) for name, path in paths.items()},
               ec_regression_targets_requested=with_regression == 'true', lab_targets_requested=with_lab == 'true')
 path = work / 'provenance/native-build.json'

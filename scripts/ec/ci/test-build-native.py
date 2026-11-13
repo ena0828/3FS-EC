@@ -74,7 +74,11 @@ class BuildInputs(unittest.TestCase):
                    '--build-jobs', '12'], 'scalar false false 12'),
                  (['--local-container-build-only', '--local-source', '/fixed/source',
                    '--local-work', '/fixed/native', '--local-revision', 'a' * 40,
-                   '--container-fdb-cache', '/fixed/cache'], 'scalar false false 1')]
+                   '--container-fdb-cache', '/fixed/cache'], 'scalar false false 1'),
+                 (['--local-container-build-only', '--local-source', '/fixed/source',
+                   '--local-work', '/fixed/native', '--local-revision', 'a' * 40,
+                   '--container-libfuse-bundle', '/fixed/fuse.bundle',
+                   '--container-libfuse-bundle-sha256', 'b' * 64], 'scalar false false 1')]
         for argv, expected in cases:
             with self.subTest(argv=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
@@ -104,6 +108,25 @@ class BuildInputs(unittest.TestCase):
                      ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
                       '--local-revision', 'a' * 40, '--container-fdb-cache', '/cache',
                       '--container-fdb-cache', '/cache2'],
+                     ['--container-libfuse-bundle', '/cache/fuse.bundle', '--container-libfuse-bundle-sha256', 'b' * 64],
+                     ['--local-source', '/a', '--local-work', '/b', '--local-revision', 'a' * 40,
+                      '--container-libfuse-bundle', '/cache/fuse.bundle', '--container-libfuse-bundle-sha256', 'b' * 64],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-libfuse-bundle', '/cache/fuse.bundle'],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-libfuse-bundle-sha256', 'b' * 64],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-libfuse-bundle', 'relative',
+                      '--container-libfuse-bundle-sha256', 'b' * 64],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-libfuse-bundle', '/cache/fuse.bundle',
+                      '--container-libfuse-bundle-sha256', 'B' * 64],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-libfuse-bundle', '/cache/fuse.bundle',
+                      '--container-libfuse-bundle', '/cache/other.bundle', '--container-libfuse-bundle-sha256', 'b' * 64],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-libfuse-bundle', '/cache/fuse.bundle',
+                      '--container-libfuse-bundle-sha256', 'b' * 64, '--container-libfuse-bundle-sha256', 'c' * 64],
                      ['--local-source', '/a', '--local-work', '/b', '--local-revision', 'a' * 40,
                       '--build-jobs', '12']):
             with self.subTest(rejected=argv):
@@ -135,6 +158,40 @@ bash() { printf '%s\\n' "$@"; }
         result = subprocess.run([bash, '-n'], input=fetch.read_text(encoding='utf-8'),
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_real_libfuse_source_branch_argv(self):
+        bash = bash_path()
+        if bash is None:
+            self.skipTest('Native Bash unavailable; no WSL fallback')
+        text = SCRIPT.read_text(encoding='utf-8')
+        block = text.split('# BEGIN LIBFUSE SOURCE\n', 1)[1].split('# END LIBFUSE SOURCE', 1)[0]
+        # Substitute only the fixed interpreter executable with an argv recorder.
+        block = block.replace('/usr/bin/python3 ', 'python_helper ')
+        prefix = '''set -euo pipefail
+source_root=/fixed/source
+work=/fixed/native
+fuse_revision=7a92727d97c10290b3501d86a194738973edb61d
+python_helper() { printf '%s\\n' "$@"; }
+git() {
+  if [[ "$*" == *'rev-parse HEAD' ]]; then printf '%s\\n' "$fuse_revision";
+  else printf 'git %s\\n' "$*"; fi
+}
+'''
+        for bundle in ('', '/fixed/cache/fuse.bundle'):
+            result = subprocess.run([bash, '-s'], input=prefix + 'container_libfuse_bundle=' + shlex.quote(bundle)
+                                    + '\ncontainer_libfuse_bundle_sha256=' + 'b' * 64 + '\n' + block,
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if bundle:
+                self.assertEqual(result.stdout.splitlines(), ['-I', '/fixed/source/scripts/ec/ci/prepare-libfuse-cache.py',
+                                 '--source', '/fixed/source', '--work', '/fixed/native', '--bundle', bundle,
+                                 '--bundle-sha256', 'b' * 64])
+            else:
+                self.assertEqual(result.stdout.splitlines(), [
+                    'git init -q /fixed/native/libfuse',
+                    'git -C /fixed/native/libfuse remote add origin https://github.com/libfuse/libfuse.git',
+                    'git -C /fixed/native/libfuse fetch --depth 1 origin 7a92727d97c10290b3501d86a194738973edb61d',
+                    'git -C /fixed/native/libfuse checkout --detach FETCH_HEAD'])
 
     def resource_functions(self):
         blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", SCRIPT.read_text(encoding='utf-8'), re.S)
@@ -495,6 +552,8 @@ rustup() { record "rustup $*"; }
                     put(work / 'provenance' / name, b'{}')
                 put(work / 'provenance/local-preflight.json',
                     b'{"tools":{},"filesystems":[{"path":"/private/work","filesystem":"xfs"}]}')
+                fuse_cache = put(work / 'provenance/libfuse-cache.json',
+                                 b'{"status":"fixed-libfuse-source-prepared","build_executed":false}')
                 original_digest, original_resolve = hashlib.file_digest, Path.resolve
                 def digest(stream, algorithm):
                     if Path(stream.name) == provider:
@@ -538,8 +597,11 @@ rustup() { record "rustup $*"; }
                     self.assertTrue(native['build_only'])
                     self.assertEqual(native['execution_environment'], 'local-linux-container-build-only')
                     self.assertEqual(native['filesystems'][0]['filesystem'], 'xfs')
+                    self.assertEqual(native['libfuse_cache_provenance'], {'path': str(fuse_cache), 'sha256': sha(fuse_cache)})
+                    self.assertEqual(lab['libfuse_cache_provenance'], native['libfuse_cache_provenance'])
                 else:
                     self.assertNotIn('build_only', native)
+                    self.assertNotIn('libfuse_cache_provenance', native)
                 self.assertEqual(lab['native_build_receipt_sha256'], sha(work / 'provenance/native-build.json'))
                 self.assertEqual(calls, [None, '/usr/local/lib'] * 13 if mode else [])
 
