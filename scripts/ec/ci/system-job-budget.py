@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 
 
-STAGES = {"file": (90, 45), "spare": (40, 35)}
+STAGES = {"repair": (80, 75), "file": (90, 45), "spare": (40, 35)}
 
 
 def budget_module():
@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--stage", choices=tuple(STAGES))
     args = parser.parse_args()
     if (args.command == "record" and args.stage is not None) or (args.command == "check" and args.stage is None):
-        parser.error("record takes no stage; check requires --stage file|spare")
+        parser.error("record takes no stage; check requires --stage repair|file|spare")
     base = budget_module()
     parent, identity = base.context()
     identity["system_driver_sha256"] = base.digest(Path(__file__).read_bytes())

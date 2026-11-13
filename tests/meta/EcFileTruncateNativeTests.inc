@@ -40,12 +40,33 @@ TEST_F(TestEcFileNativeWrite, TruncateTailLostReplyAndExtensionDoNotResurrectByt
     replyDrop_.truncateDropOperation = run->intent.operation;
   }
   bool lost = false;
+  uint64_t transactionConflicts = 0;
   const auto until = SteadyClock::now() + 60_s;
   while (SteadyClock::now() < until) {
     auto advanced = blockingWait(client->truncate(journal, deadline()));
     if (!advanced) {
-      std::lock_guard lock(replyDrop_.mutex);
-      ASSERT_EQ(replyDrop_.truncateRepliesDropped, 1) << advanced.error().describe();
+      size_t dropped;
+      {
+        std::lock_guard lock(replyDrop_.mutex);
+        dropped = replyDrop_.truncateRepliesDropped;
+      }
+      if (dropped == 0 && advanced.error().code() == TransactionCode::kConflict) {
+        // Advance may conflict with the worker's own issuance/Bind transaction
+        // before any Published reply reaches the fault seam. This definite
+        // conflict is not the lost reply under test. Keep all original IDs and
+        // query before another finite attempt; no other error is retried here.
+        ++transactionConflicts;
+        auto queried = blockingWait(client->queryTruncate(journal, deadline()));
+        ASSERT_OK(queried);
+        ASSERT_EQ(serde::serialize(queried->intent), serde::serialize(run->intent));
+        ASSERT_EQ(serde::serialize(journal->record()), serde::serialize(*run));
+        // A conflict may also precede Begin. Missing permits only the same
+        // Begin CAS; Published without the actual drop does not satisfy this test.
+        if (queried->observed) ASSERT_EQ(queried->observed->state, EcFileTruncateState::Planned);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        continue;
+      }
+      ASSERT_EQ(dropped, 1) << advanced.error().describe();
       lost = true;
       break;
     }
@@ -54,6 +75,7 @@ TEST_F(TestEcFileNativeWrite, TruncateTailLostReplyAndExtensionDoNotResurrectByt
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   ASSERT_TRUE(lost);
+  RecordProperty("same_identity_transaction_conflicts", std::to_string(transactionConflicts));
   blockingWait(client->close());
   client.reset();
   journal.reset();
