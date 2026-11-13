@@ -36,6 +36,37 @@ MANDATORY = {
     )
 } | {"TestChunkEngine.ReadWrite", "TestStorageTarget.ReadWrite", "TestStorageTarget.Uncommitted"}
 
+# Exact names prevent unrelated green suites from satisfying the control profile.
+TARGET_RETIREMENT_REQUIRED = {
+    "storage": {
+        "TestEcTargetRetirementControl." + name for name in (
+            "RequestCanonicalMacGoldenAndRedactedSerde",
+            "ObservationCanonicalMacGoldenAndExactRequest",
+            "EveryRequestFieldIsAuthenticated",
+            "EveryObservationFieldIsAuthenticated",
+            "LifetimeAuthorityActionAndWrongKeyFailClosed",
+            "MalformedFramesAndContradictoryStatesFailClosed",
+            "ScopeAndRetirementDomainsCannotCross",
+            "RetirementDigestExcludesRequestAuthorityNodeAndNonce",
+        )
+    } | {
+        "TestEcTargetRetirementExecutor." + name for name in (
+            "HeldScopesProducePendingThenLocalDataDrained",
+            "MissingAndMismatchedIntentNeverSigns",
+            "SameIdReplayCannotResurrectAdmission",
+            "ColdReopenPreservesIdentityAndRetirement",
+            "LegacyTargetCannotIssueObservation",
+            "PostEnqueueFailureAndStopWaitForRealWorker",
+            "ExpiredAfterPersistenceReturnsUnknown",
+        )
+    },
+    "service": {
+        "TestEcTargetRetirementService.RealClientPrepareQueryAndReplayBindExactObservation",
+        "TestEcTargetRetirementService.ChangedAuthorityIdentityAndTamperedRequestHaveNoEffect",
+        "TestEcTargetRetirementDisabledService.DisabledRequestsHaveNoPersistentEffects",
+    },
+}
+
 
 def require(value, message):
     if not value:
@@ -95,12 +126,27 @@ def check_suites(record, build, built):
     require(MANDATORY <= names, "codec/RMW/legacy storage coverage is incomplete")
 
 
+def check_target_retirement(record):
+    require(set(TARGET_RETIREMENT_REQUIRED) == {"storage", "service"}
+            and all(TARGET_RETIREMENT_REQUIRED.values()), "target retirement inventory is incomplete")
+    for kind, required in TARGET_RETIREMENT_REQUIRED.items():
+        rows = [row for row in record.get("suites", []) if row.get("suite") == kind]
+        require(len(rows) == 1, "target retirement suite missing or repeated")
+        cases = rows[0].get("xml_results", {}).get("cases", [])
+        actual = [case["name"] for case in cases if case.get("executed") is True
+                  and case.get("failed") is False and case.get("skipped") is False]
+        require(len(actual) == len(set(actual)) and required <= set(actual),
+                "required target retirement test did not execute successfully")
+    return {kind: sorted(names) for kind, names in TARGET_RETIREMENT_REQUIRED.items()}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--build", required=True, type=Path)
     parser.add_argument("--work", required=True, type=Path)
     parser.add_argument("--backend", required=True, choices=("scalar", "isal"))
+    parser.add_argument("--require-target-retirement", action="store_true")
     args = parser.parse_args()
     require(sys.platform == "linux" and os.getuid() == os.geteuid() != 0, "ordinary Linux UID required")
     sys.dont_write_bytecode = True
@@ -132,8 +178,15 @@ def main():
     inputs = {str(path): digest(path) for path in (
         Path(__file__), source / "scripts/ec/test-native-fragments.py", record_path,
         source / "tests/storage/store/TestEcCodec.cc", source / "tests/storage/store/TestEcRmw.cc")}
+    if args.require_target_retirement:
+        inputs.update({str(source / path): digest(source / path) for path in (
+            "tests/storage/store/TestEcTargetRetirementControl.cc",
+            "tests/storage/store/TestEcTargetRetirementExecutor.cc",
+            "tests/storage/service/TestEcTargetRetirementService.cc",
+        )})
     report = {"schema": 1, "revision": revision, "backend": args.backend, "status": "incomplete",
               "native_build_sha256": digest(record_path), "inputs_sha256": inputs,
+              "target_retirement_required": args.require_target_retirement,
               "scope": "native functional regressions; not a benchmark or real Storage process fault"}
     result = 1
     try:
@@ -164,6 +217,8 @@ def main():
         report["regression_receipt_sha256"] = digest(receipt)
         require(report["driver_exitcode"] == 0, "existing native regression driver returned nonzero")
         check_suites(actual, build, built)
+        if args.require_target_retirement:
+            report["target_retirement_verified"] = check_target_retirement(actual)
         report["actual_backend"] = backend_property(work / "tests/storage.xml", args.backend)
         report["evidence_sha256"] = {str(path): digest(path) for path in sorted((work / "tests").glob("*"))
                                      if path.is_file()}

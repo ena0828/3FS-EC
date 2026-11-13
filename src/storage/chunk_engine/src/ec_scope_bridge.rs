@@ -337,3 +337,53 @@ mod tests {
         super::binding(value)
     }
 }
+
+// Distinct local target observation; never converts to a scope Drained ACK.
+fn retirement_result(
+    result: Result<EcTargetRetirementStatus, ffi::RawEcScopeStatus>,
+) -> ffi::RawEcTargetRetirementResult {
+    match result {
+        Ok(EcTargetRetirementStatus::DataDrained) => ffi::RawEcTargetRetirementResult {
+            status: status(0, ""),
+            durable: true,
+            inflight: 0,
+            data_drained: true,
+        },
+        Ok(EcTargetRetirementStatus::Pending { inflight, durable }) => ffi::RawEcTargetRetirementResult {
+            status: status(0, ""),
+            durable,
+            inflight,
+            data_drained: false,
+        },
+        Err(status) => ffi::RawEcTargetRetirementResult {
+            status,
+            durable: false,
+            inflight: 0,
+            data_drained: false,
+        },
+    }
+}
+
+pub(crate) fn ec_target_retirement_prepare(
+    handle: &EcScopeHandle,
+    request: &ffi::RawEcTargetRetirement,
+) -> ffi::RawEcTargetRetirementResult {
+    retirement_result(boundary(|| {
+        registry(handle)?.prepare_target_retirement(EcTargetRetirement {
+            target: target(&request.target),
+            id: request.id,
+        })
+    }))
+}
+
+pub(crate) fn ec_target_retirement_query(
+    handle: &EcScopeHandle,
+    request: &ffi::RawEcTargetRetirement,
+) -> ffi::RawEcTargetRetirementResult {
+    retirement_result(boundary(|| {
+        registry(handle)?.query_target_retirement(EcTargetRetirement {
+            target: target(&request.target),
+            id: request.id,
+        })
+    }))
+}

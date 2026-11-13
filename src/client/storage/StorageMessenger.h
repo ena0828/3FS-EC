@@ -17,6 +17,7 @@
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "fbs/storage/EcTargetDiscovery.h"
+#include "fbs/storage/EcTargetRetirementControl.h"
 
 namespace hf3fs::storage::client {
 
@@ -124,6 +125,14 @@ class StorageMessenger {
                                                 const EcGcDiscoveryRequest &request,
                                                 const net::UserRequestOptions *options = nullptr,
                                                 serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcTargetRetirementRsp> prepareEcTargetRetirement(const net::Address &address,
+      const EcTargetRetirementRequest &request,
+      const net::UserRequestOptions *options = nullptr,
+      serde::Timestamp *timestamp = nullptr);
+  CoTryTask<EcTargetRetirementRsp> queryEcTargetRetirement(const net::Address &address,
+      const EcTargetRetirementRequest &request,
+      const net::UserRequestOptions *options = nullptr,
+      serde::Timestamp *timestamp = nullptr);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const net::Address &address,
                                              const EcScopeControlRequest &request,
                                              const net::UserRequestOptions *options = nullptr,

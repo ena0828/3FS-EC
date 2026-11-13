@@ -97,6 +97,10 @@ class StorageClientImpl : public StorageClient {
                                                                   std::shared_ptr<const EcGcKey>,
                                                                   EcRequestControl) override;
   CoTryTask<EcGcAck> exchangeEcGcControlled(EcGcRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) override;
+  CoTryTask<EcTargetRetirementObservation> prepareEcTargetRetirement(
+      EcTargetRetirementRequest, std::shared_ptr<const EcScopeControlKey>, EcRequestControl) override;
+  CoTryTask<EcTargetRetirementObservation> queryEcTargetRetirement(
+      EcTargetRetirementRequest, std::shared_ptr<const EcScopeControlKey>, EcRequestControl) override;
   CoTryTask<EcScopeControlAck> revokeEcScope(const EcScopeControlRequest &) override;
   CoTryTask<EcScopeControlAck> queryEcScopeDrain(const EcScopeControlRequest &) override;
 
@@ -109,6 +113,8 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<ChunkMetaVector> getAllChunkMetadata(const ChainId &chainId, const TargetId &targetId) override;
 
  private:
+  CoTryTask<EcTargetRetirementObservation> controlEcTargetRetirement(
+      EcTargetRetirementRequest, std::shared_ptr<const EcScopeControlKey>, EcRequestControl, EcTargetRetirementAction);
   template <typename WireReq>
   CoTryTask<EcFragmentReceipt> createEcFragmentImpl(const WireReq &request);
   template <typename WireReq, typename Response, auto Method>

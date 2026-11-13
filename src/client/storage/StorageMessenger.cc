@@ -353,6 +353,20 @@ CoTryTask<EcGcDiscoveryRsp> StorageMessenger::getEcGcCapability(const net::Addre
                                                                                                  timestamp);
 }
 
+CoTryTask<EcTargetRetirementRsp> StorageMessenger::prepareEcTargetRetirement(
+    const net::Address &address, const EcTargetRetirementRequest &request,
+    const net::UserRequestOptions *options, serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcTargetRetirementRequest, EcTargetRetirementRsp,
+      StorageSerde<>::prepareEcTargetRetirement<serde::ClientContext>>(client_, address, request, options, timestamp);
+}
+
+CoTryTask<EcTargetRetirementRsp> StorageMessenger::queryEcTargetRetirement(
+    const net::Address &address, const EcTargetRetirementRequest &request,
+    const net::UserRequestOptions *options, serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcTargetRetirementRequest, EcTargetRetirementRsp,
+      StorageSerde<>::queryEcTargetRetirement<serde::ClientContext>>(client_, address, request, options, timestamp);
+}
+
 CoTryTask<EcScopeControlRsp> StorageMessenger::revokeEcScope(const net::Address &address,
                                                              const EcScopeControlRequest &request,
                                                              const net::UserRequestOptions *options,

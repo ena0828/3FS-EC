@@ -553,6 +553,17 @@ pub mod ffi {
         id: [u8; 16],
         endpoint_set_digest: [u8; 32],
     }
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcTargetRetirement {
+        target: RawEcScopeTarget,
+        id: [u8; 16],
+    }
+    struct RawEcTargetRetirementResult {
+        status: RawEcScopeStatus,
+        durable: bool,
+        inflight: u64,
+        data_drained: bool,
+    }
     struct RawEcScopeStatus {
         error_code: u16,
         error: String,
@@ -579,6 +590,14 @@ pub mod ffi {
         type EcScopeHandle;
         type EcScopeTicketHandle;
         fn ec_scope_open(engine: &Engine) -> RawEcScopeOpenResult;
+        fn ec_target_retirement_prepare(
+            handle: &EcScopeHandle,
+            request: &RawEcTargetRetirement,
+        ) -> RawEcTargetRetirementResult;
+        fn ec_target_retirement_query(
+            handle: &EcScopeHandle,
+            request: &RawEcTargetRetirement,
+        ) -> RawEcTargetRetirementResult;
         fn ec_scope_register_target(
             handle: &EcScopeHandle,
             chain: u32,

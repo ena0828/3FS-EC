@@ -12,6 +12,13 @@ using EcScopeTargetIdentity = chunk_engine::RawEcScopeTarget;
 using EcScopeBinding = chunk_engine::RawEcScopeBinding;
 using EcScopeRevocation = chunk_engine::RawEcScopeRevocation;
 
+using EcTargetRetirement = chunk_engine::RawEcTargetRetirement;
+struct EcTargetRetirementStatus {
+  bool durable;
+  uint64_t inflight;
+  bool dataDrained;
+};
+
 struct EcScopeDrainStatus {
   bool durable;
   uint64_t inflight;
@@ -56,6 +63,9 @@ class EcScope {
   Result<EcScopeTicket> tryAdmit(const EcScopeBinding &binding) const;
   Result<EcScopeDrainStatus> revoke(const EcScopeRevocation &request) const;
   Result<EcScopeDrainStatus> drainStatus(const EcScopeRevocation &request) const;
+  // Trusted local disk primitives; neither authenticates nor signs evidence.
+  Result<EcTargetRetirementStatus> prepareTargetRetirement(const EcTargetRetirement &request) const;
+  Result<EcTargetRetirementStatus> queryTargetRetirement(const EcTargetRetirement &request) const;
 
  private:
   friend class EcStagingEngine;

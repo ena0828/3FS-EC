@@ -10,6 +10,9 @@ class Codec;
 namespace ec_scope_control_detail {
 class Codec;
 }
+namespace ec_target_retirement_detail {
+class Codec;
+}
 
 inline constexpr uint16_t kEcScopeControlVersion = 1;
 inline constexpr size_t kEcScopeControlRequestBytes = 208;
@@ -30,6 +33,7 @@ class EcScopeControlKey final {
  private:
   friend class ec_scope_control_detail::Codec;
   friend class ec_target_discovery_detail::Codec;
+  friend class ec_target_retirement_detail::Codec;
   explicit EcScopeControlKey(std::unique_ptr<EcCapabilityKey> key)
       : key_(std::move(key)) {}
   std::unique_ptr<EcCapabilityKey> key_;

@@ -3,6 +3,7 @@
 import contextlib
 import ast
 import copy
+import fnmatch
 import importlib.util
 import io
 import json
@@ -25,6 +26,46 @@ budget = load("checked_system_budget", "system-job-budget.py")
 
 
 class SystemEntrypoints(unittest.TestCase):
+    def test_required_target_retirement_cases_are_selected_by_real_driver(self):
+        driver = regression.module(Path(__file__).parent.parent / "test-native-fragments.py", "retirement_native_driver")
+        filters = {"storage": driver.STORAGE_FILTER, "service": driver.SERVICE_FILTER}
+        self.assertTrue(all(regression.TARGET_RETIREMENT_REQUIRED.values()))
+        for kind, names in regression.TARGET_RETIREMENT_REQUIRED.items():
+            for name in names:
+                with self.subTest(suite=kind, case=name):
+                    self.assertTrue(any(fnmatch.fnmatchcase(name, pattern) for pattern in filters[kind].split(":")))
+
+    def test_other_green_cases_do_not_satisfy_target_retirement_acceptance(self):
+        required = {"storage": {"Retirement.DurableAndHeldTicket"},
+                    "service": {"Retirement.RealRpcAndDisabled"}}
+        def case(name):
+            return {"name": name, "executed": True, "failed": False, "skipped": False}
+        rows = [{"suite": kind, "xml_results": {"cases": [case("Unrelated.Passed"), case(name)]}}
+                for kind, names in required.items() for name in names]
+        with mock.patch.object(regression, "TARGET_RETIREMENT_REQUIRED", required):
+            self.assertEqual(regression.check_target_retirement({"suites": rows}),
+                             {kind: sorted(names) for kind, names in required.items()})
+            for mutation in ("missing", "duplicate_suite", "wrong_suite", "duplicate_case",
+                             "not_executed", "failed", "skipped"):
+                changed = copy.deepcopy(rows)
+                if mutation == "missing":
+                    changed[0]["xml_results"]["cases"].pop()
+                elif mutation == "duplicate_suite":
+                    changed.append(copy.deepcopy(changed[0]))
+                elif mutation == "wrong_suite":
+                    changed[0]["xml_results"], changed[1]["xml_results"] = (
+                        changed[1]["xml_results"], changed[0]["xml_results"])
+                elif mutation == "duplicate_case":
+                    changed[0]["xml_results"]["cases"].append(copy.deepcopy(changed[0]["xml_results"]["cases"][-1]))
+                else:
+                    changed[0]["xml_results"]["cases"][-1][
+                        "executed" if mutation == "not_executed" else mutation] = mutation != "not_executed"
+                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                    regression.check_target_retirement({"suites": changed})
+        with mock.patch.object(regression, "TARGET_RETIREMENT_REQUIRED", {"storage": set(), "service": set()}):
+            with self.assertRaisesRegex(ValueError, "inventory is incomplete"):
+                regression.check_target_retirement({"suites": rows})
+
     def test_ready_loop_stop_race_is_normal_but_child_and_action_failures_propagate(self):
         source = Path(__file__).parent.parent / "cluster/native-v2.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))

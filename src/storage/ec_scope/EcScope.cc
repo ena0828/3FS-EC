@@ -16,6 +16,13 @@ Result<EcScopeDrainStatus> drain(const chunk_engine::RawEcDrainResult &result) {
   }
   return EcScopeDrainStatus{result.durable, result.inflight, result.drained};
 }
+Result<EcTargetRetirementStatus> retirement(const chunk_engine::RawEcTargetRetirementResult &result) {
+  RETURN_ON_ERROR(check(result.status));
+  if (result.data_drained != (result.durable && result.inflight == 0)) {
+    return makeError(StatusCode::kFoundBug, "contradictory local target retirement observation");
+  }
+  return EcTargetRetirementStatus{result.durable, result.inflight, result.data_drained};
+}
 }  // namespace
 
 EcScopeTicket::EcScopeTicket(EcScopeTicket &&other) noexcept
@@ -68,5 +75,11 @@ Result<EcScopeDrainStatus> EcScope::revoke(const EcScopeRevocation &request) con
 }
 Result<EcScopeDrainStatus> EcScope::drainStatus(const EcScopeRevocation &request) const {
   return drain(chunk_engine::ec_scope_drain_status(*handle_, request));
+}
+Result<EcTargetRetirementStatus> EcScope::prepareTargetRetirement(const EcTargetRetirement &request) const {
+  return retirement(chunk_engine::ec_target_retirement_prepare(*handle_, request));
+}
+Result<EcTargetRetirementStatus> EcScope::queryTargetRetirement(const EcTargetRetirement &request) const {
+  return retirement(chunk_engine::ec_target_retirement_query(*handle_, request));
 }
 }  // namespace hf3fs::storage

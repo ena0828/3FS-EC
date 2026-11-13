@@ -130,6 +130,14 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.getEcTargetIdentity(req);
   }
 
+  CoTryTask<EcTargetRetirementRsp> prepareEcTargetRetirement(serde::CallContext &ctx, const EcTargetRetirementRequest &req) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.prepareEcTargetRetirement(req);
+  }
+  CoTryTask<EcTargetRetirementRsp> queryEcTargetRetirement(serde::CallContext &ctx, const EcTargetRetirementRequest &req) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.queryEcTargetRetirement(req);
+  }
   CoTryTask<EcScopeControlRsp> revokeEcScope(serde::CallContext &ctx, const EcScopeControlRequest &req) {
     reportDefaultQueueLatency(ctx);
     return storageOperator_.revokeEcScope(req);

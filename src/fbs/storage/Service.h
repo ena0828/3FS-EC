@@ -11,6 +11,7 @@
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "fbs/storage/EcTargetDiscovery.h"
+#include "fbs/storage/EcTargetRetirementControl.h"
 
 namespace hf3fs::storage {
 
@@ -41,6 +42,8 @@ SERDE_SERVICE(StorageSerde, 3) {
   SERDE_SERVICE_METHOD(getEcTargetIdentity, 27, EcTargetDiscoveryRequest, EcTargetDiscoveryRsp);
   SERDE_SERVICE_METHOD(exchangeEcGc, 28, EcGcRequest, EcGcRsp);
   SERDE_SERVICE_METHOD(getEcGcCapability, 29, EcGcDiscoveryRequest, EcGcDiscoveryRsp);
+  SERDE_SERVICE_METHOD(prepareEcTargetRetirement, 30, EcTargetRetirementRequest, EcTargetRetirementRsp);
+  SERDE_SERVICE_METHOD(queryEcTargetRetirement, 31, EcTargetRetirementRequest, EcTargetRetirementRsp);
   SERDE_SERVICE_METHOD(readEcBlockV2, 40, EcReadBlockV2Req, EcReadBlockV2Rsp);
   SERDE_SERVICE_METHOD(beginEcStageV2, 41, EcBeginStageV2Req, EcStageV2Rsp);
   SERDE_SERVICE_METHOD(appendEcStageV2, 42, EcAppendStageV2Req, EcStageV2Rsp);

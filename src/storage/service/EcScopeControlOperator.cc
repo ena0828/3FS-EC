@@ -3,6 +3,9 @@
 
 namespace hf3fs::storage {
 Result<Void> StorageOperator::initEcScopeControl() {
+  if (config_.enable_ec_target_retirement() && !config_.enable_ec_scope_control()) {
+    return makeError(StatusCode::kInvalidConfig, "target retirement requires explicit scope control configuration");
+  }
   if (!config_.enable_ec_scope_control()) return Void{};
   if (!config_.enable_ec_fragments() || !components_.config.targets().ec_staging_v2()) {
     return makeError(StatusCode::kInvalidConfig, "EC scope control requires the V2-only storage mode");
@@ -22,6 +25,11 @@ Result<Void> StorageOperator::initEcScopeControl() {
                EcScopeControlExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_));
   CHECK_RESULT(discovery,
                EcTargetDiscoveryExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_));
+  if (config_.enable_ec_target_retirement()) {
+    CHECK_RESULT(retirement,
+                 EcTargetRetirementExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_));
+    ecTargetRetirement_ = std::move(retirement);
+  }
   ecControlKeyFileIdentity_ = shared->fileIdentity();
   ecScopeControl_ = std::move(executor);
   ecDiscovery_ = std::move(discovery);

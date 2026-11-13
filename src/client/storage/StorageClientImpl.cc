@@ -3372,6 +3372,82 @@ CoTryTask<EcGcAck> StorageClientImpl::exchangeEcGcControlled(EcGcRequest request
   }
 }
 
+CoTryTask<EcTargetRetirementObservation> StorageClientImpl::controlEcTargetRetirement(
+    EcTargetRetirementRequest request, std::shared_ptr<const EcScopeControlKey> key,
+    EcRequestControl control, EcTargetRetirementAction action) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  if (!key) co_return makeError(StatusCode::kAuthenticationFail, "retirement requires a control-role key");
+  const auto wall = [] {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  };
+  const auto check = [&]() -> Result<Void> {
+    if (std::chrono::steady_clock::now() >= control.deadline) return makeError(StorageClientCode::kTimeout);
+    if (control.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
+    return Void{};
+  };
+  CO_RETURN_ON_ERROR(check());
+  if (control.transport != EcRequestControl::TransportPolicy::TcpOnly ||
+      control.deadline - std::chrono::steady_clock::now() > std::chrono::seconds(kEcTargetRetirementMaxTtlSeconds))
+    co_return makeError(StatusCode::kInvalidArg, "target retirement requires finite TCP-only control");
+  CO_RETURN_ON_ERROR(verifyEcTargetRetirement(*key, request, request.claims.clusterAuthority,
+                                            request.claims.nodeId, action, wall()));
+  if (!ecControlConcurrency_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy);
+  auto release = folly::makeGuard([this] { ecControlConcurrency_.signal(); });
+  auto routing = getCurrentRoutingInfo();
+  if (!routing || !routing->raw()) co_return makeError(StorageClientCode::kRoutingError);
+  // Route the signed instance's node, including a retained offline instance;
+  // never substitute the chain's current owner or another address after error.
+  auto node = getNodeInfo(routing, request.claims.nodeId);
+  CO_RETURN_ON_ERROR(node);
+  if (node->app.nodeId != request.claims.nodeId || node->type != flat::NodeType::STORAGE)
+    co_return makeError(StorageClientCode::kRoutingVersionMismatch);
+  CO_RETURN_ON_ERROR(check());
+  const auto remaining = control.deadline - std::chrono::steady_clock::now();
+  if (remaining <= std::chrono::steady_clock::duration::zero()) co_return makeError(StorageClientCode::kTimeout);
+  const DebugOptions debug;
+  ClientRequestContext context(action == EcTargetRetirementAction::Prepare ? MethodType::prepareEcTargetRetirement
+                                                                         : MethodType::queryEcTargetRetirement,
+                               flat::UserInfo(), debug, config_, 1, 0, Duration(remaining));
+  bool dispatched = false;
+  Result<EcTargetRetirementRsp> response = makeError(StorageClientCode::kNotInitialized);
+  try {
+    // The request/key stay in this frame until the finite native Waiter returns.
+    // Cancellation after dispatch is observed afterward, never by detaching work.
+    if (action == EcTargetRetirementAction::Prepare) {
+      response = co_await callMessengerMethod<EcTargetRetirementRequest, EcTargetRetirementRsp,
+          &StorageMessenger::prepareEcTargetRetirement>(messenger_, context, *node, request, 0, &dispatched, true, true);
+    } else {
+      response = co_await callMessengerMethod<EcTargetRetirementRequest, EcTargetRetirementRsp,
+          &StorageMessenger::queryEcTargetRetirement>(messenger_, context, *node, request, 0, &dispatched, true, true);
+    }
+    if (!response) {
+      if (dispatched) co_return makeError(StorageCode::kEcSealOutcomeUnknown);
+      co_return makeError(response.error());
+    }
+    // A late cancellation/expiry or invalid observation does not undo a durable
+    // deny. Preserve this retirement ID for a newly authenticated Query. Server
+    // errors also never establish that Prepare had no persistent effect.
+    if (!check()) co_return makeError(StorageCode::kEcSealOutcomeUnknown);
+    CO_RETURN_ON_ERROR(response->result);
+    if (!verifyEcTargetRetirementObservation(*key, *response->result, request))
+      co_return makeError(StorageCode::kEcSealOutcomeUnknown);
+    co_return std::move(*response->result);
+  } catch (...) {
+    if (dispatched) co_return makeError(StorageCode::kEcSealOutcomeUnknown);
+    co_return makeError(StatusCode::kFoundBug);
+  }
+}
+
+CoTryTask<EcTargetRetirementObservation> StorageClientImpl::prepareEcTargetRetirement(
+    EcTargetRetirementRequest request, std::shared_ptr<const EcScopeControlKey> key, EcRequestControl control) {
+  return controlEcTargetRetirement(std::move(request), std::move(key), std::move(control), EcTargetRetirementAction::Prepare);
+}
+CoTryTask<EcTargetRetirementObservation> StorageClientImpl::queryEcTargetRetirement(
+    EcTargetRetirementRequest request, std::shared_ptr<const EcScopeControlKey> key, EcRequestControl control) {
+  return controlEcTargetRetirement(std::move(request), std::move(key), std::move(control), EcTargetRetirementAction::Query);
+}
+
 CoTryTask<EcTargetDiscoveryObservation> StorageClientImpl::getEcTargetIdentityControlled(
     EcTargetDiscoveryRequest request,
     std::shared_ptr<const EcScopeControlKey> key,

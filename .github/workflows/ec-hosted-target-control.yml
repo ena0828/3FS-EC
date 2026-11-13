@@ -1,0 +1,76 @@
+name: EC authenticated target retirement control acceptance
+
+on:
+  push:
+    branches: [feat/ec-target-control]
+    paths:
+      - .github/workflows/ec-hosted-target-control.yml
+      - scripts/ec/**
+      - src/**
+      - tests/**
+      - cmake/**
+      - configs/**
+      - patches/**
+      - third_party/**
+      - CMakeLists.txt
+      - Cargo.toml
+      - Cargo.lock
+      - .gitmodules
+      - '!**/*.md'
+      - '!**/*.rst'
+      - '!**/README*'
+      - '!**/docs/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ec-hosted-target-control-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  control:
+    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-target-control' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    # Step caps total 289 minutes, leaving margin for setup and post-job work.
+    timeout-minutes: 300
+    steps:
+      - name: Check out this revision and pinned submodules
+        timeout-minutes: 10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: recursive
+          lfs: false
+          persist-credentials: false
+
+      - name: Check the build and required acceptance sets
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          python3 -B scripts/ec/ci/test-build-native.py -v
+          python3 -B scripts/ec/ci/test-system-entrypoints.py -v
+
+      - name: Build one ISA-L configuration and the affected native targets
+        # Also compile Meta and FUSE test targets against the new interface.
+        # This job does not execute their business or mount acceptance suites.
+        timeout-minutes: 240
+        shell: bash
+        run: bash scripts/ec/ci/build-native.sh --backend isal --build-jobs 2 --with-ec-regression-targets
+
+      - name: Verify target control through real Storage and client code
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          uid=$(id -u)
+          gid=$(id -g)
+          runner_user=$(id -un)
+          runner_home=$HOME
+          test "$uid" -ne 0
+          sudo -n prlimit --memlock=3221225472:3221225472 --nofile=65536:65536 -- \
+            setpriv --reuid="$uid" --regid="$gid" --init-groups \
+            env HOME="$runner_home" USER="$runner_user" LOGNAME="$runner_user" \
+            GITHUB_SHA="$GITHUB_SHA" LD_LIBRARY_PATH=/usr/local/lib /usr/bin/python3 -B \
+            "$GITHUB_WORKSPACE/scripts/ec/ci/run-native-regressions.py" \
+            --source "$GITHUB_WORKSPACE" --build "$RUNNER_TEMP/ec-native/build" \
+            --work "$RUNNER_TEMP/ec-native/regressions" --backend isal --require-target-retirement

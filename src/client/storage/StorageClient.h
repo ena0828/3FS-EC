@@ -22,6 +22,7 @@
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "fbs/storage/EcTargetDiscovery.h"
+#include "fbs/storage/EcTargetRetirementControl.h"
 
 namespace hf3fs::storage::client {
 
@@ -379,6 +380,8 @@ class StorageClient : public folly::MoveOnly {
     reconcileEcStageV2,
     sealEcStageV2,
     executeEcHelper,
+    prepareEcTargetRetirement,
+    queryEcTargetRetirement,
     revokeEcScope,
     queryEcScopeDrain,
     getEcTargetIdentity,
@@ -677,6 +680,18 @@ class StorageClient : public folly::MoveOnly {
   }
   virtual CoTryTask<EcGcAck> exchangeEcGcControlled(EcGcRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) {
     co_return makeError(StatusCode::kNotImplemented, "GC requires native RPC28 transport");
+  }
+  // Independent local target observation. No scope ACK or distributed effect
+  // guarantee is implied. Both request and control key outlive the finite RPC.
+  // An error is not proof that Prepare did not persist. Retain the same target
+  // and retirement ID; recovery uses a freshly authenticated Query, not a new ID.
+  virtual CoTryTask<EcTargetRetirementObservation> prepareEcTargetRetirement(
+      EcTargetRetirementRequest, std::shared_ptr<const EcScopeControlKey>, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented);
+  }
+  virtual CoTryTask<EcTargetRetirementObservation> queryEcTargetRetirement(
+      EcTargetRetirementRequest, std::shared_ptr<const EcScopeControlKey>, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented);
   }
   virtual CoTryTask<EcScopeControlAck> revokeEcScope(const EcScopeControlRequest &) {
     co_return makeError(StatusCode::kNotImplemented, "EC scope control requires the RPC storage client");

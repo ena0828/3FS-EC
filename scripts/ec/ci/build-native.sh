@@ -80,6 +80,7 @@ sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
     scripts/ec/ci/build-native.sh scripts/ec/ci/run-core-tests.py \
     scripts/ec/ci/prepare-isal.py scripts/ec/reference/downloads.json cmake/EcCodecBackend.cmake \
     .github/workflows/ec-hosted-native.yml .github/workflows/ec-hosted-system.yml \
+    .github/workflows/ec-hosted-target-control.yml \
     | tee "$work/provenance/build-inputs.sha256"
 
 # Reuse the repository's dependency set, including Arrow's transitive closure.

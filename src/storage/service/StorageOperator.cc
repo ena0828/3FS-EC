@@ -92,6 +92,7 @@ Result<Void> StorageOperator::stopAndJoin() {
   if (ecGc_) RETURN_ON_ERROR(ecGc_->stopAndJoin());
   if (ecHelpers_) ecHelpers_->stopAndJoin();
   if (ecDiscovery_) ecDiscovery_->stopAndJoin();
+  if (ecTargetRetirement_) ecTargetRetirement_->stopAndJoin();
   if (ecScopeControl_) ecScopeControl_->stopAndJoin();
   storageReadAvgBytes.reset();
   updateWorker_.stopAndJoin();

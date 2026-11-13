@@ -30,6 +30,7 @@
 #include "storage/ec_rmw/EcRmwRuntime.h"
 #include "storage/ec_scope/EcScopeControlExecutor.h"
 #include "storage/ec_scope/EcTargetDiscoveryExecutor.h"
+#include "storage/ec_scope/EcTargetRetirementExecutor.h"
 #include "storage/service/BufferPool.h"
 #include "storage/service/ReliableForwarding.h"
 #include "storage/service/ReliableUpdate.h"
@@ -69,6 +70,7 @@ class StorageOperator {
     CONFIG_ITEM(ec_gc_key_id, std::string{});
     CONFIG_ITEM(ec_gc_authority, std::string{});
     CONFIG_ITEM(enable_ec_scope_control, false);
+    CONFIG_ITEM(enable_ec_target_retirement, false);
     CONFIG_ITEM(ec_scope_control_key_file, Path{});
     CONFIG_ITEM(ec_scope_control_authority, std::string{});
     CONFIG_ITEM(max_concurrent_ec_requests, 8u, [](auto value) { return value > 0 && value <= 64; });
@@ -133,6 +135,8 @@ class StorageOperator {
   CoTryTask<EcRmwStatusRsp> installEcRmw(const EcRmwInstallReq &);
   CoTryTask<EcRmwStatusRsp> putEcRmw(const EcRmwPutReq &);
   CoTryTask<EcRmwStatusRsp> actionEcRmw(const EcRmwActionReq &);
+  CoTryTask<EcTargetRetirementRsp> prepareEcTargetRetirement(const EcTargetRetirementRequest &req);
+  CoTryTask<EcTargetRetirementRsp> queryEcTargetRetirement(const EcTargetRetirementRequest &req);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const EcScopeControlRequest &req);
   CoTryTask<EcScopeControlRsp> queryEcScopeDrain(const EcScopeControlRequest &req);
   CoTryTask<EcGcRsp> exchangeEcGc(const EcGcRequest &request);
@@ -226,6 +230,8 @@ class StorageOperator {
 
   Result<Void> initEcScopeControl();
   CoTryTask<EcScopeControlRsp> controlEcScope(const EcScopeControlRequest &, EcScopeControlAction);
+  CoTryTask<EcTargetRetirementRsp> controlEcTargetRetirement(const EcTargetRetirementRequest &, EcTargetRetirementAction);
+  std::unique_ptr<EcTargetRetirementExecutor> ecTargetRetirement_;
   std::unique_ptr<EcScopeControlExecutor> ecScopeControl_;
   std::unique_ptr<EcTargetDiscoveryExecutor> ecDiscovery_;
 
