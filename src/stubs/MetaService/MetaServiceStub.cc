@@ -83,6 +83,7 @@ IMPL_META_STUB_METHOD(syncEcFileSession, SyncEcFileSessionReq, SyncEcFileSession
 IMPL_META_STUB_METHOD(beginEcFileRepair, BeginEcFileRepairReq, EcFileRepairRsp);
 IMPL_META_STUB_METHOD(queryEcFileRepair, QueryEcFileRepairReq, EcFileRepairRsp);
 IMPL_META_STUB_METHOD(advanceEcFileRepair, AdvanceEcFileRepairReq, EcFileRepairRsp);
+IMPL_META_STUB_METHOD(prepareEcFileRepairDirect, PrepareEcFileRepairDirectReq, EcFileRepairDirectRsp);
 IMPL_META_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 template class MetaServiceStub<serde::ClientContext>;

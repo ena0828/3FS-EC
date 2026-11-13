@@ -19,12 +19,14 @@
 #include "client/ec/NativeEcBlockTransport.h"
 #include "client/ec/NativeEcRepairTransport.h"
 #include "client/storage/StorageClient.h"
+#include "client/storage/EcRpcObservation.h"
 #include "client/storage/StorageMessenger.h"
 #include "common/net/Server.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "fbs/storage/EcStageValidationV2.h"
 #include "storage/ec_codec/EcCodec.h"
 #include "storage/ec_repair/EcHelperAuthorization.h"
+#include "storage/ec_repair/EcHelperDirectAuthorization.h"
 #include "storage/service/Components.h"
 #include "storage/service/StorageService.h"
 #include "tests/EcRepairTestData.h"
@@ -55,6 +57,18 @@ void smallClient(net::Client::Config &config) {
 }
 
 struct StageReplyDropState {
+  struct DirectTrace {
+    Uuid operation = Uuid::zero();
+    std::array<uint16_t, 10> enteredBlocks{};
+    size_t entered = 0, finished = 0, zeroPrefixQueries = 0;
+    std::vector<std::pair<TargetId, uint32_t>> appendAttempts;
+    std::vector<std::pair<TargetId, uint32_t>> appends;
+    std::vector<size_t> successfulResponseBytes;
+    std::optional<uint8_t> dropResultPosition;
+    size_t shutdownCalls = 0;
+    bool tcp = false;
+    int shutdownResult = -1, shutdownErrno = 0;
+  };
   // One fixed window=2 attempt. Counts describe real service-handler bodies,
   // not a distributed drain certificate or the connection's response queue.
   struct ConcurrentWindow {
@@ -157,6 +171,14 @@ struct StageReplyDropState {
   size_t reconcileCalls = 0;
   std::optional<uint16_t> delayedReadShard;
   std::shared_ptr<ConcurrentWindow> concurrentWindow;
+  std::condition_variable directChanged;
+  DirectTrace direct;
+  std::shared_ptr<ReadDelay> directDelay;
+  uint8_t directDelayPosition = 4;
+  bool waitDirect(const std::function<bool(const DirectTrace &)> &predicate) {
+    std::unique_lock lock(mutex);
+    return directChanged.wait_for(lock, std::chrono::seconds(10), [&] { return predicate(direct); });
+  }
 };
 
 // Every handler still executes the real StorageService. Rebind the serde
@@ -167,6 +189,63 @@ class StageReplyDropStorageService : public StorageService {
   StageReplyDropStorageService(StorageOperator &storageOperator, StageReplyDropState &fault)
       : StorageService(storageOperator),
         fault_(fault) {}
+
+  void disconnectDirect(const net::TransportPtr &transport) {
+    const bool tcp = transport->isTCP();
+    int rc = -1, error = ENOTSOCK;
+    if (tcp) {
+      const auto &handler = static_cast<const net::EventLoop::EventHandler &>(*transport);
+      rc = ::shutdown(handler.fd(), SHUT_RDWR);
+      error = rc < 0 ? errno : 0;
+    }
+    transport->invalidate(false);
+    std::lock_guard lock(fault_.mutex);
+    ++fault_.direct.shutdownCalls;
+    fault_.direct.tcp = tcp;
+    fault_.direct.shutdownResult = rc;
+    fault_.direct.shutdownErrno = error;
+    fault_.directChanged.notify_all();
+  }
+
+  CoTryTask<EcHelperDirectHopRsp> executeEcHelperDirect(serde::CallContext &ctx,
+                                                      const EcHelperDirectHopReq &request) {
+    const auto position = request.packet.nextHelper;
+    bool tracked = false;
+    std::shared_ptr<StageReplyDropState::ReadDelay> delay;
+    {
+      std::lock_guard lock(fault_.mutex);
+      tracked = request.plan.operationId == fault_.direct.operation && position < 10 && request.packet.blockIndex < 16;
+      if (tracked) {
+        ++fault_.direct.entered;
+        fault_.direct.enteredBlocks[position] |= uint16_t{1} << request.packet.blockIndex;
+        if (position == fault_.directDelayPosition) delay = std::move(fault_.directDelay);
+        fault_.directChanged.notify_all();
+      }
+    }
+    auto finished = folly::makeGuard([&] {
+      if (!tracked) return;
+      std::lock_guard lock(fault_.mutex);
+      ++fault_.direct.finished;
+      fault_.directChanged.notify_all();
+    });
+    if (delay) {
+      delay->entered.set_value();
+      co_await delay->resume;
+    }
+    auto result = co_await StorageService::executeEcHelperDirect(ctx, request);
+    bool drop = false;
+    if (tracked && result && result->result) {
+      const auto size = serde::serialize(*result).size();
+      std::lock_guard lock(fault_.mutex);
+      fault_.direct.successfulResponseBytes.push_back(size);
+      if (fault_.direct.dropResultPosition == position) {
+        fault_.direct.dropResultPosition.reset();
+        drop = true;
+      }
+    }
+    if (drop) disconnectDirect(ctx.transport());
+    co_return result;
+  }
 
   CoTryTask<EcReadBlockV2Rsp> readEcBlockV2(serde::CallContext &ctx, const EcReadBlockV2Req &req) {
     std::shared_ptr<StageReplyDropState::ConcurrentWindow> window;
@@ -292,7 +371,15 @@ class StageReplyDropStorageService : public StorageService {
       std::lock_guard lock(fault_.mutex);
       ++fault_.queryCalls;
     }
-    co_return co_await StorageService::queryEcStageV2(ctx, request);
+    auto result = co_await StorageService::queryEcStageV2(ctx, request);
+    if (result && result->result && result->result->prefixBytes == 0) {
+      std::lock_guard lock(fault_.mutex);
+      if (request.grant.claims.scopeId == fault_.direct.operation) {
+        ++fault_.direct.zeroPrefixQueries;
+        fault_.directChanged.notify_all();
+      }
+    }
+    co_return result;
   }
   CoTryTask<EcStageV2Rsp> reconcileEcStageV2(serde::CallContext &ctx, const EcReconcileStageV2Req &request) {
     {
@@ -306,11 +393,17 @@ class StageReplyDropStorageService : public StorageService {
     {
       std::lock_guard lock(fault_.mutex);
       ++fault_.state.appendCalls;
+      if (req.grant.claims.scopeId == fault_.direct.operation)
+        fault_.direct.appendAttempts.emplace_back(req.request.targetId, req.blockIndex);
     }
     auto response = co_await StorageService::appendEcStageV2(ctx, req);
     bool drop = false;
     if (response && response->result) {
       std::lock_guard lock(fault_.mutex);
+      if (req.grant.claims.scopeId == fault_.direct.operation) {
+        fault_.direct.appends.emplace_back(req.request.targetId, req.blockIndex);
+        fault_.directChanged.notify_all();
+      }
       if (fault_.appendRequest && StageReplyDropState::sameStage(*fault_.appendRequest, req.request) &&
           fault_.appendBlock == req.blockIndex) {
         // The real Engine has synced data and its progress WAL before success.
@@ -355,7 +448,13 @@ class StageReplyDropStorageService : public StorageService {
           window->changed.notify_all();
         }
       } else {
-        ctx.transport()->invalidate(false);
+        bool direct;
+        {
+          std::lock_guard lock(fault_.mutex);
+          direct = req.grant.claims.scopeId == fault_.direct.operation;
+        }
+        if (direct) disconnectDirect(ctx.transport());
+        else ctx.transport()->invalidate(false);
       }
     }
     co_return response;
@@ -1290,9 +1389,78 @@ class TestEcNativeRepairService : public TestEcStageService {
       EXPECT_EQ(*used, before[target] + 2 * kEcIntegrityBlockBytes);
     }
   }
+  Result<EcHelperDirectHopReq> directRequest(const Case &value, uint32_t block = 0, uint8_t mask = 0) {
+    const auto original = request(value, block);
+    EcHelperDirectHopReq result;
+    result.plan = original.plan;
+    result.helpers = original.helpers;
+    result.reads = original.reads;
+    result.sourceRouteVersions = original.routeVersions;
+    result.packet = original.packet;
+    result.deadlineUnixMillis = original.deadlineUnixMillis;
+    result.activeTargetMask = mask ? mask : uint8_t((1u << value.plan->input().targetCount) - 1);
+    std::array<EcCapabilityV2, 2> append{}, query{};
+    for (uint8_t i = 0; i != value.plan->input().targetCount; ++i) {
+      const auto &fragment = value.plan->input().targets[i];
+      CHECK_RESULT(a, token(fragment, result.plan, uint16_t(EcGrantRightV2::Append), result.plan.operationId));
+      CHECK_RESULT(q, token(fragment, result.plan, uint16_t(EcGrantRightV2::Query), result.plan.operationId));
+      append[i] = std::move(a);
+      query[i] = std::move(q);
+      result.targetRouteVersions[i] = ChainVer(1);
+    }
+    CHECK_RESULT(delegation, issueEcHelperDirectDelegation(*helperKey_, *value.plan, std::move(append),
+                                                           std::move(query),
+                                                           uint16_t((1u << value.plan->blockCount()) - 1), 1000, 100));
+    result.delegation = std::move(delegation);
+    return result;
+  }
+  Result<Void> beginDirect(const Case &value) {
+    for (uint8_t i = 0; i != value.plan->input().targetCount; ++i) {
+      const auto &fixed = value.bindings.targets[i];
+      RETURN_ON_ERROR(blockingWait(client_->beginEcStageV2Controlled({fixed.request, fixed.grant}, control())));
+      RETURN_ON_ERROR(blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control())));
+      CHECK_RESULT(state, blockingWait(client_->reconcileEcStageV2Controlled({fixed.request, fixed.grant}, control())));
+      if (state.state != 1 || state.needsReconcile) return makeError(StorageCode::kEcSealOutcomeUnknown);
+    }
+    return Void{};
+  }
+  void armDirect(const Case &value) {
+    std::lock_guard lock(replyDrop_.mutex);
+    replyDrop_.direct = {};
+    replyDrop_.direct.operation = value.plan->input().operationId;
+  }
+  StageReplyDropState::DirectTrace directTrace() {
+    std::lock_guard lock(replyDrop_.mutex);
+    return replyDrop_.direct;
+  }
+  void expectDirectSealedBytes(const Case &value) {
+    for (uint8_t i = 0; i != value.plan->input().targetCount; ++i) {
+      const auto &fixed = value.bindings.targets[i];
+      auto sealed = blockingWait(client_->sealEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+      ASSERT_OK(sealed);
+      auto before = committedBytes(value.plan->input().targets[i]);
+      ASSERT_OK(before);
+      std::string actual;
+      for (uint32_t block = 0; block != value.plan->blockCount(); ++block) {
+        auto read = blockingWait(client_->readEcBlockV2Controlled({fixed.request, block, fixed.grant}, control()));
+        ASSERT_OK(read);
+        EXPECT_TRUE(serde::equals(read->receipt, *sealed));
+        actual += read->payload.data;
+      }
+      EXPECT_EQ(actual, value.data.shards[value.plan->input().targets[i].identity.shard]);
+      auto replay = blockingWait(client_->sealEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+      ASSERT_OK(replay);
+      EXPECT_TRUE(serde::equals(*sealed, *replay));
+      auto after = committedBytes(value.plan->input().targets[i]);
+      ASSERT_OK(after);
+      EXPECT_EQ(*after, *before);
+    }
+  }
   std::unique_ptr<EcHelperKey> helperKey_;
   std::array<EcScopeEndpoint, 12> endpoints_;
 };
+
+#include "EcHelperDirectNativeTests.inc"
 
 TEST_F(TestEcNativeRepairService, ThreeNativeStrategiesRepairSingleAndDoubleTargetsThroughTcp) {
   using namespace hf3fs::client::ec;

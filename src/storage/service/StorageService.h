@@ -177,6 +177,12 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.executeEcHelper(request);
   }
 
+  CoTryTask<EcHelperDirectHopRsp> executeEcHelperDirect(serde::CallContext &ctx,
+                                                     const EcHelperDirectHopReq &request) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.executeEcHelperDirect(request);
+  }
+
   CoTryTask<EcRmwStatusRsp> installEcRmw(serde::CallContext &ctx, const EcRmwInstallReq &request) {
     reportDefaultQueueLatency(ctx);
     return storageOperator_.installEcRmw(request);

@@ -28,10 +28,14 @@ class TestTransport final : public EcRepairTransport {
  public:
   explicit TestTransport(repair_test::Data value)
       : data(std::move(value)) {}
-  enum class FaultAt { None, Begin, Read, Append, Seal };
+  enum class FaultAt { None, Begin, Read, Append, Seal, Direct };
   enum class FaultKind { BadAlloc, Standard, Status, NonStandard };
   repair_test::Data data;
   std::atomic<size_t> begun{0}, reads{0}, helperCalls{0}, seals{0}, active{0}, appends{0}, faults{0};
+  std::atomic<size_t> directCalls{0}, directWrites{0};
+  bool allowDirect = false;
+  bool holdDirectAcrossException = false;
+  folly::coro::Baton secondDirectEntered, releaseSecondDirect;
   FaultAt faultAt = FaultAt::None;
   FaultKind faultKind = FaultKind::BadAlloc;
   bool holdReadAcrossAppendException = false;
@@ -62,6 +66,7 @@ class TestTransport final : public EcRepairTransport {
   std::array<std::string, 2> written;
 
   bool supportsHelperChain() const override { return allowHelper; }
+  bool supportsHelperDirect() const override { return allowDirect; }
   CoTryTask<void> begin(Plan, uint8_t, EcRepairControl) override {
     ++begun;  // Models an entered mutation, not evidence of a real remote commit.
     inject(FaultAt::Begin);
@@ -147,6 +152,43 @@ class TestTransport final : public EcRepairTransport {
       CO_RETURN_ON_ERROR(result);
     }
     co_return std::move(*result);
+  }
+  CoTryTask<void> helperDirectBlock(Plan plan, uint32_t index, EcRepairControl control) override {
+    ++directCalls;
+    ++active;
+    SCOPE_EXIT { --active; };
+    if (holdDirectAcrossException && index == 1) {
+      secondDirectEntered.post();
+      co_await releaseSecondDirect;
+    }
+    if (holdDirectAcrossException && index == 0) co_await secondDirectEntered;
+    auto block = co_await helperBlock(plan, index, control);
+    CO_RETURN_ON_ERROR(block);
+    // A scheduler substitute for target-side prefix arbitration. It is not
+    // evidence of native direct RPC, target persistence or capability checks.
+    for (uint8_t target = 0; target != block->targetCount; ++target) {
+      bool writtenBlock = false;
+      while (!writtenBlock) {
+        if (control.cancellation.isCancellationRequested()) co_return makeError(StorageClientCode::kRequestCanceled);
+        if (Clock::now() >= control.deadline) co_return makeError(StorageClientCode::kTimeout);
+        {
+          std::lock_guard lock(mutex);
+          const size_t offset = size_t(index) * kEcIntegrityBlockBytes;
+          if (written[target].size() == offset) {
+            written[target] += block->outputs[target];
+            ++directWrites;
+            writtenBlock = true;
+          } else if (written[target].size() > offset) {
+            if (written[target].substr(offset, block->outputs[target].size()) != block->outputs[target])
+              co_return makeError(StatusCode::kDataCorruption);
+            writtenBlock = true;
+          }
+        }
+        if (!writtenBlock) co_await folly::coro::sleep(1ms);
+      }
+      inject(FaultAt::Direct);
+    }
+    co_return Void{};
   }
 };
 
@@ -473,6 +515,133 @@ TEST(TestEcRepairPipeline, UnknownAppendOutcomeDoesNotSealOrDeleteAnyAllocation)
   EXPECT_EQ(transport->begun.load(), 2);
   EXPECT_EQ(transport->seals.load(), 0);
   EXPECT_EQ(transport->active.load(), 0);
+}
+
+TEST(TestEcRepairPipeline, DirectDeliveryUsesWindowAndSealsWithoutClientAppend) {
+  folly::CPUThreadPoolExecutor executor(2);
+  for (const auto window : {1, 2, 4}) {
+    for (const auto &missing : {std::vector<uint16_t>{0}, std::vector<uint16_t>{0, 11}}) {
+      auto data = repair_test::makeData(4 * kEcIntegrityBlockBytes + 7, missing, window);
+      auto plan = EcRepairPlan::create(data.input);
+      ASSERT_OK(plan);
+      auto transport = std::make_shared<TestTransport>(data);
+      transport->allowDirect = true;
+      EcRepairObservation observation;
+      auto result = folly::coro::blockingWait(EcRepairPipeline::run(
+          *plan, transport, EcRepairMode::HelperChain, control(), executor, &observation, EcRepairDelivery::HelperDirect));
+      ASSERT_OK(result);
+      EXPECT_EQ(result->delivery, EcRepairDelivery::HelperDirect);
+      EXPECT_EQ(result->mode, EcRepairMode::HelperChain);
+      EXPECT_EQ(transport->begun.load(), missing.size());
+      EXPECT_EQ(transport->seals.load(), missing.size());
+      EXPECT_EQ(transport->directCalls.load(), 5);
+      EXPECT_EQ(transport->directWrites.load(), 5 * missing.size());
+      EXPECT_EQ(transport->reads.load(), 0);
+      EXPECT_EQ(transport->appends.load(), 0);
+      EXPECT_EQ(transport->active.load(), 0);
+      for (size_t target = 0; target != missing.size(); ++target)
+        EXPECT_EQ(transport->written[target], data.shards[missing[target]]);
+      const auto sample = observation.snapshot();
+      EXPECT_EQ(sample.at(EcRepairPoint::BlockActor).entered, 5);
+      EXPECT_LE(sample.at(EcRepairPoint::BlockActor).peakActive, window);
+      EXPECT_EQ(sample.at(EcRepairPoint::OrderedAppendWait).entered, 0);
+      EXPECT_EQ(sample.at(EcRepairPoint::ClientBlockAdvance).entered, 0);
+      for (const auto &point : sample.points) {
+        EXPECT_EQ(point.active, 0);
+        EXPECT_EQ(point.entered, point.finished);
+      }
+    }
+  }
+}
+
+TEST(TestEcRepairPipeline, DirectDeliveryRequiresExplicitSupportedHelperBeforeBegin) {
+  folly::CPUThreadPoolExecutor executor(1);
+  auto data = repair_test::makeData(31);
+  auto plan = EcRepairPlan::create(data.input);
+  ASSERT_OK(plan);
+  auto transport = std::make_shared<TestTransport>(data);
+  auto result = folly::coro::blockingWait(EcRepairPipeline::run(
+      *plan, transport, EcRepairMode::HelperChain, control(), executor, nullptr, EcRepairDelivery::HelperDirect));
+  ASSERT_ERROR(result, StatusCode::kNotImplemented);
+  transport->allowDirect = true;
+  for (auto mode : {EcRepairMode::CentralSerial, EcRepairMode::ClientPipeline}) {
+    result = folly::coro::blockingWait(EcRepairPipeline::run(
+        *plan, transport, mode, control(), executor, nullptr, EcRepairDelivery::HelperDirect));
+    ASSERT_ERROR(result, StatusCode::kInvalidArg);
+  }
+  result = folly::coro::blockingWait(EcRepairPipeline::run(
+      *plan, transport, EcRepairMode::HelperChain, control(), executor, nullptr, static_cast<EcRepairDelivery>(99)));
+  ASSERT_ERROR(result, StatusCode::kInvalidArg);
+  EXPECT_EQ(transport->begun.load(), 0);
+  EXPECT_EQ(transport->directCalls.load(), 0);
+  EXPECT_EQ(transport->appends.load(), 0);
+}
+
+TEST(TestEcRepairPipeline, PartialDirectMutationExceptionsStayUnknownAndDoNotSeal) {
+  folly::CPUThreadPoolExecutor executor(1);
+  auto data = repair_test::makeData(31);
+  auto plan = EcRepairPlan::create(data.input);
+  ASSERT_OK(plan);
+  for (auto kind : {TestTransport::FaultKind::BadAlloc,
+                    TestTransport::FaultKind::Standard,
+                    TestTransport::FaultKind::Status,
+                    TestTransport::FaultKind::NonStandard}) {
+    auto transport = std::make_shared<TestTransport>(data);
+    transport->allowDirect = true;
+    transport->faultAt = TestTransport::FaultAt::Direct;
+    transport->faultKind = kind;
+    auto result = folly::coro::blockingWait(EcRepairPipeline::run(
+        *plan, transport, EcRepairMode::HelperChain, control(), executor, nullptr, EcRepairDelivery::HelperDirect));
+    ASSERT_ERROR(result, StorageCode::kEcSealOutcomeUnknown);
+    EXPECT_TRUE(result.error().hasPayload());
+    EXPECT_EQ(transport->begun.load(), 2);
+    EXPECT_EQ(transport->directWrites.load(), 1);
+    EXPECT_FALSE(transport->written[0].empty());
+    EXPECT_TRUE(transport->written[1].empty());
+    EXPECT_EQ(transport->seals.load(), 0);
+    EXPECT_EQ(transport->appends.load(), 0);
+    EXPECT_EQ(transport->active.load(), 0);
+  }
+}
+
+TEST(TestEcRepairPipeline, DirectMutationFailureJoinsOtherStartedDirectBlock) {
+  folly::CPUThreadPoolExecutor executor(2);
+  auto data = repair_test::makeData(kEcIntegrityBlockBytes + 7, {0}, 2);
+  auto plan = EcRepairPlan::create(data.input);
+  ASSERT_OK(plan);
+  auto transport = std::make_shared<TestTransport>(data);
+  transport->allowDirect = true;
+  transport->holdDirectAcrossException = true;
+  transport->faultAt = TestTransport::FaultAt::Direct;
+  EcRepairObservation observation;
+  std::optional<Result<EcRepairSealed>> result;
+  std::atomic<bool> done{false};
+  std::thread runner([&] {
+    result = folly::coro::blockingWait(EcRepairPipeline::run(
+        *plan, transport, EcRepairMode::HelperChain, control(), executor, &observation, EcRepairDelivery::HelperDirect));
+    done = true;
+  });
+  SCOPE_EXIT {
+    transport->releaseSecondDirect.post();
+    runner.join();
+  };
+  ASSERT_TRUE(waitFor([&] { return transport->faults.load() != 0; }));
+  EXPECT_FALSE(done.load());
+  EXPECT_GE(transport->active.load(), 1);
+  transport->releaseSecondDirect.post();
+  ASSERT_TRUE(waitFor([&] { return done.load(); }));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_ERROR(*result, StorageCode::kEcSealOutcomeUnknown);
+  EXPECT_EQ(transport->directCalls.load(), 2);
+  EXPECT_EQ(transport->seals.load(), 0);
+  EXPECT_EQ(transport->appends.load(), 0);
+  EXPECT_EQ(transport->active.load(), 0);
+  const auto sample = observation.snapshot();
+  EXPECT_EQ(sample.at(EcRepairPoint::BlockActor).peakActive, 2);
+  for (const auto &point : sample.points) {
+    EXPECT_EQ(point.active, 0);
+    EXPECT_EQ(point.entered, point.finished);
+  }
 }
 
 TEST(TestEcRepairPipeline, ObservationSaturatesAndKeepsIndependentCallsSeparate) {

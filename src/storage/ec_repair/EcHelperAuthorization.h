@@ -5,6 +5,10 @@
 
 namespace hf3fs::storage {
 
+namespace ec_helper_direct_detail {
+struct Access;
+}
+
 class EcHelperKey final {
  public:
   static Result<std::unique_ptr<EcHelperKey>> loadFile(const std::filesystem::path &path);
@@ -14,6 +18,7 @@ class EcHelperKey final {
 
  private:
   friend struct ec_helper_detail::Access;
+  friend struct ec_helper_direct_detail::Access;
   explicit EcHelperKey(std::unique_ptr<EcCapabilityKey> key)
       : key_(std::move(key)) {}
   std::unique_ptr<EcCapabilityKey> key_;

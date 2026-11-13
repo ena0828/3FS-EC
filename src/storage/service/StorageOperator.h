@@ -132,6 +132,7 @@ class StorageOperator {
   CoTryTask<EcReconcileRsp> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req);
 
   CoTryTask<EcHelperHopRsp> executeEcHelper(const EcHelperHopReq &request);
+  CoTryTask<EcHelperDirectHopRsp> executeEcHelperDirect(const EcHelperDirectHopReq &request);
   CoTryTask<EcRmwStatusRsp> installEcRmw(const EcRmwInstallReq &);
   CoTryTask<EcRmwStatusRsp> putEcRmw(const EcRmwPutReq &);
   CoTryTask<EcRmwStatusRsp> actionEcRmw(const EcRmwActionReq &);
@@ -211,6 +212,8 @@ class StorageOperator {
 
   Result<Void> initEcHelpers();
   CoTryTask<EcHelperHopResult> executeEcHelperOwned(EcHelperHopReq, std::chrono::steady_clock::time_point receivedAt);
+  CoTryTask<EcHelperDirectHopResult> executeEcHelperDirectOwned(EcHelperDirectHopReq,
+                                                              std::chrono::steady_clock::time_point receivedAt);
   std::unique_ptr<EcHelperRuntime> ecHelpers_;
 
   Result<Void> initEcGc();

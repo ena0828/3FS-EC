@@ -95,6 +95,17 @@ class PortableExperiments(unittest.TestCase):
             self.assertIn("--config.repair_mode=helper", repair)
             self.assertIn("--config.repair_window_decimal=4", repair)
             self.assertIn("--config.repair_stripe_decimal=9007199254740993", repair)
+            self.assertFalse(any(value.startswith("--config.repair_delivery=") for value in repair))
+            for delivery in ("return", "direct"):
+                forwarded = file_command.command(file_command.parser().parse_args(
+                    repair_args + ["--delivery", delivery]))
+                self.assertIn("--config.repair_delivery=" + delivery, forwarded)
+                self.assertEqual(len(forwarded), len(repair) + 1)
+            for strategy in ("central", "pipeline"):
+                invalid_delivery = file_command.parser().parse_args(repair_args + ["--delivery", "direct"])
+                invalid_delivery.strategy = strategy
+                with self.assertRaises(ValueError):
+                    file_command.command(invalid_delivery)
             overlapping = file_command.parser().parse_args(repair_args)
             overlapping.sources = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
             with self.assertRaises(ValueError):

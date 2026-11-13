@@ -19,6 +19,7 @@
 #include "fbs/storage/EcGcDiscovery.h"
 #include "fbs/storage/EcGcRpc.h"
 #include "fbs/storage/EcHelper.h"
+#include "fbs/storage/EcHelperDirect.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "fbs/storage/EcTargetDiscovery.h"
@@ -380,6 +381,7 @@ class StorageClient : public folly::MoveOnly {
     reconcileEcStageV2,
     sealEcStageV2,
     executeEcHelper,
+    executeEcHelperDirect,
     prepareEcTargetRetirement,
     queryEcTargetRetirement,
     revokeEcScope,
@@ -655,6 +657,9 @@ class StorageClient : public folly::MoveOnly {
   }
   virtual CoTryTask<EcHelperHopResult> executeEcHelper(EcHelperHopReq, EcRequestControl) {
     co_return makeError(StatusCode::kNotImplemented, "native helper RPC is unavailable");
+  }
+  virtual CoTryTask<EcHelperDirectHopResult> executeEcHelperDirect(EcHelperDirectHopReq, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented, "native direct helper RPC is unavailable");
   }
   virtual CoTryTask<EcReadBlockResultV2> readEcBlockV2Controlled(EcReadBlockV2Req, EcRequestControl) {
     co_return makeError(StatusCode::kNotImplemented, "controlled V2 read is unavailable in this client implementation");

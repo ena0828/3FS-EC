@@ -26,7 +26,8 @@ Result<Void> EcHelperRuntime::enterBlock(const std::string &key, uint16_t bit, u
     return makeError(StorageClientCode::kResourceBusy, "helper plan window or duplicate block is still active");
   }
   // Global runtime admission allows at most 64 live entries. Never wait for
-  // another block while holding a helper slot or any disk-worker resource.
+  // admission here. Direct delivery's bounded prefix waits yield the executor
+  // outside this mutex; they never occupy a disk-worker resource.
   if (it == activeBlocks_.end()) {
     if (activeBlocks_.size() >= 64) return makeError(StorageClientCode::kResourceBusy);
     activeBlocks_.emplace(key, bit);

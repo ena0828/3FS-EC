@@ -62,6 +62,7 @@ struct Window {
   std::shared_ptr<const EcRepairPlan> plan;
   std::shared_ptr<EcRepairTransport> transport;
   EcRepairMode mode;
+  EcRepairDelivery delivery;
   EcRepairControl control;
   EcRepairObservation *observation = nullptr;
   std::mutex mutex;
@@ -117,6 +118,15 @@ CoTryTask<void> oneBlock(std::shared_ptr<Window> state, uint32_t blockIndex) {
   if (state->stopped()) co_return Void{};
   CO_RETURN_ON_ERROR(active(state->control));
   EcRepairObservation::Scope actor(state->observation, EcRepairPoint::BlockActor);
+  if (state->delivery == EcRepairDelivery::HelperDirect) {
+    // Target persistent prefixes and Engine::append arbitrate block order.
+    // Holding the client writeTurn here would serialize the whole helper chain.
+    auto completed = co_await mutationCall<void>([&] {
+      return state->transport->helperDirectBlock(state->plan, blockIndex, state->control);
+    });
+    if (completed) actor.success();
+    co_return completed;
+  }
   auto block = EcRepairBlockCore::begin(*state->plan, blockIndex);
   CO_RETURN_ON_ERROR(block);
   if (state->mode == EcRepairMode::HelperChain) {
@@ -205,21 +215,28 @@ CoTryTask<EcRepairSealed> runOwned(std::shared_ptr<const EcRepairPlan> plan,
                                    std::shared_ptr<EcRepairTransport> transport,
                                    EcRepairMode mode,
                                    EcRepairControl control,
-                                   EcRepairObservation *observation) {
+                                   EcRepairObservation *observation,
+                                   EcRepairDelivery delivery) {
   try {
     if (!plan || !transport ||
         (mode != EcRepairMode::CentralSerial && mode != EcRepairMode::ClientPipeline &&
-         mode != EcRepairMode::HelperChain)) {
+         mode != EcRepairMode::HelperChain) ||
+        (delivery != EcRepairDelivery::ClientAppend && delivery != EcRepairDelivery::HelperDirect) ||
+        (delivery == EcRepairDelivery::HelperDirect && mode != EcRepairMode::HelperChain)) {
       co_return makeError(StatusCode::kInvalidArg, "EC repair requires a plan, transport and explicit strategy");
     }
     CO_RETURN_ON_ERROR(active(control));
     if (mode == EcRepairMode::HelperChain && !transport->supportsHelperChain()) {
       co_return makeError(StatusCode::kNotImplemented, "transport has no authenticated native helper chain");
     }
+    if (delivery == EcRepairDelivery::HelperDirect && !transport->supportsHelperDirect()) {
+      co_return makeError(StatusCode::kNotImplemented, "transport has no authorized native helper direct delivery");
+    }
     auto state = std::make_shared<Window>();
     state->plan = std::move(plan);
     state->transport = std::move(transport);
     state->mode = mode;
+    state->delivery = delivery;
     state->control = control;
     state->observation = observation;
     state->writeTurn[0].post();
@@ -242,6 +259,7 @@ CoTryTask<EcRepairSealed> runOwned(std::shared_ptr<const EcRepairPlan> plan,
     }
     EcRepairSealed result;
     result.mode = mode;
+    result.delivery = delivery;
     result.planDigest = state->plan->digest();
     result.targetCount = state->plan->input().targetCount;
     result.blocks = state->plan->blockCount();
@@ -279,12 +297,13 @@ CoTryTask<EcRepairSealed> EcRepairPipeline::run(std::shared_ptr<const storage::E
                                                 EcRepairMode mode,
                                                 EcRepairControl control,
                                                 folly::CPUThreadPoolExecutor &executor,
-                                                EcRepairObservation *observation) {
+                                                EcRepairObservation *observation,
+                                                EcRepairDelivery delivery) {
   // Ignore ambient cancellation only for ownership/join. The explicit token
   // and absolute deadline are checked before every new transport operation.
   co_return co_await folly::coro::co_withCancellation(
       CancellationToken{},
-      runOwned(std::move(plan), std::move(transport), mode, control, observation).scheduleOn(&executor));
+      runOwned(std::move(plan), std::move(transport), mode, control, observation, delivery).scheduleOn(&executor));
 }
 
 }  // namespace hf3fs::client::ec

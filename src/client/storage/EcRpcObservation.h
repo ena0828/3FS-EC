@@ -19,9 +19,9 @@ namespace hf3fs::storage::client {
 // Local, opt-in observations of the client -> Storage first hop. No wire or
 // journal fields, payloads, credentials, callbacks or allocations. Optional
 // local permit intervals use steady_clock, separately from RPC host timestamps.
-enum class EcRpcMethod : size_t { Read, Begin, Append, Query, Reconcile, Seal, Helper, Count };
+enum class EcRpcMethod : size_t { Read, Begin, Append, Query, Reconcile, Seal, Helper, HelperDirect, Count };
 inline constexpr std::array<const char *, size_t(EcRpcMethod::Count)> kEcRpcMethodNames{
-    "read_block", "begin_stage", "append_stage", "query_stage", "reconcile_stage", "seal_stage", "helper"};
+    "read_block", "begin_stage", "append_stage", "query_stage", "reconcile_stage", "seal_stage", "helper", "helper_direct"};
 
 struct EcRpcClockSample {
   uint64_t valid = 0, missing = 0, reversed = 0, outOfRange = 0;
@@ -181,6 +181,7 @@ class EcRpcObservation {
    public:
     LimiterScope(EcRpcObservation *owner, EcRpcMethod method, EcRpcLimiter limiter) noexcept {
       if (!owner || size_t(method) >= size_t(EcRpcMethod::Count) || method == EcRpcMethod::Helper ||
+          method == EcRpcMethod::HelperDirect ||
           size_t(limiter) >= size_t(EcRpcLimiter::Count))
         return;
       owner_ = owner;

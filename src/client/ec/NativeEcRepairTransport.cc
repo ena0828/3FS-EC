@@ -7,6 +7,7 @@
 #include "client/storage/EcRequestControl.h"
 #include "fbs/storage/EcStageValidationV2.h"
 #include "storage/ec_repair/EcHelperAuthorization.h"
+#include "storage/ec_repair/EcHelperDirectAuthorization.h"
 
 namespace hf3fs::client::ec {
 namespace {
@@ -74,7 +75,8 @@ Result<std::shared_ptr<NativeEcRepairTransport>> NativeEcRepairTransport::create
     std::shared_ptr<storage::client::StorageClient> client,
     EcRepairNativeBindings bindings,
     std::optional<std::array<storage::EcHelperCapability, 10>> helpers,
-    EcRepairObservation *observation) {
+    EcRepairObservation *observation,
+    std::optional<EcHelperDirectDelegation> direct) {
   if (!plan || !client) return makeError(StatusCode::kInvalidArg, "native repair requires plan and StorageClient");
   for (size_t i = 0; i != 10; ++i) {
     RETURN_ON_ERROR(binding(*plan,
@@ -97,9 +99,13 @@ Result<std::shared_ptr<NativeEcRepairTransport>> NativeEcRepairTransport::create
                                 uint16_t(EcGrantRightV2::Query) | uint16_t(EcGrantRightV2::Reconcile) |
                                 uint16_t(EcGrantRightV2::Seal)));
   }
+  if (direct) {
+    if (!helpers) return makeError(StatusCode::kInvalidArg, "direct delivery requires native helper capabilities");
+    RETURN_ON_ERROR(validateEcHelperDirectDelegation(*plan, *direct, 0));
+  }
   return std::shared_ptr<NativeEcRepairTransport>(
       new NativeEcRepairTransport(
-          std::move(plan), std::move(client), std::move(bindings), std::move(helpers), observation));
+          std::move(plan), std::move(client), std::move(bindings), std::move(helpers), observation, std::move(direct)));
 }
 
 Result<Void> NativeEcRepairTransport::check(const Plan &plan, const EcRepairControl &control) const {
@@ -123,6 +129,10 @@ CoTryTask<void> NativeEcRepairTransport::begin(Plan plan, uint8_t target, EcRepa
   const auto failure = [&](Status error) { return makeError(preserveOutcome(target, std::move(error))); };
   if (auto active = check(plan, control); !active) co_return failure(active.error());
   const auto request = bindings_.targets[target];
+  // A resumed direct chain can have appended without returning its small ACK.
+  // Re-establish the original allocation's durable state even when a fresh
+  // adapter has no in-memory uncertainty from that prior process.
+  if (direct_) unconfirmed_[target].store(true);
   metric.noteInvocation();
   auto result = co_await client_->beginEcStageV2Controlled(request, options(control, observation_));
   uint32_t observedPrefix = 0;
@@ -312,6 +322,89 @@ CoTryTask<storage::EcRepairBlock> NativeEcRepairTransport::helperBlock(Plan plan
   for (size_t target = 0; target != result.targetCount; ++target) metric.validated(result.outputs[target].size());
   metric.success();
   co_return result;
+}
+
+CoTryTask<void> NativeEcRepairTransport::helperDirectBlock(Plan plan,
+                                                            uint32_t block,
+                                                            EcRepairControl control) {
+  EcRepairObservation::Scope metric(observation_, EcRepairPoint::NativeHelper);
+  uint8_t activeMask = 0;
+  for (uint8_t target = 0; target != plan_->input().targetCount; ++target) {
+    if (!alreadySealed_[target].load()) activeMask |= uint8_t{1} << target;
+  }
+  bool dispatched = false;
+  const auto failure = [&](Status error) {
+    bool unknown = dispatched;
+    for (uint8_t target = 0; target != plan_->input().targetCount; ++target) {
+      if (activeMask & (uint8_t{1} << target)) {
+        if (dispatched || error.code() == StorageCode::kEcSealOutcomeUnknown) unconfirmed_[target].store(true);
+        unknown = unknown || unconfirmed_[target].load();
+      }
+    }
+    return unknown ? error.convert(StorageCode::kEcSealOutcomeUnknown) : error;
+  };
+  const auto exception = [&]() noexcept {
+    // Pipeline also guards task creation. Retain uncertainty in this adapter
+    // before returning, so another block cannot clear an unconfirmed mutation.
+    if (dispatched) {
+      for (uint8_t target = 0; target != plan_->input().targetCount; ++target) {
+        if (activeMask & (uint8_t{1} << target)) unconfirmed_[target].store(true);
+      }
+    }
+    return makeError(StorageCode::kEcSealOutcomeUnknown);
+  };
+  try {
+    if (auto ready = check(plan, control); !ready) co_return makeError(failure(ready.error()));
+    if (!supportsHelperDirect())
+      co_return makeError(failure(Status(StatusCode::kNotImplemented, "native helper direct delegation was not supplied")));
+    auto seed = EcRepairBlockCore::begin(*plan_, block);
+    if (!seed) co_return makeError(failure(seed.error()));
+    if (!activeMask) {
+      // Every target was already sealed by a previous attempt. The enclosing
+      // pipeline still performs a real Seal for each original allocation.
+      metric.success();
+      co_return Void{};
+    }
+    EcHelperDirectHopReq request;
+    request.plan = plan_->input();
+    request.helpers = *helpers_;
+    request.delegation = *direct_;
+    request.activeTargetMask = activeMask;
+    for (size_t source = 0; source != 10; ++source) {
+      request.reads[source] = bindings_.sources[source].grant;
+      request.sourceRouteVersions[source] = bindings_.sources[source].request.vChainId.chainVer;
+    }
+    for (uint8_t target = 0; target != plan_->input().targetCount; ++target) {
+      request.targetRouteVersions[target] = bindings_.targets[target].request.vChainId.chainVer;
+    }
+    request.packet = helperPacket(std::move(*seed));
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(control.deadline - std::chrono::steady_clock::now());
+    if (remaining.count() <= 0) co_return makeError(failure(Status(StorageClientCode::kTimeout)));
+    const auto wall =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    request.deadlineUnixMillis = wall + std::min<int64_t>(60000, remaining.count());
+    if (auto valid = validateEcHelperDirectRequest(*plan_, request); !valid)
+      co_return makeError(failure(valid.error()));
+    if (auto ready = check(plan, control); !ready) co_return makeError(failure(ready.error()));
+    dispatched = true;
+    metric.noteInvocation();
+    // Keep the bounded original request to validate the complete context. The
+    // SDK owns its copy until the actual local RPC task completes.
+    auto response = co_await client_->executeEcHelperDirect(request, options(control, observation_));
+    if (!response) co_return makeError(failure(response.error()));
+    if (auto ready = check(plan, control); !ready) co_return makeError(failure(ready.error()));
+    if (auto valid = validateEcHelperDirectResult(*plan_, request, *response); !valid)
+      co_return makeError(failure(valid.error()));
+    // This client has no helper MAC key and receives no reconstructed payload.
+    // Do not count bytes as client-hash-validated or clear prior uncertainty.
+    // True Seal and Meta's full readback/publication barriers remain required.
+    metric.success();
+    co_return Void{};
+  } catch (...) {
+    co_return exception();
+  }
 }
 
 }  // namespace hf3fs::client::ec

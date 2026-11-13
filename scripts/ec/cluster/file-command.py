@@ -57,6 +57,8 @@ def parser():
             item.add_argument("--sources", type=lambda value: shards(value, (10,)), required=True,
                               help="固定的10个源分片索引与顺序，不得包含待重建片")
             item.add_argument("--strategy", choices=("central", "pipeline", "helper"), required=True)
+            item.add_argument("--delivery", choices=("return", "direct"), default=None,
+                              help="仅 helper 策略：return 回传客户端写入（默认）；direct 末站直写目标")
             item.add_argument("--window", choices=("1", "2", "3", "4"), default="2")
         if name == "truncate":
             item.add_argument("--length", type=decimal, required=True, help="新文件长度，单位为字节")
@@ -94,12 +96,16 @@ def command(args):
             value = getattr(args, source)
             options[target] = absolute(value) if isinstance(value, Path) else value
     if args.action == "repair":
+        if args.delivery is not None and args.strategy != "helper":
+            raise ValueError("--delivery 只适用于 helper 修复策略")
         if set(args.targets) & set(args.sources):
             raise ValueError("固定源集合不得包含待重建片")
         options.update(repair_stripe_decimal=args.stripe,
                        repair_mask_decimal=str(sum(1 << item for item in args.targets)),
                        repair_source_order=",".join(str(item) for item in args.sources),
                        repair_mode=args.strategy, repair_window_decimal=args.window)
+        if args.delivery is not None:
+            options["repair_delivery"] = args.delivery
     if hasattr(args, "rights"):
         options["session_rights"] = RIGHTS[args.rights]
     if getattr(args, "metrics", None) is not None:

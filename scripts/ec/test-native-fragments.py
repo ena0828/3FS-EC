@@ -23,6 +23,7 @@ STORAGE_FILTER = "TestEcProtocol.*:TestEcTarget.*:TestEcIntegrity.*:TestEcCodec.
 SERVICE_FILTER = "TestEcService.*:TestEcServiceWithoutEngine.*:TestEcAuthorizedService.*:TestEcAuthorizedNoKeyService.*:TestEcCapabilityComponents.*:TestEcScopeControlService.*:TestEcStageService.*:TestEcNativeRepairService.*:TestEcTargetDiscoveryService.*:TestEcTargetDiscoveryDisabled.*:TestEcGcDiscoveryDisabled.*:TestEcGcDiscoveryService.*:TestEcRmwNative.*"
 CLIENT_FILTER = "TestEcStripeRead.*:TestEcBlockRead.*:TestEcRepairPipeline.*:TestFakeMgmtdRoutingListeners.*:TestEcStripeClient.*:TestEcStripeRunRecord.*:TestEcStripeFragmentRecovery.*:TestEcStripeCompletion.*:TestEcGcCommands.*:TestEcRevisionRetirementCommands.*:TestEcAllocationExport.*:TestEcFilePlanning.*:TestEcFilePayload.*:TestEcFileRunJournal.*:TestEcFileClient.*:TestEcReadDispatcher.*:TestEcTreeReadJournal.*:TestEcTreeReadClient.*:TestEcFilePwriteClient.*:TestEcTruncateJournal.*:TestEcAppendJournal.*:TestEcTreeRepairJournal.*:TestEcMetadataRouting.*"
 STORAGE_FILTER += ":TestEcTargetRetirementControl.*:TestEcTargetRetirementExecutor.*"
+STORAGE_FILTER += ":TestEcHelperDirectAuthorization.*"
 SERVICE_FILTER += ":TestEcTargetRetirementService.*:TestEcTargetRetirementDisabledService.*"
 CLIENT_FILTER += ":TestEcTargetRetirementCommands.*"
 CLIENT_FILTER += ":TestEcRpcFrameSizes.*"

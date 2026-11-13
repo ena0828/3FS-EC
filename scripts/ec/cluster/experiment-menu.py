@@ -165,7 +165,14 @@ def file_selection(root, script_directory):
     command += ["--session", existing_path("已打开会话的原日志目录：")]
     if action == "repair":
         print("会话须同时具有读写权限。目标选择本身不等于真实节点离线。")
-        return command + ["--strategy", choose("修复策略", STRATEGIES),
+        strategy = choose("修复策略", STRATEGIES)
+        delivery = []
+        if strategy == "helper":
+            delivery = ["--delivery", choose("Helper 结果交付方式", {
+                "1": ("return", "回传客户端，由客户端写入目标"),
+                "2": ("direct", "末站直接写入目标，客户端接收小回执"),
+            })]
+        return command + ["--strategy", strategy, *delivery,
                           "--stripe", input("文件条带索引：").strip(),
                           "--targets", input("待重建分片（1或2个，0至11，逗号分隔）：").strip(),
                           "--sources", input("固定10个源分片的顺序（不得含待重建片，逗号分隔）：").strip(),

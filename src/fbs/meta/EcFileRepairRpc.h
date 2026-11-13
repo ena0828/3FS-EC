@@ -1,6 +1,7 @@
 #pragma once
 #include "EcFileRepair.h"
 #include "fbs/storage/EcRmwRpc.h"
+#include "fbs/storage/EcHelperDirect.h"
 
 namespace hf3fs::meta {
 enum class EcFileRepairAdvance : uint8_t { Prepare = 1, Publish = 2 };
@@ -12,6 +13,11 @@ struct EcFileRepairAccess {
   SERDE_STRUCT_FIELD(pipelineReads, (std::array<storage::EcCapabilityV2, 10>{}));
   SERDE_STRUCT_FIELD(writes, (std::array<storage::EcCapabilityV2, 12>{}));
   SERDE_STRUCT_FIELD(helpers, (std::optional<std::array<storage::EcHelperCapability, 10>>{}));
+};
+// Separate response envelope: the original seven-field access and its wire bytes remain unchanged.
+struct EcFileRepairDirectAccess {
+  SERDE_STRUCT_FIELD(base, EcFileRepairAccess{});
+  SERDE_STRUCT_FIELD(delegation, storage::EcHelperDirectDelegation{});
 };
 struct EcFileRepairProgress {
   SERDE_STRUCT_FIELD(record, (std::optional<EcFileRepairRecord>{}));

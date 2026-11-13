@@ -13,8 +13,11 @@
 #include <linux/magic.h>
 #include <mutex>
 #include <optional>
+#include <bit>
+#include <condition_variable>
 #include <stdexcept>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <thread>
@@ -54,6 +57,7 @@
 #include "meta/store/Inode.h"
 #include "meta/store/detail/EcFileTreeKeys.h"
 #include "storage/ec_codec/EcCodec.h"
+#include "storage/ec_repair/EcHelperDirectAuthorization.h"
 #include "storage/service/Components.h"
 #include "storage/service/StorageService.h"
 #include "tests/GtestHelpers.h"
@@ -115,6 +119,12 @@ struct PublishReplyDrop {
   Uuid truncateDropOperation = Uuid::zero();
   size_t truncateRepliesDropped = 0;
   size_t fileBeginRepliesToDrop = 0, filePublishRepliesToDrop = 0;
+  Uuid directPrepareDropOperation = Uuid::zero();
+  size_t directPrepareRepliesDropped = 0;
+  int directShutdownResult = -1;
+  bool directShutdownObserved = false;
+  std::condition_variable directChanged;
+  std::optional<EcFileRepairDirectRsp> directPrepared;
 };
 
 // The real operator has returned from its FDB commit before this one-shot
@@ -124,6 +134,39 @@ class DropPublishMetaService : public MetaSerdeService {
   DropPublishMetaService(MetaOperator &meta, PublishReplyDrop &fault)
       : MetaSerdeService(meta),
         fault_(fault) {}
+
+  CoTryTask<EcFileRepairDirectRsp> prepareEcFileRepairDirect(
+      serde::CallContext &ctx, const PrepareEcFileRepairDirectReq &req) {
+    auto response = co_await MetaSerdeService::prepareEcFileRepairDirect(ctx, req);
+    bool drop = false;
+    if (response && response->access && response->progress.record) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.directPrepareDropOperation == req.intent.operation) {
+        fault_.directPrepareDropOperation = Uuid::zero();
+        ++fault_.directPrepareRepliesDropped;
+        fault_.directPrepared = *response;
+        drop = true;
+      }
+    }
+    if (drop) {
+      // The real Prepare returned its committed issuance. End this actual TCP
+      // connection before a response can be sent, without inventing an error.
+      const auto transport = ctx.transport();
+      int result = -1;
+      if (transport->isTCP()) {
+        const auto &handler = static_cast<const net::EventLoop::EventHandler &>(*transport);
+        result = ::shutdown(handler.fd(), SHUT_RDWR);
+      }
+      transport->invalidate(false);
+      {
+        std::lock_guard lock(fault_.mutex);
+        fault_.directShutdownResult = result;
+        fault_.directShutdownObserved = true;
+      }
+      fault_.directChanged.notify_all();
+    }
+    co_return response;
+  }
 
   CoTryTask<EcFileTruncateRsp> advanceEcFileTruncate(serde::CallContext &ctx, const AdvanceEcFileTruncateReq &req) {
     auto response = co_await MetaSerdeService::advanceEcFileTruncate(ctx, req);
@@ -1256,6 +1299,7 @@ class TestEcV2NativeHelperPlan : public TestEcV2NativeLifecycle {
 // The following fragments require TestEcFileNativeWrite to be defined first.
 #include "EcFileNativeWriteTests.inc"
 #include "EcFileRepairNativeTests.inc"
+#include "EcFileHelperDirectNativeTests.inc"
 #include "EcFileRepairPendingNativeTests.inc"
 #include "EcFileAppendNativeTests.inc"
 #include "EcFileTruncateNativeTests.inc"

@@ -10,7 +10,8 @@ target_add_lib(storage core-app core-service memory-common storage-fbs mgmtd-cli
 get_target_property(STORAGE_SOURCES storage SOURCES)
 list(REMOVE_ITEM STORAGE_SOURCES "ec_codec/EcCodec.cc" "ec_codec/EcCodec.h")
 list(REMOVE_ITEM STORAGE_SOURCES "ec_repair/EcRepairPlan.cc" "ec_repair/EcRepairPlan.h"
-     "ec_repair/EcHelperAuthorization.cc" "ec_repair/EcHelperAuthorization.h")
+     "ec_repair/EcHelperAuthorization.cc" "ec_repair/EcHelperAuthorization.h"
+     "ec_repair/EcHelperDirectAuthorization.cc" "ec_repair/EcHelperDirectAuthorization.h")
 list(REMOVE_ITEM STORAGE_SOURCES
   "ec_rmw/EcRmwPlan.cc" "ec_rmw/EcRmwPlan.h"
   "ec_rmw/EcRmwAuthorization.cc" "ec_rmw/EcRmwAuthorization.h"

@@ -87,6 +87,7 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<EcStageStateV2> reconcileEcStageV2Controlled(EcReconcileStageV2Req, EcRequestControl) override;
   CoTryTask<EcFragmentReceiptV2> sealEcStageV2Controlled(EcSealStageV2Req, EcRequestControl) override;
   CoTryTask<EcHelperHopResult> executeEcHelper(EcHelperHopReq, EcRequestControl) override;
+  CoTryTask<EcHelperDirectHopResult> executeEcHelperDirect(EcHelperDirectHopReq, EcRequestControl) override;
   CoTryTask<EcReadBlockResultV2> readEcBlockV2Controlled(EcReadBlockV2Req, EcRequestControl) override;
   CoTryTask<EcFragmentReceipt> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req) override;
 

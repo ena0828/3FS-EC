@@ -1230,6 +1230,16 @@ struct AdvanceEcFileRepairReq : EcFileRepairReq {
     RETURN_ON_ERROR(EcFileRepairReq::valid());
     if (action != EcFileRepairAdvance::Prepare && action != EcFileRepairAdvance::Publish)
       return INVALID("unknown repair action");
+    if (action == EcFileRepairAdvance::Prepare && intent.mode == EcFileRepairMode::HelperChainDirect)
+      return INVALID("direct repair requires prepareEcFileRepairDirect");
+    return VALID;
+  }
+};
+struct PrepareEcFileRepairDirectReq : EcFileRepairReq {
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcFileRepairReq::valid());
+    if (intent.mode != EcFileRepairMode::HelperChainDirect) return INVALID("direct repair mode required");
     return VALID;
   }
 };
@@ -1250,6 +1260,12 @@ struct EcFileRepairRsp : RspBase {
   SERDE_STRUCT_FIELD(progress, EcFileRepairProgress{});
   // Present only after a committed issuance for an accepted READ|WRITE session.
   SERDE_STRUCT_FIELD(access, (std::optional<EcFileRepairAccess>{}));
+};
+
+struct EcFileRepairDirectRsp : RspBase {
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(progress, EcFileRepairProgress{});
+  SERDE_STRUCT_FIELD(access, (std::optional<EcFileRepairDirectAccess>{}));
 };
 
 struct TestRpcReq : ReqBase {
@@ -1362,6 +1378,7 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(closeEcFileRepairDebt, 67, CloseEcFileRepairDebtReq, EcFileRepairRsp);
   META_SERVICE_METHOD(prepareEcTargetRetirement, 68, PrepareEcTargetRetirementReq, EcTargetRetirementRsp);
   META_SERVICE_METHOD(queryEcTargetRetirement, 69, QueryEcTargetRetirementReq, EcTargetRetirementRsp);
+  META_SERVICE_METHOD(prepareEcFileRepairDirect, 70, PrepareEcFileRepairDirectReq, EcFileRepairDirectRsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
   META_SERVICE_METHOD(bindEcRmwOutput, 52, BindEcRmwOutputReq, BindEcRmwOutputRsp);

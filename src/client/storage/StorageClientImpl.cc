@@ -23,6 +23,7 @@
 #include "common/utils/StringUtils.h"
 #include "fbs/storage/EcStageValidationV2.h"
 #include "storage/ec_repair/EcHelperAuthorization.h"
+#include "storage/ec_repair/EcHelperDirectAuthorization.h"
 
 namespace hf3fs::storage::client {
 
@@ -44,6 +45,8 @@ EcRpcMethod observedEcMethod(StorageClient::MethodType method) noexcept {
       return EcRpcMethod::Seal;
     case Method::executeEcHelper:
       return EcRpcMethod::Helper;
+    case Method::executeEcHelperDirect:
+      return EcRpcMethod::HelperDirect;
     default:
       return EcRpcMethod::Count;
   }
@@ -3691,6 +3694,76 @@ CoTryTask<EcHelperHopResult> StorageClientImpl::executeEcHelper(EcHelperHopReq r
   // Caller has no helper key. The next Storage hop verifies predecessor MAC;
   // clients verify the final target block hashes and require Meta publication.
   co_return std::move(*response->result);
+}
+
+CoTryTask<EcHelperDirectHopResult> StorageClientImpl::executeEcHelperDirect(EcHelperDirectHopReq request,
+                                                                          EcRequestControl control) {
+  bool dispatched = false;
+  const auto unknown = [] { return makeError(StorageCode::kEcSealOutcomeUnknown); };
+  try {
+    if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+    const auto check = [&]() -> Result<Void> {
+      if (std::chrono::steady_clock::now() >= control.deadline) return makeError(StorageClientCode::kTimeout);
+      if (control.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
+      return Void{};
+    };
+    CO_RETURN_ON_ERROR(check());
+    if (control.transport != EcRequestControl::TransportPolicy::TcpOnly ||
+        control.deadline - std::chrono::steady_clock::now() > std::chrono::hours(1))
+      co_return makeError(StatusCode::kInvalidArg);
+    auto plan = EcRepairPlan::create(request.plan);
+    CO_RETURN_ON_ERROR(plan);
+    CO_RETURN_ON_ERROR(validateEcHelperDirectRequest(**plan, request));
+    const auto wall = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch()).count());
+    if (request.deadlineUnixMillis <= wall || request.deadlineUnixMillis - wall > 60000)
+      co_return makeError(StorageClientCode::kTimeout);
+    const auto deadline = std::min(control.deadline,
+                                  std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(request.deadlineUnixMillis - wall));
+    if (!ecHelperConcurrency_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy);
+    auto release = folly::makeGuard([this] { ecHelperConcurrency_.signal(); });
+    const auto position = request.packet.nextHelper;
+    const auto &source = (*plan)->input().sources[position];
+    auto node = getEcNodeInfo(getCurrentRoutingInfo(),
+                             {source.endpoint.chainId, request.sourceRouteVersions[position]},
+                             source.endpoint.targetId);
+    CO_RETURN_ON_ERROR(node);
+    if (node->app.nodeId != source.endpoint.nodeId) co_return makeError(StorageClientCode::kRoutingVersionMismatch);
+    CO_RETURN_ON_ERROR(check());
+    const auto remaining = deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) co_return makeError(StorageClientCode::kTimeout);
+    const DebugOptions debug;
+    ClientRequestContext context(MethodType::executeEcHelperDirect, flat::UserInfo(), debug, config_, 1, 0,
+                                  Duration(remaining));
+    // This boundary includes task construction and every later validation. No
+    // later local error proves that the last helper did not append either target.
+    // Do not pass this sticky flag to callMessengerMethod, which resets its flag.
+    dispatched = true;
+    auto response = co_await folly::coro::co_withCancellation(
+        control.cancellation,
+        callMessengerMethod<EcHelperDirectHopReq, EcHelperDirectHopRsp, &StorageMessenger::executeEcHelperDirect>(
+            messenger_, context, *node, request, 0, nullptr, true, true, control.observation));
+    if (!response || !response->result) co_return unknown();
+    if (!check() || std::chrono::steady_clock::now() >= deadline) co_return unknown();
+    node = getEcNodeInfo(getCurrentRoutingInfo(),
+                         {source.endpoint.chainId, request.sourceRouteVersions[position]},
+                         source.endpoint.targetId);
+    if (!node || node->app.nodeId != source.endpoint.nodeId) co_return unknown();
+    if (!validateEcHelperDirectResult(**plan, request, *response->result)) co_return unknown();
+    // Public structure/identity checks only: the SDK has no helper MAC key.
+    // This is not Seal, Meta publication, or proof that downstream work drained.
+    co_return std::move(*response->result);
+  } catch (const std::bad_alloc &) {
+    if (dispatched) co_return unknown();
+    co_return makeError(StatusCode::kNotEnoughMemory);
+  } catch (const OperationCancelled &) {
+    if (dispatched) co_return unknown();
+    co_return makeError(StorageClientCode::kRequestCanceled);
+  } catch (...) {
+    if (dispatched) co_return unknown();
+    co_return makeError(StatusCode::kIOError);
+  }
 }
 
 }  // namespace hf3fs::storage::client

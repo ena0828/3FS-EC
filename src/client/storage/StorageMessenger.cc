@@ -517,4 +517,15 @@ CoTryTask<EcHelperHopRsp> StorageMessenger::executeEcHelper(const net::Address &
                                                                                                timestamp, sizes);
 }
 
+CoTryTask<EcHelperDirectHopRsp> StorageMessenger::executeEcHelperDirect(const net::Address &address,
+                                                                      const EcHelperDirectHopReq &request,
+                                                                      const net::UserRequestOptions *options,
+                                                                      serde::Timestamp *timestamp,
+                                                                      serde::RpcCallSizes *sizes) {
+  co_return co_await callSerdeRpcMethod<EcHelperDirectHopReq,
+                                       EcHelperDirectHopRsp,
+                                       StorageSerde<>::executeEcHelperDirect<EcFrameSizeContext>>(
+      client_, address, request, options, timestamp, sizes);
+}
+
 }  // namespace hf3fs::storage::client

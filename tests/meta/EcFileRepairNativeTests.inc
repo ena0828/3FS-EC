@@ -171,10 +171,10 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_FALSE(copyRpc.clockAnomaly);
     // One block per fragment, two reconstructed outputs and ten copied outputs.
     // Copy always Reconciles its original allocation; the fresh repair does not.
-    const std::array<uint64_t, 7> repairCalls{
+    const std::array<uint64_t, static_cast<size_t>(EcRpcMethod::Count)> repairCalls{
         mode == EcFileRepairMode::HelperChain ? 0ULL : 10ULL, 2, 2, 0, 0, 2,
         mode == EcFileRepairMode::HelperChain ? 1ULL : 0ULL};
-    const std::array<uint64_t, 7> copyCalls{10, 10, 10, 0, 10, 10, 0};
+    const std::array<uint64_t, static_cast<size_t>(EcRpcMethod::Count)> copyCalls{10, 10, 10, 0, 10, 10, 0};
     for (size_t i = 0; i != rpc.methods.size(); ++i) {
       const auto &method = rpc.methods[i];
       const auto &repairMethod = repairRpc.methods[i];

@@ -1,5 +1,6 @@
 #include "EcRmwPlanIssuer.h"
 
+#include <bit>
 #include <limits>
 
 #include "meta/store/EcFileRepairCatalog.h"
@@ -23,14 +24,16 @@ CoTryTask<EcRmwIssuedExecution> EcRmwPlanIssuer::issue(EcObjectRef object, EcOwn
   auto observed = co_await EcFileExecutionCatalog::reserveIssuance(txn, owner, object, child);
   if (!observed) co_return makeError(std::move(observed.error()));
   std::optional<std::array<uint8_t, 10>> selected;
+  uint16_t directMask = 0;
   if (observed->record.ownerKind == EcFileExecutionOwner::Repair) {
     auto repair = co_await EcFileRepairCatalog::byChild(txn, owner, object, child);
     CO_RETURN_ON_ERROR(repair);
     selected = repair->intent.selection.sourceOrder;
+    if (repair->intent.mode == EcFileRepairMode::HelperChainDirect) directMask = repair->intent.replacementMask;
   }
   auto committed = co_await txn.commit();
   if (!committed) co_return makeError(std::move(committed.error()));
-  auto result = sign(std::move(*observed));
+  auto result = sign(std::move(*observed), directMask);
   CO_RETURN_ON_ERROR(result);
   if (selected) {
     result->repairReads.emplace();
@@ -107,7 +110,7 @@ Result<EcCapabilityV2> EcRmwPlanIssuer::dataGrant(const EcRepairFragment &f,
   c.expiresAtSeconds = now + config_.ttlSeconds;
   return signEcGrantV2(*data_, c, now, config_.ttlSeconds);
 }
-Result<EcRmwIssuedExecution> EcRmwPlanIssuer::sign(EcFileExecutionObservation observation) const {
+Result<EcRmwIssuedExecution> EcRmwPlanIssuer::sign(EcFileExecutionObservation observation, uint16_t directMask) const {
   if (!observation.plan || observation.record.issuanceSequence == 0 ||
       (observation.record.state != EcFileExecutionState::Reserved &&
        observation.record.state != EcFileExecutionState::Bound))
@@ -140,8 +143,16 @@ Result<EcRmwIssuedExecution> EcRmwPlanIssuer::sign(EcFileExecutionObservation ob
       (*issued.reads)[i] = std::move(grant);
     }
   }
+  if (directMask) {
+    if ((directMask & ~uint16_t{4095}) || std::popcount(directMask) > 2 ||
+        observation.record.ownerKind != EcFileExecutionOwner::Repair || !observation.record.allocations)
+      return makeError(StatusCode::kDataCorruption);
+    issued.repairAppends.emplace();
+    issued.repairQueries.emplace();
+  }
   if (observation.record.allocations) {
     issued.writes.emplace();
+    size_t selectedTarget = 0;
     for (size_t i = 0; i < 12; ++i) {
       const auto &a = (*observation.record.allocations)[i];
       EcRepairFragment f;
@@ -152,6 +163,15 @@ Result<EcRmwIssuedExecution> EcRmwPlanIssuer::sign(EcFileExecutionObservation ob
       f.integrity = a.fragment.integrity;
       CHECK_RESULT(grant, dataGrant(f, plan, EcGrantScope::WriteOperation, p.operationId, kEcGrantAllRightsV2, now));
       (*issued.writes)[i] = std::move(grant);
+      if (directMask & (uint16_t{1} << i)) {
+        // Each is a new MAC over exact rights, never a changed full-rights grant.
+        CHECK_RESULT(append, dataGrant(f, plan, EcGrantScope::WriteOperation, p.operationId,
+                                      uint16_t(EcGrantRightV2::Append), now));
+        CHECK_RESULT(query, dataGrant(f, plan, EcGrantScope::WriteOperation, p.operationId,
+                                     uint16_t(EcGrantRightV2::Query), now));
+        (*issued.repairAppends)[selectedTarget] = std::move(append);
+        (*issued.repairQueries)[selectedTarget++] = std::move(query);
+      }
     }
   }
   issued.observed = std::move(observation);

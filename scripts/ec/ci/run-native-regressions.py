@@ -48,6 +48,17 @@ CLIENT_MANDATORY = {
     )
 }
 
+MANDATORY |= {
+    "TestEcHelperDirectAuthorization." + name for name in (
+        "SingleAndDoubleDelegationRoundtripPreservesUnusedSlots",
+        "IndependentDomainMacExactRightsAndLifetime",
+        "ContextBindsRoutesMaskDeadlineAndEveryCredential",
+        "SmallResultAllowsAdvancedPrefixButRejectsUnknownAndTampering",
+        "ActiveSubsetAndPredecessorCannotBecomeFinalProof",
+        "BoundedWireRejectsArrayCountsOversizeAndEmptyActiveAuthority",
+    )
+}
+
 RPC_FRAME_CASES = tuple("TestEcRpcFrameSizes." + name for name in (
     "ActualEncodedFramesIncludeHeaderAcrossCompression",
     "ReverseRepliesOnOneConnectionKeepUuidAttribution",
@@ -60,6 +71,14 @@ RPC_OBSERVER_CASES = (
     "TestEcRepairPipeline.RpcFrameObservationCountsMissingErrorsExceptionsAndSaturates",
 )
 CLIENT_MANDATORY |= set(RPC_FRAME_CASES) | set(RPC_OBSERVER_CASES)
+CLIENT_MANDATORY |= {
+    "TestEcRepairPipeline." + name for name in (
+        "DirectDeliveryUsesWindowAndSealsWithoutClientAppend",
+        "DirectDeliveryRequiresExplicitSupportedHelperBeforeBegin",
+        "PartialDirectMutationExceptionsStayUnknownAndDoNotSeal",
+        "DirectMutationFailureJoinsOtherStartedDirectBlock",
+    )
+}
 
 SERVICE_MANDATORY = {
     "TestEcStageService.LostSealReplyIsUnknownAndRetryDoesNotDoubleAccount",
@@ -67,6 +86,17 @@ SERVICE_MANDATORY = {
     "TestEcNativeRepairService.ThreeStrategiesRecoverLostAppendReplyOnOriginalStages",
     "TestEcNativeRepairService.ThreeStrategiesRecoverLostSealReplyAfterEngineReopen",
     "TestEcNativeRepairService.WindowTwoLostAppendReplyRecoversBothOriginalTargets",
+}
+SERVICE_MANDATORY |= {
+    "TestEcNativeRepairService." + name for name in (
+        "HelperDirectW1W2W4WriteOriginalTargetsWithSmallReplies",
+        "HelperDirectReverseArrivalWaitsForDurablePrefixAcrossWindows",
+        "HelperDirectLostSecondAppendReplyReconcilesOriginalAllocations",
+        "HelperDirectLostFinalAndIntermediateSmallRepliesRemainUnknown",
+        "HelperDirectMissingPredecessorAndDuplicateHaveFiniteOwnedLifetime",
+        "HelperDirectMaskSkipsSealedTargetAndBadDataMacCannotAppend",
+        "HelperDirectCancellationAndSourceFenceKeepRealDownstreamJoined",
+    )
 }
 
 # Exact names prevent unrelated green suites from satisfying the control profile.

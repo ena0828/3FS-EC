@@ -362,7 +362,8 @@ auto MetaClient::retry(Func &&func, Req &&req, RetryConfig retryConfig, std::fun
   auto options = net::UserRequestOptions();
   options.timeout = retryConfig.rpc_timeout();
   if constexpr (std::is_same_v<std::remove_cvref_t<Req>, PrepareEcTargetRetirementReq> ||
-                std::is_same_v<std::remove_cvref_t<Req>, QueryEcTargetRetirementReq>) {
+                std::is_same_v<std::remove_cvref_t<Req>, QueryEcTargetRetirementReq> ||
+                std::is_same_v<std::remove_cvref_t<Req>, PrepareEcFileRepairDirectReq>) {
     // Disable the network sender's own retransmission as well as the explicit
     // caller's zero-backoff policy. Recovery belongs to the original request ID.
     options.sendRetryTimes = 0;
@@ -1284,6 +1285,12 @@ CoTryTask<EcFileRepairRsp> MetaClient::advanceEcFileRepair(AdvanceEcFileRepairRe
   auto once = config_.retry_default();
   once.set_retry_init_wait(0_ms);
   co_return co_await retry(&IMetaServiceStub::advanceEcFileRepair, req, std::move(once));
+}
+CoTryTask<EcFileRepairDirectRsp> MetaClient::prepareEcFileRepairDirect(PrepareEcFileRepairDirectReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist fixed repair request before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::prepareEcFileRepairDirect, req, std::move(once));
 }
 CoTryTask<EcFileRepairRsp> MetaClient::closeEcFileRepairDebt(CloseEcFileRepairDebtReq req) {
   if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist fixed repair request before dispatch");

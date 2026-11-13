@@ -6,6 +6,7 @@
 
 #include "EcBlockRead.h"
 #include "fbs/storage/EcStageValidationV2.h"
+#include "storage/ec_repair/EcHelperDirectAuthorization.h"
 
 namespace hf3fs::client::ec {
 namespace {
@@ -128,7 +129,9 @@ Result<std::shared_ptr<const EcRepairPlan>> validate(const meta::EcFileRepairAcc
   for (size_t n = 0; n < 12; ++n)
     if (i.replacementMask & (uint16_t{1} << n))
       if (!same(p.targets[target++], fragment(a.targets[n]))) return makeError(StatusCode::kTokenMismatch);
-  if ((i.mode == meta::EcFileRepairMode::HelperChain) != a.helpers.has_value())
+  const bool helper = i.mode == meta::EcFileRepairMode::HelperChain ||
+                      i.mode == meta::EcFileRepairMode::HelperChainDirect;
+  if (helper != a.helpers.has_value())
     return makeError(StatusCode::kTokenMismatch);
   return plan;
 }
@@ -269,7 +272,10 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
   }
 }
 CoTryTask<Void> EcFileRepairClient::transfer(meta::EcFileRepairAccess a, const EcTreeRepairRun &r, EcStripeControl c,
-                                           EcRepairObservation *observation) {
+                                           EcRepairObservation *observation,
+                                           std::optional<EcHelperDirectDelegation> direct) {
+  if ((r.intent.mode == meta::EcFileRepairMode::HelperChainDirect) != direct.has_value())
+    co_return makeError(StatusCode::kTokenMismatch);
   // validate() was completed against the fixed accepted record before entry.
   auto plan = EcRepairPlan::create(a.plan);
   CO_RETURN_ON_ERROR(plan);
@@ -293,7 +299,8 @@ CoTryTask<Void> EcFileRepairClient::transfer(meta::EcFileRepairAccess a, const E
       CO_RETURN_ON_ERROR(v);
       bindings.targets[index++] = {access(a.targets[n], *v), a.writes[n]};
     }
-  auto transport = NativeEcRepairTransport::create(*plan, storage_, std::move(bindings), a.helpers, observation);
+  auto transport = NativeEcRepairTransport::create(
+      *plan, storage_, std::move(bindings), a.helpers, observation, std::move(direct));
   CO_RETURN_ON_ERROR(transport);
   auto mode = r.intent.mode == meta::EcFileRepairMode::CentralSerial    ? EcRepairMode::CentralSerial
               : r.intent.mode == meta::EcFileRepairMode::ClientPipeline ? EcRepairMode::ClientPipeline
@@ -301,7 +308,9 @@ CoTryTask<Void> EcFileRepairClient::transfer(meta::EcFileRepairAccess a, const E
   {
     EcRepairObservation::Scope selected(observation, EcRepairPoint::SelectedRepair);
     auto done = co_await EcRepairPipeline::run(
-        *plan, *transport, mode, {c.deadline, c.cancellation}, executor_, observation);
+        *plan, *transport, mode, {c.deadline, c.cancellation}, executor_, observation,
+        r.intent.mode == meta::EcFileRepairMode::HelperChainDirect ? EcRepairDelivery::HelperDirect
+                                                                : EcRepairDelivery::ClientAppend);
     CO_RETURN_ON_ERROR(done);
     selected.success();
   }
@@ -360,7 +369,7 @@ EcTreeRepairOutcome EcFileRepairClient::execute(EcTreeRepairJournal &j,
     if (!ok) return fail(std::move(ok.error()));
     const auto &r = j.record();
     auto state = j.latest().value_or(EcTreeRepairState{});
-    auto remember = [&](const meta::EcFileRepairRsp &rsp, Uuid id) -> Result<Void> {
+    auto remember = [&](const auto &rsp, Uuid id) -> Result<Void> {
       if (rsp.requestId != id) return makeError(StatusCode::kTokenMismatch);
       state.issued = state.issued || rsp.progress.record.has_value();
       state.progress = rsp.progress;
@@ -410,20 +419,45 @@ EcTreeRepairOutcome EcFileRepairClient::execute(EcTreeRepairJournal &j,
     if (state.progress.record->state == meta::EcFileRepairState::Published) return finish();
     if (state.progress.record->state != meta::EcFileRepairState::Planned) return fail(Status(StatusCode::kTokenStale));
     if (!state.dataComplete && !state.progress.outputClosing) {
-      meta::AdvanceEcFileRepairReq prepare;
-      request(prepare, r, r.prepareRequest);
-      prepare.action = meta::EcFileRepairAdvance::Prepare;
+      std::optional<meta::EcFileRepairAccess> access;
+      std::optional<EcHelperDirectDelegation> direct;
       invoked = true;
-      auto access = observeResult(
-          metrics, EcRepairPoint::Prepare, [&] { return blockingWait(meta_->advanceEcFileRepair(std::move(prepare))); }, true);
-      if (!access) return fail(std::move(access.error()));
-      ok = remember(*access, r.prepareRequest);
-      if (!ok) return fail(std::move(ok.error()));
-      if (state.progress.record && state.progress.record->state == meta::EcFileRepairState::Published) return finish();
-      if (!access->access || !state.progress.record) return fail(Status(StatusCode::kDataCorruption));
-      auto plan = validate(*access->access, r, *state.progress.record);
+      if (r.intent.mode == meta::EcFileRepairMode::HelperChainDirect) {
+        meta::PrepareEcFileRepairDirectReq prepare;
+        request(prepare, r, r.prepareRequest);
+        auto response = observeResult(metrics, EcRepairPoint::Prepare,
+            [&] { return blockingWait(meta_->prepareEcFileRepairDirect(std::move(prepare))); }, true);
+        if (!response) return fail(std::move(response.error()));
+        ok = remember(*response, r.prepareRequest);
+        if (!ok) return fail(std::move(ok.error()));
+        if (state.progress.record && state.progress.record->state == meta::EcFileRepairState::Published) return finish();
+        if (response->access) {
+          access = std::move(response->access->base);
+          direct = std::move(response->access->delegation);
+        }
+      } else {
+        meta::AdvanceEcFileRepairReq prepare;
+        request(prepare, r, r.prepareRequest);
+        prepare.action = meta::EcFileRepairAdvance::Prepare;
+        auto response = observeResult(metrics, EcRepairPoint::Prepare,
+            [&] { return blockingWait(meta_->advanceEcFileRepair(std::move(prepare))); }, true);
+        if (!response) return fail(std::move(response.error()));
+        ok = remember(*response, r.prepareRequest);
+        if (!ok) return fail(std::move(ok.error()));
+        if (state.progress.record && state.progress.record->state == meta::EcFileRepairState::Published) return finish();
+        access = std::move(response->access);
+      }
+      if (!access || !state.progress.record) return fail(Status(StatusCode::kDataCorruption));
+      auto plan = validate(*access, r, *state.progress.record);
       if (!plan) return fail(std::move(plan.error()));
-      auto moved = blockingWait(transfer(std::move(*access->access), r, c, metrics));
+      if (direct) {
+        const auto mask = static_cast<uint16_t>((uint32_t{1} << (*plan)->blockCount()) - 1);
+        if (direct->directGrant.claims.blockMask != mask) return fail(Status(StatusCode::kTokenMismatch));
+        // Public shape/exact-role binding only. Storage authenticates every MAC.
+        ok = validateEcHelperDirectDelegation(**plan, *direct, 0);
+        if (!ok) return fail(std::move(ok.error()));
+      }
+      auto moved = blockingWait(transfer(std::move(*access), r, c, metrics, std::move(direct)));
       if (!moved) return fail(std::move(moved.error()));
       state.dataComplete = true;
       ok = observeResult(metrics, EcRepairPoint::Journal, [&] { return j.append(state); });

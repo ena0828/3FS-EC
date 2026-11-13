@@ -10,7 +10,7 @@ Result<Void> validateEcFileRepairIntent(const EcFileRepairIntent &i) {
       i.expectedRoot.is_nil() || !i.expectedEpoch || !i.expectedSequence || (i.replacementMask & ~uint16_t{4095}) ||
       !i.replacementMask || std::popcount(i.replacementMask) > 2 ||
       (i.mode != EcFileRepairMode::CentralSerial && i.mode != EcFileRepairMode::ClientPipeline &&
-       i.mode != EcFileRepairMode::HelperChain) ||
+       i.mode != EcFileRepairMode::HelperChain && i.mode != EcFileRepairMode::HelperChainDirect) ||
       !i.selection.maxBlocksInFlight || i.selection.maxBlocksInFlight > 4)
     return makeError(StatusCode::kInvalidArg, "invalid mode4 repair identity/selection");
   std::set<Uuid> ids;

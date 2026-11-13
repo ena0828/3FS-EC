@@ -9,6 +9,7 @@
 #include "fbs/meta/EcRequestDigest.h"
 #include "fbs/storage/EcStageValidationV2.h"
 #include "storage/ec_codec/EcCodec.h"
+#include "storage/ec_repair/EcHelperDirectAuthorization.h"
 
 namespace hf3fs::meta::server {
 namespace {
@@ -239,6 +240,24 @@ Result<std::optional<std::array<storage::EcHelperCapability, 10>>> EcV2Coordinat
                              wallSeconds(),
                              std::min(config_.ec_grant_ttl_seconds(), config_.ec_v2_helper_grant_ttl_seconds())));
   return std::optional<std::array<storage::EcHelperCapability, 10>>(std::move(grants));
+}
+Result<storage::EcHelperDirectDelegation> EcV2Coordinator::issueRepairDirect(
+    const EcV2RepairPlanRecord &record, std::array<storage::EcCapabilityV2, 2> appends,
+    std::array<storage::EcCapabilityV2, 2> queries) const {
+  RETURN_ON_ERROR(checkEnabled());
+  if (!helperKey_) return makeError(StatusCode::kNotImplemented, "native direct helper key is unavailable");
+  CHECK_RESULT(plan, EcV2RepairPlanCatalog::validate(record));
+  const auto blocks = plan->blockCount();
+  if (!blocks || blocks > 16) return makeError(StatusCode::kInvalidArg);
+  const auto now = wallSeconds();
+  uint64_t ttl = std::min(config_.ec_grant_ttl_seconds(), config_.ec_v2_helper_grant_ttl_seconds());
+  for (size_t n = 0; n != plan->input().targetCount; ++n) {
+    const auto expiry = std::min(appends[n].claims.expiresAtSeconds, queries[n].claims.expiresAtSeconds);
+    if (expiry <= now) return makeError(StatusCode::kTokenStale);
+    ttl = std::min(ttl, expiry - now);
+  }
+  return storage::issueEcHelperDirectDelegation(*helperKey_, *plan, std::move(appends), std::move(queries),
+      static_cast<uint16_t>((uint32_t{1} << blocks) - 1), now, ttl);
 }
 CoTryTask<std::shared_ptr<const EcV2PublishEvidence>> EcV2Coordinator::verifyForPublish(
     const EcV2MutationRsp &snapshot) {

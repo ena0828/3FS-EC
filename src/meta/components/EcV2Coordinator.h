@@ -41,6 +41,10 @@ class EcV2Coordinator {
   Result<Void> addReadGrants(AcquireEcReadV2Rsp &) const;
   Result<std::optional<std::array<storage::EcHelperCapability, 10>>> issueRepairHelpers(
       const EcV2RepairPlanRecord &) const;
+  // Only the internal mode4 Prepare path may call this after committed issuance.
+  Result<storage::EcHelperDirectDelegation> issueRepairDirect(
+      const EcV2RepairPlanRecord &, std::array<storage::EcCapabilityV2, 2>,
+      std::array<storage::EcCapabilityV2, 2>) const;
   CoTryTask<std::shared_ptr<const EcV2PublishEvidence>> verifyForPublish(const EcV2MutationRsp &);
   CoTryTask<std::optional<EcVerifiedDrainAck>> observeDrain(const EcV2DrainRecord &,
                                                             size_t index,

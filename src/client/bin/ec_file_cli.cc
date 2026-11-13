@@ -71,6 +71,7 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(repair_stripe_decimal, "");
   CONFIG_ITEM(repair_mask_decimal, "");
   CONFIG_ITEM(repair_mode, "");
+  CONFIG_ITEM(repair_delivery, "");
   CONFIG_ITEM(repair_source_order, "");
   CONFIG_ITEM(repair_window_decimal, "");
   CONFIG_ITEM(repair_metrics, false);
@@ -148,7 +149,8 @@ int execute(int argc, char **argv) {
                  "New repair: accepted READ|WRITE session_run_dir + new run_dir + repair_stripe_decimal,\n"
                  "repair_mask_decimal, repair_mode=central|pipeline|helper and ten repair_source_order indices.\n"
                  "Optional repair_metrics=true observes this call only; default false, journal format unchanged.\n"
-                 "Optional repair_window_decimal=1..4 (default 2); resume/query/close use only original run_dir.\n"
+                 "Optional repair_window_decimal=1..4 (default 2); helper repair_delivery=return|direct.\n"
+                 "Resume/query/close use only original run_dir; no repair_delivery override.\n"
                  "Published and source-released are separate; close-repair-debt cancels an unfinished repair.\n"
                  "Mode4 truncate: mode4-truncate/resume-truncate/query-truncate/close-truncate-debt.\n"
                  "New truncate: session_run_dir + new run_dir + length_decimal; resume keeps original CAS/IDs.\n"

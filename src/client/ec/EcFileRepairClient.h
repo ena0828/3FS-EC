@@ -41,7 +41,8 @@ class EcFileRepairClient final {
   Result<Void> check(const EcTreeRepairJournal &, EcStripeControl) const;
   void request(meta::EcFileRepairReq &, const EcTreeRepairRun &, Uuid) const;
   EcTreeRepairOutcome execute(EcTreeRepairJournal &, EcStripeControl, uint8_t action, bool collectMetrics);
-  CoTryTask<Void> transfer(meta::EcFileRepairAccess, const EcTreeRepairRun &, EcStripeControl, EcRepairObservation *);
+  CoTryTask<Void> transfer(meta::EcFileRepairAccess, const EcTreeRepairRun &, EcStripeControl, EcRepairObservation *,
+                          std::optional<storage::EcHelperDirectDelegation> direct = std::nullopt);
   CoTryTask<Void> copyOne(const meta::EcV2AllocationBinding &,
                           const meta::EcV2AllocationBinding &,
                           storage::EcCapabilityV2,

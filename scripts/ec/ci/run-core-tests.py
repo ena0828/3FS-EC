@@ -31,11 +31,12 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
 REPAIR_CASES = (
     "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
     "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
+    "TestEcFileNativeRepair.HelperDirectCommittedIssuanceLostReplyAndFreshTwelvePublication",
 )
 AUTH_USER_CASES = tuple(f"TestAuth/{backend}.{case}" for backend in (0, 1)
                         for case in ("Basic", "ExplicitPrimaryGroup"))
 SERVICE_CONTRACT_CASES = AUTH_USER_CASES + (
-    "TestMetaServiceReflection.RegistersAll69IncludingBeyondDefaultFieldRank",
+    "TestMetaServiceReflection.RegistersAll70IncludingBeyondDefaultFieldRank",
 )
 TARGET_META_CASES = (
     "TestEcTargetRetirementCatalog.RealFdbImmutableIntentAndRequestIdentity",

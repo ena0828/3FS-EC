@@ -14,6 +14,9 @@ struct EcRmwIssuedExecution {
   std::optional<std::array<storage::EcCapabilityV2, 12>> writes;
   // Only the selected ten repair helpers receive output-scope read authority.
   std::optional<std::array<storage::EcCapabilityV2, 10>> repairReads;
+  // Issued only for a committed HelperChainDirect record, in selected target order.
+  std::optional<std::array<storage::EcCapabilityV2, 2>> repairAppends;
+  std::optional<std::array<storage::EcCapabilityV2, 2>> repairQueries;
 };
 class EcRmwPlanIssuer final {
  public:
@@ -46,7 +49,7 @@ class EcRmwPlanIssuer final {
         db_(std::move(db)),
         rmw_(std::move(rmw)),
         data_(std::move(data)) {}
-  Result<EcRmwIssuedExecution> sign(EcFileExecutionObservation) const;
+  Result<EcRmwIssuedExecution> sign(EcFileExecutionObservation, uint16_t directMask = 0) const;
   Result<storage::EcCapabilityV2> dataGrant(const storage::EcRepairFragment &,
                                             const storage::EcRmwPlan &,
                                             storage::EcGrantScope,

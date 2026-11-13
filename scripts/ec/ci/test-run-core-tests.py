@@ -62,7 +62,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
         self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 21)
         combined, combined_filter, combined_fuse = RUNNER.selection("service-contracts")
         self.assertEqual(combined, expected + (
-            "TestMetaServiceReflection.RegistersAll69IncludingBeyondDefaultFieldRank",))
+            "TestMetaServiceReflection.RegistersAll70IncludingBeyondDefaultFieldRank",))
         self.assertEqual(combined_filter, ":".join(combined))
         self.assertEqual(combined_fuse, ())
         RUNNER.check_meta_receipt(receipt(binary, output, combined, combined_filter), binary, output,
@@ -199,6 +199,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
         self.assertEqual(cases, (
             "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
             "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
+            "TestEcFileNativeRepair.HelperDirectCommittedIssuanceLostReplyAndFreshTwelvePublication",
         ))
         self.assertEqual(test_filter, ":".join(cases))
         self.assertEqual(fuse, ())

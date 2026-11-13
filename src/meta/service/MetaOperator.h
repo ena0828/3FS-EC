@@ -125,6 +125,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<EcFileRepairRsp> beginEcFileRepair(BeginEcFileRepairReq req);
   CoTryTask<EcFileRepairRsp> queryEcFileRepair(QueryEcFileRepairReq req);
   CoTryTask<EcFileRepairRsp> advanceEcFileRepair(AdvanceEcFileRepairReq req);
+  CoTryTask<EcFileRepairDirectRsp> prepareEcFileRepairDirect(PrepareEcFileRepairDirectReq req);
   CoTryTask<EcFileRepairRsp> closeEcFileRepairDebt(CloseEcFileRepairDebtReq req);
 
   CoTryTask<MkdirsRsp> mkdirs(MkdirsReq req);
@@ -158,6 +159,8 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<BatchStatByPathRsp> batchStatByPath(BatchStatByPathReq req);
 
  private:
+  // Both authenticated Prepare methods share the same committed issuance path.
+  CoTryTask<EcFileRepairDirectRsp> prepareEcFileRepair(const EcFileRepairReq &req);
   friend class MockMeta;
 
   template <typename>

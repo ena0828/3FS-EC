@@ -3,7 +3,7 @@
 #include "fbs/meta/EcV2Repair.h"
 
 namespace hf3fs::meta {
-enum class EcFileRepairMode : uint8_t { CentralSerial = 1, ClientPipeline = 2, HelperChain = 3 };
+enum class EcFileRepairMode : uint8_t { CentralSerial = 1, ClientPipeline = 2, HelperChain = 3, HelperChainDirect = 4 };
 enum class EcFileRepairState : uint8_t { Planned = 1, Published = 2, Aborted = 3 };
 struct EcFileRepairIntent {
   SERDE_STRUCT_FIELD(version, uint16_t{1});

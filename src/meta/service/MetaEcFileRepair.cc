@@ -100,6 +100,14 @@ CoTryTask<EcFileRepairRsp> observe(Tx &tx, const EcFileRepairReq &req) {
   if (out.progress.sourceReleased && !out.progress.outputDrained) co_return makeError(StatusCode::kDataCorruption);
   co_return out;
 }
+CoTryTask<EcFileRepairDirectRsp> observeDirect(Tx &tx, const EcFileRepairReq &req) {
+  auto observed = co_await observe(tx, req);
+  CO_RETURN_ON_ERROR(observed);
+  EcFileRepairDirectRsp out;
+  out.requestId = observed->requestId;
+  out.progress = std::move(observed->progress);
+  co_return out;
+}
 CoTryTask<Void> closeDebt(kv::IKVEngine &db,
                           storage::client::StorageClient &storage,
                           const EcV2Coordinator &coordinator,
@@ -257,6 +265,15 @@ CoTryTask<EcFileRepairRsp> MetaOperator::advanceEcFileRepair(AdvanceEcFileRepair
   if (config_.readonly()) co_return makeError(StatusCode::kReadOnlyMode);
   const auto &i = req.intent;
   const auto owner = ownerOf(req);
+  if (req.action == EcFileRepairAdvance::Prepare) {
+    auto prepared = co_await prepareEcFileRepair(req);
+    CO_RETURN_ON_ERROR(prepared);
+    EcFileRepairRsp out;
+    out.requestId = prepared->requestId;
+    out.progress = std::move(prepared->progress);
+    if (prepared->access) out.access = std::move(prepared->access->base);
+    co_return out;
+  }
   auto before = co_await transaction<EcFileRepairRecord>(*kvEngine_, [&](Tx &tx) -> CoTryTask<EcFileRepairRecord> {
     auto r = co_await retained(tx, req);
     CO_RETURN_ON_ERROR(r);
@@ -277,6 +294,30 @@ CoTryTask<EcFileRepairRsp> MetaOperator::advanceEcFileRepair(AdvanceEcFileRepair
     }));
     co_return co_await transaction<EcFileRepairRsp>(*kvEngine_, [&](Tx &tx) { return observe(tx, req); });
   }
+  co_return makeError(StatusCode::kInvalidArg);
+}
+CoTryTask<EcFileRepairDirectRsp> MetaOperator::prepareEcFileRepairDirect(PrepareEcFileRepairDirectReq req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEcFileSession(req));
+  req.intent.owner = ownerOf(req);
+  CO_RETURN_ON_ERROR(req.valid());
+  if (config_.readonly()) co_return makeError(StatusCode::kReadOnlyMode);
+  co_return co_await prepareEcFileRepair(req);
+}
+CoTryTask<EcFileRepairDirectRsp> MetaOperator::prepareEcFileRepair(const EcFileRepairReq &req) {
+  // The public entry already authenticated the session, normalized owner and
+  // validated mode/action. Both Prepare protocols share one issuance sequence.
+  const auto &i = req.intent;
+  const auto owner = ownerOf(req);
+  auto before = co_await transaction<EcFileRepairRecord>(*kvEngine_, [&](Tx &tx) -> CoTryTask<EcFileRepairRecord> {
+    auto r = co_await retained(tx, req);
+    CO_RETURN_ON_ERROR(r);
+    if (!*r) co_return makeError(MetaCode::kNotFound);
+    co_return std::move(**r);
+  });
+  CO_RETURN_ON_ERROR(before);
+  if (before->state == EcFileRepairState::Aborted) co_return makeError(StatusCode::kTokenStale);
+  if (before->state == EcFileRepairState::Published)
+    co_return co_await transaction<EcFileRepairDirectRsp>(*kvEngine_, [&](Tx &tx) { return observeDirect(tx, req); });
   CO_RETURN_ON_ERROR(co_await transaction<Void>(*kvEngine_, [&](Tx &tx) -> CoTryTask<Void> {
     auto r = co_await retained(tx, req);
     CO_RETURN_ON_ERROR(r);
@@ -306,8 +347,8 @@ CoTryTask<EcFileRepairRsp> MetaOperator::advanceEcFileRepair(AdvanceEcFileRepair
   if (issued->observed.record.ownerKind != EcFileExecutionOwner::Repair || !issued->reads || !issued->repairReads ||
       !issued->writes || !issued->observed.record.allocations)
     co_return makeError(StatusCode::kDataCorruption);
-  auto output = co_await transaction<EcFileRepairRsp>(*kvEngine_, [&](Tx &tx) -> CoTryTask<EcFileRepairRsp> {
-    auto out = co_await observe(tx, req);
+  auto output = co_await transaction<EcFileRepairDirectRsp>(*kvEngine_, [&](Tx &tx) -> CoTryTask<EcFileRepairDirectRsp> {
+    auto out = co_await observeDirect(tx, req);
     CO_RETURN_ON_ERROR(out);
     if (!out->progress.record || out->progress.record->state != EcFileRepairState::Planned)
       co_return makeError(StatusCode::kTokenStale);
@@ -322,17 +363,18 @@ CoTryTask<EcFileRepairRsp> MetaOperator::advanceEcFileRepair(AdvanceEcFileRepair
     access.reads = *issued->reads;
     access.pipelineReads = *issued->repairReads;
     access.writes = *issued->writes;
-    out->access = std::move(access);
+    out->access.emplace();
+    out->access->base = std::move(access);
     co_return std::move(*out);
   });
   CO_RETURN_ON_ERROR(output);
-  if (i.mode == EcFileRepairMode::HelperChain) {
+  if (i.mode == EcFileRepairMode::HelperChain || i.mode == EcFileRepairMode::HelperChainDirect) {
     EcV2RepairPlanRecord helper;
     helper.object = i.object;
     helper.operation = i.child;
     helper.owner = owner;
     helper.selection = i.selection;
-    helper.plan = output->access->plan;
+    helper.plan = output->access->base.plan;
     auto compiled = storage::EcRepairPlan::create(helper.plan);
     CO_RETURN_ON_ERROR(compiled);
     helper.digest = (*compiled)->digest();
@@ -340,7 +382,13 @@ CoTryTask<EcFileRepairRsp> MetaOperator::advanceEcFileRepair(AdvanceEcFileRepair
     CO_RETURN_ON_ERROR(grants);
     if (!*grants)
       co_return makeError(StatusCode::kNotImplemented, "native helper key is unavailable; no centralized fallback");
-    output->access->helpers = std::move(*grants);
+    output->access->base.helpers = std::move(*grants);
+    if (i.mode == EcFileRepairMode::HelperChainDirect) {
+      if (!issued->repairAppends || !issued->repairQueries) co_return makeError(StatusCode::kDataCorruption);
+      auto direct = ecV2Coordinator_->issueRepairDirect(helper, *issued->repairAppends, *issued->repairQueries);
+      CO_RETURN_ON_ERROR(direct);
+      output->access->delegation = std::move(*direct);
+    }
   }
   co_return std::move(*output);
 }

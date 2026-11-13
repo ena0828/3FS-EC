@@ -81,6 +81,7 @@ class MetaSerdeService : public serde::ServiceWrapper<MetaSerdeService, MetaSerd
   META_SERVICE_METHOD(beginEcFileRepair, BeginEcFileRepairReq, EcFileRepairRsp);
   META_SERVICE_METHOD(queryEcFileRepair, QueryEcFileRepairReq, EcFileRepairRsp);
   META_SERVICE_METHOD(advanceEcFileRepair, AdvanceEcFileRepairReq, EcFileRepairRsp);
+  META_SERVICE_METHOD(prepareEcFileRepairDirect, PrepareEcFileRepairDirectReq, EcFileRepairDirectRsp);
   META_SERVICE_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
   META_SERVICE_METHOD(bindEcRmwOutput, BindEcRmwOutputReq, BindEcRmwOutputRsp);

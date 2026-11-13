@@ -30,6 +30,7 @@ const char *repairModeName(meta::EcFileRepairMode mode) {
     case meta::EcFileRepairMode::ClientPipeline:
       return "pipeline";
     case meta::EcFileRepairMode::HelperChain:
+    case meta::EcFileRepairMode::HelperChainDirect:
       return "helper";
   }
   return "invalid";
@@ -110,7 +111,8 @@ std::string repairMetricsJson(const EcRepairSample &m) {
                                                "received_to_waked_ns_decimal"}))(
           "server", clockSample(sample.server, {"received_to_waked_ns_decimal", "waked_to_processed_ns_decimal",
                                                "processed_to_serialized_ns_decimal"}));
-      if (n != size_t(storage::client::EcRpcMethod::Helper)) {
+      if (n != size_t(storage::client::EcRpcMethod::Helper) &&
+          n != size_t(storage::client::EcRpcMethod::HelperDirect)) {
         auto &limiters = methods[storage::client::kEcRpcMethodNames[n]]["limiters"];
         limiters = folly::dynamic::object();
         constexpr std::array<const char *, 2> names{"per_server", "global"};
@@ -182,6 +184,7 @@ int executeMode4Repair(const Config &cfg, const std::string &command) {
       out["stripe_decimal"] = std::to_string(i.stripe);
       out["replacement_mask_decimal"] = std::to_string(i.replacementMask);
       out["strategy"] = repairModeName(i.mode);
+      out["delivery"] = i.mode == meta::EcFileRepairMode::HelperChainDirect ? "direct" : "return";
       out["window"] = unsigned(i.selection.maxBlocksInFlight);
       out["source_order"] = folly::dynamic::array();
       for (auto index : i.selection.sourceOrder) out["source_order"].push_back(unsigned(index));
@@ -251,6 +254,13 @@ int executeMode4Repair(const Config &cfg, const std::string &command) {
         mode = meta::EcFileRepairMode::HelperChain;
       else
         return fail(Status(StatusCode::kInvalidArg, "repair_mode must be central, pipeline or helper"), 2);
+      if (!cfg.repair_delivery().empty() && cfg.repair_delivery() != "return" && cfg.repair_delivery() != "direct")
+        return fail(Status(StatusCode::kInvalidArg, "repair_delivery must be return or direct"), 2);
+      if (!cfg.repair_delivery().empty() && mode != meta::EcFileRepairMode::HelperChain)
+        return fail(Status(StatusCode::kInvalidArg, "repair_delivery requires helper strategy"), 2);
+      if (cfg.repair_delivery() == "direct") {
+        mode = meta::EcFileRepairMode::HelperChainDirect;
+      }
       auto order = repairSources(cfg.repair_source_order(), mask);
       if (!order) return fail(std::move(order.error()), 2);
       sources = *order;
@@ -269,7 +279,7 @@ int executeMode4Repair(const Config &cfg, const std::string &command) {
       // original immutable body, never a partially reconstructed request.
       if (!cfg.session_run_dir().empty() || !cfg.repair_stripe_decimal().empty() ||
           !cfg.repair_mask_decimal().empty() || !cfg.repair_mode().empty() || !cfg.repair_source_order().empty() ||
-          !cfg.repair_window_decimal().empty())
+          !cfg.repair_window_decimal().empty() || !cfg.repair_delivery().empty())
         return fail(Status(StatusCode::kInvalidArg, "resume/query/close-debt accept only the original repair run"), 2);
       auto old = EcTreeRepairJournal::resume(cfg.run_dir());
       if (!old) return fail(std::move(old.error()));

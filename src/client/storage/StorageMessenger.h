@@ -15,6 +15,7 @@
 #include "fbs/storage/EcGcDiscovery.h"
 #include "fbs/storage/EcGcRpc.h"
 #include "fbs/storage/EcHelper.h"
+#include "fbs/storage/EcHelperDirect.h"
 #include "fbs/storage/EcScopeControl.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "fbs/storage/EcTargetDiscovery.h"
@@ -153,6 +154,11 @@ class StorageMessenger {
                                             const net::UserRequestOptions *options = nullptr,
                                             serde::Timestamp *timestamp = nullptr,
                                             serde::RpcCallSizes *sizes = nullptr);
+  CoTryTask<EcHelperDirectHopRsp> executeEcHelperDirect(const net::Address &address,
+                                                      const EcHelperDirectHopReq &request,
+                                                      const net::UserRequestOptions *options = nullptr,
+                                                      serde::Timestamp *timestamp = nullptr,
+                                                      serde::RpcCallSizes *sizes = nullptr);
   CoTryTask<EcStageV2Rsp> beginEcStageV2(const net::Address &address,
                                          const EcBeginStageV2Req &request,
                                          const net::UserRequestOptions *options = nullptr,

@@ -151,6 +151,7 @@ class MetaClient {
   CoTryTask<EcFileRepairRsp> beginEcFileRepair(BeginEcFileRepairReq req);
   CoTryTask<EcFileRepairRsp> queryEcFileRepair(QueryEcFileRepairReq req);
   CoTryTask<EcFileRepairRsp> advanceEcFileRepair(AdvanceEcFileRepairReq req);
+  CoTryTask<EcFileRepairDirectRsp> prepareEcFileRepairDirect(PrepareEcFileRepairDirectReq req);
   CoTryTask<EcFileRepairRsp> closeEcFileRepairDebt(CloseEcFileRepairDebtReq req);
 
   CoTryTask<Inode> stat(const UserInfo &userInfo,
