@@ -2,6 +2,13 @@
 set -euo pipefail
 BUNDLE="${1:?Usage: fetch-fdb.sh BUNDLE_DIRECTORY}"
 [[ "$BUNDLE" == /* && "$BUNDLE" != / ]] || { echo "Use an absolute task directory" >&2; exit 1; }
+if (($# > 1)); then
+  [[ $# == 7 && "$2" == --container-fdb-cache && "$4" == --source && "$6" == --work ]] || {
+    echo 'Cache usage: fetch-fdb.sh BUNDLE --container-fdb-cache ABS --source ABS --work ABS' >&2; exit 2;
+  }
+  /usr/bin/python3 -I "$(dirname -- "${BASH_SOURCE[0]}")/prepare-fdb-cache.py" \
+    --bundle "$BUNDLE" --cache "$3" --source "$5" --work "$7"
+else
 mkdir -p "$BUNDLE"/{downloads,bin,lib,fdb-package}
 BUNDLE="$(realpath "$BUNDLE")"
 exec 9>"$BUNDLE/fdb-download.lock"
@@ -21,6 +28,7 @@ for role in clients server; do
   sha256sum --check "$package.sha256"
   dpkg-deb --extract "$package" "$BUNDLE/fdb-package"
 done
+fi
 install -m 755 "$BUNDLE/fdb-package/usr/sbin/fdbserver" "$BUNDLE/bin/fdbserver"
 install -m 755 "$BUNDLE/fdb-package/usr/bin/fdbcli" "$BUNDLE/bin/fdbcli"
 install -m 755 "$BUNDLE/fdb-package/usr/lib/libfdb_c.so" "$BUNDLE/lib/libfdb_c.so"

@@ -12,11 +12,17 @@ local_source=
 local_work=
 local_revision=
 local_container=false
+container_fdb_cache=
 usage() {
-    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs N] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA [--local-container-build-only]]; N=1|2|4 except explicit container builds' >&2
+    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs N] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA [--local-container-build-only [--container-fdb-cache ABS]]]; N=1|2|4 except explicit container builds' >&2
 }
 while (($#)); do
     case "$1" in
+        --container-fdb-cache)
+            if [[ -n "$container_fdb_cache" ]] || (($# < 2)) || [[ "$2" != /* ]]; then usage; exit 2; fi
+            container_fdb_cache="$2"
+            shift 2
+            ;;
         --local-container-build-only)
             if "$local_container"; then usage; exit 2; fi
             local_container=true
@@ -71,6 +77,7 @@ if "$local_container"; then
 elif [[ "$build_jobs" != 1 && "$build_jobs" != 2 && "$build_jobs" != 4 ]]; then
     usage; exit 2
 fi
+if [[ -n "$container_fdb_cache" ]] && ! "$local_container"; then usage; exit 2; fi
 # END ARGUMENT PARSER
 if "$local_mode"; then
     # No environment impersonation: the requested revision is checked against Git.
@@ -126,6 +133,7 @@ git rev-parse HEAD > "$work/provenance/source-head.txt"
 git submodule status --recursive | tee "$work/provenance/submodules.txt"
 sha256sum Cargo.lock src/storage/ec/Cargo.lock > "$work/provenance/cargo-locks.sha256"
 sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
+    scripts/ec/cluster/prepare-fdb-cache.py \
     patches/apply.sh patches/folly.patch patches/rocksdb.patch patches/rocksdb.patch.2 \
     cmake/AddCrate.cmake cmake/ApacheArrow.cmake cmake/Jemalloc.cmake \
     scripts/ec/ci/build-native.sh scripts/ec/ci/prepare-local-build.py scripts/ec/ci/run-core-tests.py \
@@ -298,7 +306,13 @@ export PKG_CONFIG_PATH="$dependency_prefix/lib/pkgconfig"
 export LD_LIBRARY_PATH="$dependency_prefix/lib"
 # END BUILD ENVIRONMENT
 
-bash "$source_root/scripts/ec/cluster/fetch-fdb.sh" "$work/fdb"
+# BEGIN FDB FETCH
+fdb_cache_args=()
+if [[ -n "$container_fdb_cache" ]]; then
+    fdb_cache_args=(--container-fdb-cache "$container_fdb_cache" --source "$source_root" --work "$work")
+fi
+bash "$source_root/scripts/ec/cluster/fetch-fdb.sh" "$work/fdb" "${fdb_cache_args[@]}"
+# END FDB FETCH
 # BEGIN FDB INSTALL
 if "$local_mode"; then
     install -d "$dependency_prefix/include/foundationdb" "$dependency_prefix/lib"
@@ -656,6 +670,9 @@ common = {'schema': 1, 'source': str(source), 'revision': revision,
 if local_container == 'true':
     common.update(build_only=True, filesystems=preflight['filesystems'],
                   container_resource_helper_sha256=sha(source / 'scripts/ec/ci/container-build-resources.py'))
+    fdb_cache = work / 'fdb/fdb-cache-provenance.json'
+    if fdb_cache.exists():
+        common['fdb_cache_provenance'] = {'path': str(fdb_cache), 'sha256': sha(fdb_cache)}
 record = dict(common, targets=list(paths), binaries={name: sha(path) for name, path in paths.items()},
               ec_regression_targets_requested=with_regression == 'true', lab_targets_requested=with_lab == 'true')
 path = work / 'provenance/native-build.json'
