@@ -9,6 +9,7 @@
 #include <memory>
 #include <random>
 
+#include "EcRpcObservation.h"
 #include "TargetSelection.h"
 #include "common/logging/LogHelper.h"
 #include "common/monitor/Recorder.h"
@@ -896,7 +897,29 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
                                                       uint32_t sendRetryTimes,
                                                       bool *dispatched,
                                                       bool allowTcp,
-                                                      bool tcpOnly) {
+                                                      bool tcpOnly,
+                                                      EcRpcObservation *observation) {
+  const auto observedMethod = [&] {
+    switch (requestCtx.methodType) {
+      case MethodType::readEcBlockV2:
+        return EcRpcMethod::Read;
+      case MethodType::beginEcStageV2:
+        return EcRpcMethod::Begin;
+      case MethodType::appendEcStageV2:
+        return EcRpcMethod::Append;
+      case MethodType::queryEcStageV2:
+        return EcRpcMethod::Query;
+      case MethodType::reconcileEcStageV2:
+        return EcRpcMethod::Reconcile;
+      case MethodType::sealEcStageV2:
+        return EcRpcMethod::Seal;
+      case MethodType::executeEcHelper:
+        return EcRpcMethod::Helper;
+      default:
+        return EcRpcMethod::Count;
+    }
+  };
+  EcRpcObservation::Scope rpcMetric(observation, observation ? observedMethod() : EcRpcMethod::Count);
   if (dispatched) *dispatched = false;
   monitor::ScopedLatencyWriter latencyWriter(request_latency, requestCtx.requestTagSet);
   monitor::ScopedCounterWriter inflightRequests(inflight_requests,
@@ -941,6 +964,9 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
       FAULT_INJECTION_POINT(requestCtx.debugFlags.injectClientError(),
                             makeError(StorageClientCode::kCommError),
                             (co_await std::invoke(Method, messenger, address, request, &options, &timestamp)));
+  // Inspect both successful and error Results. Missing/invalid timestamps are
+  // counted independently; outer success is not the EC business result.
+  rpcMetric.returned(bool(response), timestamp);
 
   XLOGF_IF(WARN,
            latencyWriter.getElapsedTime() > requestCtx.requestTimeout * 2,
@@ -2929,7 +2955,8 @@ CoTryTask<Response> StorageClientImpl::stageRequestV2(const WireReq &wire,
                                                               0,
                                                               dispatched,
                                                               true,
-                                                              control != nullptr);
+                                                              control != nullptr,
+                                                              control ? control->observation : nullptr);
   if (!response) {
     if (durable && *dispatched) co_return makeError(ecSealOutcomeUnknown(response.error()));
     // Native Waiter timeout and the outer coroutine timer have the same
@@ -3553,7 +3580,8 @@ CoTryTask<EcHelperHopResult> StorageClientImpl::executeEcHelper(EcHelperHopReq r
                                                                                                        0,
                                                                                                        nullptr,
                                                                                                        true,
-                                                                                                       true);
+                                                                                                       true,
+                                                                                                       control.observation);
   CO_RETURN_ON_ERROR(response);
   CO_RETURN_ON_ERROR(response->result);
   CO_RETURN_ON_ERROR(check());

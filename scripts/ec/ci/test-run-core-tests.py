@@ -3,6 +3,7 @@
 
 import copy
 import importlib.util
+import json
 from pathlib import Path
 import signal
 import tempfile
@@ -22,11 +23,11 @@ def xml(names):
             "declared_tests": str(len(names)), "declared_failures": "0", "declared_errors": "0"}
 
 
-def receipt(binary, output):
+def receipt(binary, output, cases=RUNNER.META_CASES, test_filter=RUNNER.META_FILTER):
     return {"status": "passed", "exitcode": 0, "bootstrap": "passed", "failures": [],
-            "selected": list(RUNNER.META_CASES), "test_results": xml(RUNNER.META_CASES),
-            "passed_tests": 7,
-            "commands": [{"argv": [str(binary), *RUNNER.flags(RUNNER.META_FILTER), *ending], "exitcode": 0}
+            "selected": list(cases), "test_results": xml(cases),
+            "passed_tests": len(cases),
+            "commands": [{"argv": [str(binary), *RUNNER.flags(test_filter), *ending], "exitcode": 0}
                          for ending in (["--gtest_list_tests"],
                                         ["--gtest_output=xml:" + str(output / "tests.xml")])],
             "server": {"exitcode_before_cleanup": None, "exitcode_after_cleanup": -15,
@@ -36,6 +37,74 @@ def receipt(binary, output):
 
 
 class TestCoreAcceptanceContract(unittest.TestCase):
+    def test_repair_driver_uses_exact_filter_and_restores_listing_hook(self):
+        # The external FDB owner is faked; exercise the real wrapper's argv,
+        # pre-dispatch selection, receipt/XML checks and hook restoration.
+        cases, test_filter, _ = RUNNER.selection("repair")
+        for invalid_listing in (False, True):
+            with self.subTest(invalid_listing=invalid_listing), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                source, build, fdb = work / "source", work / "build", work / "fdb"
+                output = work / "meta"
+                output.mkdir()
+                binary = build / "tests/test_meta"
+                names = RUNNER.META_CASES if invalid_listing else cases
+                listing = mock.Mock(return_value=[{"name": name, "disabled": False} for name in names])
+                common = SimpleNamespace(listed_tests=listing, xml_tests=lambda _: xml(cases),
+                                         sha256=lambda _: "a" * 64)
+                module = SimpleNamespace()
+                def child_main():
+                    argv = RUNNER.sys.argv
+                    self.assertEqual(argv[argv.index("--filter") + 1], test_filter)
+                    self.assertEqual(module.helpers(), common)
+                    common.listed_tests(output / "test-list.log")
+                    (output / "results.json").write_text(
+                        json.dumps(receipt(binary, output, cases, test_filter)), encoding="utf-8")
+                    return 0
+                module.main = child_main
+                original_argv = RUNNER.sys.argv
+                report = {}
+                with mock.patch.object(RUNNER, "load_module", return_value=module):
+                    if invalid_listing:
+                        with self.assertRaises(ValueError):
+                            RUNNER.run_meta(source, build, fdb, work, common, SimpleNamespace(received=[]),
+                                            report, cases, test_filter)
+                        self.assertFalse((output / "results.json").exists())
+                    else:
+                        RUNNER.run_meta(source, build, fdb, work, common, SimpleNamespace(received=[]),
+                                        report, cases, test_filter)
+                        self.assertEqual(report["meta"]["passed_tests"], 1)
+                        self.assertEqual(report["meta"]["status"], "passed")
+                self.assertIs(RUNNER.sys.argv, original_argv)
+                self.assertIs(common.listed_tests, listing)
+
+    def test_repair_profile_is_fixed_and_cannot_replace_core_evidence(self):
+        base = ["--source", "/source", "--build", "/build",
+                "--fdb-bin-dir", "/fdb", "--work", "/private/new"]
+        self.assertEqual(RUNNER.parser().parse_args(base).profile, "core")
+        self.assertEqual(RUNNER.parser().parse_args(base + ["--profile", "repair"]).profile, "repair")
+        cases, test_filter, fuse = RUNNER.selection("repair")
+        self.assertEqual(cases, ("TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",))
+        self.assertEqual(test_filter, cases[0])
+        self.assertEqual(fuse, ())
+        binary, output = Path("/build/tests/test_meta"), Path("/work/meta")
+        sample = receipt(binary, output, cases, test_filter)
+        RUNNER.check_meta_receipt(sample, binary, output, cases, test_filter)
+        with self.assertRaises(ValueError):
+            RUNNER.check_meta_receipt(sample, binary, output)
+        with self.assertRaises(ValueError):
+            RUNNER.check_meta_receipt(receipt(binary, output), binary, output, cases, test_filter)
+        for broken in ("filter", "skip", "unjoined"):
+            invalid = copy.deepcopy(sample)
+            if broken == "filter":
+                invalid["commands"][0]["argv"][1] = "--gtest_filter=TestEcFileNativeRepair.*"
+            elif broken == "skip":
+                invalid["test_results"]["cases"][0]["skipped"] = True
+            else:
+                invalid["server"]["cleanup"]["leader_reaped"] = False
+            with self.subTest(broken=broken), self.assertRaises(ValueError):
+                RUNNER.check_meta_receipt(invalid, binary, output, cases, test_filter)
+
     def test_fixed_sets_and_required_cli(self):
         self.assertEqual(len(set(RUNNER.META_CASES)), 7)
         self.assertEqual(len(set(RUNNER.FUSE_CASES)), 14)

@@ -4,8 +4,9 @@
 #include "fbs/storage/EcStageValidationV2.h"
 
 namespace hf3fs::client::ec {
-NativeEcBlockTransport::NativeEcBlockTransport(std::shared_ptr<storage::client::StorageClient> client)
-    : client_(std::move(client)) {}
+NativeEcBlockTransport::NativeEcBlockTransport(std::shared_ptr<storage::client::StorageClient> client,
+                                               storage::client::EcRpcObservation *observation)
+    : client_(std::move(client)), observation_(observation) {}
 CoTryTask<storage::EcReadBlockResultV2> NativeEcBlockTransport::read(storage::EcReadBlockV2Req request,
                                                                      EcReadControl control) {
   auto client = client_;
@@ -14,6 +15,7 @@ CoTryTask<storage::EcReadBlockResultV2> NativeEcBlockTransport::read(storage::Ec
   options.deadline = control.deadline;
   options.cancellation = control.cancellation;
   options.transport = storage::client::EcRequestControl::TransportPolicy::TcpOnly;
+  options.observation = observation_;
   // Keep our own fixed request for verification; the controlled RPC receives
   // its own value and owns it until ClientContext completion.
   auto result = co_await client->readEcBlockV2Controlled(request, std::move(options));

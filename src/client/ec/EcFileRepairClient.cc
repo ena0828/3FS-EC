@@ -26,8 +26,9 @@ Result<Void> active(EcStripeControl c) {
   if (std::chrono::steady_clock::now() >= c.deadline) return makeError(StorageClientCode::kTimeout);
   return Void{};
 }
-storage::client::EcRequestControl options(EcStripeControl c) {
-  return {c.deadline, c.cancellation, storage::client::EcRequestControl::TransportPolicy::TcpOnly};
+storage::client::EcRequestControl options(EcStripeControl c, EcRepairObservation *observation) {
+  return {c.deadline, c.cancellation, storage::client::EcRequestControl::TransportPolicy::TcpOnly,
+          observation ? &observation->storageRpc() : nullptr};
 }
 Result<VersionedChainId> route(hf3fs::client::ICommonMgmtdClient &mgmtd, const meta::EcV2PhysicalEndpoint &e) {
   const auto &p = e.placement;
@@ -188,7 +189,7 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
     CO_RETURN_ON_ERROR(q);
     EcRepairObservation::Scope readMetric(observation, EcRepairPoint::CopyRead);
     readMetric.noteInvocation();
-    auto value = co_await storage_->readEcBlockV2Controlled(*q, options(c));
+    auto value = co_await storage_->readEcBlockV2Controlled(*q, options(c, observation));
     CO_RETURN_ON_ERROR(value);
     CO_RETURN_ON_ERROR(validateEcReadBlockV2(*value, *q));
     readMetric.validated(value->payload.data.size());
@@ -208,7 +209,7 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
     invoked = true;
     EcRepairObservation::Scope beginMetric(observation, EcRepairPoint::CopyBegin);
     beginMetric.noteInvocation();
-    auto state = co_await storage_->beginEcStageV2Controlled(begin, options(c));
+    auto state = co_await storage_->beginEcStageV2Controlled(begin, options(c, observation));
     uint32_t prefix = 0;
     if (state) {
       CO_RETURN_ON_ERROR(validateEcStageStateV2(*state, begin.request, write.claims));
@@ -222,7 +223,7 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
     CO_RETURN_ON_ERROR(active(c));
     EcRepairObservation::Scope reconcileMetric(observation, EcRepairPoint::CopyReconcile);
     reconcileMetric.noteInvocation();
-    state = co_await storage_->reconcileEcStageV2Controlled({begin.request, write}, options(c));
+    state = co_await storage_->reconcileEcStageV2Controlled({begin.request, write}, options(c, observation));
     CO_RETURN_ON_ERROR(state);
     CO_RETURN_ON_ERROR(validateEcStageStateV2(*state, begin.request, write.claims));
     if (state->needsReconcile || state->pendingBlock || state->prefixBytes < prefix)
@@ -240,7 +241,7 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
         q.payload.data = data.substr(size_t(b) * kEcIntegrityBlockBytes, descriptor->blocks[b].validLength);
         EcRepairObservation::Scope appendMetric(observation, EcRepairPoint::CopyAppend);
         appendMetric.noteInvocation(q.payload.data.size());
-        auto added = co_await storage_->appendEcStageV2Controlled(std::move(q), options(c));
+        auto added = co_await storage_->appendEcStageV2Controlled(std::move(q), options(c, observation));
         CO_RETURN_ON_ERROR(added);
         CO_RETURN_ON_ERROR(validateEcStageStateV2(*added, begin.request, write.claims));
         if (added->needsReconcile || added->pendingBlock || added->state != 1 ||
@@ -251,7 +252,7 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
     CO_RETURN_ON_ERROR(active(c));
     EcRepairObservation::Scope sealMetric(observation, EcRepairPoint::CopySeal);
     sealMetric.noteInvocation();
-    auto sealed = co_await storage_->sealEcStageV2Controlled({begin.request, write}, options(c));
+    auto sealed = co_await storage_->sealEcStageV2Controlled({begin.request, write}, options(c, observation));
     CO_RETURN_ON_ERROR(sealed);
     CO_RETURN_ON_ERROR(validateEcReceiptV2(*sealed, begin.request, write.claims));
     CO_RETURN_ON_ERROR(active(c));

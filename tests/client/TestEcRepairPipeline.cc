@@ -484,5 +484,99 @@ TEST(TestEcRepairPipeline, ObservationSaturatesAndKeepsIndependentCallsSeparate)
   for (const auto &point : next.points) EXPECT_EQ(point.entered, 0);
 }
 
+TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOverflow) {
+  using storage::client::EcRpcMethod;
+  using storage::client::EcRpcObservation;
+  serde::Timestamp ts;
+  ts.clientCalled = 1000;
+  ts.clientSerialized = 1010;
+  ts.clientReceived = 1050;
+  ts.clientWaked = 1060;
+  // Deliberate cross-host offset: only each host's own sequence is relevant.
+  ts.serverReceived = 900000;
+  ts.serverWaked = 900005;
+  ts.serverProcessed = 900015;
+  ts.serverSerialized = 900020;
+  EcRpcObservation observation;
+  {
+    EcRpcObservation::Scope frame(&observation, EcRpcMethod::Read);
+    EXPECT_EQ(observation.snapshot().at(EcRpcMethod::Read).active, 1);
+    frame.returned(false, ts);  // A decoded outer error can carry valid times.
+  }
+  auto sample = observation.snapshot();
+  EXPECT_FALSE(sample.clockAnomaly);
+  EXPECT_FALSE(sample.overflow);
+  const auto &read = sample.at(EcRpcMethod::Read);
+  EXPECT_EQ(read.entered, 1);
+  EXPECT_EQ(read.finished, 1);
+  EXPECT_EQ(read.active, 0);
+  EXPECT_EQ(read.outerOk, 0);
+  EXPECT_EQ(read.outerError, 1);
+  EXPECT_EQ(read.client.valid, 1);
+  EXPECT_EQ(read.server.valid, 1);
+  EXPECT_EQ(read.client.spanNs, (std::array<uint64_t, 3>{10000, 40000, 10000}));
+  EXPECT_EQ(read.server.spanNs, (std::array<uint64_t, 3>{5000, 10000, 5000}));
+
+  {
+    EcRpcObservation::Scope frame(&observation, EcRpcMethod::Append);
+    frame.returned(false, serde::Timestamp{});  // Fault/no response is missing.
+  }
+  { EcRpcObservation::Scope localReject(&observation, EcRpcMethod::Append); }
+  sample = observation.snapshot();
+  const auto &append = sample.at(EcRpcMethod::Append);
+  EXPECT_EQ(append.outerError, 1);
+  EXPECT_EQ(append.withoutResult, 1);
+  EXPECT_EQ(append.client.missing, 2);
+  EXPECT_EQ(append.server.missing, 2);
+  EXPECT_EQ(append.client.valid, 0);
+  EXPECT_EQ(append.server.valid, 0);
+  EXPECT_EQ(append.client.spanNs, (std::array<uint64_t, 3>{}));
+
+  auto reversed = ts;
+  reversed.clientSerialized = ts.clientCalled - 1;
+  {
+    EcRpcObservation::Scope frame(&observation, EcRpcMethod::Query);
+    frame.returned(true, reversed);
+  }
+  sample = observation.snapshot();
+  EXPECT_TRUE(sample.clockAnomaly);
+  EXPECT_EQ(sample.at(EcRpcMethod::Query).client.reversed, 1);
+  EXPECT_EQ(sample.at(EcRpcMethod::Query).client.valid, 0);
+  EXPECT_EQ(sample.at(EcRpcMethod::Query).server.valid, 1);
+
+  auto huge = ts;
+  huge.serverSerialized = std::numeric_limits<int64_t>::max();
+  {
+    EcRpcObservation::Scope frame(&observation, EcRpcMethod::Seal);
+    frame.returned(true, huge);
+  }
+  sample = observation.snapshot();
+  EXPECT_TRUE(sample.overflow);
+  EXPECT_EQ(sample.at(EcRpcMethod::Seal).server.outOfRange, 1);
+  EXPECT_EQ(sample.at(EcRpcMethod::Seal).server.valid, 0);
+  EXPECT_EQ(sample.at(EcRpcMethod::Seal).client.valid, 1);
+
+  // Each duration is representable; only their aggregate saturates.
+  EcRpcObservation summed;
+  auto longSpan = ts;
+  longSpan.clientCalled = 1;
+  longSpan.clientSerialized = int64_t(1 + std::numeric_limits<uint64_t>::max() / 1000);
+  longSpan.clientReceived = longSpan.clientSerialized;
+  longSpan.clientWaked = longSpan.clientSerialized;
+  for (int i = 0; i != 2; ++i) {
+    EcRpcObservation::Scope frame(&summed, EcRpcMethod::Helper);
+    frame.returned(true, longSpan);
+  }
+  const auto sum = summed.snapshot();
+  EXPECT_TRUE(sum.overflow);
+  EXPECT_EQ(sum.at(EcRpcMethod::Helper).client.valid, 2);
+  EXPECT_EQ(sum.at(EcRpcMethod::Helper).client.outOfRange, 0);
+  EXPECT_EQ(sum.at(EcRpcMethod::Helper).client.spanNs[0], std::numeric_limits<uint64_t>::max());
+  EXPECT_EQ(sum.at(EcRpcMethod::Helper).client.spanNs[1], 0);  // Valid equal timestamps.
+  EXPECT_EQ(sum.at(EcRpcMethod::Helper).active, 0);
+  EcRpcObservation nextCall;
+  for (const auto &method : nextCall.snapshot().methods) EXPECT_EQ(method.entered, 0);
+}
+
 }  // namespace
 }  // namespace hf3fs::client::ec

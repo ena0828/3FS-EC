@@ -63,8 +63,9 @@ Result<Void> stage(const EcRepairFragment &expected,
   }
   return Void{};
 }
-storage::client::EcRequestControl options(EcRepairControl control) {
-  return {control.deadline, control.cancellation, storage::client::EcRequestControl::TransportPolicy::TcpOnly};
+storage::client::EcRequestControl options(EcRepairControl control, EcRepairObservation *observation) {
+  return {control.deadline, control.cancellation, storage::client::EcRequestControl::TransportPolicy::TcpOnly,
+          observation ? &observation->storageRpc() : nullptr};
 }
 }  // namespace
 
@@ -123,7 +124,7 @@ CoTryTask<void> NativeEcRepairTransport::begin(Plan plan, uint8_t target, EcRepa
   if (auto active = check(plan, control); !active) co_return failure(active.error());
   const auto request = bindings_.targets[target];
   metric.noteInvocation();
-  auto result = co_await client_->beginEcStageV2Controlled(request, options(control));
+  auto result = co_await client_->beginEcStageV2Controlled(request, options(control, observation_));
   uint32_t observedPrefix = 0;
   if (!result) {
     auto error = preserveOutcome(target, result.error());
@@ -141,7 +142,7 @@ CoTryTask<void> NativeEcRepairTransport::begin(Plan plan, uint8_t target, EcRepa
     if (auto active = check(plan, control); !active) co_return failure(active.error());
     EcQueryStageV2Req query{request.request, request.grant};
     metric.noteInvocation();
-    auto observed = co_await client_->queryEcStageV2Controlled(std::move(query), options(control));
+    auto observed = co_await client_->queryEcStageV2Controlled(std::move(query), options(control, observation_));
     if (observed) {
       auto valid = validateEcStageStateV2(*observed, request.request, request.grant.claims);
       if (!valid) co_return failure(valid.error());
@@ -153,7 +154,7 @@ CoTryTask<void> NativeEcRepairTransport::begin(Plan plan, uint8_t target, EcRepa
     if (auto active = check(plan, control); !active) co_return failure(active.error());
     EcReconcileStageV2Req reconcile{request.request, request.grant};
     metric.noteInvocation();
-    result = co_await client_->reconcileEcStageV2Controlled(std::move(reconcile), options(control));
+    result = co_await client_->reconcileEcStageV2Controlled(std::move(reconcile), options(control, observation_));
     if (!result) co_return failure(result.error());
     auto valid = validateEcStageStateV2(*result, request.request, request.grant.claims);
     if (!valid) co_return failure(valid.error());
@@ -191,7 +192,7 @@ CoTryTask<std::string> NativeEcRepairTransport::read(Plan plan,
                              bindings_.sources[source].request.vChainId,
                              block);
   CO_RETURN_ON_ERROR(request);
-  NativeEcBlockTransport transport(client_);
+  NativeEcBlockTransport transport(client_, observation_ ? &observation_->storageRpc() : nullptr);
   metric.noteInvocation();
   auto result = co_await transport.read(std::move(*request), {control.deadline, control.cancellation});
   CO_RETURN_ON_ERROR(result);
@@ -229,7 +230,7 @@ CoTryTask<void> NativeEcRepairTransport::append(Plan plan,
   request.blockIndex = block;
   request.payload.data = std::move(data);
   metric.noteInvocation(request.payload.data.size());
-  auto result = co_await client_->appendEcStageV2Controlled(std::move(request), options(control));
+  auto result = co_await client_->appendEcStageV2Controlled(std::move(request), options(control, observation_));
   if (!result) co_return failure(result.error());
   if (!check(plan, control))
     co_return failure(
@@ -257,7 +258,7 @@ CoTryTask<storage::EcFragmentReceiptV2> NativeEcRepairTransport::seal(Plan plan,
   request.request = bindings_.targets[target].request;
   request.grant = bindings_.targets[target].grant;
   metric.noteInvocation();
-  auto result = co_await client_->sealEcStageV2Controlled(std::move(request), options(control));
+  auto result = co_await client_->sealEcStageV2Controlled(std::move(request), options(control, observation_));
   if (!result) co_return failure(result.error());
   if (!check(plan, control))
     co_return failure(
@@ -297,7 +298,8 @@ CoTryTask<storage::EcRepairBlock> NativeEcRepairTransport::helperBlock(Plan plan
   request.deadlineUnixMillis = wall + std::min<int64_t>(60000, remaining.count());
   storage::client::EcRequestControl options{control.deadline,
                                             control.cancellation,
-                                            storage::client::EcRequestControl::TransportPolicy::TcpOnly};
+                                            storage::client::EcRequestControl::TransportPolicy::TcpOnly,
+                                            observation_ ? &observation_->storageRpc() : nullptr};
   metric.noteInvocation();
   auto response = co_await client_->executeEcHelper(std::move(request), options);
   CO_RETURN_ON_ERROR(response);

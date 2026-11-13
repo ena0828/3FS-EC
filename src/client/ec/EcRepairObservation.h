@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <limits>
 
+#include "client/storage/EcRpcObservation.h"
+
 namespace hf3fs::client::ec {
 
 // Local, opt-in observations, never serialized into an operation journal.
@@ -42,6 +44,7 @@ struct EcRepairSample {
   bool cancellationRequested = false, deadlineExpired = false;
   bool overflow = false, clockAnomaly = false;
   std::array<EcRepairPointSample, size_t(EcRepairPoint::Count)> points{};
+  storage::client::EcRpcSample storageRpc;
   const EcRepairPointSample &at(EcRepairPoint point) const { return points[size_t(point)]; }
 };
 
@@ -57,6 +60,7 @@ class EcRepairObservation {
   };
   std::array<Counter, size_t(EcRepairPoint::Count)> counters_{};
   std::atomic<bool> overflow_{false}, clockAnomaly_{false};
+  storage::client::EcRpcObservation storageRpc_;
   Clock::time_point start_ = Clock::now();
 
   uint64_t add(std::atomic<uint64_t> &value, uint64_t amount) noexcept {
@@ -86,6 +90,8 @@ class EcRepairObservation {
   }
 
  public:
+  storage::client::EcRpcObservation &storageRpc() noexcept { return storageRpc_; }
+
   class Scope {
     EcRepairObservation *owner_;
     Counter *counter_ = nullptr;
@@ -130,8 +136,9 @@ class EcRepairObservation {
     EcRepairSample out;
     out.available = true;
     out.elapsedNs = elapsed(start_);
-    out.overflow = overflow_.load(std::memory_order_relaxed);
-    out.clockAnomaly = clockAnomaly_.load(std::memory_order_relaxed);
+    out.storageRpc = storageRpc_.snapshot();
+    out.overflow = overflow_.load(std::memory_order_relaxed) || out.storageRpc.overflow;
+    out.clockAnomaly = clockAnomaly_.load(std::memory_order_relaxed) || out.storageRpc.clockAnomaly;
     for (size_t i = 0; i != counters_.size(); ++i) {
       const auto &c = counters_[i];
       out.points[i] = {c.entered.load(std::memory_order_relaxed), c.finished.load(std::memory_order_relaxed),

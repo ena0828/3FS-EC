@@ -111,6 +111,7 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_EQ(stopped.metrics.priorJournalSequence, priorSequence);
     EXPECT_EQ(journal->latest()->sequence, priorSequence);
     for (const auto &point : stopped.metrics.points) EXPECT_EQ(point.entered, 0);
+    for (const auto &method : stopped.metrics.storageRpc.methods) EXPECT_EQ(method.entered, 0);
     auto completed = client->repair(*journal, ctl(), true);
     ASSERT_FALSE(completed.failure);
     ASSERT_TRUE(completed.revalidated);
@@ -145,6 +146,32 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
       EXPECT_EQ(point.active, 0);
       EXPECT_EQ(point.entered, point.finished);
     }
+    using storage::client::EcRpcMethod;
+    const auto &rpc = metrics.storageRpc;
+    EXPECT_FALSE(rpc.overflow);
+    EXPECT_FALSE(rpc.clockAnomaly);
+    // Real TCP first-hop samples, including healthy-copy and the selected
+    // repair's NativeEcBlockTransport adapter. No downstream Helper claims.
+    EXPECT_EQ(rpc.at(EcRpcMethod::Read).entered, mode == EcFileRepairMode::HelperChain ? 10 : 20);
+    EXPECT_EQ(rpc.at(EcRpcMethod::Begin).entered, 12);
+    EXPECT_EQ(rpc.at(EcRpcMethod::Append).entered, 12);
+    EXPECT_EQ(rpc.at(EcRpcMethod::Seal).entered, 12);
+    EXPECT_EQ(rpc.at(EcRpcMethod::Helper).entered, mode == EcFileRepairMode::HelperChain ? 1 : 0);
+    for (size_t i = 0; i != rpc.methods.size(); ++i) {
+      const auto &method = rpc.methods[i];
+      EXPECT_EQ(method.active, 0);
+      EXPECT_EQ(method.finished, method.entered);
+      EXPECT_EQ(method.outerOk, method.entered);
+      EXPECT_EQ(method.outerError, 0);
+      EXPECT_EQ(method.withoutResult, 0);
+      EXPECT_EQ(method.client.valid, method.entered);
+      EXPECT_EQ(method.server.valid, method.entered);
+      EXPECT_EQ(method.client.missing + method.client.reversed + method.client.outOfRange, 0);
+      EXPECT_EQ(method.server.missing + method.server.reversed + method.server.outOfRange, 0);
+      RecordProperty(fmt::format("repair_rpc_{}_{}", uint8_t(mode), storage::client::kEcRpcMethodNames[i]),
+                     fmt::format("frames={},client_valid={},server_valid={},active={}", method.entered,
+                                 method.client.valid, method.server.valid, method.active));
+    }
     const auto &child = completed.progress.record->child;
     EXPECT_EQ(child.targetGeneration, child.source.generation);
     EXPECT_GT(child.targetRevision, child.source.revision);
@@ -155,6 +182,7 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_EQ(replay.metrics.at(EcRepairPoint::Prepare).entered, 0);
     EXPECT_EQ(replay.metrics.at(EcRepairPoint::SelectedRepair).entered, 0);
     EXPECT_EQ(replay.metrics.at(EcRepairPoint::NativeAppend).apiInvocations, 0);
+    for (const auto &method : replay.metrics.storageRpc.methods) EXPECT_EQ(method.entered, 0);
     EXPECT_EQ(serde::serialize(replay.progress.record->child.publishedRoot), serde::serialize(child.publishedRoot));
     auto acquire = request<AcquireEcTreeReadReq>();
     acquire.intent.session = open.session;
@@ -198,6 +226,7 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_EQ(closed.metrics.action, 2);
     EXPECT_EQ(closed.metrics.at(EcRepairPoint::CloseDebt).succeeded, 1);
     EXPECT_EQ(closed.metrics.at(EcRepairPoint::SelectedRepair).entered, 0);
+    for (const auto &method : closed.metrics.storageRpc.methods) EXPECT_EQ(method.entered, 0);
     auto historical = client->query(*journal, ctl());
     ASSERT_FALSE(historical.failure);
     EXPECT_FALSE(historical.metrics.available); // Default remains opt-out, including replay.

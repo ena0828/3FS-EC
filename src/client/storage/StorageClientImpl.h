@@ -197,7 +197,8 @@ class StorageClientImpl : public StorageClient {
                                      uint32_t sendRetryTimes = 1,
                                      bool *dispatched = nullptr,
                                      bool allowTcp = false,
-                                     bool tcpOnly = false);
+                                     bool tcpOnly = false,
+                                     EcRpcObservation *observation = nullptr);
 
   template <typename Op, typename BatchReq, typename BatchRsp, auto Method>
   CoTryTask<BatchRsp> sendBatchRequest(StorageMessenger &messenger,

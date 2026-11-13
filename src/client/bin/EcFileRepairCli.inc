@@ -56,6 +56,39 @@ std::string repairMetricsJson(const EcRepairSample &m) {
         "submitted_payload_bytes_decimal", std::to_string(p.submittedPayloadBytes))(
         "validated_returned_payload_bytes_decimal", std::to_string(p.validatedReturnedPayloadBytes));
   }
+  const auto clockSample = [](const storage::client::EcRpcClockSample &sample,
+                              const std::array<const char *, 3> &names) {
+    auto value = folly::dynamic::object("valid_samples_decimal", std::to_string(sample.valid))(
+        "missing_or_nonpositive_samples_decimal", std::to_string(sample.missing))(
+        "reversed_samples_decimal", std::to_string(sample.reversed))(
+        "out_of_range_samples_decimal", std::to_string(sample.outOfRange));
+    for (size_t i = 0; i != names.size(); ++i) value[names[i]] = std::to_string(sample.spanNs[i]);
+    return value;
+  };
+  auto rpc = folly::dynamic::object("schema", 1)("coverage", "controlled_client_to_storage_first_hop")(
+      "clock", "per_host_utc_microseconds_checked_then_ns")("missing_samples_are_censored", true)(
+      "frame_counts_are_not_dispatch_counts", true)("outer_ok_is_not_business_success", true)(
+      "spans_overlap_and_are_not_total_wall_time", true)(
+      "server_received_to_waked_scope", "outer_decode_complete_to_payload_decode_start")(
+      "helper_downstream", "included_in_outer_server_span_not_individually_observed")(
+      "overflow", m.storageRpc.overflow)("clock_anomaly", m.storageRpc.clockAnomaly)(
+      "wire_bytes", nullptr)("encoded_bytes", nullptr)("transport_retry_attempts", nullptr)(
+      "complete_server_queue", nullptr)("methods", folly::dynamic::object());
+  for (size_t n = 0; n != m.storageRpc.methods.size(); ++n) {
+    const auto &sample = m.storageRpc.methods[n];
+    rpc["methods"][storage::client::kEcRpcMethodNames[n]] = folly::dynamic::object(
+        "frame_entered_decimal", std::to_string(sample.entered))(
+        "frame_finished_decimal", std::to_string(sample.finished))(
+        "frame_active_decimal", std::to_string(sample.active))(
+        "outer_ok_decimal", std::to_string(sample.outerOk))(
+        "outer_error_decimal", std::to_string(sample.outerError))(
+        "without_outer_result_decimal", std::to_string(sample.withoutResult))(
+        "client", clockSample(sample.client, {"called_to_serialized_ns_decimal", "serialized_to_received_ns_decimal",
+                                             "received_to_waked_ns_decimal"}))(
+        "server", clockSample(sample.server, {"received_to_waked_ns_decimal", "waked_to_processed_ns_decimal",
+                                             "processed_to_serialized_ns_decimal"}));
+  }
+  out["storage_rpc"] = std::move(rpc);
   return folly::toJson(out);
 }
 int executeMode4Repair(const Config &cfg, const std::string &command) {
