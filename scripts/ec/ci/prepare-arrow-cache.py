@@ -12,7 +12,7 @@ import stat
 ARROW_REVISION = 'b7d2f7ffca66c868bd2fce5b3749c6caa002a7f0'
 VERSIONS_SHA256 = '2738d2dba6dfe4630ebec78f41e7f667f33c20a6f529f229da5cdebd6578f10a'
 # Fail closed if this reviewed component/options closure changes.
-PROJECT_CMAKE_SHA256 = '8602b71163982272a9a6d7daaad9846a1d32d5b8debc989ec547437d89bea94b'
+PROJECT_CMAKE_SHA256 = 'a300d451d536fbd432eef327fed5fbf5c0236f79693a5f4e5fd81cc2a04f282a'
 MAX_ARCHIVE_BYTES = 1024 ** 3
 ARCHIVES = (
     {'name': 'BOOST', 'version': '1.81.0', 'filename': 'boost-1.81.0.tar.gz', 'sha256': '9e0ffae35528c35f90468997bc8d99500bf179cbae355415a89a600c38e13574', 'extension': '.tar.gz'},

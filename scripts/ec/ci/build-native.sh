@@ -14,13 +14,25 @@ local_revision=
 local_container=false
 container_fdb_cache=
 container_arrow_cache=
+container_arrow_source_pack=
+container_arrow_source_pack_sha256=
 container_libfuse_bundle=
 container_libfuse_bundle_sha256=
 usage() {
-    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs N] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA [--local-container-build-only [--container-fdb-cache ABS] [--container-arrow-cache ABS] [--container-libfuse-bundle ABS --container-libfuse-bundle-sha256 SHA256]]]; N=1|2|4 except explicit container builds' >&2
+    echo 'Usage: build-native.sh [--backend scalar|isal] [--build-jobs N] [--with-lab-targets] [--with-ec-regression-targets] [--local-source ABS --local-work ABS --local-revision FULL_SHA [--local-container-build-only [--container-fdb-cache ABS] [--container-arrow-cache ABS] [--container-arrow-source-pack ABS --container-arrow-source-pack-sha256 SHA256] [--container-libfuse-bundle ABS --container-libfuse-bundle-sha256 SHA256]]]; N=1|2|4 except explicit container builds' >&2
 }
 while (($#)); do
     case "$1" in
+        --container-arrow-source-pack)
+            if [[ -n "$container_arrow_source_pack" ]] || (($# < 2)) || [[ "$2" != /* ]]; then usage; exit 2; fi
+            container_arrow_source_pack="$2"
+            shift 2
+            ;;
+        --container-arrow-source-pack-sha256)
+            if [[ -n "$container_arrow_source_pack_sha256" ]] || (($# < 2)) || [[ ! "$2" =~ ^[a-f0-9]{64}$ ]]; then usage; exit 2; fi
+            container_arrow_source_pack_sha256="$2"
+            shift 2
+            ;;
         --container-arrow-cache)
             if [[ -n "$container_arrow_cache" ]] || (($# < 2)) || [[ "$2" != /* ]]; then usage; exit 2; fi
             container_arrow_cache="$2"
@@ -99,6 +111,9 @@ if [[ -n "$container_fdb_cache$container_arrow_cache" ]] && ! "$local_container"
 if [[ -n "$container_libfuse_bundle$container_libfuse_bundle_sha256" ]]; then
     "$local_container" && [[ -n "$container_libfuse_bundle" && -n "$container_libfuse_bundle_sha256" ]] || { usage; exit 2; }
 fi
+if [[ -n "$container_arrow_source_pack$container_arrow_source_pack_sha256" ]]; then
+    "$local_container" && [[ -n "$container_arrow_source_pack" && -n "$container_arrow_source_pack_sha256" ]] || { usage; exit 2; }
+fi
 # END ARGUMENT PARSER
 if "$local_mode"; then
     # No environment impersonation: the requested revision is checked against Git.
@@ -160,6 +175,7 @@ sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
     scripts/ec/ci/build-native.sh scripts/ec/ci/prepare-local-build.py scripts/ec/ci/run-core-tests.py \
     scripts/ec/ci/container-build-resources.py \
     scripts/ec/ci/prepare-libfuse-cache.py scripts/ec/ci/prepare-arrow-cache.py \
+    scripts/ec/ci/prepare-arrow-source-cache.py \
     scripts/ec/ci/prepare-isal.py scripts/ec/reference/downloads.json cmake/EcCodecBackend.cmake \
     .github/workflows/ec-hosted-native.yml .github/workflows/ec-hosted-system.yml \
     .github/workflows/ec-hosted-target-control.yml \
@@ -327,6 +343,17 @@ export LIBCLANG_PATH=/usr/lib/llvm-18/lib
 export PKG_CONFIG_PATH="$dependency_prefix/lib/pkgconfig"
 export LD_LIBRARY_PATH="$dependency_prefix/lib"
 # END BUILD ENVIRONMENT
+
+# BEGIN ARROW SOURCE CACHE
+arrow_source_cmake_args=()
+if [[ -n "$container_arrow_source_pack" ]]; then
+    /usr/bin/python3 -I "$source_root/scripts/ec/ci/prepare-arrow-source-cache.py" \
+        --source "$source_root" --work "$work" --pack "$container_arrow_source_pack" \
+        --pack-sha256 "$container_arrow_source_pack_sha256"
+    sha256sum "$work/provenance/arrow-source-cache.json" > "$work/provenance/arrow-source-cache-proof.sha256"
+    arrow_source_cmake_args=("-DHF3FS_ARROW_SOURCE_DIR=$work/build/src/apache-arrow-cpp")
+fi
+# END ARROW SOURCE CACHE
 
 # BEGIN ARROW CACHE
 if [[ -n "$container_arrow_cache" ]]; then
@@ -587,7 +614,7 @@ cmake -S "$source_root" -B "$work/build" -G Ninja \
     "-DCMAKE_SHARED_LINKER_FLAGS=-L$dependency_prefix/lib" "${local_cmake_args[@]}" \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DHF3FS_EXTERNAL_BUILD_JOBS=1 "${backend_cmake_args[@]}" \
     "-DCMAKE_JOB_POOLS=ec_compile=$build_jobs;ec_link=1" \
-    -DCMAKE_JOB_POOL_COMPILE=ec_compile -DCMAKE_JOB_POOL_LINK=ec_link
+    -DCMAKE_JOB_POOL_COMPILE=ec_compile -DCMAKE_JOB_POOL_LINK=ec_link "${arrow_source_cmake_args[@]}"
 build_targets=(test_meta test_fuse_ec)
 if "$with_regression"; then
     build_targets+=(test_storage_store test_storage_service test_client)
@@ -618,19 +645,22 @@ sha256sum --check "$work/provenance/private-libraries.sha256"
 if [[ -n "$container_arrow_cache" ]]; then
     sha256sum --check "$work/provenance/arrow-cache-proof.sha256"
 fi
+if [[ -n "$container_arrow_source_pack" ]]; then
+    sha256sum --check "$work/provenance/arrow-source-cache-proof.sha256"
+fi
 sha256sum "$work/build/CMakeCache.txt" "$work/build/compile_commands.json" \
     "$work/build/tests/test_meta" "$work/build/tests/test_fuse_ec"
 du -sh -- "$work/build" "$work/cargo-target" "$work/cargo-home" "$work/fdb"
 # Keep the existing eight-binary lab receipt contract; additionally bind every
 # requested test target and the selected backend in an always-written receipt.
-python3 - "$source_root" "$work" "$backend" "$with_lab" "$with_regression" "$source_revision" "$local_mode" "$dependency_prefix" "$local_container" "$container_arrow_cache" <<'PY'
+python3 - "$source_root" "$work" "$backend" "$with_lab" "$with_regression" "$source_revision" "$local_mode" "$dependency_prefix" "$local_container" "$container_arrow_cache" "$container_arrow_source_pack" <<'PY'
 from pathlib import Path
 import hashlib
 import json
 import os
 import sys
 source, work = map(Path, sys.argv[1:3])
-backend, with_lab, with_regression, revision, local_mode, dependency_prefix, local_container, container_arrow_cache = sys.argv[3:]
+backend, with_lab, with_regression, revision, local_mode, dependency_prefix, local_container, container_arrow_cache, container_arrow_source_pack = sys.argv[3:]
 lab_names = ('storage_main', 'mgmtd_main', 'meta_main', 'admin_cli', 'ec_stripe_cli',
              'ec_file_cli', 'hf3fs_fuse_main', 'ec_mount_read_probe')
 tests = ['test_meta', 'test_fuse_ec']
@@ -736,6 +766,16 @@ if container_arrow_cache:
     spec.loader.exec_module(arrow_cache)
     common['arrow_cache_provenance'] = arrow_cache.verify_preparation(
         source, work, Path(container_arrow_cache), verify_upstream=True)
+if container_arrow_source_pack:
+    if local_container != 'true':
+        raise SystemExit('Arrow source pack is container-build-only')
+    if ('HF3FS_ARROW_SOURCE_DIR:PATH=' + str(work / 'build/src/apache-arrow-cpp') + '\n') not in cache:
+        raise SystemExit('Configured Arrow source differs from the prepared snapshot')
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('arrow_source_cache', source / 'scripts/ec/ci/prepare-arrow-source-cache.py')
+    arrow_source_cache = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(arrow_source_cache)
+    common['arrow_source_cache_provenance'] = arrow_source_cache.verify_preparation(source, work)
 record = dict(common, targets=list(paths), binaries={name: sha(path) for name, path in paths.items()},
               ec_regression_targets_requested=with_regression == 'true', lab_targets_requested=with_lab == 'true')
 path = work / 'provenance/native-build.json'

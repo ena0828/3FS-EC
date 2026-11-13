@@ -36,6 +36,9 @@ spec.loader.exec_module(container)
 spec = importlib.util.spec_from_file_location('arrow_cache', HERE / 'prepare-arrow-cache.py')
 arrow_cache = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(arrow_cache)
+spec = importlib.util.spec_from_file_location('arrow_source_cache', HERE / 'prepare-arrow-source-cache.py')
+arrow_source = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(arrow_source)
 
 
 def bash_path():
@@ -89,10 +92,30 @@ class BuildInputs(unittest.TestCase):
                    '--local-work', '/fixed/native', '--local-revision', 'a' * 40,
                    '--container-libfuse-bundle', '/fixed/fuse.bundle',
                    '--container-libfuse-bundle-sha256', 'b' * 64], 'scalar false false 1')]
+        container_args = ['--local-container-build-only', '--local-source', '/fixed/source',
+                          '--local-work', '/fixed/native', '--local-revision', 'a' * 40]
+        cases.append((container_args + ['--container-arrow-source-pack', '/cache/arrow.pack',
+                      '--container-arrow-source-pack-sha256', 'b' * 64], 'scalar false false 1'))
         for argv, expected in cases:
             with self.subTest(argv=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
                 self.assertEqual((result.returncode, result.stdout.strip()), (0, expected), result.stderr)
+        bad_pack = [[], ['--container-arrow-source-pack', '/cache/arrow.pack'],
+                    ['--container-arrow-source-pack-sha256', 'b' * 64],
+                    ['--container-arrow-source-pack', 'relative', '--container-arrow-source-pack-sha256', 'b' * 64],
+                    ['--container-arrow-source-pack', '/cache/a', '--container-arrow-source-pack-sha256', 'B' * 64],
+                    ['--container-arrow-source-pack', '/cache/a', '--container-arrow-source-pack', '/cache/b',
+                     '--container-arrow-source-pack-sha256', 'b' * 64],
+                    ['--container-arrow-source-pack', '/cache/a', '--container-arrow-source-pack-sha256', 'b' * 64,
+                     '--container-arrow-source-pack-sha256', 'b' * 64]]
+        for partial in bad_pack[1:]:
+            result = subprocess.run([bash, '-s', '--', *container_args, *partial], input=parser,
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 2)
+        for prefix in ([], ['--local-source', '/s', '--local-work', '/w', '--local-revision', 'a' * 40]):
+            result = subprocess.run([bash, '-s', '--', *prefix, '--container-arrow-source-pack', '/c/a',
+                '--container-arrow-source-pack-sha256', 'b' * 64], input=parser, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 2)
         for argv in (['--container-arrow-cache'], ['--container-arrow-cache', '/cache'],
                      ['--local-source', '/a', '--local-work', '/b', '--local-revision', 'a' * 40,
                       '--container-arrow-cache', '/cache'],
@@ -299,6 +322,7 @@ source_root=/fixed/source
 work=/fixed/work
 gcc_toolchain=/fixed/gcc12
 backend_cmake_args=(-DHF3FS_EC_BACKEND=isal -DHF3FS_EC_ISAL_ROOT=/fixed/isal)
+arrow_source_cmake_args=()
 cmake() {
     printf '%s\\n' "$@" >> "$CAPTURE/cmake-argv"
     printf '%s\\n' END >> "$CAPTURE/cmake-argv"
@@ -551,6 +575,8 @@ rustup() { record "rustup $*"; }
                 for name in names:
                     put(work / 'build' / ('tests' if name.startswith('test_') else 'bin') / name)
                 cache = 'HF3FS_EC_BACKEND:STRING=' + backend + '\n'
+                if container_mode:
+                    cache += 'HF3FS_ARROW_SOURCE_DIR:PATH=' + str(work / 'build/src/apache-arrow-cpp') + '\n'
                 isal_prefix = work / 'isal-prefix'
                 provider = isal_prefix / 'usr/lib/x86_64-linux-gnu/libisal.so.2.0.31'
                 if backend == 'isal':
@@ -580,6 +606,12 @@ rustup() { record "rustup $*"; }
                     "    assert verify_upstream and cache == work.parent / 'arrow-input'\n"
                     "    proof = work / 'provenance/arrow-cache.json'\n"
                     "    return {'path': str(proof), 'sha256': hashlib.sha256(proof.read_bytes()).hexdigest()}\n").encode())
+                source_proof = put(work / 'provenance/arrow-source-cache.json', b'fixture source snapshot')
+                put(source / 'scripts/ec/ci/prepare-arrow-source-cache.py', ("from pathlib import Path\n"
+                    "import hashlib\n"
+                    "def verify_preparation(source, work):\n"
+                    "    proof = work / 'provenance/arrow-source-cache.json'\n"
+                    "    return {'path': str(proof), 'sha256': hashlib.sha256(proof.read_bytes()).hexdigest()}\n").encode())
                 original_digest, original_resolve = hashlib.file_digest, Path.resolve
                 def digest(stream, algorithm):
                     if Path(stream.name) == provider:
@@ -602,7 +634,8 @@ rustup() { record "rustup $*"; }
                         rows.append('libisal.so.2 => ' + str(provider) + ' (0x3)')
                     return '\n'.join(rows)
                 argv = ['-', str(source), str(work), backend, 'true', 'true', 'a' * 40,
-                        str(mode).lower(), str(deps), str(container_mode).lower(), str(root / 'arrow-input') if container_mode else '']
+                        str(mode).lower(), str(deps), str(container_mode).lower(), str(root / 'arrow-input') if container_mode else '',
+                        str(root / 'arrow-source.pack') if container_mode else '']
                 with mock.patch('sys.argv', argv), mock.patch.object(hashlib, 'file_digest', side_effect=digest), \
                         mock.patch.object(Path, 'resolve', resolve), \
                         mock.patch.object(subprocess, 'check_output', side_effect=ldd), \
@@ -627,10 +660,14 @@ rustup() { record "rustup $*"; }
                     self.assertEqual(lab['libfuse_cache_provenance'], native['libfuse_cache_provenance'])
                     self.assertEqual(native['arrow_cache_provenance'], {'path': str(arrow_proof), 'sha256': sha(arrow_proof)})
                     self.assertEqual(lab['arrow_cache_provenance'], native['arrow_cache_provenance'])
+                    self.assertEqual(native['arrow_source_cache_provenance'],
+                                     {'path': str(source_proof), 'sha256': sha(source_proof)})
+                    self.assertEqual(lab['arrow_source_cache_provenance'], native['arrow_source_cache_provenance'])
                 else:
                     self.assertNotIn('build_only', native)
                     self.assertNotIn('libfuse_cache_provenance', native)
                     self.assertNotIn('arrow_cache_provenance', native)
+                    self.assertNotIn('arrow_source_cache_provenance', native)
                 self.assertEqual(lab['native_build_receipt_sha256'], sha(work / 'provenance/native-build.json'))
                 self.assertEqual(calls, [None, '/usr/local/lib'] * 13 if mode else [])
 
@@ -842,6 +879,262 @@ raise SystemExit(int(os.environ['ARROW_TEST_EXIT']))
                 self.assertEqual(observed['argv'], argv[1:])
                 self.assertFalse(observed['unexpected'])
                 self.assertEqual(observed['export'], observed['old_export'])
+
+
+class ArrowSourceCache(unittest.TestCase):
+    @contextmanager
+    def fixture(self, variant='complete'):
+        git_exe = shutil.which('git')
+        if git_exe is None:
+            self.skipTest('Native Git required; no WSL fallback')
+        with tempfile.TemporaryDirectory(prefix='arrow source ') as folder:
+            root = Path(folder).resolve()
+            source, work, cache, repository = [root / x for x in ('source', 'work', 'cache', 'repository')]
+            for directory in (source, work, cache, repository, work / 'provenance'):
+                directory.mkdir()
+            def git(*args, data=None):
+                result = subprocess.run([git_exe, '-c', 'core.autocrlf=false', '-C', str(repository), *args],
+                                        input=data, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+                return result.stdout
+            git('init', '-q')
+            git('config', 'user.name', 'Offline fixture')
+            git('config', 'user.email', 'fixture@example.invalid')
+            (repository / 'parent-only').write_bytes(b'not part of snapshot\n')
+            git('add', '.')
+            git('commit', '-qm', 'parent')
+            parent = git('rev-parse', 'HEAD').decode().strip()
+            git('rm', 'parent-only')
+            versions = repository / 'cpp/thirdparty/versions.txt'
+            versions.parent.mkdir(parents=True)
+            versions.write_bytes(b'fixed fixture versions\n')
+            (repository / 'cpp/CMakeLists.txt').write_bytes(b'# no build invoked\n')
+            git('add', '.')
+            gitlinks = {'testing': parent}
+            git('update-index', '--add', '--cacheinfo', '160000,' + parent + ',testing')
+            git('commit', '-qm', 'snapshot with original parent and external gitlink')
+            revision = git('rev-parse', 'HEAD').decode().strip()
+            tree = git('rev-parse', 'HEAD^{tree}').decode().strip()
+            objects = {revision, tree}
+            for entry in filter(None, git('ls-tree', '-r', '-t', '-z', revision).split(b'\0')):
+                mode, kind, oid = entry.split(b'\t')[0].decode().split()
+                if mode != '160000':
+                    objects.add(oid)
+            if variant == 'missing':
+                objects.remove(git('rev-parse', 'HEAD:cpp/thirdparty/versions.txt').decode().strip())
+            elif variant == 'extra':
+                objects.add(git('hash-object', '-w', '--stdin', data=b'unrelated object').decode().strip())
+            pack = cache / 'snapshot.pack'
+            pack.write_bytes(git('pack-objects', '--stdout', '--threads=1',
+                                 data=('\n'.join(sorted(objects)) + '\n').encode()))
+            if variant == 'corrupt':
+                pack.write_bytes(pack.read_bytes()[:-1])
+            real_fstat = os.fstat
+            def posix_fstat(fd):
+                value = real_fstat(fd)
+                if os.name == 'nt':
+                    path_info = pack.lstat()
+                    if (value.st_dev, value.st_ino) == (path_info.st_dev, path_info.st_ino):
+                        return SimpleNamespace(**{key: getattr(value, key) for key in
+                            ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_mode', 'st_nlink')},
+                            st_ctime_ns=path_info.st_ctime_ns)
+                return value
+            with mock.patch.multiple(arrow_source, GIT=git_exe, REVISION=revision, EXPECTED_TREE=tree,
+                                     GITLINKS=gitlinks, VERSIONS_SHA256=hashlib.sha256(versions.read_bytes()).hexdigest()), \
+                    mock.patch.object(os, 'fstat', posix_fstat):
+                yield source, work, pack, hashlib.sha256(pack.read_bytes()).hexdigest(), parent
+
+    def test_real_pack_preserves_original_commit_shallow_boundary_and_build_outputs(self):
+        with self.fixture() as (source, work, pack, sha, parent):
+            bad_config = pack.parent / 'bad-config'
+            bad_config.write_text('not valid Git configuration\n')
+            polluted = {'GIT_DIR': str(pack.parent / 'wrong.git'), 'GIT_WORK_TREE': str(pack.parent),
+                        'GIT_OBJECT_DIRECTORY': str(pack.parent / 'wrong-objects'),
+                        'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'true',
+                        'GIT_CONFIG_GLOBAL': str(bad_config), 'GIT_CONFIG_SYSTEM': str(bad_config),
+                        'GIT_DEFAULT_HASH': 'sha256'}
+            with mock.patch.dict(os.environ, polluted):
+                record = arrow_source.prepare(source, work, pack, sha)
+            checkout = Path(record['checkout'])
+            result = subprocess.run([arrow_source.GIT, '-C', str(checkout), 'cat-file', '-e', parent], capture_output=True)
+            self.assertNotEqual(result.returncode, 0)  # It really has no ancestor object.
+            original = subprocess.check_output([arrow_source.GIT, '-C', str(checkout), 'cat-file', '-p', record['revision']])
+            self.assertIn(('parent ' + parent + '\n').encode(), original)  # Parent was not rewritten.
+            self.assertEqual((checkout / '.git/shallow').read_text(), record['revision'] + '\n')
+            self.assertEqual((checkout / 'cpp/thirdparty/versions.txt').read_bytes(), b'fixed fixture versions\n')
+            self.assertFalse(record['history_verified'])
+            self.assertFalse(record['network_fetch_performed'])
+            (checkout / 'cpp/build/release').mkdir(parents=True)
+            (checkout / 'cpp/build/release/generated.a').write_bytes(b'untracked output allowed')
+            with mock.patch.dict(os.environ, polluted):
+                verified = arrow_source.verify_preparation(source, work)
+            self.assertEqual(verified['sha256'], arrow_source.digest(work / 'provenance/arrow-source-cache.json'))
+            (checkout / 'cpp/thirdparty/versions.txt').write_bytes(b'changed tracked input\n')
+            with self.assertRaises(ValueError):
+                arrow_source.verify_preparation(source, work)
+
+    def test_real_pack_missing_corrupt_extra_or_wrong_identity_has_no_success_proof(self):
+        for variant in ('missing', 'corrupt', 'extra', 'wrong-tree', 'wrong-sha'):
+            with self.subTest(variant=variant), self.fixture(variant) as (source, work, pack, sha, parent):
+                identity = '0' * 40 if variant == 'wrong-tree' else arrow_source.EXPECTED_TREE
+                with mock.patch.object(arrow_source, 'EXPECTED_TREE', identity):
+                    with self.assertRaises(ValueError):
+                        arrow_source.prepare(source, work, pack, '0' * 64 if variant == 'wrong-sha' else sha)
+                self.assertFalse((work / 'provenance/arrow-source-cache.json').exists())
+                with self.assertRaises((ValueError, FileExistsError)):
+                    arrow_source.prepare(source, work, pack, sha)  # No adoption of partial prep.
+
+    def test_source_pack_paths_links_and_postbuild_proof_mutation_are_rejected(self):
+        with self.fixture() as (source, work, pack, sha, parent):
+            os.link(pack, pack.with_suffix('.second'))
+            with self.assertRaises(ValueError):
+                arrow_source.prepare(source, work, pack, sha)
+            self.assertFalse((work / 'provenance/arrow-source-cache.json').exists())
+        with self.fixture() as (source, work, pack, sha, parent):
+            with self.assertRaises(ValueError):
+                arrow_source.prepare(work, work, pack, sha)
+            record = arrow_source.prepare(source, work, pack, sha)
+            proof = work / 'provenance/arrow-source-cache.json'
+            record['history_verified'] = True
+            proof.write_text(json.dumps(record))
+            with self.assertRaises(ValueError):
+                arrow_source.verify_preparation(source, work)
+
+    def test_actual_cmake_selects_only_explicit_prepared_source_and_preserves_commands(self):
+        cmake = shutil.which('cmake')
+        if cmake is None:
+            self.skipTest('Native CMake required; no WSL fallback')
+        actual = (HERE.parents[2] / 'cmake/ApacheArrow.cmake').read_text()
+        with tempfile.TemporaryDirectory(prefix='arrow cmake ') as folder:
+            root = Path(folder).resolve()
+            checkout = root / 'src/apache-arrow-cpp'
+            (checkout / '.git').mkdir(parents=True)
+            (checkout / 'cpp').mkdir()
+            (checkout / 'cpp/CMakeLists.txt').write_text('# fixture')
+            parser = root / 'capture.cmake'
+            functions = '\n'.join('function(' + name + ')\nendfunction()' for name in
+                ('add_library', 'include', 'add_dependencies', 'set_target_properties',
+                 'target_include_directories', 'target_link_libraries'))
+            parser.write_text('cmake_minimum_required(VERSION 3.16)\n' + functions + '''
+function(ExternalProject_Add)
+  file(WRITE "${OUTPUT}" "")
+  math(EXPR last "${ARGC} - 1")
+  foreach(i RANGE 0 ${last})
+    file(APPEND "${OUTPUT}" "${ARGV${i}}\\n")
+  endforeach()
+endfunction()
+set(CMAKE_CURRENT_BINARY_DIR "${ROOT}")
+''' + actual)
+            options = []
+            for prepared in (False, True):
+                output = root / ('prepared' if prepared else 'network')
+                argv = [cmake, '-DROOT=' + root.as_posix(), '-DOUTPUT=' + output.as_posix()]
+                if prepared:
+                    argv += ['-DHF3FS_ARROW_SOURCE_DIR=' + checkout.as_posix()]
+                result = subprocess.run([*argv, '-P', str(parser)], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                options.append(output.read_text().splitlines())
+            network, prepared = options
+            start = network.index('GIT_REPOSITORY')
+            self.assertEqual(network[start:], ['GIT_REPOSITORY', 'https://github.com/apache/arrow.git',
+                'GIT_TAG', 'b7d2f7ffca66c868bd2fce5b3749c6caa002a7f0', 'GIT_SHALLOW', 'ON',
+                'GIT_PROGRESS', 'ON', 'GIT_SUBMODULES', ''])
+            self.assertEqual(prepared[prepared.index('SOURCE_DIR'):],
+                             ['SOURCE_DIR', checkout.as_posix(), 'DOWNLOAD_COMMAND', '',
+                              'UPDATE_COMMAND', '', 'GIT_SUBMODULES', ''])
+            self.assertEqual(network[:start], prepared[:prepared.index('SOURCE_DIR')])
+            result = subprocess.run([cmake, '-DROOT=' + root.as_posix(), '-DOUTPUT=' + str(root / 'bad'),
+                '-DHF3FS_ARROW_SOURCE_DIR=' + root.as_posix(), '-P', str(parser)], capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            # Use the installed real ExternalProject module as well: a token
+            # stub alone cannot prove that an empty option's SET bit survives.
+            # LANGUAGES NONE only configures/generates; no make, download or
+            # compiler command is invoked. true is a placeholder make program.
+            make = (Path(os.environ.get('ProgramFiles', 'C:/Program Files')) / 'Git/usr/bin/true.exe'
+                    if os.name == 'nt' else Path(shutil.which('true')))
+            project = root / 'project'
+            project.mkdir()
+            (project / 'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.16)
+project(ArrowSourceContract LANGUAGES NONE)
+''' + actual + '''
+foreach(key GIT_SUBMODULES DOWNLOAD_COMMAND UPDATE_COMMAND)
+  get_property(is_set TARGET apache-arrow-cpp PROPERTY _EP_${key} SET)
+  get_property(value TARGET apache-arrow-cpp PROPERTY _EP_${key})
+  file(WRITE "${CMAKE_BINARY_DIR}/${key}.txt" "${is_set}|${value}")
+endforeach()
+''')
+            for mode in ('network', 'prepared'):
+                output = root / ('actual-' + mode)
+                argv = [cmake, '-S', str(project), '-B', str(output), '-G', 'Unix Makefiles',
+                        '-DCMAKE_MAKE_PROGRAM=' + make.as_posix()]
+                if mode == 'prepared':
+                    ready = output / 'src/apache-arrow-cpp'
+                    (ready / '.git').mkdir(parents=True)
+                    (ready / 'cpp').mkdir()
+                    (ready / 'cpp/CMakeLists.txt').write_text('# fixture')
+                    argv += ['-DHF3FS_ARROW_SOURCE_DIR=' + ready.as_posix()]
+                result = subprocess.run(argv, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((output / 'GIT_SUBMODULES.txt').read_text(), '1|')
+                if mode == 'prepared':
+                    self.assertEqual((output / 'DOWNLOAD_COMMAND.txt').read_text(), '1|')
+                    self.assertEqual((output / 'UPDATE_COMMAND.txt').read_text(), '1|')
+                    self.assertFalse(list(output.rglob('*-gitclone.cmake')))
+                else:
+                    clone, = output.rglob('*-gitclone.cmake')
+                    self.assertIn('set(init_submodules FALSE)', clone.read_text())
+
+    def test_actual_source_prepare_branch_forwards_only_verified_path_and_stops_on_failure(self):
+        bash = bash_path()
+        if bash is None:
+            self.skipTest('Native Bash unavailable; no WSL fallback')
+        text = SCRIPT.read_text()
+        prepare = text.split('# BEGIN ARROW SOURCE CACHE\n', 1)[1].split('# END ARROW SOURCE CACHE', 1)[0]
+        prepare = prepare.replace('/usr/bin/python3 ', 'python_helper ')
+        build = text.split('# BEGIN REQUESTED BUILD\n', 1)[1].split('# END REQUESTED BUILD', 1)[0]
+        for enabled, error in ((False, 0), (True, 0), (True, 37)):
+            with self.subTest(enabled=enabled, error=error), tempfile.TemporaryDirectory(prefix='arrow branch ') as folder:
+                root = Path(folder).resolve()
+                (root / 'work/provenance').mkdir(parents=True)
+                prefix = '''set -euo pipefail
+source_root=/fixed/source
+work="$CAPTURE/work"
+local_mode=true
+dependency_prefix="$work/deps"
+gcc_toolchain=/fixed/gcc12
+backend_cmake_args=(-DHF3FS_EC_BACKEND=scalar)
+build_jobs=1
+with_lab=false
+with_regression=false
+python_helper() {
+  printf '%s\\n' "$@" > "$CAPTURE/helper.args"
+  if [[ "$FAIL" != 0 ]]; then return "$FAIL"; fi
+  printf '{}\\n' > "$work/provenance/arrow-source-cache.json"
+}
+python3() { cat >/dev/null; }
+cmake() { printf '%s\\n' "$@" >> "$CAPTURE/cmake.args"; }
+'''
+                flags = 'container_arrow_source_pack=' + shlex.quote('/cache/source.pack' if enabled else '') + '\n'
+                flags += 'container_arrow_source_pack_sha256=' + 'b' * 64 + '\n'
+                environment = dict(os.environ, CAPTURE=root.as_posix(), FAIL=str(error))
+                result = subprocess.run([bash, '-s'], input=prefix + flags + prepare + '\n' + build,
+                                        env=environment, text=True, capture_output=True)
+                self.assertEqual(result.returncode, error, result.stderr)
+                captured = root / 'cmake.args'
+                if error:
+                    self.assertFalse(captured.exists())
+                    self.assertFalse((root / 'work/provenance/arrow-source-cache-proof.sha256').exists())
+                    continue
+                args = captured.read_text().splitlines()
+                expected = '-DHF3FS_ARROW_SOURCE_DIR=' + root.as_posix() + '/work/build/src/apache-arrow-cpp'
+                self.assertEqual(expected in args, enabled)
+                if enabled:
+                    self.assertEqual((root / 'helper.args').read_text().splitlines(), [
+                        '-I', '/fixed/source/scripts/ec/ci/prepare-arrow-source-cache.py', '--source', '/fixed/source',
+                        '--work', root.as_posix() + '/work', '--pack', '/cache/source.pack', '--pack-sha256', 'b' * 64])
+                    self.assertTrue((root / 'work/provenance/arrow-source-cache-proof.sha256').is_file())
+                else:
+                    self.assertFalse((root / 'helper.args').exists())
 
 
 class ArrowCache(unittest.TestCase):
