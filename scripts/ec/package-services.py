@@ -132,7 +132,8 @@ def main():
 
     if args.ec_file_mount:
         for name in ("prepare-fuse-file.py", "prepare-fuse-read.py", "generate.py", "native_v2_config.py",
-                     "mode4-mount-acceptance.py", "mode4-usrbio-acceptance.py", "fuse-read-acceptance.py"):
+                     "mode4-mount-acceptance.py", "mode4-usrbio-acceptance.py", "fuse-read-acceptance.py",
+                     "mode4-lifecycle-acceptance.py"):
             script = Path(__file__).with_name("cluster") / name
             if not script.is_file():
                 raise RuntimeError(f"Missing mode4 preparation source: {script}; integrate the mount candidate first")

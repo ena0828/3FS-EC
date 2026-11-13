@@ -2,6 +2,12 @@
 # One fresh, disposable GitHub-hosted runner; no cache, service or mount here.
 set -euo pipefail
 umask 077
+with_lab=false
+if [[ "${1:-}" == --with-lab-targets && "$#" == 1 ]]; then
+    with_lab=true
+elif (($#)); then
+    echo 'Usage: build-native.sh [--with-lab-targets]' >&2; exit 2
+fi
 
 [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_OS:-}" == Linux ]] || {
     echo "This entry point requires a fresh Linux GitHub-hosted job" >&2; exit 2;
@@ -161,6 +167,10 @@ cmake -S "$source_root" -B "$work/build" -G Ninja \
     -DFOLLY_CXX_FLAGS=-g0 -DSHUFFLE_METHOD=g++11 -DENABLE_FUSE_APPLICATION=ON \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DHF3FS_EXTERNAL_BUILD_JOBS=1
 cmake --build "$work/build" --parallel 1 --target test_meta test_fuse_ec
+if "$with_lab"; then
+    cmake --build "$work/build" --parallel 1 --target storage_main mgmtd_main meta_main admin_cli \
+        ec_stripe_cli ec_file_cli hf3fs_fuse_main ec_mount_read_probe
+fi
 [[ "$(git -C "$work/build/src/apache-arrow-cpp" rev-parse HEAD)" == b7d2f7ffca66c868bd2fce5b3749c6caa002a7f0 ]]
 printf 'Arrow actual checkout: '
 git -C "$work/build/src/apache-arrow-cpp" rev-parse HEAD
@@ -169,4 +179,28 @@ git diff --exit-code HEAD --ignore-submodules=all
 sha256sum "$work/build/CMakeCache.txt" "$work/build/compile_commands.json" \
     "$work/build/tests/test_meta" "$work/build/tests/test_fuse_ec"
 du -sh -- "$work/build" "$work/cargo-target" "$work/cargo-home" "$work/fdb"
-printf 'Built only test_meta and test_fuse_ec; acceptance and actual mounts are separate.\n'
+if "$with_lab"; then
+    python3 - "$source_root" "$work" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import os
+import sys
+source, work = map(Path, sys.argv[1:])
+names = ('storage_main', 'mgmtd_main', 'meta_main', 'admin_cli', 'ec_stripe_cli',
+         'ec_file_cli', 'hf3fs_fuse_main', 'ec_mount_read_probe')
+def sha(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+record = {'schema': 1, 'source': str(source), 'revision': os.environ['GITHUB_SHA'],
+          'build': str(work / 'build'), 'targets': list(names),
+          'binaries': {name: sha(work / 'build/bin' / name) for name in names},
+          'build_script_sha256': sha(source / 'scripts/ec/ci/build-native.sh'),
+          'acceptance_executed': False}
+with (work / 'provenance/lab-build.json').open('x') as out:
+    json.dump(record, out, indent=2)
+    out.write('\n')
+print('lab-build receipt sha256=' + sha(work / 'provenance/lab-build.json'))
+PY
+fi
+printf 'Requested build targets completed; acceptance and actual mounts are separate.\n'

@@ -1,15 +1,33 @@
-name: EC hosted native core validation
+name: EC hosted native file acceptance
 
 on:
   push:
     branches: [feat/ec-distributed]
     paths:
       - .github/workflows/ec-hosted-native.yml
-      - scripts/ec/ci/build-native.sh
-      - scripts/ec/ci/run-core-tests.py
+      - scripts/ec/**
+      - src/**
+      - tests/**
+      - cmake/**
+      - configs/**
+      - patches/**
+      - third_party/**
+      - benchmarks/**/CMakeLists.txt
+      - CMakeLists.txt
+      - Cargo.toml
+      - Cargo.lock
+      - .gitmodules
+      - '!**/*.md'
+      - '!**/*.rst'
+      - '!**/README*'
+      - '!**/docs/**'
 
 permissions:
   contents: read
+
+concurrency:
+  group: ec-hosted-native-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   native:
@@ -26,13 +44,27 @@ jobs:
           lfs: false
           persist-credentials: false
 
-      - name: Prepare dependencies and build the two native test targets
+      - name: Record the API job start and admission timing
+        timeout-minutes: 2
+        shell: bash
+        run: python3 -B scripts/ec/ci/job-budget.py record
+
+      - name: Check acceptance gates and Linux directory descriptors before building
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          python3 -B scripts/ec/ci/test-run-core-tests.py -v
+          python3 -B scripts/ec/ci/test-run-file-lab.py -v
+          python3 -B scripts/ec/test-mode4-lifecycle-acceptance.py -v
+          python3 -B scripts/ec/cluster/test-portable-experiments.py -v
+
+      - name: Build core tests and the eight native file-lab programs
         timeout-minutes: 240
         shell: bash
-        run: bash scripts/ec/ci/build-native.sh
+        run: bash scripts/ec/ci/build-native.sh --with-lab-targets
 
       - name: Run private FDB native cases and FUSE component tests
-        # The job's 350-minute limit also applies; this is not extra time.
+        # All steps share the 350-minute job cap; these are not additive budgets.
         timeout-minutes: 95
         shell: bash
         run: |
@@ -50,3 +82,16 @@ jobs:
             --build "$RUNNER_TEMP/ec-native/build" \
             --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
             --work "$RUNNER_TEMP/ec-native/acceptance"
+
+      - name: Run file CLI and same-state FUSE remount acceptance
+        # Admission needs at least 50 estimated minutes left. This 45-minute cap is
+        # an infrastructure limit, never evidence of orderly business cleanup.
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          python3 -B scripts/ec/ci/job-budget.py check
+          exec python3 -B scripts/ec/ci/run-file-lab.py \
+            --source "$GITHUB_WORKSPACE" \
+            --build "$RUNNER_TEMP/ec-native/build" \
+            --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
+            --core-record "$RUNNER_TEMP/ec-native/acceptance/results.json"
