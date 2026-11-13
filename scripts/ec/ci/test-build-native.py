@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small offline checks; no native build, package extraction or network request."""
 import ast
+from contextlib import contextmanager
 import copy
 import hashlib
 import importlib.util
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import shlex
 import subprocess
 import sys
@@ -30,6 +32,10 @@ spec.loader.exec_module(local)
 spec = importlib.util.spec_from_file_location('container_resources', HERE / 'container-build-resources.py')
 container = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(container)
+
+spec = importlib.util.spec_from_file_location('arrow_cache', HERE / 'prepare-arrow-cache.py')
+arrow_cache = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(arrow_cache)
 
 
 def bash_path():
@@ -78,13 +84,23 @@ class BuildInputs(unittest.TestCase):
                    '--container-fdb-cache', '/fixed/cache'], 'scalar false false 1'),
                  (['--local-container-build-only', '--local-source', '/fixed/source',
                    '--local-work', '/fixed/native', '--local-revision', 'a' * 40,
+                   '--container-arrow-cache', '/fixed/arrow'], 'scalar false false 1'),
+                 (['--local-container-build-only', '--local-source', '/fixed/source',
+                   '--local-work', '/fixed/native', '--local-revision', 'a' * 40,
                    '--container-libfuse-bundle', '/fixed/fuse.bundle',
                    '--container-libfuse-bundle-sha256', 'b' * 64], 'scalar false false 1')]
         for argv, expected in cases:
             with self.subTest(argv=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
                 self.assertEqual((result.returncode, result.stdout.strip()), (0, expected), result.stderr)
-        for argv in (['--backend'], ['--backend', 'avx'], ['--backend=isal'], ['extra'],
+        for argv in (['--container-arrow-cache'], ['--container-arrow-cache', '/cache'],
+                     ['--local-source', '/a', '--local-work', '/b', '--local-revision', 'a' * 40,
+                      '--container-arrow-cache', '/cache'],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-arrow-cache', 'relative'],
+                     ['--local-container-build-only', '--local-source', '/a', '--local-work', '/b',
+                      '--local-revision', 'a' * 40, '--container-arrow-cache', '/a', '--container-arrow-cache', '/b'],
+                     ['--backend'], ['--backend', 'avx'], ['--backend=isal'], ['extra'],
                      ['--backend', 'scalar', '--backend', 'isal'],
                      ['--with-lab-targets', '--with-lab-targets'],
                      ['--with-ec-regression-targets', '--with-ec-regression-targets'],
@@ -555,6 +571,15 @@ rustup() { record "rustup $*"; }
                     b'{"tools":{},"filesystems":[{"path":"/private/work","filesystem":"xfs"}]}')
                 fuse_cache = put(work / 'provenance/libfuse-cache.json',
                                  b'{"status":"fixed-libfuse-source-prepared","build_executed":false}')
+                arrow_proof = put(work / 'provenance/arrow-cache.json', b'fixture preparation')
+                # The actual receipt writer must call verification before emitting
+                # either receipt. The helper's real filesystem checks are tested below.
+                put(source / 'scripts/ec/ci/prepare-arrow-cache.py', ("from pathlib import Path\n"
+                    "import hashlib\n"
+                    "def verify_preparation(source, work, cache, *, verify_upstream):\n"
+                    "    assert verify_upstream and cache == work.parent / 'arrow-input'\n"
+                    "    proof = work / 'provenance/arrow-cache.json'\n"
+                    "    return {'path': str(proof), 'sha256': hashlib.sha256(proof.read_bytes()).hexdigest()}\n").encode())
                 original_digest, original_resolve = hashlib.file_digest, Path.resolve
                 def digest(stream, algorithm):
                     if Path(stream.name) == provider:
@@ -577,7 +602,7 @@ rustup() { record "rustup $*"; }
                         rows.append('libisal.so.2 => ' + str(provider) + ' (0x3)')
                     return '\n'.join(rows)
                 argv = ['-', str(source), str(work), backend, 'true', 'true', 'a' * 40,
-                        str(mode).lower(), str(deps), str(container_mode).lower()]
+                        str(mode).lower(), str(deps), str(container_mode).lower(), str(root / 'arrow-input') if container_mode else '']
                 with mock.patch('sys.argv', argv), mock.patch.object(hashlib, 'file_digest', side_effect=digest), \
                         mock.patch.object(Path, 'resolve', resolve), \
                         mock.patch.object(subprocess, 'check_output', side_effect=ldd), \
@@ -600,9 +625,12 @@ rustup() { record "rustup $*"; }
                     self.assertEqual(native['filesystems'][0]['filesystem'], 'xfs')
                     self.assertEqual(native['libfuse_cache_provenance'], {'path': str(fuse_cache), 'sha256': sha(fuse_cache)})
                     self.assertEqual(lab['libfuse_cache_provenance'], native['libfuse_cache_provenance'])
+                    self.assertEqual(native['arrow_cache_provenance'], {'path': str(arrow_proof), 'sha256': sha(arrow_proof)})
+                    self.assertEqual(lab['arrow_cache_provenance'], native['arrow_cache_provenance'])
                 else:
                     self.assertNotIn('build_only', native)
                     self.assertNotIn('libfuse_cache_provenance', native)
+                    self.assertNotIn('arrow_cache_provenance', native)
                 self.assertEqual(lab['native_build_receipt_sha256'], sha(work / 'provenance/native-build.json'))
                 self.assertEqual(calls, [None, '/usr/local/lib'] * 13 if mode else [])
 
@@ -814,6 +842,160 @@ raise SystemExit(int(os.environ['ARROW_TEST_EXIT']))
                 self.assertEqual(observed['argv'], argv[1:])
                 self.assertFalse(observed['unexpected'])
                 self.assertEqual(observed['export'], observed['old_export'])
+
+
+class ArrowCache(unittest.TestCase):
+    @contextmanager
+    def fixture(self):
+        # Synthetic small bytes substitute only the locked archive contents.
+        # No real upstream download, extraction or compiler is invoked.
+        with tempfile.TemporaryDirectory(prefix='arrow cache ') as folder:
+            root = Path(folder).resolve()
+            source, work, cache = (root / name for name in ('source', 'work', 'cache'))
+            for directory in (source, work, cache, work / 'provenance', source / 'cmake'):
+                directory.mkdir()
+            (source / 'cmake/ApacheArrow.cmake').write_bytes((HERE.parents[2] / 'cmake/ApacheArrow.cmake').read_bytes())
+            versions = b'synthetic fixed version table\n'
+            table = work / 'build/src/apache-arrow-cpp/cpp/thirdparty/versions.txt'
+            table.parent.mkdir(parents=True)
+            table.write_bytes(versions)
+            specs = []
+            for original in arrow_cache.ARCHIVES:
+                data = ('synthetic archive ' + original['name']).encode()
+                spec = dict(original, sha256=hashlib.sha256(data).hexdigest())
+                (cache / (spec['sha256'] + spec['extension'])).write_bytes(data)
+                specs.append(spec)
+            original_fstat = os.fstat
+            def posix_fstat(fd):
+                info = original_fstat(fd)
+                if os.name == 'nt':
+                    # Windows Python lstat ctime is creation-time while fstat
+                    # exposes change-time. Normalize only that platform field;
+                    # inode, size, mode, link count, mtime and real bytes remain.
+                    for spec in specs:
+                        candidate = cache / (spec['sha256'] + spec['extension'])
+                        if candidate.exists():
+                            path_info = candidate.lstat()
+                            if (info.st_dev, info.st_ino) == (path_info.st_dev, path_info.st_ino):
+                                return SimpleNamespace(**{name: getattr(info, name) for name in
+                                    ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_mode', 'st_nlink')},
+                                    st_ctime_ns=path_info.st_ctime_ns)
+                return info
+            with mock.patch.object(arrow_cache, 'ARCHIVES', tuple(specs)), \
+                    mock.patch.object(arrow_cache, 'VERSIONS_SHA256', hashlib.sha256(versions).hexdigest()), \
+                    mock.patch.object(os, 'fstat', posix_fstat):
+                yield source, work, cache, specs
+
+    def test_complete_private_copies_and_postbuild_proof_use_fixed_inputs(self):
+        with self.fixture() as (source, work, cache, specs):
+            record = arrow_cache.prepare(source, work, cache)
+            self.assertEqual(len(record['archives']), 7)
+            self.assertFalse(record['network_fetch_performed'])
+            self.assertFalse(record['build_executed'])
+            urls = (work / 'arrow-cache/urls.nul').read_bytes().split(b'\0')
+            self.assertEqual(len(urls), 8)
+            self.assertEqual(urls[-1], b'')
+            for spec, item, url in zip(specs, record['archives'], urls):
+                copied = Path(item['path'])
+                self.assertEqual(hashlib.sha256(copied.read_bytes()).hexdigest(), spec['sha256'])
+                self.assertEqual(url.decode(), copied.as_uri())
+                self.assertIn('%20', item['url'])  # The actual private path contains a space.
+                (cache / (spec['sha256'] + spec['extension'])).write_bytes(b'changed original after copy')
+            # Consumers verify and use only the exclusive private copies.
+            proof = arrow_cache.verify_preparation(source, work, cache, verify_upstream=True)
+            self.assertEqual(proof['archive_count'], 7)
+            self.assertEqual(proof['sha256'], hashlib.sha256((work / 'provenance/arrow-cache.json').read_bytes()).hexdigest())
+            with self.assertRaises(FileExistsError):
+                arrow_cache.prepare(source, work, cache)
+
+    def test_missing_corrupt_and_output_failure_never_publish_success_or_resume(self):
+        for failure in ('missing', 'corrupt', 'output'):
+            with self.subTest(failure=failure), self.fixture() as (source, work, cache, specs):
+                item = cache / (specs[2]['sha256'] + specs[2]['extension'])
+                if failure == 'missing':
+                    item.unlink()
+                elif failure == 'corrupt':
+                    item.write_bytes(b'wrong content')
+                    item.with_suffix('.sha256').write_text(hashlib.sha256(item.read_bytes()).hexdigest())
+                original_open = Path.open
+                def opened(path, *args, **kwargs):
+                    if failure == 'output' and path == work / 'arrow-cache' / specs[2]['filename']:
+                        raise OSError('controlled output failure')
+                    return original_open(path, *args, **kwargs)
+                with mock.patch.object(Path, 'open', opened), self.assertRaises((ValueError, OSError)):
+                    arrow_cache.prepare(source, work, cache)
+                self.assertFalse((work / 'provenance/arrow-cache.json').exists())
+                with self.assertRaises(FileExistsError):
+                    arrow_cache.prepare(source, work, cache)
+
+    def test_hardlink_symlink_shape_nesting_and_feature_drift_are_rejected(self):
+        for failure in ('hardlink', 'symlink_shape', 'nested', 'features'):
+            with self.subTest(failure=failure), self.fixture() as (source, work, cache, specs):
+                item = cache / (specs[0]['sha256'] + specs[0]['extension'])
+                original_lstat = Path.lstat
+                if failure == 'hardlink':
+                    os.link(item, cache / 'second-link')
+                elif failure == 'nested':
+                    cache = source / 'nested'
+                    cache.mkdir()
+                elif failure == 'features':
+                    (source / 'cmake/ApacheArrow.cmake').write_text('changed options')
+                def lstat(path, *args, **kwargs):
+                    info = original_lstat(path, *args, **kwargs)
+                    if failure == 'symlink_shape' and path == item:
+                        # Portable stat input boundary; actual Windows symlink
+                        # creation privileges are not a prerequisite for this check.
+                        return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_nlink=1)
+                    return info
+                with mock.patch.object(Path, 'lstat', lstat), self.assertRaises(ValueError):
+                    arrow_cache.prepare(source, work, cache)
+                self.assertFalse((work / 'provenance/arrow-cache.json').exists())
+
+    def test_postbuild_rejects_changed_copy_proof_urls_and_upstream_table(self):
+        for failure in ('copy', 'proof', 'urls', 'versions'):
+            with self.subTest(failure=failure), self.fixture() as (source, work, cache, specs):
+                arrow_cache.prepare(source, work, cache)
+                if failure == 'copy':
+                    (work / 'arrow-cache' / specs[0]['filename']).write_bytes(b'changed copy')
+                elif failure == 'proof':
+                    proof = work / 'provenance/arrow-cache.json'
+                    record = json.loads(proof.read_text())
+                    record['archives'][0]['url'] = 'https://untrusted.invalid/archive'
+                    proof.write_text(json.dumps(record))
+                elif failure == 'urls':
+                    (work / 'arrow-cache/urls.nul').write_bytes(b'wrong\0')
+                else:
+                    (work / 'build/src/apache-arrow-cpp/cpp/thirdparty/versions.txt').write_bytes(b'changed version table')
+                with self.assertRaises(ValueError):
+                    arrow_cache.verify_preparation(source, work, cache, verify_upstream=True)
+
+    def test_actual_builder_branch_keeps_default_and_exports_only_after_success(self):
+        bash = bash_path()
+        if bash is None:
+            self.skipTest('Native Bash unavailable; no WSL fallback')
+        block = SCRIPT.read_text().split('# BEGIN ARROW CACHE\n', 1)[1].split('# END ARROW CACHE', 1)[0]
+        block = block.replace('/usr/bin/python3 ', 'python_helper ')
+        for enabled, code in ((False, 0), (True, 0), (True, 37)):
+            with self.subTest(enabled=enabled, code=code), self.fixture() as (source, work, cache, specs):
+                record = arrow_cache.prepare(source, work, cache)
+                prefix = ('set -euo pipefail\nsource_root=/fixed/source\nwork=' + shlex.quote(work.as_posix())
+                          + '\ncontainer_arrow_cache=' + shlex.quote(cache.as_posix() if enabled else '')
+                          + '\npython_helper() { printf "helper %s\\n" "$@"; return ' + str(code) + '; }\n')
+                names = ['ARROW_' + spec['name'] + '_URL' for spec in specs]
+                prefix += ''.join('export ' + name + '=unchanged\n' for name in names)
+                suffix = '\nprintf "exports\\n"\n' + ''.join('printf "%s\\n" "$' + name + '"\n' for name in names)
+                result = subprocess.run([bash, '-s'], input=prefix + block + suffix, text=True, capture_output=True)
+                self.assertEqual(result.returncode, code, result.stderr)
+                if code:
+                    self.assertNotIn('exports', result.stdout)
+                    self.assertFalse((work / 'provenance/arrow-cache-proof.sha256').exists())
+                else:
+                    exported = result.stdout.split('exports\n', 1)[1].splitlines()
+                    self.assertEqual(exported, [item['url'] for item in record['archives']] if enabled else ['unchanged'] * 7)
+                    self.assertEqual((work / 'provenance/arrow-cache-proof.sha256').exists(), enabled)
+                    if enabled:
+                        self.assertIn('helper /fixed/source/scripts/ec/ci/prepare-arrow-cache.py', result.stdout)
+                        self.assertIn('helper --cache', result.stdout)
 
 
 if __name__ == '__main__':
