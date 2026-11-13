@@ -83,21 +83,21 @@ def command_joins(value):
                     for index, row in enumerate(commands)))
 
 
-def case_cleanup_known(value, ready, strategy, failures):
+def case_cleanup_known(value, ready, strategy, failures, expected_uid=1000):
     return (ready is not None and type(value.get('schema')) is int and value['schema'] == 1
             and value.get('strategy') == strategy and type(value.get('failures')) is int
-            and value['failures'] == failures and value.get('supervisor_uid') == 1000
+            and value['failures'] == failures and value.get('supervisor_uid') == expected_uid
             and value.get('supervisor_run') == ready['run'] and command_joins(value))
 
 
-def case_gate(value, ready, completed, root, strategy, failures):
+def case_gate(value, ready, completed, root, strategy, failures, expected_uid=1000):
     """Bind the formal driver's proof, not a second implementation of repair/T2."""
     initial = ready_gate(ready, root)
     require(type(value.get('schema')) is int and value['schema'] == 1
             and value.get('state') == 'completed' and value.get('success') is True
             and value.get('failure') is None and value.get('strategy') == strategy
             and type(value.get('failures')) is int and value['failures'] == failures
-            and value.get('supervisor_uid') == 1000 and value.get('supervisor_run') == ready['run']
+            and value.get('supervisor_uid') == expected_uid and value.get('supervisor_run') == ready['run']
             and value.get('whole_cluster_started_or_stopped') is False
             and value.get('old_debt_completion_requires_actual_cli_T2') is True
             and value.get('physical_machine_failure_domains') == 1
@@ -236,21 +236,51 @@ def build_gate(built, native, source, build, revision):
                 'unexpected ISA-L provider digest')
 
 
+def local_identity(request, uid, euid, gid, egid):
+    require(type(uid) is int and uid > 0 and uid == euid and type(gid) is int and gid >= 0 and gid == egid,
+            'local mode requires unchanged ordinary real/effective UID and GID')
+    require(request.get('execution_mode') == 'local-same-user'
+            and type(request.get('creator_uid')) is int and request['creator_uid'] == uid
+            and type(request.get('target_uid')) is int and request['target_uid'] == uid
+            and type(request.get('target_gid')) is int and request['target_gid'] == gid,
+            'local OS identity differs from preparation')
+
+
+def local_shape(parent, request):
+    """Same-UID mode has no privileged handoff and adopts no pre-existing tree."""
+    local_identity(request, os.getuid(), os.geteuid(), os.getgid(), os.getegid())
+    shared.private(parent, os.geteuid())
+    shared.private(parent.parent, os.geteuid())
+    require(request.get('execution_mode') == 'local-same-user'
+            and type(request.get('schema')) is int and request['schema'] == 1
+            and request.get('parent') == str(parent)
+            and request.get('parent_identity') == [parent.stat().st_dev, parent.stat().st_ino],
+            'local preparation identity differs')
+    suffix(request['strategy'], request['failures'])
+
+
 def runtime(parent):
     global STAGE
     STAGE = 'runtime-preflight'
-    require(os.getuid() == os.geteuid() == os.getgid() == 1000, 'runtime requires actual UID/GID1000')
-    shared.private(parent, 1000)
+    shared.private(parent, os.geteuid())
     request = read_json(parent / 'handoff-request.json')
     case_suffix = suffix(request['strategy'], request['failures'])
-    shared.handoff_shape(parent, request, suffix=case_suffix)
+    local = request.get('execution_mode') == 'local-same-user'
+    if local:
+        local_shape(parent, request)
+    else:
+        require(os.getuid() == os.geteuid() == os.getgid() == os.getegid() == 1000,
+                'hosted runtime requires actual UID/GID1000')
+        shared.handoff_shape(parent, request, suffix=case_suffix)
     marker = read_json(parent / 'handoff-complete.json')
+    require(marker.get('uid') == os.geteuid() and marker.get('gid') == os.getegid(), 'prepared owner differs')
+    require(not local or marker.get('ownership_changed') is False, 'local mode cannot change ownership')
     require(marker['request_sha256'] == sha(parent / 'handoff-request.json')
             and marker['parent_identity'] == request['parent_identity']
             and request['parent_identity'] == [parent.stat().st_dev, parent.stat().st_ino]
             and sha(Path(__file__).resolve()) == request['driver_sha256']
             and sha(parent / 'tools/run-file-lab.py') == request['shared_driver_sha256'], 'handoff/source proof differs')
-    require([row for row in shared.tree_rows(parent, 1000)
+    require([row for row in shared.tree_rows(parent, os.geteuid())
              if row['path'] not in ('handoff-request.json', 'handoff-complete.json')] == request['inventory'],
             'post-handoff inputs changed')
     lab = parent / '3fs-ec-native-spare'
@@ -264,6 +294,10 @@ def runtime(parent):
     report = {'schema': 1, 'status': 'running', 'exitcode': 1, 'revision': request['revision'],
               'strategy': request['strategy'], 'failures': request['failures'], 'backend': request['backend'],
               'core': request['core'], 'services_started': False, 'performance_validated': False,
+              'preparation_sha256': sha(parent / 'handoff-request.json'),
+              'lab_build_sha256': request['lab_build_sha256'],
+              'native_build_sha256': request['native_build_sha256'],
+              'execution_mode': request.get('execution_mode', 'hosted-handoff'),
               'backend_validation': request['backend_validation'],
               'physical_machine_failure_domains': 1}
     supervisor, log, ready, completed = None, None, None, None
@@ -317,9 +351,9 @@ def runtime(parent):
         owner.command('fault-case', [sys.executable, '-B', lab / 'scripts/spare-fault-acceptance.py', '--root', lab,
                                     '--strategy', request['strategy'], '--failures', str(request['failures'])])
         value = read_json(result_path)
-        safe_stop = case_cleanup_known(value, ready, request['strategy'], request['failures'])
+        safe_stop = case_cleanup_known(value, ready, request['strategy'], request['failures'], os.geteuid())
         completed = native.request_control(lab, 'status')
-        case_gate(value, ready, completed, lab, request['strategy'], request['failures'])
+        case_gate(value, ready, completed, lab, request['strategy'], request['failures'], os.geteuid())
         require(value.get('file_driver_sha256') == sha(lab / 'scripts/file-cli-acceptance.py'), 'file driver receipt differs')
         for row in value['controls']:
             if row.get('operation') in {'fault-storage', 'restart-storage', 'replace-placement'}:
@@ -332,7 +366,7 @@ def runtime(parent):
             actual = shared.canonical(Path(path))
             require(actual.is_relative_to(lab / 'client') and sha(actual) == expected, 'retained journal changed')
         saved = read_json(result_path.parent / 'completed-supervisor.json')
-        require(saved.get('supervisor_uid') == 1000 and saved.get('observation') == completed,
+        require(saved.get('supervisor_uid') == os.geteuid() and saved.get('observation') == completed,
                 'current supervisor differs from formal case completion')
         report['completed'] = completed
         report['completed_process_identities'] = [dict(name=row['name'], **shared.process_identity(row['pid']))
@@ -348,7 +382,7 @@ def runtime(parent):
         try:
             if case_started and not safe_stop:
                 try:
-                    safe_stop = case_cleanup_known(read_json(result_path), ready, request['strategy'], request['failures'])
+                    safe_stop = case_cleanup_known(read_json(result_path), ready, request['strategy'], request['failures'], os.geteuid())
                 except Exception:
                     safe_stop = False
             if supervisor is not None:
@@ -412,18 +446,29 @@ def runtime(parent):
 def prepare(args):
     global STAGE
     STAGE = 'source'
-    require(os.getuid() == os.geteuid() == 1001 and os.environ.get('GITHUB_ACTIONS') == 'true'
-            and os.environ.get('RUNNER_OS') == 'Linux', 'ordinary hosted Linux UID1001 required')
-    run_id, attempt = os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']
-    require(all(re.fullmatch(r'[1-9][0-9]*', item) for item in (run_id, attempt)), 'invalid hosted run identity')
+    local = args.local_work is not None
     case_suffix = suffix(args.strategy, args.failures)
     source, build, fdb, core_path = map(shared.canonical, (args.source, args.build, args.fdb_bin_dir, args.core_record))
-    work = shared.canonical(Path(os.environ['RUNNER_TEMP']) / 'ec-native')
-    require(source == shared.canonical(Path(os.environ['GITHUB_WORKSPACE'])) and build == work / 'build'
-            and fdb == work / 'fdb/bin' and core_path == work / 'acceptance/results.json', 'unexpected build/core paths')
+    if local:
+        require(os.getuid() == os.geteuid() and os.getuid() > 0 and os.getgid() == os.getegid(),
+                'local mode requires unchanged ordinary real/effective UID and GID')
+        work = shared.canonical(build.parent)
+        require(build.name == 'build' and fdb == work / 'fdb/bin', 'local build/FDB layout differs')
+        shared.private(args.local_work.parent, os.geteuid())
+        require(args.local_work.is_absolute() and '..' not in args.local_work.parts
+                and not os.path.lexists(args.local_work), 'fresh canonical local work required')
+        run_id, attempt = None, None
+    else:
+        require(os.getuid() == os.geteuid() == 1001 and os.environ.get('GITHUB_ACTIONS') == 'true'
+                and os.environ.get('RUNNER_OS') == 'Linux', 'ordinary hosted Linux UID1001 required')
+        run_id, attempt = os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']
+        require(all(re.fullmatch(r'[1-9][0-9]*', item) for item in (run_id, attempt)), 'invalid hosted run identity')
+        work = shared.canonical(Path(os.environ['RUNNER_TEMP']) / 'ec-native')
+        require(source == shared.canonical(Path(os.environ['GITHUB_WORKSPACE'])) and build == work / 'build'
+                and fdb == work / 'fdb/bin' and core_path == work / 'acceptance/results.json', 'unexpected build/core paths')
     require(Path(__file__).resolve() == source / 'scripts/ec/ci/run-spare-lab.py', 'use formal checked-out driver')
     revision = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
-    require(revision == os.environ['GITHUB_SHA'], 'source is not triggering revision')
+    require(local or revision == os.environ['GITHUB_SHA'], 'source is not triggering revision')
     subprocess.run(['git', '-C', str(source), 'diff', '--exit-code', 'HEAD', '--ignore-submodules=all'],
                    stdout=subprocess.DEVNULL, check=True)
     STAGE = 'core'
@@ -438,13 +483,15 @@ def prepare(args):
     require(built.get('cmake_cache_sha256') == sha(build / 'CMakeCache.txt')
             and built.get('native_build_receipt_sha256') == sha(work / 'provenance/native-build.json'),
             'backend/native build input binding differs')
-    output = work / ('spare-preparation' + case_suffix)
+    output = (args.local_work.with_name(args.local_work.name + '-preparation') if local
+              else work / ('spare-preparation' + case_suffix))
     output.mkdir(mode=0o700)
     helper = shared.module(source / 'scripts/ec/cluster/fuse-read-acceptance.py', 'spare_prepare_owner')
     owner = helper.Owner(output)
     previous = shared.stop_signals(owner)
-    parent = Path('/tmp') / ('ec-h-' + run_id + '-' + attempt + case_suffix)
-    require(not os.path.lexists(parent) and shared.canonical(parent.parent) == Path('/tmp'), 'fresh handoff root required')
+    parent = args.local_work if local else Path('/tmp') / ('ec-h-' + run_id + '-' + attempt + case_suffix)
+    require(not os.path.lexists(parent) and (local or shared.canonical(parent.parent) == Path('/tmp')),
+            'fresh preparation root required')
     parent.mkdir(mode=0o700)
     lab = parent / '3fs-ec-native-spare'
     try:
@@ -484,27 +531,44 @@ def prepare(args):
         shared_sha = shared.copy_new(source / 'scripts/ec/ci/run-file-lab.py', parent / 'tools/run-file-lab.py')
         shared.copy_new(source / 'scripts/ec/cluster/fuse-read-acceptance.py', parent / 'tools/fuse-read-acceptance.py')
         request = {'schema': 1, 'parent': str(parent), 'parent_identity': [parent.stat().st_dev, parent.stat().st_ino],
-                   'creator_uid': 1001, 'target_uid': 1000, 'run_id': run_id, 'run_attempt': attempt,
+                   'creator_uid': os.geteuid() if local else 1001, 'target_uid': os.geteuid() if local else 1000,
+                   'target_gid': os.getegid() if local else 1000, 'run_id': run_id, 'run_attempt': attempt,
+                   'execution_mode': 'local-same-user' if local else 'hosted-handoff',
                    'strategy': args.strategy, 'failures': args.failures, 'revision': revision, 'backend': built['backend'],
                    'backend_validation': backend_validation,
                    'core': core, 'driver_sha256': driver_sha, 'shared_driver_sha256': shared_sha,
                    'package_manifest_sha256': sha(manifests[0]), 'lab_build_sha256': sha(built_path),
+                   'native_build_sha256': sha(work / 'provenance/native-build.json'),
                    'preparation_commands': command_records(output, owner.sequence),
-                   'inventory': shared.tree_rows(parent, 1001)}
+                   'inventory': shared.tree_rows(parent, os.geteuid())}
         shared.write_new(parent / 'handoff-request.json', request)
         request_sha = sha(parent / 'handoff-request.json')
-        marker = json.loads(command('handoff', ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I',
-                            parent / 'tools/run-spare-lab.py', '--handoff', parent, '--request-sha256', request_sha]))
-        require(marker['request_sha256'] == request_sha and marker['uid'] == 1000, 'handoff response differs')
+        if local:
+            import pwd
+            marker = {'schema': 1, 'request_sha256': request_sha, 'uid': os.geteuid(), 'gid': os.getegid(),
+                      'user': pwd.getpwuid(os.geteuid()).pw_name, 'parent_identity': request['parent_identity'],
+                      'services_started': False, 'ownership_changed': False}
+            shared.write_new(parent / 'handoff-complete.json', marker)
+        else:
+            marker = json.loads(command('handoff', ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I',
+                                parent / 'tools/run-spare-lab.py', '--handoff', parent, '--request-sha256', request_sha]))
+        require(marker['request_sha256'] == request_sha and marker['uid'] == (os.geteuid() if local else 1000), 'handoff response differs')
         shared.write_new(output / 'prepared.json', {'parent': str(parent), 'revision': revision, 'request_sha256': request_sha,
                          'handoff': marker, 'services_started': False, 'commands': command_records(output, owner.sequence)})
         owner.checkpoint()
-        STAGE = 'exec-uid1000'
+        STAGE = 'exec-same-user' if local else 'exec-uid1000'
         argv = ['/usr/bin/sudo', '-n', 'prlimit', '--memlock=3221225472:3221225472', '--nofile=65536:65536', '--',
                 'setpriv', '--reuid=1000', '--regid=1000', '--clear-groups', 'env', '--chdir=' + str(parent),
                 'HOME=' + str(parent / 'home'), 'USER=' + marker['user'], 'LOGNAME=' + marker['user'],
                 'TMPDIR=' + str(parent / 'tmp'), 'LD_LIBRARY_PATH=' + str(lab / 'lib'), 'PATH=/usr/local/bin:/usr/bin:/bin',
                 '/usr/bin/python3', '-I', parent / 'tools/run-spare-lab.py', '--run-owned', parent]
+        if local:
+            # Keep the same ordinary UID and inherited resource limits. No sudo,
+            # account creation, permission change or adoption of another tree.
+            argv = ['/usr/bin/env', '--chdir=' + str(parent), 'HOME=' + str(parent / 'home'),
+                    'USER=' + marker['user'], 'LOGNAME=' + marker['user'], 'TMPDIR=' + str(parent / 'tmp'),
+                    'LD_LIBRARY_PATH=' + str(lab / 'lib'), 'PATH=/usr/local/bin:/usr/bin:/bin',
+                    '/usr/bin/python3', '-I', parent / 'tools/run-spare-lab.py', '--run-owned', parent]
         for sig in previous:
             signal.signal(sig, signal.SIG_DFL)
         os.execv(argv[0], list(map(str, argv)))
@@ -517,6 +581,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('source', 'build', 'fdb-bin-dir', 'core-record'):
         parser.add_argument('--' + name, type=Path)
+    parser.add_argument('--local-work', type=Path, help='fresh private same-user work; no hosted environment or chown')
     parser.add_argument('--strategy', choices=('central', 'pipeline', 'helper'))
     parser.add_argument('--failures', type=int, choices=(1, 2))
     internal = parser.add_mutually_exclusive_group()
@@ -524,6 +589,7 @@ def main():
     internal.add_argument('--run-owned', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--request-sha256', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    require(sys.version_info >= (3, 11), 'Python 3.11 or newer required')
     require(sys.platform == 'linux', 'Linux only; no WSL/VM launcher')
     os.umask(0o077)
     sys.dont_write_bytecode = True
