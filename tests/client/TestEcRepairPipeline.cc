@@ -221,11 +221,12 @@ TEST(TestEcRepairPipeline, AppendExceptionStillJoinsAnotherStartedRead) {
   auto transport = std::make_shared<TestTransport>(data);
   transport->faultAt = TestTransport::FaultAt::Append;
   transport->holdReadAcrossAppendException = true;
+  EcRepairObservation observation;
   std::optional<Result<EcRepairSealed>> result;
   std::atomic<bool> done{false};
   std::thread runner([&] {
     result = folly::coro::blockingWait(
-        EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline, control(), executor));
+        EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline, control(), executor, &observation));
     done = true;
   });
   SCOPE_EXIT {
@@ -238,6 +239,16 @@ TEST(TestEcRepairPipeline, AppendExceptionStillJoinsAnotherStartedRead) {
   transport->releaseSecondRead.post();
   ASSERT_TRUE(waitFor([&] { return done.load(); }));
   ASSERT_TRUE(result.has_value());
+  const auto sample = observation.snapshot();
+  EXPECT_FALSE(sample.overflow);
+  EXPECT_FALSE(sample.clockAnomaly);
+  for (const auto &point : sample.points) {
+    EXPECT_EQ(point.active, 0);
+    EXPECT_EQ(point.entered, point.finished);
+  }
+  const auto &actors = sample.at(EcRepairPoint::BlockActor);
+  EXPECT_LE(actors.peakActive, 2);
+  EXPECT_GE(actors.entered, 1);
   ASSERT_ERROR(*result, StorageCode::kEcSealOutcomeUnknown);
   EXPECT_EQ(transport->active.load(), 0);
   EXPECT_EQ(transport->seals.load(), 0);
@@ -251,8 +262,16 @@ TEST(TestEcRepairPipeline, AllThreeModesMatchIndependentSingleAndDoubleTargets) 
     ASSERT_OK(plan);
     for (const auto mode : {EcRepairMode::CentralSerial, EcRepairMode::ClientPipeline, EcRepairMode::HelperChain}) {
       auto transport = std::make_shared<TestTransport>(data);
-      auto result = folly::coro::blockingWait(EcRepairPipeline::run(*plan, transport, mode, control(), executor));
+      EcRepairObservation observation;
+      auto result = folly::coro::blockingWait(EcRepairPipeline::run(*plan, transport, mode, control(), executor, &observation));
       ASSERT_OK(result);
+      const auto sample = observation.snapshot();
+      const auto &actors = sample.at(EcRepairPoint::BlockActor);
+      EXPECT_EQ(actors.entered, mode == EcRepairMode::CentralSerial ? 0 : 2);
+      EXPECT_EQ(actors.finished, actors.entered);
+      EXPECT_EQ(actors.succeeded, actors.entered);
+      EXPECT_EQ(actors.active, 0);
+      EXPECT_EQ(sample.at(EcRepairPoint::NativeRead).apiInvocations, 0); // Fake transport is not native RPC evidence.
       EXPECT_EQ(result->mode, mode);
       EXPECT_EQ(result->targetCount, missing.size());
       EXPECT_EQ(transport->seals.load(), missing.size());
@@ -272,11 +291,12 @@ TEST(TestEcRepairPipeline, WindowOverlapsReadWithAppendAndBoundsLaterBlocks) {
   ASSERT_OK(plan);
   auto transport = std::make_shared<TestTransport>(data);
   transport->holdFirstAppend = true;
+  EcRepairObservation observation;
   std::optional<Result<EcRepairSealed>> result;
   std::atomic<bool> done{false};
   std::thread runner([&] {
     result = folly::coro::blockingWait(
-        EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline, control(), executor));
+        EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline, control(), executor, &observation));
     done = true;
   });
   SCOPE_EXIT {
@@ -285,11 +305,26 @@ TEST(TestEcRepairPipeline, WindowOverlapsReadWithAppendAndBoundsLaterBlocks) {
   };
   ASSERT_TRUE(waitFor([&] { return transport->firstAppendEntered && (transport->startedBlocks.load() & 2); }));
   EXPECT_FALSE(done);
+  EXPECT_EQ(observation.snapshot().at(EcRepairPoint::BlockActor).active, 2);
   EXPECT_EQ(transport->startedBlocks.load(), 3);  // Block 2 has no window slot yet.
   transport->holdFirstAppend = false;
   ASSERT_TRUE(waitFor([&] { return done.load(); }));
   ASSERT_TRUE(result.has_value());
+  const auto sample = observation.snapshot();
+  EXPECT_FALSE(sample.overflow);
+  EXPECT_FALSE(sample.clockAnomaly);
+  for (const auto &point : sample.points) {
+    EXPECT_EQ(point.active, 0);
+    EXPECT_EQ(point.entered, point.finished);
+  }
+  const auto &actors = sample.at(EcRepairPoint::BlockActor);
+  EXPECT_LE(actors.peakActive, 2);
+  EXPECT_GE(actors.entered, 1);
   ASSERT_OK(*result);
+  EXPECT_EQ(actors.entered, 3);
+  EXPECT_EQ(actors.succeeded, 3);
+  EXPECT_EQ(actors.peakActive, 2);
+  EXPECT_EQ(sample.at(EcRepairPoint::OrderedAppendWait).entered, 3);
 }
 
 TEST(TestEcRepairPipeline, CancellationRetainsSubmittedAppendAndDoesNotSeal) {
@@ -302,11 +337,12 @@ TEST(TestEcRepairPipeline, CancellationRetainsSubmittedAppendAndDoesNotSeal) {
   CancellationSource stop;
   auto options = control();
   options.cancellation = stop.getToken();
+  EcRepairObservation observation;
   std::optional<Result<EcRepairSealed>> result;
   std::atomic<bool> done{false};
   std::thread runner([&] {
     result = folly::coro::blockingWait(
-        EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline, options, executor));
+        EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline, options, executor, &observation));
     done = true;
   });
   SCOPE_EXIT {
@@ -318,10 +354,22 @@ TEST(TestEcRepairPipeline, CancellationRetainsSubmittedAppendAndDoesNotSeal) {
   std::this_thread::sleep_for(10ms);
   EXPECT_FALSE(done);
   EXPECT_GE(transport->active.load(), 1);
+  EXPECT_GE(observation.snapshot().at(EcRepairPoint::BlockActor).active, 1);
   transport->holdFirstAppend = false;
   ASSERT_TRUE(waitFor([&] { return done.load(); }));
   ASSERT_TRUE(result.has_value());
+  const auto sample = observation.snapshot();
+  EXPECT_FALSE(sample.overflow);
+  EXPECT_FALSE(sample.clockAnomaly);
+  for (const auto &point : sample.points) {
+    EXPECT_EQ(point.active, 0);
+    EXPECT_EQ(point.entered, point.finished);
+  }
+  const auto &actors = sample.at(EcRepairPoint::BlockActor);
+  EXPECT_LE(actors.peakActive, 2);
+  EXPECT_GE(actors.entered, 1);
   ASSERT_FALSE(result->hasValue());
+  EXPECT_LT(actors.succeeded, actors.entered);
   EXPECT_EQ(transport->seals.load(), 0);
   EXPECT_EQ(transport->active.load(), 0);
 }
@@ -334,11 +382,12 @@ TEST(TestEcRepairPipeline, CorruptionFailureStillJoinsOtherInFlightRead) {
   auto transport = std::make_shared<TestTransport>(data);
   transport->corruptFirstAfterSecondStarts = true;
   transport->holdSecondRead = true;
+  EcRepairObservation observation;
   std::optional<Result<EcRepairSealed>> result;
   std::atomic<bool> done{false};
   std::thread runner([&] {
     result = folly::coro::blockingWait(
-        EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline, control(), executor));
+        EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline, control(), executor, &observation));
     done = true;
   });
   SCOPE_EXIT {
@@ -351,6 +400,16 @@ TEST(TestEcRepairPipeline, CorruptionFailureStillJoinsOtherInFlightRead) {
   transport->holdSecondRead = false;
   ASSERT_TRUE(waitFor([&] { return done.load(); }));
   ASSERT_TRUE(result.has_value());
+  const auto sample = observation.snapshot();
+  EXPECT_FALSE(sample.overflow);
+  EXPECT_FALSE(sample.clockAnomaly);
+  for (const auto &point : sample.points) {
+    EXPECT_EQ(point.active, 0);
+    EXPECT_EQ(point.entered, point.finished);
+  }
+  const auto &actors = sample.at(EcRepairPoint::BlockActor);
+  EXPECT_LE(actors.peakActive, 2);
+  EXPECT_GE(actors.entered, 1);
   ASSERT_ERROR(*result, StatusCode::kDataCorruption);
   EXPECT_EQ(transport->seals.load(), 0);
   EXPECT_EQ(transport->active.load(), 0);
@@ -404,6 +463,25 @@ TEST(TestEcRepairPipeline, UnknownAppendOutcomeDoesNotSealOrDeleteAnyAllocation)
   EXPECT_EQ(transport->begun.load(), 2);
   EXPECT_EQ(transport->seals.load(), 0);
   EXPECT_EQ(transport->active.load(), 0);
+}
+
+TEST(TestEcRepairPipeline, ObservationSaturatesAndKeepsIndependentCallsSeparate) {
+  EcRepairObservation observation;
+  {
+    EcRepairObservation::Scope scope(&observation, EcRepairPoint::NativeAppend);
+    scope.noteInvocation(std::numeric_limits<uint64_t>::max());
+    scope.noteInvocation(7);
+    scope.success();
+  }
+  const auto first = observation.snapshot();
+  EXPECT_TRUE(first.overflow);
+  EXPECT_EQ(first.at(EcRepairPoint::NativeAppend).submittedPayloadBytes, std::numeric_limits<uint64_t>::max());
+  EXPECT_EQ(first.at(EcRepairPoint::NativeAppend).apiInvocations, 2);
+  EXPECT_EQ(first.at(EcRepairPoint::NativeAppend).active, 0);
+  EcRepairObservation nextCall;
+  const auto next = nextCall.snapshot();
+  EXPECT_FALSE(next.overflow);
+  for (const auto &point : next.points) EXPECT_EQ(point.entered, 0);
 }
 
 }  // namespace

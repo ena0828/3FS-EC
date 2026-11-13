@@ -1,8 +1,10 @@
 """Deployment-entry and supervisor compatibility checks; no services or workloads."""
 import argparse
+import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
@@ -26,6 +28,29 @@ spec.loader.exec_module(file_command)
 
 
 class PortableExperiments(unittest.TestCase):
+    def test_repair_metrics_only_forwards_explicit_choice_without_changing_run(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent).resolve()
+            (root / "cluster.json").write_text(json.dumps({"root": str(root), "file_api": True}))
+            run, session = root / "fixed repair", root / "fixed session"
+            before = sorted(path.name for path in root.iterdir())
+            for action in ("repair", "resume-repair", "query-repair", "close-repair-debt"):
+                args = ["--root", str(root), action, "--run-dir", str(run)]
+                if action == "repair":
+                    args += ["--session", str(session), "--stripe", "0", "--targets", "0,11",
+                             "--sources", "10,9,8,7,6,5,4,3,2,1", "--strategy", "helper", "--window", "4"]
+                baseline = file_command.command(file_command.parser().parse_args(args))
+                self.assertFalse(any(value.startswith("--config.repair_metrics=") for value in baseline))
+                for flag, expected in (("--metrics", "true"), ("--no-metrics", "false")):
+                    with self.subTest(action=action, flag=flag):
+                        actual = file_command.command(file_command.parser().parse_args([*args, flag]))
+                        self.assertEqual(actual, baseline[:-1] + ["--config.repair_metrics=" + expected, baseline[-1]])
+                        self.assertIn("--config.run_dir=" + str(run), actual)
+                self.assertEqual(sorted(path.name for path in root.iterdir()), before)
+            for action in ("query", "resume", "close"):
+                with self.subTest(rejected=action), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    file_command.parser().parse_args(["--root", str(root), action, "--run-dir", str(run), "--metrics"])
+
     def test_file_wrapper_preserves_paths_and_decimal_arguments_without_creating_runs(self):
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent).resolve()

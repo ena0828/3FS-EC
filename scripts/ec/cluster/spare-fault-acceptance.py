@@ -20,7 +20,7 @@ PROFILE = "native-gc-local-14-storage-14-targets"
 BUNDLE_SCRIPTS = {
     "experiment-runner.py": "5678f503616d79b7f36e93ce87c4d8192eca7a8dd8e18bfdeeb8a9ad142beaf4",
     "ack-service-acceptance.py": "9e65e8190b685e8b15ea61a7cc5529de45ab8c764588d24c9637dda097daf64e",
-    "file-command.py": "1b31f9bf239c3ac4ad3c3ee308991298a413936e7d62e5c9b18111cafba14316",
+    "file-command.py": "5932205a2496e1a70c26dc0bcf3e175a082833cda1c4586700d10fcbe9f2c433",
     "native-v2.py": "e4c38b3ff58e95ccf3f3a22d151b967459175f15d649a63b1f74c859e44681d2",
     "native_v2_config.py": "b0bcfa5ce594bca254b96ccd730be8f7fc34bf6e7dd089ed61dee7dde14596d6",
     "native_fault_control.py": "b409e69d65283f2cf75d0305940b5850968047b3758eec99430a229d7590cf87",

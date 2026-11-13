@@ -95,18 +95,66 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
       EXPECT_EQ(g.claims.scopeKind, storage::EcGrantScope::WriteOperation);
       EXPECT_EQ(g.claims.scopeId, run->intent.child);
     }
-    auto completed = client->repair(*journal, ctl());
+    // An explicit cancelled call records no new RPC and leaves the old journal
+    // sequence unchanged. The next call uses the same original operation IDs.
+    const auto priorSequence = journal->latest()->sequence;
+    CancellationSource cancelled;
+    cancelled.requestCancellation();
+    auto cancelledControl = ctl();
+    cancelledControl.cancellation = cancelled.getToken();
+    auto stopped = client->repair(*journal, cancelledControl, true);
+    ASSERT_TRUE(stopped.failure);
+    EXPECT_EQ(stopped.failure->code(), StorageClientCode::kRequestCanceled);
+    EXPECT_TRUE(stopped.metrics.available);
+    EXPECT_TRUE(stopped.metrics.journalStateObserved);
+    EXPECT_TRUE(stopped.metrics.cancellationRequested);
+    EXPECT_EQ(stopped.metrics.priorJournalSequence, priorSequence);
+    EXPECT_EQ(journal->latest()->sequence, priorSequence);
+    for (const auto &point : stopped.metrics.points) EXPECT_EQ(point.entered, 0);
+    auto completed = client->repair(*journal, ctl(), true);
     ASSERT_FALSE(completed.failure);
     ASSERT_TRUE(completed.revalidated);
     ASSERT_TRUE(completed.progress.record);
     EXPECT_EQ(completed.progress.record->state, EcFileRepairState::Published);
     EXPECT_TRUE(completed.progress.outputDrained);
     EXPECT_FALSE(completed.progress.sourceReleased);
+    const auto &metrics = completed.metrics;
+    ASSERT_TRUE(metrics.available);
+    EXPECT_FALSE(metrics.overflow);
+    EXPECT_FALSE(metrics.clockAnomaly);
+    EXPECT_EQ(metrics.action, 1);
+    EXPECT_EQ(metrics.at(EcRepairPoint::Query).succeeded, 1);
+    EXPECT_EQ(metrics.at(EcRepairPoint::Prepare).succeeded, 1);
+    EXPECT_EQ(metrics.at(EcRepairPoint::Publish).succeeded, 1);
+    EXPECT_EQ(metrics.at(EcRepairPoint::SelectedRepair).succeeded, 1);
+    EXPECT_EQ(metrics.at(EcRepairPoint::HealthyCopy).succeeded, 10);
+    EXPECT_EQ(metrics.at(EcRepairPoint::CopyRead).validatedReturnedPayloadBytes, 10ULL * kShardBytes);
+    EXPECT_EQ(metrics.at(EcRepairPoint::CopyAppend).submittedPayloadBytes, 10ULL * kShardBytes);
+    EXPECT_EQ(metrics.at(EcRepairPoint::NativeAppend).submittedPayloadBytes, 2ULL * kShardBytes);
+    EXPECT_EQ(metrics.at(EcRepairPoint::NativeSeal).succeeded, 2);
+    EXPECT_EQ(metrics.blockActorsApplicable, mode != EcFileRepairMode::CentralSerial);
+    EXPECT_LE(metrics.at(EcRepairPoint::BlockActor).peakActive, run->intent.selection.maxBlocksInFlight);
+    if (mode == EcFileRepairMode::HelperChain) {
+      EXPECT_EQ(metrics.at(EcRepairPoint::NativeRead).apiInvocations, 0);
+      EXPECT_EQ(metrics.at(EcRepairPoint::NativeHelper).validatedReturnedPayloadBytes, 2ULL * kShardBytes);
+    } else {
+      EXPECT_EQ(metrics.at(EcRepairPoint::NativeRead).validatedReturnedPayloadBytes, 10ULL * kShardBytes);
+      EXPECT_EQ(metrics.at(EcRepairPoint::NativeHelper).apiInvocations, 0);
+    }
+    for (const auto &point : metrics.points) {
+      EXPECT_EQ(point.active, 0);
+      EXPECT_EQ(point.entered, point.finished);
+    }
     const auto &child = completed.progress.record->child;
     EXPECT_EQ(child.targetGeneration, child.source.generation);
     EXPECT_GT(child.targetRevision, child.source.revision);
-    auto replay = client->repair(*journal, ctl());
+    auto replay = client->repair(*journal, ctl(), true);
     ASSERT_FALSE(replay.failure);
+    EXPECT_TRUE(replay.metrics.available);
+    EXPECT_EQ(replay.metrics.at(EcRepairPoint::Query).succeeded, 1);
+    EXPECT_EQ(replay.metrics.at(EcRepairPoint::Prepare).entered, 0);
+    EXPECT_EQ(replay.metrics.at(EcRepairPoint::SelectedRepair).entered, 0);
+    EXPECT_EQ(replay.metrics.at(EcRepairPoint::NativeAppend).apiInvocations, 0);
     EXPECT_EQ(serde::serialize(replay.progress.record->child.publishedRoot), serde::serialize(child.publishedRoot));
     auto acquire = request<AcquireEcTreeReadReq>();
     acquire.intent.session = open.session;
@@ -142,12 +190,17 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     release.intent = acquire.intent;
     release.revocations[0] = Uuid::random();
     ASSERT_OK(blockingWait(metaClient_->releaseEcTreeRead(release)));
-    auto closed = client->closeDebt(*journal, ctl());
+    auto closed = client->closeDebt(*journal, ctl(), true);
     ASSERT_FALSE(closed.failure);
     EXPECT_TRUE(closed.progress.outputDrained);
     EXPECT_TRUE(closed.progress.sourceReleased);
+    EXPECT_TRUE(closed.metrics.available);
+    EXPECT_EQ(closed.metrics.action, 2);
+    EXPECT_EQ(closed.metrics.at(EcRepairPoint::CloseDebt).succeeded, 1);
+    EXPECT_EQ(closed.metrics.at(EcRepairPoint::SelectedRepair).entered, 0);
     auto historical = client->query(*journal, ctl());
     ASSERT_FALSE(historical.failure);
+    EXPECT_FALSE(historical.metrics.available); // Default remains opt-out, including replay.
     EXPECT_TRUE(historical.progress.sourceReleased);
     auto end = request<CloseEcFileSessionReq>();
     end.object = opened->object.object;

@@ -73,6 +73,7 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(repair_mode, "");
   CONFIG_ITEM(repair_source_order, "");
   CONFIG_ITEM(repair_window_decimal, "");
+  CONFIG_ITEM(repair_metrics, false);
   CONFIG_ITEM(deadline_seconds, uint32_t{300});
   CONFIG_ITEM(worker_threads, uint32_t{4});
   CONFIG_ITEM(log, "INFO:normal; normal=file:path=ec-file.log,async=true,sync_level=ERR");
@@ -146,6 +147,7 @@ int execute(int argc, char **argv) {
                  "Mode4 repair: mode4-repair/resume-repair/query-repair/close-repair-debt.\n"
                  "New repair: accepted READ|WRITE session_run_dir + new run_dir + repair_stripe_decimal,\n"
                  "repair_mask_decimal, repair_mode=central|pipeline|helper and ten repair_source_order indices.\n"
+                 "Optional repair_metrics=true observes this call only; default false, journal format unchanged.\n"
                  "Optional repair_window_decimal=1..4 (default 2); resume/query/close use only original run_dir.\n"
                  "Published and source-released are separate; close-repair-debt cancels an unfinished repair.\n"
                  "Mode4 truncate: mode4-truncate/resume-truncate/query-truncate/close-truncate-debt.\n"

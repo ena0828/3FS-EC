@@ -4,6 +4,7 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <memory>
 
+#include "EcRepairObservation.h"
 #include "common/utils/Coroutine.h"
 #include "fbs/storage/EcStageResultV2.h"
 #include "storage/ec_repair/EcRepairPlan.h"
@@ -49,11 +50,14 @@ class EcRepairPipeline {
   // Owns and joins every started task. Caller must await this coroutine and keep
   // executor alive. No detached jobs, early success, implicit release or delete.
   // The transport is shared-owned until all children and final seal calls end.
+  // Optional observation is borrowed for this entire joined call; caller must
+  // keep it alive. It never changes the transport or cancellation policy.
   static CoTryTask<EcRepairSealed> run(std::shared_ptr<const storage::EcRepairPlan> plan,
                                        std::shared_ptr<EcRepairTransport> transport,
                                        EcRepairMode mode,
                                        EcRepairControl control,
-                                       folly::CPUThreadPoolExecutor &executor);
+                                       folly::CPUThreadPoolExecutor &executor,
+                                       EcRepairObservation *observation = nullptr);
 };
 
 }  // namespace hf3fs::client::ec

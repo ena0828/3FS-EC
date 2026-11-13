@@ -20,11 +20,13 @@ struct EcRepairNativeBindings {
 // issued helper capabilities and uses RPC46; it has no centralized fallback.
 class NativeEcRepairTransport final : public EcRepairTransport {
  public:
+  // Optional observation must outlive this adapter and all its joined calls.
   static Result<std::shared_ptr<NativeEcRepairTransport>> create(
       Plan plan,
       std::shared_ptr<storage::client::StorageClient> client,
       EcRepairNativeBindings bindings,
-      std::optional<std::array<storage::EcHelperCapability, 10>> helpers = std::nullopt);
+      std::optional<std::array<storage::EcHelperCapability, 10>> helpers = std::nullopt,
+      EcRepairObservation *observation = nullptr);
   bool supportsHelperChain() const override { return helpers_.has_value(); }
   CoTryTask<void> begin(Plan, uint8_t target, EcRepairControl) override;
   CoTryTask<std::string> read(Plan, uint8_t source, uint32_t block, EcRepairControl) override;
@@ -36,13 +38,17 @@ class NativeEcRepairTransport final : public EcRepairTransport {
   NativeEcRepairTransport(Plan plan,
                           std::shared_ptr<storage::client::StorageClient> client,
                           EcRepairNativeBindings bindings,
-                          std::optional<std::array<storage::EcHelperCapability, 10>> helpers)
-      : plan_(std::move(plan)),
+                          std::optional<std::array<storage::EcHelperCapability, 10>> helpers,
+                          EcRepairObservation *observation)
+      : observation_(observation),
+        plan_(std::move(plan)),
         client_(std::move(client)),
         bindings_(std::move(bindings)),
         helpers_(std::move(helpers)) {}
   Result<Void> check(const Plan &, const EcRepairControl &) const;
   Status preserveOutcome(uint8_t target, Status error);
+  // Borrowed only until the enclosing owned pipeline and every call join.
+  EcRepairObservation *observation_;
   Plan plan_;
   std::shared_ptr<storage::client::StorageClient> client_;
   EcRepairNativeBindings bindings_;

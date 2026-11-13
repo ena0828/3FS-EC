@@ -72,7 +72,8 @@ Result<std::shared_ptr<NativeEcRepairTransport>> NativeEcRepairTransport::create
     Plan plan,
     std::shared_ptr<storage::client::StorageClient> client,
     EcRepairNativeBindings bindings,
-    std::optional<std::array<storage::EcHelperCapability, 10>> helpers) {
+    std::optional<std::array<storage::EcHelperCapability, 10>> helpers,
+    EcRepairObservation *observation) {
   if (!plan || !client) return makeError(StatusCode::kInvalidArg, "native repair requires plan and StorageClient");
   for (size_t i = 0; i != 10; ++i) {
     RETURN_ON_ERROR(binding(*plan,
@@ -96,7 +97,8 @@ Result<std::shared_ptr<NativeEcRepairTransport>> NativeEcRepairTransport::create
                                 uint16_t(EcGrantRightV2::Seal)));
   }
   return std::shared_ptr<NativeEcRepairTransport>(
-      new NativeEcRepairTransport(std::move(plan), std::move(client), std::move(bindings), std::move(helpers)));
+      new NativeEcRepairTransport(
+          std::move(plan), std::move(client), std::move(bindings), std::move(helpers), observation));
 }
 
 Result<Void> NativeEcRepairTransport::check(const Plan &plan, const EcRepairControl &control) const {
@@ -115,10 +117,12 @@ Status NativeEcRepairTransport::preserveOutcome(uint8_t target, Status error) {
 }
 
 CoTryTask<void> NativeEcRepairTransport::begin(Plan plan, uint8_t target, EcRepairControl control) {
+  EcRepairObservation::Scope metric(observation_, EcRepairPoint::NativeBegin);
   if (target >= plan_->input().targetCount) co_return makeError(StatusCode::kInvalidArg);
   const auto failure = [&](Status error) { return makeError(preserveOutcome(target, std::move(error))); };
   if (auto active = check(plan, control); !active) co_return failure(active.error());
   const auto request = bindings_.targets[target];
+  metric.noteInvocation();
   auto result = co_await client_->beginEcStageV2Controlled(request, options(control));
   uint32_t observedPrefix = 0;
   if (!result) {
@@ -136,6 +140,7 @@ CoTryTask<void> NativeEcRepairTransport::begin(Plan plan, uint8_t target, EcRepa
   if (unconfirmed_[target].load()) {
     if (auto active = check(plan, control); !active) co_return failure(active.error());
     EcQueryStageV2Req query{request.request, request.grant};
+    metric.noteInvocation();
     auto observed = co_await client_->queryEcStageV2Controlled(std::move(query), options(control));
     if (observed) {
       auto valid = validateEcStageStateV2(*observed, request.request, request.grant.claims);
@@ -147,6 +152,7 @@ CoTryTask<void> NativeEcRepairTransport::begin(Plan plan, uint8_t target, EcRepa
     // It can never allocate another identity, instance or position here.
     if (auto active = check(plan, control); !active) co_return failure(active.error());
     EcReconcileStageV2Req reconcile{request.request, request.grant};
+    metric.noteInvocation();
     result = co_await client_->reconcileEcStageV2Controlled(std::move(reconcile), options(control));
     if (!result) co_return failure(result.error());
     auto valid = validateEcStageStateV2(*result, request.request, request.grant.claims);
@@ -166,6 +172,7 @@ CoTryTask<void> NativeEcRepairTransport::begin(Plan plan, uint8_t target, EcRepa
   auto valid = stage(plan_->input().targets[target], *result, observedPrefix, true);
   if (!valid) co_return failure(valid.error());
   alreadySealed_[target].store(result->state == 2);
+  metric.success();
   co_return Void{};
 }
 
@@ -173,6 +180,7 @@ CoTryTask<std::string> NativeEcRepairTransport::read(Plan plan,
                                                      uint8_t source,
                                                      uint32_t block,
                                                      EcRepairControl control) {
+  EcRepairObservation::Scope metric(observation_, EcRepairPoint::NativeRead);
   CO_RETURN_ON_ERROR(check(plan, control));
   if (source >= 10) co_return makeError(StatusCode::kInvalidArg);
   CO_RETURN_ON_ERROR(plan->blockLength(block));
@@ -184,12 +192,15 @@ CoTryTask<std::string> NativeEcRepairTransport::read(Plan plan,
                              block);
   CO_RETURN_ON_ERROR(request);
   NativeEcBlockTransport transport(client_);
+  metric.noteInvocation();
   auto result = co_await transport.read(std::move(*request), {control.deadline, control.cancellation});
   CO_RETURN_ON_ERROR(result);
   CO_RETURN_ON_ERROR(check(plan, control));
   CO_RETURN_ON_ERROR(receipt(expected, result->receipt));
   if (result->blockIndex != block) co_return makeError(StatusCode::kDataCorruption);
   CO_RETURN_ON_ERROR(verifyEcIntegrityBlock(expected.identity, expected.integrity, block, result->payload.data));
+  metric.validated(result->payload.data.size());
+  metric.success();
   co_return std::move(result->payload.data);
 }
 
@@ -198,6 +209,7 @@ CoTryTask<void> NativeEcRepairTransport::append(Plan plan,
                                                 uint32_t block,
                                                 std::string data,
                                                 EcRepairControl control) {
+  EcRepairObservation::Scope metric(observation_, EcRepairPoint::NativeAppend);
   if (target >= plan_->input().targetCount) co_return makeError(StatusCode::kInvalidArg);
   const auto failure = [&](Status error) { return makeError(preserveOutcome(target, std::move(error))); };
   if (auto active = check(plan, control); !active) co_return failure(active.error());
@@ -207,12 +219,16 @@ CoTryTask<void> NativeEcRepairTransport::append(Plan plan,
   // Begin may recover the durable result of an earlier Seal whose ACK was
   // lost. A sealed allocation cannot accept append; retain its immutable bytes
   // and require another real Seal barrier below instead of rewriting them.
-  if (alreadySealed_[target].load()) co_return Void{};
+  if (alreadySealed_[target].load()) {
+    metric.success();
+    co_return Void{};
+  }
   EcAppendStageV2Req request;
   request.request = bindings_.targets[target].request;
   request.grant = bindings_.targets[target].grant;
   request.blockIndex = block;
   request.payload.data = std::move(data);
+  metric.noteInvocation(request.payload.data.size());
   auto result = co_await client_->appendEcStageV2Controlled(std::move(request), options(control));
   if (!result) co_return failure(result.error());
   if (!check(plan, control))
@@ -226,18 +242,21 @@ CoTryTask<void> NativeEcRepairTransport::append(Plan plan,
   }
   auto valid = stage(expected, *result, block * kEcIntegrityBlockBytes + expected.integrity.blocks[block].validLength);
   if (!valid) co_return failure(valid.error());
+  metric.success();
   co_return Void{};
 }
 
 CoTryTask<storage::EcFragmentReceiptV2> NativeEcRepairTransport::seal(Plan plan,
                                                                       uint8_t target,
                                                                       EcRepairControl control) {
+  EcRepairObservation::Scope metric(observation_, EcRepairPoint::NativeSeal);
   if (target >= plan_->input().targetCount) co_return makeError(StatusCode::kInvalidArg);
   const auto failure = [&](Status error) { return makeError(preserveOutcome(target, std::move(error))); };
   if (auto active = check(plan, control); !active) co_return failure(active.error());
   EcSealStageV2Req request;
   request.request = bindings_.targets[target].request;
   request.grant = bindings_.targets[target].grant;
+  metric.noteInvocation();
   auto result = co_await client_->sealEcStageV2Controlled(std::move(request), options(control));
   if (!result) co_return failure(result.error());
   if (!check(plan, control))
@@ -249,12 +268,14 @@ CoTryTask<storage::EcFragmentReceiptV2> NativeEcRepairTransport::seal(Plan plan,
     co_return failure(valid.error());
   }
   unconfirmed_[target].store(false);
+  metric.success();
   co_return std::move(*result);
 }
 
 CoTryTask<storage::EcRepairBlock> NativeEcRepairTransport::helperBlock(Plan plan,
                                                                        uint32_t block,
                                                                        EcRepairControl control) {
+  EcRepairObservation::Scope metric(observation_, EcRepairPoint::NativeHelper);
   CO_RETURN_ON_ERROR(check(plan, control));
   if (!helpers_) co_return makeError(StatusCode::kNotImplemented, "native helper capabilities were not supplied");
   auto seed = EcRepairBlockCore::begin(*plan_, block);
@@ -277,6 +298,7 @@ CoTryTask<storage::EcRepairBlock> NativeEcRepairTransport::helperBlock(Plan plan
   storage::client::EcRequestControl options{control.deadline,
                                             control.cancellation,
                                             storage::client::EcRequestControl::TransportPolicy::TcpOnly};
+  metric.noteInvocation();
   auto response = co_await client_->executeEcHelper(std::move(request), options);
   CO_RETURN_ON_ERROR(response);
   CO_RETURN_ON_ERROR(check(plan, control));
@@ -285,6 +307,8 @@ CoTryTask<storage::EcRepairBlock> NativeEcRepairTransport::helperBlock(Plan plan
   CO_RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(*plan_, result));
   // Clients do not possess the helper MAC key. Actual target block hashes are
   // checked here; upstream Storage verifies finalStamp in every forwarding hop.
+  for (size_t target = 0; target != result.targetCount; ++target) metric.validated(result.outputs[target].size());
+  metric.success();
   co_return result;
 }
 

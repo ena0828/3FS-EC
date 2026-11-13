@@ -37,6 +37,9 @@ def parser():
                  "fsync", "resume-fsync", "repair", "resume-repair", "query-repair", "close-repair-debt"):
         item = sub.add_parser(name)
         item.add_argument("--run-dir", type=Path, required=True, help="该操作的固定日志目录；新操作必须使用新目录")
+        if name in ("repair", "resume-repair", "query-repair", "close-repair-debt"):
+            item.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
+                              help="显式开启/关闭本次原生修复计量；默认沿用配置（默认关闭），开启有计量开销")
         if name in ("pwrite", "read", "truncate", "append", "fsync", "repair"):
             item.add_argument("--session", type=Path, required=True, help="已接受会话的原日志目录")
         if name in ("pwrite", "read"):
@@ -99,6 +102,8 @@ def command(args):
                        repair_mode=args.strategy, repair_window_decimal=args.window)
     if hasattr(args, "rights"):
         options["session_rights"] = RIGHTS[args.rights]
+    if getattr(args, "metrics", None) is not None:
+        options["repair_metrics"] = "true" if args.metrics else "false"
     if args.action == "create" and not args.path.startswith("/"):
         raise ValueError("--path 必须为 3FS 绝对路径")
     return [str(root / "bin/ec_file_cli"), f"--cfg={root / 'client/file-client.toml'}",

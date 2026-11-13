@@ -10,6 +10,7 @@ struct EcTreeRepairOutcome {
   // A real successful query in THIS call, separately from historical journal.
   bool revalidated = false;
   std::optional<Status> failure;
+  EcRepairSample metrics;
 };
 // Serialized synchronous facade for an ordinary owned caller thread. Every
 // actual RPC/pipeline child is joined before return; shared runtime outlives it.
@@ -20,11 +21,12 @@ class EcFileRepairClient final {
                                                              std::shared_ptr<hf3fs::client::ICommonMgmtdClient>,
                                                              flat::UserInfo,
                                                              Uuid expectedNamespace);
-  EcTreeRepairOutcome repair(EcTreeRepairJournal &, EcStripeControl);
-  EcTreeRepairOutcome query(EcTreeRepairJournal &, EcStripeControl);
+  // Opt-in observations describe this call only, never historical journal totals.
+  EcTreeRepairOutcome repair(EcTreeRepairJournal &, EcStripeControl, bool collectMetrics = false);
+  EcTreeRepairOutcome query(EcTreeRepairJournal &, EcStripeControl, bool collectMetrics = false);
   // Explicit close aborts a still-Planned operation. Published repair remains
   // published even if an unreachable original source keeps real T2 debt open.
-  EcTreeRepairOutcome closeDebt(EcTreeRepairJournal &, EcStripeControl);
+  EcTreeRepairOutcome closeDebt(EcTreeRepairJournal &, EcStripeControl, bool collectMetrics = false);
 
  private:
   EcFileRepairClient(std::shared_ptr<meta::client::MetaClient> m,
@@ -38,13 +40,13 @@ class EcFileRepairClient final {
         executor_(1) {}
   Result<Void> check(const EcTreeRepairJournal &, EcStripeControl) const;
   void request(meta::EcFileRepairReq &, const EcTreeRepairRun &, Uuid) const;
-  EcTreeRepairOutcome execute(EcTreeRepairJournal &, EcStripeControl, uint8_t action);
-  CoTryTask<Void> transfer(meta::EcFileRepairAccess, const EcTreeRepairRun &, EcStripeControl);
+  EcTreeRepairOutcome execute(EcTreeRepairJournal &, EcStripeControl, uint8_t action, bool collectMetrics);
+  CoTryTask<Void> transfer(meta::EcFileRepairAccess, const EcTreeRepairRun &, EcStripeControl, EcRepairObservation *);
   CoTryTask<Void> copyOne(const meta::EcV2AllocationBinding &,
                           const meta::EcV2AllocationBinding &,
                           storage::EcCapabilityV2,
                           storage::EcCapabilityV2,
-                          EcStripeControl);
+                          EcStripeControl, EcRepairObservation *);
   std::shared_ptr<meta::client::MetaClient> meta_;
   std::shared_ptr<storage::client::StorageClient> storage_;
   std::shared_ptr<hf3fs::client::ICommonMgmtdClient> mgmtd_;

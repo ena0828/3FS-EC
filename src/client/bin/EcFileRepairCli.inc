@@ -34,6 +34,30 @@ const char *repairModeName(meta::EcFileRepairMode mode) {
   }
   return "invalid";
 }
+// Best-effort rendering is separated from required business JSON. If any
+// telemetry allocation/formatting fails, emit the already-rendered business
+// result plus literal unavailable fields, without changing its exit status.
+std::string repairMetricsJson(const EcRepairSample &m) {
+  folly::dynamic out = folly::dynamic::object("schema", 1)("scope", "this_call")(
+      "action", unsigned(m.action))("journal_state_observed", m.journalStateObserved)("had_journal_state", m.hadJournalState)(
+      "prior_journal_sequence_decimal", std::to_string(m.priorJournalSequence))(
+      "elapsed_ns_decimal", std::to_string(m.elapsedNs))("configured_window", unsigned(m.configuredWindow))(
+      "block_actors_applicable", m.blockActorsApplicable)("cancellation_requested", m.cancellationRequested)(
+      "deadline_expired", m.deadlineExpired)("overflow", m.overflow)("clock_anomaly", m.clockAnomaly)(
+      "wire_bytes", nullptr)("rpc_encoded_bytes", nullptr)("transport_retry_attempts", nullptr)(
+      "server_queue_depth", nullptr)("persisted_in_business_journal", false)("points", folly::dynamic::object());
+  for (size_t n = 0; n != m.points.size(); ++n) {
+    const auto &p = m.points[n];
+    out["points"][kEcRepairPointNames[n]] = folly::dynamic::object(
+        "entered_decimal", std::to_string(p.entered))("finished_decimal", std::to_string(p.finished))(
+        "succeeded_decimal", std::to_string(p.succeeded))("span_ns_decimal", std::to_string(p.spanNs))(
+        "active_decimal", std::to_string(p.active))("peak_active_decimal", std::to_string(p.peakActive))(
+        "api_invocations_decimal", std::to_string(p.apiInvocations))(
+        "submitted_payload_bytes_decimal", std::to_string(p.submittedPayloadBytes))(
+        "validated_returned_payload_bytes_decimal", std::to_string(p.validatedReturnedPayloadBytes));
+  }
+  return folly::toJson(out);
+}
 int executeMode4Repair(const Config &cfg, const std::string &command) {
   const bool fresh = command == "mode4-repair";
   std::unique_ptr<EcTreeRepairJournal> journal;
@@ -79,7 +103,26 @@ int executeMode4Repair(const Config &cfg, const std::string &command) {
       out["source_order"] = folly::dynamic::array();
       for (auto index : i.selection.sourceOrder) out["source_order"].push_back(unsigned(index));
     }
-    std::cout << folly::toJson(out) << '\n';
+    const auto business = folly::toJson(out);
+    if (!cfg.repair_metrics()) {
+      std::cout << business << '\n';
+      return;
+    }
+    std::string metrics;
+    bool available = false;
+    try {
+      if (result.metrics.available) {
+        metrics = repairMetricsJson(result.metrics);
+        available = true;
+      }
+    } catch (...) {
+      // No telemetry failure becomes a business failure/unknown commit.
+    }
+    std::cout.write(business.data(), business.size() - 1);
+    std::cout << ",\"metrics\":";
+    if (available) std::cout << metrics;
+    else std::cout << "null";
+    std::cout << ",\"telemetry_unavailable\":" << (available ? "false" : "true") << "}\n";
   };
   auto fail = [&](Status error, int code = 1) {
     if (journal && journal->latest()) result.progress = journal->latest()->progress;
@@ -211,9 +254,9 @@ int executeMode4Repair(const Config &cfg, const std::string &command) {
     auto connected = EcFileRepairClient::connect(metadata, storage, mgmtd, credentials, ns);
     if (!connected) return fail(std::move(connected.error()));
     auto client = std::move(*connected);
-    result = command == "mode4-query-repair"        ? client->query(*journal, control(cfg))
-             : command == "mode4-close-repair-debt" ? client->closeDebt(*journal, control(cfg))
-                                                    : client->repair(*journal, control(cfg));
+    result = command == "mode4-query-repair"        ? client->query(*journal, control(cfg), cfg.repair_metrics())
+             : command == "mode4-close-repair-debt" ? client->closeDebt(*journal, control(cfg), cfg.repair_metrics())
+                                                    : client->repair(*journal, control(cfg), cfg.repair_metrics());
     emit();
     if (result.failure) {
       std::cerr << "repair unconfirmed: " << result.failure->describe() << "; retain the original run and IDs\n";

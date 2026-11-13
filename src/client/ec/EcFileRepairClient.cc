@@ -11,6 +11,15 @@ namespace hf3fs::client::ec {
 namespace {
 using folly::coro::blockingWait;
 using namespace storage;
+// End the observation before returning the original Result.
+template <typename F>
+auto observeResult(EcRepairObservation *observation, EcRepairPoint point, F &&call, bool rpc = false) {
+  EcRepairObservation::Scope metric(observation, point);
+  if (rpc) metric.noteInvocation();
+  auto result = call();
+  if (result) metric.success();
+  return result;
+}
 bool same(const auto &a, const auto &b) { return serde::serialize(a) == serde::serialize(b); }
 Result<Void> active(EcStripeControl c) {
   if (c.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
@@ -160,7 +169,7 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
                                             const meta::EcV2AllocationBinding &t,
                                             EcCapabilityV2 read,
                                             EcCapabilityV2 write,
-                                            EcStripeControl c) {
+                                            EcStripeControl c, EcRepairObservation *observation) {
   CO_RETURN_ON_ERROR(active(c));
   auto sr = route(*mgmtd_, s.endpoint());
   CO_RETURN_ON_ERROR(sr);
@@ -177,9 +186,14 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
         *sr,
         b);
     CO_RETURN_ON_ERROR(q);
+    EcRepairObservation::Scope readMetric(observation, EcRepairPoint::CopyRead);
+    readMetric.noteInvocation();
     auto value = co_await storage_->readEcBlockV2Controlled(*q, options(c));
     CO_RETURN_ON_ERROR(value);
     CO_RETURN_ON_ERROR(validateEcReadBlockV2(*value, *q));
+    readMetric.validated(value->payload.data.size());
+    readMetric.success();
+    readMetric.finish();
     data.append(value->payload.data);
   }
   auto descriptor = computeEcIntegrity(t.fragment.identity, data);
@@ -192,22 +206,30 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
   try {
     CO_RETURN_ON_ERROR(active(c));
     invoked = true;
+    EcRepairObservation::Scope beginMetric(observation, EcRepairPoint::CopyBegin);
+    beginMetric.noteInvocation();
     auto state = co_await storage_->beginEcStageV2Controlled(begin, options(c));
     uint32_t prefix = 0;
     if (state) {
       CO_RETURN_ON_ERROR(validateEcStageStateV2(*state, begin.request, write.claims));
       prefix = state->prefixBytes;
+      beginMetric.success();
     } else if (state.error().code() != StorageCode::kEcSealOutcomeUnknown)
       co_return makeError(std::move(state.error()));
+    beginMetric.finish();
     // Always reconcile the same allocation after restart, never infer durability
     // from a stale Query or create a replacement operation on uncertain I/O.
     CO_RETURN_ON_ERROR(active(c));
+    EcRepairObservation::Scope reconcileMetric(observation, EcRepairPoint::CopyReconcile);
+    reconcileMetric.noteInvocation();
     state = co_await storage_->reconcileEcStageV2Controlled({begin.request, write}, options(c));
     CO_RETURN_ON_ERROR(state);
     CO_RETURN_ON_ERROR(validateEcStageStateV2(*state, begin.request, write.claims));
     if (state->needsReconcile || state->pendingBlock || state->prefixBytes < prefix)
       co_return makeError(StorageCode::kEcSealOutcomeUnknown);
     if (state->state == 3) co_return makeError(StatusCode::kTokenStale);
+    reconcileMetric.success();
+    reconcileMetric.finish();
     if (state->state == 1)
       for (uint32_t b = state->prefixBytes / kEcIntegrityBlockBytes; b < descriptor->blockCount; ++b) {
         CO_RETURN_ON_ERROR(active(c));
@@ -216,24 +238,31 @@ CoTryTask<Void> EcFileRepairClient::copyOne(const meta::EcV2AllocationBinding &s
         q.grant = write;
         q.blockIndex = b;
         q.payload.data = data.substr(size_t(b) * kEcIntegrityBlockBytes, descriptor->blocks[b].validLength);
+        EcRepairObservation::Scope appendMetric(observation, EcRepairPoint::CopyAppend);
+        appendMetric.noteInvocation(q.payload.data.size());
         auto added = co_await storage_->appendEcStageV2Controlled(std::move(q), options(c));
         CO_RETURN_ON_ERROR(added);
         CO_RETURN_ON_ERROR(validateEcStageStateV2(*added, begin.request, write.claims));
         if (added->needsReconcile || added->pendingBlock || added->state != 1 ||
             added->prefixBytes < (b * kEcIntegrityBlockBytes + descriptor->blocks[b].validLength))
           co_return makeError(StorageCode::kEcSealOutcomeUnknown);
+        appendMetric.success();
       }
     CO_RETURN_ON_ERROR(active(c));
+    EcRepairObservation::Scope sealMetric(observation, EcRepairPoint::CopySeal);
+    sealMetric.noteInvocation();
     auto sealed = co_await storage_->sealEcStageV2Controlled({begin.request, write}, options(c));
     CO_RETURN_ON_ERROR(sealed);
     CO_RETURN_ON_ERROR(validateEcReceiptV2(*sealed, begin.request, write.claims));
     CO_RETURN_ON_ERROR(active(c));
+    sealMetric.success();
     co_return Void{};
   } catch (...) {
     co_return makeError(invoked ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kIOError);
   }
 }
-CoTryTask<Void> EcFileRepairClient::transfer(meta::EcFileRepairAccess a, const EcTreeRepairRun &r, EcStripeControl c) {
+CoTryTask<Void> EcFileRepairClient::transfer(meta::EcFileRepairAccess a, const EcTreeRepairRun &r, EcStripeControl c,
+                                           EcRepairObservation *observation) {
   // validate() was completed against the fixed accepted record before entry.
   auto plan = EcRepairPlan::create(a.plan);
   CO_RETURN_ON_ERROR(plan);
@@ -257,32 +286,67 @@ CoTryTask<Void> EcFileRepairClient::transfer(meta::EcFileRepairAccess a, const E
       CO_RETURN_ON_ERROR(v);
       bindings.targets[index++] = {access(a.targets[n], *v), a.writes[n]};
     }
-  auto transport = NativeEcRepairTransport::create(*plan, storage_, std::move(bindings), a.helpers);
+  auto transport = NativeEcRepairTransport::create(*plan, storage_, std::move(bindings), a.helpers, observation);
   CO_RETURN_ON_ERROR(transport);
   auto mode = r.intent.mode == meta::EcFileRepairMode::CentralSerial    ? EcRepairMode::CentralSerial
               : r.intent.mode == meta::EcFileRepairMode::ClientPipeline ? EcRepairMode::ClientPipeline
                                                                         : EcRepairMode::HelperChain;
-  auto done = co_await EcRepairPipeline::run(*plan, *transport, mode, {c.deadline, c.cancellation}, executor_);
-  CO_RETURN_ON_ERROR(done);
+  {
+    EcRepairObservation::Scope selected(observation, EcRepairPoint::SelectedRepair);
+    auto done = co_await EcRepairPipeline::run(
+        *plan, *transport, mode, {c.deadline, c.cancellation}, executor_, observation);
+    CO_RETURN_ON_ERROR(done);
+    selected.success();
+  }
   // The selected erasures use the requested real strategy; surviving fragments
   // are separately copied into fresh allocations. This is deliberately visible.
   for (size_t n = 0; n < 12; ++n)
-    if (!(r.intent.replacementMask & (uint16_t{1} << n)))
-      CO_RETURN_ON_ERROR(co_await copyOne(a.sources[n], a.targets[n], a.reads[n], a.writes[n], c));
+    if (!(r.intent.replacementMask & (uint16_t{1} << n))) {
+      EcRepairObservation::Scope copied(observation, EcRepairPoint::HealthyCopy);
+      CO_RETURN_ON_ERROR(co_await copyOne(a.sources[n], a.targets[n], a.reads[n], a.writes[n], c, observation));
+      copied.success();
+    }
   co_return Void{};
 }
-EcTreeRepairOutcome EcFileRepairClient::execute(EcTreeRepairJournal &j, EcStripeControl c, uint8_t action) {
+EcTreeRepairOutcome EcFileRepairClient::execute(EcTreeRepairJournal &j,
+                                               EcStripeControl c,
+                                               uint8_t action,
+                                               bool collectMetrics) {
   EcTreeRepairOutcome out;
-  if (j.latest()) out.progress = j.latest()->progress;
+  std::optional<EcRepairObservation> observation;
+  if (collectMetrics) observation.emplace();
+  auto *metrics = observation ? &*observation : nullptr;
+  bool journalStateObserved = false, hadState = false;
+  uint64_t priorSequence = 0;
+  // Snapshot BEFORE moving the return value, including Busy/check/query/close.
+  // Every instrumented scope has ended before these return sites.
+  auto finish = [&] {
+    if (metrics) {
+      out.metrics = metrics->snapshot();
+      out.metrics.action = action;
+      out.metrics.journalStateObserved = journalStateObserved;
+      out.metrics.hadJournalState = hadState;
+      out.metrics.priorJournalSequence = priorSequence;
+      out.metrics.configuredWindow = j.record().intent.selection.maxBlocksInFlight;
+      out.metrics.blockActorsApplicable = j.record().intent.mode != meta::EcFileRepairMode::CentralSerial;
+      out.metrics.cancellationRequested = c.cancellation.isCancellationRequested();
+      out.metrics.deadlineExpired = std::chrono::steady_clock::now() >= c.deadline;
+    }
+    return std::move(out);
+  };
   std::unique_lock lock(mutex_, std::try_to_lock);
   if (!lock) {
     out.failure = Status(StorageClientCode::kResourceBusy);
-    return out;
+    return finish();
   }
+  journalStateObserved = true;
+  hadState = j.latest().has_value();
+  priorSequence = hadState ? j.latest()->sequence : 0;
+  if (hadState) out.progress = j.latest()->progress;
   bool invoked = false;
   auto fail = [&](Status s) {
     out.failure = std::move(s);
-    return out;
+    return finish();
   };
   try {
     auto ok = check(j, c);
@@ -296,17 +360,18 @@ EcTreeRepairOutcome EcFileRepairClient::execute(EcTreeRepairJournal &j, EcStripe
       RETURN_ON_ERROR(state.validate(r, nullptr));
       out.progress = rsp.progress;
       out.revalidated = true;
-      auto saved = j.append(state);
+      auto saved = observeResult(metrics, EcRepairPoint::Journal, [&] { return j.append(state); });
       if (!saved) return makeError(TransactionCode::kMaybeCommitted, "repair observation not durably journaled");
       return Void{};
     };
     meta::QueryEcFileRepairReq q;
     request(q, r, r.queryRequest);
-    auto observed = blockingWait(meta_->queryEcFileRepair(std::move(q)));
+    auto observed = observeResult(
+        metrics, EcRepairPoint::Query, [&] { return blockingWait(meta_->queryEcFileRepair(std::move(q))); }, true);
     if (!observed) return fail(std::move(observed.error()));
     ok = remember(*observed, r.queryRequest);
     if (!ok) return fail(std::move(ok.error()));
-    if (action == 0) return out;
+    if (action == 0) return finish();
     if (action == 2) {
       if (!state.progress.record) return fail(Status(MetaCode::kNotFound, "missing repair is not cleanup completion"));
       meta::CloseEcFileRepairDebtReq close;
@@ -314,44 +379,47 @@ EcTreeRepairOutcome EcFileRepairClient::execute(EcTreeRepairJournal &j, EcStripe
       close.outputRevocation = r.outputRevocation;
       close.sourceRevocation = r.sourceRevocation;
       invoked = true;
-      auto closed = blockingWait(meta_->closeEcFileRepairDebt(std::move(close)));
+      auto closed = observeResult(
+          metrics, EcRepairPoint::CloseDebt, [&] { return blockingWait(meta_->closeEcFileRepairDebt(std::move(close))); }, true);
       if (!closed) return fail(std::move(closed.error()));
       ok = remember(*closed, r.closeRequest);
       if (!ok) return fail(std::move(ok.error()));
-      return out;
+      return finish();
     }
     if (!state.progress.record) {
       state.issued = true;
-      ok = j.append(state);
+      ok = observeResult(metrics, EcRepairPoint::Journal, [&] { return j.append(state); });
       if (!ok) return fail(std::move(ok.error()));
       meta::BeginEcFileRepairReq begin;
       request(begin, r, r.intent.request);
       invoked = true;
-      auto accepted = blockingWait(meta_->beginEcFileRepair(std::move(begin)));
+      auto accepted = observeResult(
+          metrics, EcRepairPoint::Begin, [&] { return blockingWait(meta_->beginEcFileRepair(std::move(begin))); }, true);
       if (!accepted) return fail(std::move(accepted.error()));
       ok = remember(*accepted, r.intent.request);
       if (!ok) return fail(std::move(ok.error()));
     }
     if (!state.progress.record) return fail(Status(StatusCode::kDataCorruption));
-    if (state.progress.record->state == meta::EcFileRepairState::Published) return out;
+    if (state.progress.record->state == meta::EcFileRepairState::Published) return finish();
     if (state.progress.record->state != meta::EcFileRepairState::Planned) return fail(Status(StatusCode::kTokenStale));
     if (!state.dataComplete && !state.progress.outputClosing) {
       meta::AdvanceEcFileRepairReq prepare;
       request(prepare, r, r.prepareRequest);
       prepare.action = meta::EcFileRepairAdvance::Prepare;
       invoked = true;
-      auto access = blockingWait(meta_->advanceEcFileRepair(std::move(prepare)));
+      auto access = observeResult(
+          metrics, EcRepairPoint::Prepare, [&] { return blockingWait(meta_->advanceEcFileRepair(std::move(prepare))); }, true);
       if (!access) return fail(std::move(access.error()));
       ok = remember(*access, r.prepareRequest);
       if (!ok) return fail(std::move(ok.error()));
-      if (state.progress.record && state.progress.record->state == meta::EcFileRepairState::Published) return out;
+      if (state.progress.record && state.progress.record->state == meta::EcFileRepairState::Published) return finish();
       if (!access->access || !state.progress.record) return fail(Status(StatusCode::kDataCorruption));
       auto plan = validate(*access->access, r, *state.progress.record);
       if (!plan) return fail(std::move(plan.error()));
-      auto moved = blockingWait(transfer(std::move(*access->access), r, c));
+      auto moved = blockingWait(transfer(std::move(*access->access), r, c, metrics));
       if (!moved) return fail(std::move(moved.error()));
       state.dataComplete = true;
-      ok = j.append(state);
+      ok = observeResult(metrics, EcRepairPoint::Journal, [&] { return j.append(state); });
       if (!ok) return fail(Status(TransactionCode::kMaybeCommitted, "fixed targets require reconciliation"));
     }
     ok = check(j, c);
@@ -360,18 +428,23 @@ EcTreeRepairOutcome EcFileRepairClient::execute(EcTreeRepairJournal &j, EcStripe
     request(publish, r, r.publishRequest);
     publish.action = meta::EcFileRepairAdvance::Publish;
     invoked = true;
-    auto result = blockingWait(meta_->advanceEcFileRepair(std::move(publish)));
+    auto result = observeResult(
+        metrics, EcRepairPoint::Publish, [&] { return blockingWait(meta_->advanceEcFileRepair(std::move(publish))); }, true);
     if (!result) return fail(std::move(result.error()));
     ok = remember(*result, r.publishRequest);
     if (!ok) return fail(std::move(ok.error()));
-    return out;
+    return finish();
   } catch (...) {
     return fail(Status(invoked ? TransactionCode::kMaybeCommitted : StatusCode::kIOError));
   }
 }
-EcTreeRepairOutcome EcFileRepairClient::repair(EcTreeRepairJournal &j, EcStripeControl c) { return execute(j, c, 1); }
-EcTreeRepairOutcome EcFileRepairClient::query(EcTreeRepairJournal &j, EcStripeControl c) { return execute(j, c, 0); }
-EcTreeRepairOutcome EcFileRepairClient::closeDebt(EcTreeRepairJournal &j, EcStripeControl c) {
-  return execute(j, c, 2);
+EcTreeRepairOutcome EcFileRepairClient::repair(EcTreeRepairJournal &j, EcStripeControl c, bool collectMetrics) {
+  return execute(j, c, 1, collectMetrics);
+}
+EcTreeRepairOutcome EcFileRepairClient::query(EcTreeRepairJournal &j, EcStripeControl c, bool collectMetrics) {
+  return execute(j, c, 0, collectMetrics);
+}
+EcTreeRepairOutcome EcFileRepairClient::closeDebt(EcTreeRepairJournal &j, EcStripeControl c, bool collectMetrics) {
+  return execute(j, c, 2, collectMetrics);
 }
 }  // namespace hf3fs::client::ec

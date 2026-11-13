@@ -63,6 +63,7 @@ struct Window {
   std::shared_ptr<EcRepairTransport> transport;
   EcRepairMode mode;
   EcRepairControl control;
+  EcRepairObservation *observation = nullptr;
   std::mutex mutex;
   std::optional<Status> error;
   std::array<folly::coro::Baton, kEcIntegrityMaxBlocks + 1> writeTurn;
@@ -89,7 +90,11 @@ struct Window {
 
 CoTryTask<void> appendBlock(std::shared_ptr<Window> state, EcRepairBlock block) {
   CO_RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(*state->plan, block));
-  co_await state->writeTurn[block.blockIndex];
+  {
+    EcRepairObservation::Scope waiting(state->observation, EcRepairPoint::OrderedAppendWait);
+    co_await state->writeTurn[block.blockIndex];
+    waiting.success();
+  }
   if (state->stopped())
     co_return makeError(StorageClientCode::kRequestCanceled, "EC repair stopped before ordered append");
   CO_RETURN_ON_ERROR(active(state->control));
@@ -111,6 +116,7 @@ CoTryTask<void> appendBlock(std::shared_ptr<Window> state, EcRepairBlock block) 
 CoTryTask<void> oneBlock(std::shared_ptr<Window> state, uint32_t blockIndex) {
   if (state->stopped()) co_return Void{};
   CO_RETURN_ON_ERROR(active(state->control));
+  EcRepairObservation::Scope actor(state->observation, EcRepairPoint::BlockActor);
   auto block = EcRepairBlockCore::begin(*state->plan, blockIndex);
   CO_RETURN_ON_ERROR(block);
   if (state->mode == EcRepairMode::HelperChain) {
@@ -131,7 +137,9 @@ CoTryTask<void> oneBlock(std::shared_ptr<Window> state, uint32_t blockIndex) {
     }
   }
   CO_RETURN_ON_ERROR(active(state->control));
-  co_return co_await appendBlock(state, std::move(*block));
+  auto appended = co_await appendBlock(state, std::move(*block));
+  if (appended) actor.success();
+  co_return appended;
 }
 
 CoTask<void> ownedBlock(std::shared_ptr<Window> state, uint32_t index) {
@@ -185,7 +193,8 @@ CoTryTask<void> central(std::shared_ptr<Window> state) {
 CoTryTask<EcRepairSealed> runOwned(std::shared_ptr<const EcRepairPlan> plan,
                                    std::shared_ptr<EcRepairTransport> transport,
                                    EcRepairMode mode,
-                                   EcRepairControl control) {
+                                   EcRepairControl control,
+                                   EcRepairObservation *observation) {
   try {
     if (!plan || !transport ||
         (mode != EcRepairMode::CentralSerial && mode != EcRepairMode::ClientPipeline &&
@@ -201,6 +210,7 @@ CoTryTask<EcRepairSealed> runOwned(std::shared_ptr<const EcRepairPlan> plan,
     state->transport = std::move(transport);
     state->mode = mode;
     state->control = control;
+    state->observation = observation;
     state->writeTurn[0].post();
     for (uint8_t target = 0; target != state->plan->input().targetCount; ++target) {
       CO_RETURN_ON_ERROR(active(control));
@@ -257,12 +267,13 @@ CoTryTask<EcRepairSealed> EcRepairPipeline::run(std::shared_ptr<const storage::E
                                                 std::shared_ptr<EcRepairTransport> transport,
                                                 EcRepairMode mode,
                                                 EcRepairControl control,
-                                                folly::CPUThreadPoolExecutor &executor) {
+                                                folly::CPUThreadPoolExecutor &executor,
+                                                EcRepairObservation *observation) {
   // Ignore ambient cancellation only for ownership/join. The explicit token
   // and absolute deadline are checked before every new transport operation.
   co_return co_await folly::coro::co_withCancellation(
       CancellationToken{},
-      runOwned(std::move(plan), std::move(transport), mode, control).scheduleOn(&executor));
+      runOwned(std::move(plan), std::move(transport), mode, control, observation).scheduleOn(&executor));
 }
 
 }  // namespace hf3fs::client::ec
