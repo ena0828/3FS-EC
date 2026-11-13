@@ -1,0 +1,79 @@
+name: OpenEC hosted RSPIPE reference
+
+on:
+  push:
+    branches: [feat/ec-reference-runtime]
+    paths:
+      - .github/workflows/ec-hosted-openec.yml
+      - scripts/ec/reference/**
+      - '!**/*.md'
+      - '!**/*.rst'
+      - '!**/README*'
+      - '!**/docs/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ec-hosted-openec-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  openec:
+    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-reference-runtime' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      CMAKE_BUILD_PARALLEL_LEVEL: '1'
+      MAKEFLAGS: '-j1'
+      CC: /usr/bin/gcc
+      CXX: /usr/bin/g++
+    steps:
+      - name: Check out this adapter revision only
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+          persist-credentials: false
+
+      - name: Install build tools and check the existing runtime guards
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          test "$(id -u)" -ne 0
+          sudo -n apt-get update -qq
+          sudo -n apt-get install -y --no-install-recommends build-essential cmake git python3 libssl3t64
+          /usr/bin/g++ --version
+          /usr/bin/cmake --version
+          python3 --version
+          ulimit -n 4096
+          python3 -B scripts/ec/reference/test_runtime_contract.py -v
+
+      - name: Fetch locked official sources and private packages; build Redis serially
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          ulimit -n 4096
+          exec python3 -B scripts/ec/reference/bootstrap_openec.py prepare --work "$RUNNER_TEMP/openec-reference"
+
+      - name: Build exactly the three OpenEC programs
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          ulimit -n 4096
+          exec python3 -B scripts/ec/reference/build_reference.py \
+            --prepared-root "$RUNNER_TEMP/openec-reference/prepared" \
+            --dependency-prefix "$RUNNER_TEMP/openec-reference/prefix" \
+            --build-root "$RUNNER_TEMP/openec-reference/openec-build"
+
+      - name: Run one real RSPIPE missing-object repair and join every owned process
+        # 900-second runtime deadline plus owned cleanup. The job cap is an
+        # infrastructure stop, not evidence of a graceful protocol drain.
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          ulimit -n 4096
+          exec python3 -B scripts/ec/reference/bootstrap_openec.py run --work "$RUNNER_TEMP/openec-reference"

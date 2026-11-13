@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "openec": {
+    "url": "https://codeload.github.com/ukulililixl/openec/tar.gz/04e91d8c9f94bb9f22b7a98570482dfd0eb767b3",
+    "sha256": "816e63aa18a92e45c3838d936a6730c380bdb92b66be22f611e2842ab13b1652",
+    "size": 2297334
+  },
+  "redis": {
+    "url": "https://download.redis.io/releases/redis-7.2.11.tar.gz",
+    "sha256": "2f9886eca68d30114ad6a01da65631f8007d802fd3e6c9fac711251e6390323d",
+    "size": 3398130
+  },
+  "packages": [
+    {
+      "package": "libhiredis-dev",
+      "version": "1.2.0-6ubuntu3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/h/hiredis/libhiredis-dev_1.2.0-6ubuntu3_amd64.deb",
+      "sha256": "178926b5b14988c86f8f359f61894abd4ea6966e852a00349dbeaf3cccda09a2",
+      "size": 78290
+    },
+    {
+      "package": "libhiredis1.1.0",
+      "version": "1.2.0-6ubuntu3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/h/hiredis/libhiredis1.1.0_1.2.0-6ubuntu3_amd64.deb",
+      "sha256": "912a25553f29a47d1524c0b58a3c5bff2d067109da2adae9fa9c4fb15efaa568",
+      "size": 41380
+    },
+    {
+      "package": "libgf-complete-dev",
+      "version": "1.0.2+2017.04.10.git.ea75cdf-9.1build1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gf-complete/libgf-complete-dev_1.0.2+2017.04.10.git.ea75cdf-9.1build1_amd64.deb",
+      "sha256": "b1e9bc5dcc7d97094966b85028cdc856d4687bd0529745e7c50bb8adee8814e5",
+      "size": 5584
+    },
+    {
+      "package": "libgf-complete1t64",
+      "version": "1.0.2+2017.04.10.git.ea75cdf-9.1build1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gf-complete/libgf-complete1t64_1.0.2+2017.04.10.git.ea75cdf-9.1build1_amd64.deb",
+      "sha256": "9bfe03896f647fe752942b90d291b34de0c2980d7617bfb1b1d0785bf02d5f9f",
+      "size": 63410
+    },
+    {
+      "package": "libisal-dev",
+      "version": "2.31.0-0.1build1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/libi/libisal/libisal-dev_2.31.0-0.1build1_amd64.deb",
+      "sha256": "293bf52a13045fd95b202fe83cdc56927923f893d8f7e7d9aa8ca2884e2f3f67",
+      "size": 27434
+    },
+    {
+      "package": "libisal2",
+      "version": "2.31.0-0.1build1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/libi/libisal/libisal2_2.31.0-0.1build1_amd64.deb",
+      "sha256": "94ae550dc0d4cbd8405a9626034dcfac655edad97b5d70d38cf4c42388111e14",
+      "size": 117168
+    }
+  ]
+}
