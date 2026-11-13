@@ -10,6 +10,8 @@
 
 #include "chunk_engine/src/cxx.rs.h"
 
+namespace chunk_engine = hf3fs::chunk_engine;
+
 namespace {
 using Block = std::vector<uint8_t>;
 
