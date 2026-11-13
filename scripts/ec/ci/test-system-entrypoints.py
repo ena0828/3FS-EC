@@ -136,6 +136,11 @@ class SystemEntrypoints(unittest.TestCase):
                            "listing": {"exitcode": 0}, "execution": {"exitcode": 0}})
         original = {"status": "passed", "exitcode": 0, "failures": [], "suites": suites}
         regression.check_suites(original, build, built)
+        def omit_window_two_recovery(receipt):
+            service = receipt["suites"][1]
+            name = "TestEcNativeRepairService.WindowTwoLostAppendReplyRecoversBothOriginalTargets"
+            service["listed_tests"] = [row for row in service["listed_tests"] if row["name"] != name]
+            service["xml_results"]["cases"] = [row for row in service["xml_results"]["cases"] if row["name"] != name]
         changes = [
             lambda r: r["suites"].pop(),
             lambda r: r["suites"][0].update(binary_sha256_after="f" * 64),
@@ -144,7 +149,7 @@ class SystemEntrypoints(unittest.TestCase):
             lambda r: r["suites"][0]["xml_results"]["cases"][0].update(skipped=True),
             lambda r: (r["suites"][0]["listed_tests"].pop(), r["suites"][0]["xml_results"]["cases"].pop()),
             lambda r: (r["suites"][2]["listed_tests"].pop(), r["suites"][2]["xml_results"]["cases"].pop()),
-            lambda r: (r["suites"][1]["listed_tests"].pop(), r["suites"][1]["xml_results"]["cases"].pop()),
+            omit_window_two_recovery,
         ]
         for change in changes:
             value = copy.deepcopy(original)

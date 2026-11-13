@@ -135,6 +135,10 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_EQ(metrics.at(EcRepairPoint::NativeSeal).succeeded, 2);
     EXPECT_EQ(metrics.blockActorsApplicable, mode != EcFileRepairMode::CentralSerial);
     EXPECT_LE(metrics.at(EcRepairPoint::BlockActor).peakActive, run->intent.selection.maxBlocksInFlight);
+    EXPECT_EQ(metrics.at(EcRepairPoint::CentralCodecRecover).entered,
+              mode == EcFileRepairMode::CentralSerial ? 1 : 0);
+    EXPECT_EQ(metrics.at(EcRepairPoint::ClientBlockAdvance).entered,
+              mode == EcFileRepairMode::ClientPipeline ? 10 : 0);
     if (mode == EcFileRepairMode::HelperChain) {
       EXPECT_EQ(metrics.at(EcRepairPoint::NativeRead).apiInvocations, 0);
       EXPECT_EQ(metrics.at(EcRepairPoint::NativeHelper).validatedReturnedPayloadBytes, 2ULL * kShardBytes);
@@ -164,6 +168,17 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
       EXPECT_EQ(method.outerOk, method.entered);
       EXPECT_EQ(method.outerError, 0);
       EXPECT_EQ(method.withoutResult, 0);
+      EXPECT_EQ(method.messengerInvocations, method.entered);
+      EXPECT_EQ(method.withoutMessenger, 0);
+      for (const auto &limiter : method.limiters) {
+        const auto expected = i == size_t(EcRpcMethod::Helper) ? 0 : method.entered;
+        EXPECT_EQ(limiter.entered, expected);
+        EXPECT_EQ(limiter.acquired, expected);
+        EXPECT_EQ(limiter.finished, expected);
+        EXPECT_EQ(limiter.withoutPermit, 0);
+        EXPECT_EQ(limiter.active, 0);
+        EXPECT_LE(limiter.peakActive, expected);
+      }
       EXPECT_EQ(method.client.valid, method.entered);
       EXPECT_EQ(method.server.valid, method.entered);
       EXPECT_EQ(method.client.missing + method.client.reversed + method.client.outOfRange, 0);

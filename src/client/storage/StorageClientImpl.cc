@@ -25,6 +25,30 @@
 
 namespace hf3fs::storage::client {
 
+namespace {
+EcRpcMethod observedEcMethod(StorageClient::MethodType method) noexcept {
+  using Method = StorageClient::MethodType;
+  switch (method) {
+    case Method::readEcBlockV2:
+      return EcRpcMethod::Read;
+    case Method::beginEcStageV2:
+      return EcRpcMethod::Begin;
+    case Method::appendEcStageV2:
+      return EcRpcMethod::Append;
+    case Method::queryEcStageV2:
+      return EcRpcMethod::Query;
+    case Method::reconcileEcStageV2:
+      return EcRpcMethod::Reconcile;
+    case Method::sealEcStageV2:
+      return EcRpcMethod::Seal;
+    case Method::executeEcHelper:
+      return EcRpcMethod::Helper;
+    default:
+      return EcRpcMethod::Count;
+  }
+}
+}  // namespace
+
 /* Performance metrics */
 
 static std::unordered_map<StorageClient::MethodType, std::atomic_int64_t> atomic_concurrent_user_calls;
@@ -899,27 +923,8 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
                                                       bool allowTcp,
                                                       bool tcpOnly,
                                                       EcRpcObservation *observation) {
-  const auto observedMethod = [&] {
-    switch (requestCtx.methodType) {
-      case MethodType::readEcBlockV2:
-        return EcRpcMethod::Read;
-      case MethodType::beginEcStageV2:
-        return EcRpcMethod::Begin;
-      case MethodType::appendEcStageV2:
-        return EcRpcMethod::Append;
-      case MethodType::queryEcStageV2:
-        return EcRpcMethod::Query;
-      case MethodType::reconcileEcStageV2:
-        return EcRpcMethod::Reconcile;
-      case MethodType::sealEcStageV2:
-        return EcRpcMethod::Seal;
-      case MethodType::executeEcHelper:
-        return EcRpcMethod::Helper;
-      default:
-        return EcRpcMethod::Count;
-    }
-  };
-  EcRpcObservation::Scope rpcMetric(observation, observation ? observedMethod() : EcRpcMethod::Count);
+  EcRpcObservation::Scope rpcMetric(
+      observation, observation ? observedEcMethod(requestCtx.methodType) : EcRpcMethod::Count);
   if (dispatched) *dispatched = false;
   monitor::ScopedLatencyWriter latencyWriter(request_latency, requestCtx.requestTagSet);
   monitor::ScopedCounterWriter inflightRequests(inflight_requests,
@@ -963,7 +968,8 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
   auto response =
       FAULT_INJECTION_POINT(requestCtx.debugFlags.injectClientError(),
                             makeError(StorageClientCode::kCommError),
-                            (co_await std::invoke(Method, messenger, address, request, &options, &timestamp)));
+                            (rpcMetric.messengerInvocation(),
+                             (co_await std::invoke(Method, messenger, address, request, &options, &timestamp))));
   // Inspect both successful and error Results. Missing/invalid timestamps are
   // counted independently; outer success is not the EC business result.
   rpcMetric.returned(bool(response), timestamp);
@@ -2925,11 +2931,17 @@ CoTryTask<Response> StorageClientImpl::stageRequestV2(const WireReq &wire,
   }
   auto &limiter = durable ? writeConcurrencyLimit_ : readConcurrencyLimit_;
   auto serverSemaphore = limiter.getPerServerSemaphore(nodeId);
+  auto *observation = control ? control->observation : nullptr;
+  const auto observedMethod = observation ? observedEcMethod(methodType) : EcRpcMethod::Count;
+  EcRpcObservation::LimiterScope perServerMetric(observation, observedMethod, EcRpcLimiter::PerServer);
   SemaphoreGuard perServer(*serverSemaphore);
   co_await perServer.coWait();
+  perServerMetric.acquired();
   CO_RETURN_ON_ERROR(checkControl());
+  EcRpcObservation::LimiterScope globalMetric(observation, observedMethod, EcRpcLimiter::Global);
   SemaphoreGuard global(limiter.getConcurrencySemaphore());
   co_await global.coWait();
+  globalMetric.acquired();
   CO_RETURN_ON_ERROR(checkControl());
   if (context.isTimeout()) co_return makeError(StorageClientCode::kTimeout);
   node = getEcNodeInfo(getCurrentRoutingInfo(), req.vChainId, req.targetId);

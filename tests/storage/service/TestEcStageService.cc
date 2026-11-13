@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <fcntl.h>
 #include <folly/ScopeGuard.h>
 #include <folly/experimental/coro/Baton.h>
@@ -52,6 +53,45 @@ void smallClient(net::Client::Config &config) {
 }
 
 struct StageReplyDropState {
+  // One fixed window=2 attempt. Counts describe real service-handler bodies,
+  // not a distributed drain certificate or the connection's response queue.
+  struct ConcurrentWindow {
+    struct Snapshot {
+      bool held = false;
+      bool dropped = false;
+      bool sameConnection = false;
+      size_t readEntered = 0, readFinished = 0, readSucceeded = 0;
+      std::array<size_t, 10> helperEntered{}, helperFinished{}, helperSucceeded{}, helperBusy{};
+    };
+    EcRepairPlanInput plan;
+    EcFragmentAccessV2 sourceRequest;
+    bool helper = false;
+    std::mutex mutex;
+    std::condition_variable changed;
+    Snapshot state;
+    net::TransportPtr firstHop;
+    folly::coro::Baton entered, resume;
+    std::atomic<bool> released{false};
+
+    Snapshot snapshot() {
+      std::lock_guard lock(mutex);
+      return state;
+    }
+    template <class Predicate>
+    bool waitFor(Predicate predicate) {
+      std::unique_lock lock(mutex);
+      return changed.wait_for(lock, std::chrono::seconds(10), [&] { return predicate(state); });
+    }
+    void unblock() {
+      if (!released.exchange(true)) {
+        // Also unblock the post-commit Append handler on an assertion failure
+        // before the intended remote request reached its barrier.
+        entered.post();
+        resume.post();
+      }
+    }
+    ~ConcurrentWindow() { unblock(); }
+  };
   struct ReadDelay {
     std::promise<void> entered;
     // Suspend only this handler; never block its shared network processor.
@@ -112,6 +152,7 @@ struct StageReplyDropState {
   size_t queryCalls = 0;
   size_t reconcileCalls = 0;
   std::optional<uint16_t> delayedReadShard;
+  std::shared_ptr<ConcurrentWindow> concurrentWindow;
 };
 
 // Every handler still executes the real StorageService. Rebind the serde
@@ -124,6 +165,35 @@ class StageReplyDropStorageService : public StorageService {
         fault_(fault) {}
 
   CoTryTask<EcReadBlockV2Rsp> readEcBlockV2(serde::CallContext &ctx, const EcReadBlockV2Req &req) {
+    std::shared_ptr<StageReplyDropState::ConcurrentWindow> window;
+    {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.concurrentWindow && !fault_.concurrentWindow->helper && req.blockIndex == 1 &&
+          StageReplyDropState::sameStage(req.request, fault_.concurrentWindow->sourceRequest)) {
+        window = fault_.concurrentWindow;
+      }
+    }
+    if (window) {
+      bool success = false;
+      {
+        std::lock_guard lock(window->mutex);
+        ++window->state.readEntered;
+        window->firstHop = ctx.transport();
+        window->state.held = true;
+      }
+      auto finished = folly::makeGuard([&] {
+        std::lock_guard lock(window->mutex);
+        ++window->state.readFinished;
+        window->state.readSucceeded += success;
+        window->changed.notify_all();
+      });
+      window->changed.notify_all();
+      window->entered.post();
+      co_await window->resume;
+      auto result = co_await StorageService::readEcBlockV2(ctx, req);
+      success = result && result->result;
+      co_return result;
+    }
     std::shared_ptr<StageReplyDropState::ReadDelay> delay;
     {
       std::lock_guard lock(fault_.mutex);
@@ -142,6 +212,40 @@ class StageReplyDropStorageService : public StorageService {
   }
 
   CoTryTask<EcHelperHopRsp> executeEcHelper(serde::CallContext &ctx, const EcHelperHopReq &request) {
+    std::shared_ptr<StageReplyDropState::ConcurrentWindow> window;
+    {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.concurrentWindow && fault_.concurrentWindow->helper && request.packet.blockIndex == 1 &&
+          request.packet.nextHelper < 10 && serde::equals(request.plan, fault_.concurrentWindow->plan)) {
+        window = fault_.concurrentWindow;
+      }
+    }
+    if (window) {
+      const auto position = request.packet.nextHelper;
+      bool success = false, busy = false;
+      {
+        std::lock_guard lock(window->mutex);
+        ++window->state.helperEntered[position];
+        if (position == 0 && !window->firstHop) window->firstHop = ctx.transport();
+        if (position == 4) window->state.held = true;
+      }
+      auto finished = folly::makeGuard([&] {
+        std::lock_guard lock(window->mutex);
+        ++window->state.helperFinished[position];
+        window->state.helperSucceeded[position] += success;
+        window->state.helperBusy[position] += busy;
+        window->changed.notify_all();
+      });
+      window->changed.notify_all();
+      if (position == 4) {
+        window->entered.post();
+        co_await window->resume;
+      }
+      auto result = co_await StorageService::executeEcHelper(ctx, request);
+      success = result && result->result;
+      busy = result && !result->result && result->result.error().code() == StorageClientCode::kResourceBusy;
+      co_return result;
+    }
     std::shared_ptr<StageReplyDropState::ReadDelay> delay;
     {
       std::lock_guard lock(fault_.mutex);
@@ -211,7 +315,30 @@ class StageReplyDropStorageService : public StorageService {
         drop = true;
       }
     }
-    if (drop) ctx.transport()->invalidate(false);
+    if (drop) {
+      std::shared_ptr<StageReplyDropState::ConcurrentWindow> window;
+      {
+        std::lock_guard lock(fault_.mutex);
+        window = fault_.concurrentWindow;
+      }
+      if (window) {
+        // The actual Append has succeeded. Wait until the other block is
+        // really in a remote handler before disconnecting this shared socket.
+        co_await window->entered;
+        {
+          std::lock_guard lock(window->mutex);
+          window->state.sameConnection = window->firstHop == ctx.transport();
+        }
+        ctx.transport()->invalidate(false);
+        {
+          std::lock_guard lock(window->mutex);
+          window->state.dropped = true;
+          window->changed.notify_all();
+        }
+      } else {
+        ctx.transport()->invalidate(false);
+      }
+    }
     co_return response;
   }
 
@@ -1326,6 +1453,165 @@ TEST_F(TestEcNativeRepairService, ThreeStrategiesRecoverLostAppendReplyOnOrigina
   RecordProperty("unknown_append_fault_cut",
                  "real successful Append reply dropped over TCP; two blocks, window=1; three strategies, one/two targets");
   RecordProperty("unknown_append_join_scope", "local pipeline/adapter frames only; no distributed drain claim");
+}
+
+TEST_F(TestEcNativeRepairService, WindowTwoLostAppendReplyRecoversBothOriginalTargets) {
+  using namespace hf3fs::client::ec;
+  // These are the fixture's existing defaults, not a production cancellation
+  // policy change. Check the actual server-side connection identity below too.
+  ASSERT_FALSE(clientConfig_.create_net_client_for_updates());
+  ASSERT_EQ(clientConfig_.net_client().io_worker().transport_pool().max_connections(), 1);
+  folly::CPUThreadPoolExecutor executor(2);
+  for (auto mode : {EcRepairMode::ClientPipeline, EcRepairMode::HelperChain}) {
+    SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<unsigned>(mode) << " missing=2 window=2");
+    auto value = prepare({0, 11}, kEcIntegrityBlockBytes + 7, 2);
+    ASSERT_OK(value);
+    std::array<uint64_t, 2> before{};
+    for (uint8_t target = 0; target != 2; ++target) {
+      auto used = committedBytes(value->plan->input().targets[target]);
+      ASSERT_OK(used);
+      before[target] = *used;
+    }
+    EcRepairObservation observation;
+    auto transport = NativeEcRepairTransport::create(value->plan, client_, value->bindings, value->helpers, &observation);
+    ASSERT_OK(transport);
+    auto window = std::make_shared<StageReplyDropState::ConcurrentWindow>();
+    window->plan = value->plan->input();
+    window->sourceRequest = value->bindings.sources[0].request;
+    window->helper = mode == EcRepairMode::HelperChain;
+    const auto &unknown = value->bindings.targets[1];
+    replyDrop_.armAppend(unknown.request, 0);
+    {
+      std::lock_guard lock(replyDrop_.mutex);
+      replyDrop_.concurrentWindow = window;
+    }
+    auto ctl = control();
+    ctl.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    std::future<Result<EcRepairSealed>> running;
+    SCOPE_EXIT {
+      // Failure cleanup releases both test barriers and joins the local call.
+      // Remote handlers keep their shared window alive. The fixture then joins
+      // the real default dispatch pool and helper sessions before targets go;
+      // this fallback is not the successful per-handler completion proof below.
+      window->unblock();
+      if (running.valid()) running.wait();
+      std::lock_guard lock(replyDrop_.mutex);
+      replyDrop_.concurrentWindow.reset();
+    };
+    running = std::async(std::launch::async, [&] {
+      return blockingWait(EcRepairPipeline::run(
+          value->plan, *transport, mode, {ctl.deadline, ctl.cancellation}, executor, &observation));
+    });
+    ASSERT_TRUE(window->waitFor([](const auto &s) { return s.held && s.dropped; }));
+    ASSERT_TRUE(window->snapshot().sameConnection);
+    ASSERT_EQ(running.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    auto failed = running.get();
+    ASSERT_ERROR(failed, StorageCode::kEcSealOutcomeUnknown);
+    const auto dropped = replyDrop_.snapshot();
+    ASSERT_EQ(dropped.appendCalls, 2);  // target 0 ACK, then target 1's real committed reply was lost.
+    ASSERT_TRUE(dropped.droppedAppend);
+    EXPECT_TRUE(serde::equals(dropped.droppedAppend->receipt, repair_test::receipt(value->plan->input().targets[1])));
+    EXPECT_EQ(dropped.droppedAppend->prefixBytes, kEcIntegrityBlockBytes);
+    EXPECT_FALSE(dropped.droppedAppend->pendingBlock);
+    EXPECT_FALSE(dropped.droppedAppend->needsReconcile);
+    EXPECT_EQ(dropped.sealCalls, 0);
+    const auto joined = observation.snapshot();
+    EXPECT_EQ(joined.at(EcRepairPoint::BlockActor).peakActive, 2);
+    for (const auto &point : joined.points) {
+      EXPECT_EQ(point.active, 0);
+      EXPECT_EQ(point.entered, point.finished);
+    }
+    EXPECT_EQ(joined.at(EcRepairPoint::NativeSeal).entered, 0);
+    const auto remote = window->snapshot();
+    if (window->helper) {
+      // The client has joined, but upstream hops still await the held hop 4.
+      for (size_t hop = 0; hop != 5; ++hop) {
+        EXPECT_EQ(remote.helperEntered[hop], 1);
+        EXPECT_EQ(remote.helperFinished[hop], 0);
+      }
+      for (size_t hop = 5; hop != 10; ++hop) EXPECT_EQ(remote.helperEntered[hop], 0);
+    } else {
+      EXPECT_EQ(remote.readEntered, 1);
+      EXPECT_EQ(remote.readFinished, 0);
+    }
+    CancellationSource cancelled;
+    cancelled.requestCancellation();
+    ASSERT_ERROR(blockingWait((*transport)->begin(value->plan, 0, {ctl.deadline, cancelled.getToken()})),
+                 StorageClientCode::kRequestCanceled);
+    ASSERT_ERROR(blockingWait((*transport)->begin(value->plan, 1, {ctl.deadline, cancelled.getToken()})),
+                 StorageCode::kEcSealOutcomeUnknown);
+    for (uint8_t target = 0; target != 2; ++target) {
+      const auto &binding = value->bindings.targets[target];
+      auto state = blockingWait(client_->queryEcStageV2Controlled({binding.request, binding.grant}, control()));
+      ASSERT_OK(state);
+      EXPECT_EQ(state->state, 1);
+      EXPECT_EQ(state->prefixBytes, kEcIntegrityBlockBytes);
+      EXPECT_FALSE(state->pendingBlock);
+      EXPECT_FALSE(state->needsReconcile);
+      EXPECT_TRUE(serde::equals(state->receipt, repair_test::receipt(value->plan->input().targets[target])));
+      auto used = committedBytes(value->plan->input().targets[target]);
+      ASSERT_OK(used);
+      EXPECT_EQ(*used, before[target]);
+    }
+    size_t queries, reconciles;
+    {
+      std::lock_guard lock(replyDrop_.mutex);
+      queries = replyDrop_.queryCalls;
+      reconciles = replyDrop_.reconcileCalls;
+    }
+    const EcRepairControl live{ctl.deadline, {}};
+    ASSERT_OK(blockingWait((*transport)->begin(value->plan, 0, live)));
+    ASSERT_OK(blockingWait((*transport)->begin(value->plan, 1, live)));
+    {
+      std::lock_guard lock(replyDrop_.mutex);
+      EXPECT_EQ(replyDrop_.queryCalls, queries + 1);
+      EXPECT_EQ(replyDrop_.reconcileCalls, reconciles + 1);
+    }
+    // Target reconciliation is not a remote helper barrier. One intentional
+    // duplicate is rejected while the original block still owns its window.
+    if (window->helper) {
+      ASSERT_ERROR(blockingWait(client_->executeEcHelper(request(*value, 1), control())),
+                   StorageClientCode::kResourceBusy);
+      const auto busy = window->snapshot();
+      EXPECT_EQ(busy.helperEntered[0], 2);
+      EXPECT_EQ(busy.helperFinished[0], 1);
+      EXPECT_EQ(busy.helperBusy[0], 1);
+      EXPECT_EQ(busy.helperSucceeded[0], 0);
+      EXPECT_EQ(busy.helperFinished[4], 0);
+    } else {
+      EXPECT_EQ(window->snapshot().readFinished, 0);
+    }
+    window->unblock();
+    // Do not retry through Busy. Wait for the actual old request tree to
+    // succeed and leave every entered handler, including its first hop. An
+    // expired/failed helper chain cannot satisfy these counts.
+    ASSERT_TRUE(window->waitFor([&](const auto &s) {
+      if (!window->helper) return s.readEntered == 1 && s.readFinished == 1 && s.readSucceeded == 1;
+      for (size_t hop = 0; hop != 10; ++hop) {
+        const size_t expected = hop == 0 ? 2 : 1;
+        if (s.helperEntered[hop] != expected || s.helperFinished[hop] != expected ||
+            s.helperSucceeded[hop] != 1 || s.helperBusy[hop] != (hop == 0 ? 1u : 0u)) {
+          return false;
+        }
+      }
+      return true;
+    }));
+    {
+      std::lock_guard lock(replyDrop_.mutex);
+      replyDrop_.concurrentWindow.reset();
+    }
+    auto repaired = blockingWait(EcRepairPipeline::run(value->plan, *transport, mode, live, executor));
+    ASSERT_OK(repaired);
+    EXPECT_EQ(replyDrop_.snapshot().sealCalls, 2);
+    ASSERT_NO_FATAL_FAILURE(expectRecovered(*value, *repaired, before));
+    auto repeated = blockingWait(EcRepairPipeline::run(value->plan, *transport, mode, live, executor));
+    ASSERT_OK(repeated);
+    ASSERT_NO_FATAL_FAILURE(expectRecovered(*value, *repeated, before));
+  }
+  RecordProperty("window_two_unknown_append",
+                 "real target1/block0 Append ACK lost on shared TCP while block1 Read/helper hop4 is held");
+  RecordProperty("window_two_completion_scope",
+                 "local actors joined before remote release; real old handler completion before same-plan recovery; no T2");
 }
 
 TEST_F(TestEcNativeRepairService, ThreeStrategiesRecoverLostSealReplyAfterEngineReopen) {

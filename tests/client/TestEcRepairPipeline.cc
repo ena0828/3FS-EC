@@ -11,6 +11,8 @@
 #include <thread>
 
 #include "client/ec/EcRepairPipeline.h"
+#include "common/utils/SemaphoreGuard.h"
+#include "fbs/storage/Common.h"
 #include "tests/EcRepairTestData.h"
 
 namespace hf3fs::client::ec {
@@ -271,6 +273,13 @@ TEST(TestEcRepairPipeline, AllThreeModesMatchIndependentSingleAndDoubleTargets) 
       EXPECT_EQ(actors.finished, actors.entered);
       EXPECT_EQ(actors.succeeded, actors.entered);
       EXPECT_EQ(actors.active, 0);
+      EXPECT_EQ(sample.at(EcRepairPoint::CentralCodecRecover).entered, mode == EcRepairMode::CentralSerial ? 1 : 0);
+      EXPECT_EQ(sample.at(EcRepairPoint::ClientBlockAdvance).entered, mode == EcRepairMode::ClientPipeline ? 20 : 0);
+      for (auto point : {EcRepairPoint::CentralCodecRecover, EcRepairPoint::ClientBlockAdvance}) {
+        EXPECT_EQ(sample.at(point).succeeded, sample.at(point).entered);
+        EXPECT_EQ(sample.at(point).finished, sample.at(point).entered);
+        EXPECT_EQ(sample.at(point).active, 0);
+      }
       EXPECT_EQ(sample.at(EcRepairPoint::NativeRead).apiInvocations, 0); // Fake transport is not native RPC evidence.
       EXPECT_EQ(result->mode, mode);
       EXPECT_EQ(result->targetCount, missing.size());
@@ -501,6 +510,7 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
   {
     EcRpcObservation::Scope frame(&observation, EcRpcMethod::Read);
     EXPECT_EQ(observation.snapshot().at(EcRpcMethod::Read).active, 1);
+    frame.messengerInvocation();
     frame.returned(false, ts);  // A decoded outer error can carry valid times.
   }
   auto sample = observation.snapshot();
@@ -512,6 +522,8 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
   EXPECT_EQ(read.active, 0);
   EXPECT_EQ(read.outerOk, 0);
   EXPECT_EQ(read.outerError, 1);
+  EXPECT_EQ(read.messengerInvocations, 1);
+  EXPECT_EQ(read.withoutMessenger, 0);
   EXPECT_EQ(read.client.valid, 1);
   EXPECT_EQ(read.server.valid, 1);
   EXPECT_EQ(read.client.spanNs, (std::array<uint64_t, 3>{10000, 40000, 10000}));
@@ -519,6 +531,22 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
 
   {
     EcRpcObservation::Scope frame(&observation, EcRpcMethod::Append);
+    // Exercise the SAME macro branch contract as callMessengerMethod. Release
+    // builds disable injected errors, so their actual invocation must count.
+    size_t calls = 0;
+    const auto actual = [&] {
+      frame.messengerInvocation();
+      ++calls;
+      return 7;
+    };
+    const auto result = FAULT_INJECTION_POINT(true, 5, actual());
+#ifndef NDEBUG
+    EXPECT_EQ(result, 5);
+    EXPECT_EQ(calls, 0);
+#else
+    EXPECT_EQ(result, 7);
+    EXPECT_EQ(calls, 1);
+#endif
     frame.returned(false, serde::Timestamp{});  // Fault/no response is missing.
   }
   { EcRpcObservation::Scope localReject(&observation, EcRpcMethod::Append); }
@@ -531,6 +559,51 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
   EXPECT_EQ(append.client.valid, 0);
   EXPECT_EQ(append.server.valid, 0);
   EXPECT_EQ(append.client.spanNs, (std::array<uint64_t, 3>{}));
+#ifndef NDEBUG
+  EXPECT_EQ(append.messengerInvocations, 0);
+  EXPECT_EQ(append.withoutMessenger, 2);
+#else
+  EXPECT_EQ(append.messengerInvocations, 1);
+  EXPECT_EQ(append.withoutMessenger, 1);
+#endif
+
+  using storage::client::EcRpcLimiter;
+  Semaphore semaphore(1, 1);
+  {
+    EcRpcObservation::LimiterScope metric(&observation, EcRpcMethod::Read, EcRpcLimiter::PerServer);
+    SemaphoreGuard permit(semaphore);  // Must be destroyed BEFORE metric.
+    folly::coro::blockingWait(permit.coWait());
+    metric.acquired();
+    EXPECT_FALSE(semaphore.try_wait());
+    const auto during = observation.snapshot().at(EcRpcMethod::Read).limiters[0];
+    EXPECT_EQ(during.entered, 1);
+    EXPECT_EQ(during.acquired, 1);
+    EXPECT_EQ(during.active, 1);
+    EXPECT_EQ(during.finished, 0);
+  }
+  ASSERT_TRUE(semaphore.try_wait());  // Real permit release, not just a counter.
+  semaphore.signal();
+  try {
+    EcRpcObservation::LimiterScope metric(&observation, EcRpcMethod::Read, EcRpcLimiter::PerServer);
+    SemaphoreGuard unacquired(semaphore);
+    throw std::runtime_error("before acquire completed");
+  } catch (const std::runtime_error &) {
+  }
+  const auto permit = observation.snapshot().at(EcRpcMethod::Read).limiters[0];
+  EXPECT_EQ(permit.entered, 2);
+  EXPECT_EQ(permit.acquired, 1);
+  EXPECT_EQ(permit.finished, 2);
+  EXPECT_EQ(permit.withoutPermit, 1);
+  EXPECT_EQ(permit.active, 0);
+  EXPECT_EQ(permit.peakActive, 1);
+  {
+    EcRpcObservation::LimiterScope disabled(nullptr, EcRpcMethod::Read, EcRpcLimiter::PerServer);
+    disabled.acquired();
+    EcRpcObservation::LimiterScope notApplicable(&observation, EcRpcMethod::Helper, EcRpcLimiter::PerServer);
+    notApplicable.acquired();
+  }
+  EXPECT_EQ(observation.snapshot().at(EcRpcMethod::Helper).limiters[0].entered, 0);
+  EXPECT_EQ(observation.snapshot().at(EcRpcMethod::Read).limiters[0].entered, 2);
 
   auto reversed = ts;
   reversed.clientSerialized = ts.clientCalled - 1;

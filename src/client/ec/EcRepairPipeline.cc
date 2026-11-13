@@ -132,7 +132,13 @@ CoTryTask<void> oneBlock(std::shared_ptr<Window> state, uint32_t blockIndex) {
       CO_RETURN_ON_ERROR(active(state->control));
       auto bytes = co_await state->transport->read(state->plan, source, blockIndex, state->control);
       CO_RETURN_ON_ERROR(bytes);
-      block = EcRepairBlockCore::advance(*state->plan, source, std::move(*block), *bytes);
+      {
+        // Includes integrity/plan validation and contribution accumulation;
+        // this local wall span is not a pure GF arithmetic CPU measurement.
+        EcRepairObservation::Scope compute(state->observation, EcRepairPoint::ClientBlockAdvance);
+        block = EcRepairBlockCore::advance(*state->plan, source, std::move(*block), *bytes);
+        if (block) compute.success();
+      }
       CO_RETURN_ON_ERROR(block);
     }
   }
@@ -171,7 +177,12 @@ CoTryTask<void> central(std::shared_ptr<Window> state) {
     views[source] = {fragment.identity.shard, data[source]};
   }
   CO_RETURN_ON_ERROR(active(state->control));
-  auto recovered = EcCodec::recover(views, state->plan->input().logicalLength, state->plan->shardBytes());
+  auto recovered = [&] {
+    EcRepairObservation::Scope compute(state->observation, EcRepairPoint::CentralCodecRecover);
+    auto value = EcCodec::recover(views, state->plan->input().logicalLength, state->plan->shardBytes());
+    if (value) compute.success();
+    return value;
+  }();
   CO_RETURN_ON_ERROR(recovered);
   for (uint32_t index = 0; index != state->plan->blockCount(); ++index) {
     CO_RETURN_ON_ERROR(active(state->control));

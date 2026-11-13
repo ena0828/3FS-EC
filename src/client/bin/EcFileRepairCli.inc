@@ -45,7 +45,9 @@ std::string repairMetricsJson(const EcRepairSample &m) {
       "block_actors_applicable", m.blockActorsApplicable)("cancellation_requested", m.cancellationRequested)(
       "deadline_expired", m.deadlineExpired)("overflow", m.overflow)("clock_anomaly", m.clockAnomaly)(
       "wire_bytes", nullptr)("rpc_encoded_bytes", nullptr)("transport_retry_attempts", nullptr)(
-      "server_queue_depth", nullptr)("persisted_in_business_journal", false)("points", folly::dynamic::object());
+      "server_queue_depth", nullptr)("persisted_in_business_journal", false)(
+      "codec_scope", "local wall spans include validation; not pure arithmetic CPU time")(
+      "helper_server_compute", nullptr)("points", folly::dynamic::object());
   for (size_t n = 0; n != m.points.size(); ++n) {
     const auto &p = m.points[n];
     out["points"][kEcRepairPointNames[n]] = folly::dynamic::object(
@@ -68,7 +70,11 @@ std::string repairMetricsJson(const EcRepairSample &m) {
   folly::dynamic rpc = folly::dynamic::object("schema", 1)("coverage", "controlled_client_to_storage_first_hop")(
       "clock", "per_host_utc_microseconds_checked_then_ns")("missing_samples_are_censored", true)(
       "frame_counts_are_not_dispatch_counts", true)("outer_ok_is_not_business_success", true)(
+      "messenger_invocations_are_not_dispatch_or_retry_counts", true)(
       "spans_overlap_and_are_not_total_wall_time", true)(
+      "limiter_clock", "steady_clock")(
+      "limiter_scope", "entry through acquire and guard release; active scopes include waiting and holding")(
+      "helper_limiters", "not_applicable; helper has separate non-waiting admission, not measured here")(
       "server_received_to_waked_scope", "outer_decode_complete_to_payload_decode_start")(
       "helper_downstream", "included_in_outer_server_span_not_individually_observed")(
       "overflow", m.storageRpc.overflow)("clock_anomaly", m.storageRpc.clockAnomaly)(
@@ -83,10 +89,28 @@ std::string repairMetricsJson(const EcRepairSample &m) {
         "outer_ok_decimal", std::to_string(sample.outerOk))(
         "outer_error_decimal", std::to_string(sample.outerError))(
         "without_outer_result_decimal", std::to_string(sample.withoutResult))(
+        "messenger_invocations_decimal", std::to_string(sample.messengerInvocations))(
+        "frames_without_messenger_decimal", std::to_string(sample.withoutMessenger))(
+        "limiters", nullptr)(
         "client", clockSample(sample.client, {"called_to_serialized_ns_decimal", "serialized_to_received_ns_decimal",
                                              "received_to_waked_ns_decimal"}))(
         "server", clockSample(sample.server, {"received_to_waked_ns_decimal", "waked_to_processed_ns_decimal",
                                              "processed_to_serialized_ns_decimal"}));
+    if (n != size_t(storage::client::EcRpcMethod::Helper)) {
+      auto &limiters = rpc["methods"][storage::client::kEcRpcMethodNames[n]]["limiters"];
+      limiters = folly::dynamic::object();
+      constexpr std::array<const char *, 2> names{"per_server", "global"};
+      for (size_t i = 0; i != names.size(); ++i) {
+        const auto &l = sample.limiters[i];
+        limiters[names[i]] = folly::dynamic::object("entered_decimal", std::to_string(l.entered))(
+            "acquired_decimal", std::to_string(l.acquired))("finished_decimal", std::to_string(l.finished))(
+            "without_permit_decimal", std::to_string(l.withoutPermit))(
+            "active_scopes_decimal", std::to_string(l.active))("peak_active_scopes_decimal", std::to_string(l.peakActive))(
+            "entry_to_acquired_ns_decimal", std::to_string(l.acquiredWaitNs))(
+            "entry_to_unacquired_exit_ns_decimal", std::to_string(l.unacquiredSpanNs))(
+            "acquired_to_exit_ns_decimal", std::to_string(l.heldNs));
+      }
+    }
   }
   out["storage_rpc"] = std::move(rpc);
   return folly::toJson(out);

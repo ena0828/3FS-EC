@@ -52,6 +52,7 @@ SERVICE_MANDATORY = {
     "TestEcNativeRepairService.UnknownSealSurvivesCancellationUntilSameStageIsReconciled",
     "TestEcNativeRepairService.ThreeStrategiesRecoverLostAppendReplyOnOriginalStages",
     "TestEcNativeRepairService.ThreeStrategiesRecoverLostSealReplyAfterEngineReopen",
+    "TestEcNativeRepairService.WindowTwoLostAppendReplyRecoversBothOriginalTargets",
 }
 
 # Exact names prevent unrelated green suites from satisfying the control profile.

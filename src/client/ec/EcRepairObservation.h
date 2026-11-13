@@ -20,13 +20,13 @@ enum class EcRepairPoint : size_t {
   Query, Begin, Prepare, SelectedRepair, HealthyCopy, Publish, CloseDebt, Journal,
   NativeBegin, NativeRead, NativeAppend, NativeSeal, NativeHelper,
   CopyRead, CopyBegin, CopyReconcile, CopyAppend, CopySeal,
-  BlockActor, OrderedAppendWait, Count
+  BlockActor, OrderedAppendWait, CentralCodecRecover, ClientBlockAdvance, Count
 };
 inline constexpr std::array<const char *, size_t(EcRepairPoint::Count)> kEcRepairPointNames{
     "query_rpc", "begin_rpc", "prepare_rpc", "selected_repair", "healthy_copy", "publish_rpc",
     "close_debt_rpc", "journal_append", "native_begin", "native_read", "native_append", "native_seal",
     "native_helper", "copy_read", "copy_begin", "copy_reconcile", "copy_append", "copy_seal",
-    "block_actor", "ordered_append_wait"};
+    "block_actor", "ordered_append_wait", "central_codec_recover", "client_block_advance"};
 
 struct EcRepairPointSample {
   uint64_t entered = 0, finished = 0, succeeded = 0, spanNs = 0;
