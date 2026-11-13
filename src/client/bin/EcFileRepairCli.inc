@@ -84,46 +84,60 @@ std::string repairMetricsJson(const EcRepairSample &m) {
       "overflow", m.storageRpc.overflow)("clock_anomaly", m.storageRpc.clockAnomaly)(
       "wire_bytes", nullptr)("encoded_bytes", nullptr)("transport_retry_attempts", nullptr)(
       "complete_server_queue", nullptr)("methods", folly::dynamic::object());
-  for (size_t n = 0; n != m.storageRpc.methods.size(); ++n) {
-    const auto &sample = m.storageRpc.methods[n];
-    rpc["methods"][storage::client::kEcRpcMethodNames[n]] = folly::dynamic::object(
-        "frame_entered_decimal", std::to_string(sample.entered))(
-        "frame_finished_decimal", std::to_string(sample.finished))(
-        "frame_active_decimal", std::to_string(sample.active))(
-        "outer_ok_decimal", std::to_string(sample.outerOk))(
-        "outer_error_decimal", std::to_string(sample.outerError))(
-        "without_outer_result_decimal", std::to_string(sample.withoutResult))(
-        "messenger_invocations_decimal", std::to_string(sample.messengerInvocations))(
-        "frames_without_messenger_decimal", std::to_string(sample.withoutMessenger))(
-        "observed_encoded_request_frames_decimal", std::to_string(sample.observedEncodedRequestFrames))(
-        "request_frame_bytes_decimal", std::to_string(sample.requestFrameBytes))(
-        "missing_encoded_request_frames_decimal", std::to_string(sample.missingEncodedRequestFrames))(
-        "compressed_request_frames_decimal", std::to_string(sample.compressedRequestFrames))(
-        "observed_encoded_response_frames_decimal", std::to_string(sample.observedEncodedResponseFrames))(
-        "response_frame_bytes_decimal", std::to_string(sample.responseFrameBytes))(
-        "missing_encoded_response_frames_decimal", std::to_string(sample.missingEncodedResponseFrames))(
-        "compressed_response_frames_decimal", std::to_string(sample.compressedResponseFrames))(
-        "limiters", nullptr)(
-        "client", clockSample(sample.client, {"called_to_serialized_ns_decimal", "serialized_to_received_ns_decimal",
-                                             "received_to_waked_ns_decimal"}))(
-        "server", clockSample(sample.server, {"received_to_waked_ns_decimal", "waked_to_processed_ns_decimal",
-                                             "processed_to_serialized_ns_decimal"}));
-    if (n != size_t(storage::client::EcRpcMethod::Helper)) {
-      auto &limiters = rpc["methods"][storage::client::kEcRpcMethodNames[n]]["limiters"];
-      limiters = folly::dynamic::object();
-      constexpr std::array<const char *, 2> names{"per_server", "global"};
-      for (size_t i = 0; i != names.size(); ++i) {
-        const auto &l = sample.limiters[i];
-        limiters[names[i]] = folly::dynamic::object("entered_decimal", std::to_string(l.entered))(
-            "acquired_decimal", std::to_string(l.acquired))("finished_decimal", std::to_string(l.finished))(
-            "without_permit_decimal", std::to_string(l.withoutPermit))(
-            "active_scopes_decimal", std::to_string(l.active))("peak_active_scopes_decimal", std::to_string(l.peakActive))(
-            "entry_to_acquired_ns_decimal", std::to_string(l.acquiredWaitNs))(
-            "entry_to_unacquired_exit_ns_decimal", std::to_string(l.unacquiredSpanNs))(
-            "acquired_to_exit_ns_decimal", std::to_string(l.heldNs));
+  const auto methodsJson = [&](const storage::client::EcRpcSample &sampled) {
+    folly::dynamic methods = folly::dynamic::object();
+    for (size_t n = 0; n != sampled.methods.size(); ++n) {
+      const auto &sample = sampled.methods[n];
+      methods[storage::client::kEcRpcMethodNames[n]] = folly::dynamic::object(
+          "frame_entered_decimal", std::to_string(sample.entered))(
+          "frame_finished_decimal", std::to_string(sample.finished))(
+          "frame_active_decimal", std::to_string(sample.active))(
+          "outer_ok_decimal", std::to_string(sample.outerOk))(
+          "outer_error_decimal", std::to_string(sample.outerError))(
+          "without_outer_result_decimal", std::to_string(sample.withoutResult))(
+          "messenger_invocations_decimal", std::to_string(sample.messengerInvocations))(
+          "frames_without_messenger_decimal", std::to_string(sample.withoutMessenger))(
+          "observed_encoded_request_frames_decimal", std::to_string(sample.observedEncodedRequestFrames))(
+          "request_frame_bytes_decimal", std::to_string(sample.requestFrameBytes))(
+          "missing_encoded_request_frames_decimal", std::to_string(sample.missingEncodedRequestFrames))(
+          "compressed_request_frames_decimal", std::to_string(sample.compressedRequestFrames))(
+          "observed_encoded_response_frames_decimal", std::to_string(sample.observedEncodedResponseFrames))(
+          "response_frame_bytes_decimal", std::to_string(sample.responseFrameBytes))(
+          "missing_encoded_response_frames_decimal", std::to_string(sample.missingEncodedResponseFrames))(
+          "compressed_response_frames_decimal", std::to_string(sample.compressedResponseFrames))(
+          "limiters", nullptr)(
+          "client", clockSample(sample.client, {"called_to_serialized_ns_decimal", "serialized_to_received_ns_decimal",
+                                               "received_to_waked_ns_decimal"}))(
+          "server", clockSample(sample.server, {"received_to_waked_ns_decimal", "waked_to_processed_ns_decimal",
+                                               "processed_to_serialized_ns_decimal"}));
+      if (n != size_t(storage::client::EcRpcMethod::Helper)) {
+        auto &limiters = methods[storage::client::kEcRpcMethodNames[n]]["limiters"];
+        limiters = folly::dynamic::object();
+        constexpr std::array<const char *, 2> names{"per_server", "global"};
+        for (size_t i = 0; i != names.size(); ++i) {
+          const auto &l = sample.limiters[i];
+          limiters[names[i]] = folly::dynamic::object("entered_decimal", std::to_string(l.entered))(
+              "acquired_decimal", std::to_string(l.acquired))("finished_decimal", std::to_string(l.finished))(
+              "without_permit_decimal", std::to_string(l.withoutPermit))(
+              "active_scopes_decimal", std::to_string(l.active))("peak_active_scopes_decimal", std::to_string(l.peakActive))(
+              "entry_to_acquired_ns_decimal", std::to_string(l.acquiredWaitNs))(
+              "entry_to_unacquired_exit_ns_decimal", std::to_string(l.unacquiredSpanNs))(
+              "acquired_to_exit_ns_decimal", std::to_string(l.heldNs));
+        }
       }
     }
-  }
+    return methods;
+  };
+  rpc["methods"] = methodsJson(m.storageRpc);
+  const auto phaseJson = [&](const storage::client::EcRpcSample &sampled) -> folly::dynamic {
+    return folly::dynamic::object("overflow", sampled.overflow)("clock_anomaly", sampled.clockAnomaly)(
+        "methods", methodsJson(sampled));
+  };
+  rpc["by_phase"] = folly::dynamic::object("schema", 1)(
+      "attribution", "explicit selected-repair or healthy-copy call path, not RPC method name")(
+      "scope", "this_call; recovery/replay RPCs stay with their actual phase")(
+      "totals", "parent methods retain both phases; phase peaks are not additive")(
+      "selected_repair", phaseJson(m.selectedRepairRpc))("healthy_copy", phaseJson(m.healthyCopyRpc));
   out["storage_rpc"] = std::move(rpc);
   return folly::toJson(out);
 }

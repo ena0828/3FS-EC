@@ -44,7 +44,10 @@ struct EcRepairSample {
   bool cancellationRequested = false, deadlineExpired = false;
   bool overflow = false, clockAnomaly = false;
   std::array<EcRepairPointSample, size_t(EcRepairPoint::Count)> points{};
+  // The original total is retained. Groups follow the explicit caller path,
+  // not RPC method names; both paths use the same Storage primitives.
   storage::client::EcRpcSample storageRpc;
+  storage::client::EcRpcSample selectedRepairRpc, healthyCopyRpc;
   const EcRepairPointSample &at(EcRepairPoint point) const { return points[size_t(point)]; }
 };
 
@@ -60,7 +63,12 @@ class EcRepairObservation {
   };
   std::array<Counter, size_t(EcRepairPoint::Count)> counters_{};
   std::atomic<bool> overflow_{false}, clockAnomaly_{false};
+  // Declare the aggregate before its two borrowers; all live until local joins.
   storage::client::EcRpcObservation storageRpc_;
+  storage::client::EcRpcObservation selectedRepairRpc_{
+      storage::client::EcRpcObservation::AggregateSink{}, storageRpc_};
+  storage::client::EcRpcObservation healthyCopyRpc_{
+      storage::client::EcRpcObservation::AggregateSink{}, storageRpc_};
   Clock::time_point start_ = Clock::now();
 
   uint64_t add(std::atomic<uint64_t> &value, uint64_t amount) noexcept {
@@ -90,7 +98,15 @@ class EcRepairObservation {
   }
 
  public:
+  EcRepairObservation() = default;
+  EcRepairObservation(const EcRepairObservation &) = delete;
+  EcRepairObservation &operator=(const EcRepairObservation &) = delete;
+  EcRepairObservation(EcRepairObservation &&) = delete;
+  EcRepairObservation &operator=(EcRepairObservation &&) = delete;
+
   storage::client::EcRpcObservation &storageRpc() noexcept { return storageRpc_; }
+  storage::client::EcRpcObservation &selectedRepairRpc() noexcept { return selectedRepairRpc_; }
+  storage::client::EcRpcObservation &healthyCopyRpc() noexcept { return healthyCopyRpc_; }
 
   class Scope {
     EcRepairObservation *owner_;
@@ -137,6 +153,8 @@ class EcRepairObservation {
     out.available = true;
     out.elapsedNs = elapsed(start_);
     out.storageRpc = storageRpc_.snapshot();
+    out.selectedRepairRpc = selectedRepairRpc_.snapshot();
+    out.healthyCopyRpc = healthyCopyRpc_.snapshot();
     out.overflow = overflow_.load(std::memory_order_relaxed) || out.storageRpc.overflow;
     out.clockAnomaly = clockAnomaly_.load(std::memory_order_relaxed) || out.storageRpc.clockAnomaly;
     for (size_t i = 0; i != counters_.size(); ++i) {

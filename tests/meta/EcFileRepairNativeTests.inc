@@ -112,6 +112,8 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_EQ(journal->latest()->sequence, priorSequence);
     for (const auto &point : stopped.metrics.points) EXPECT_EQ(point.entered, 0);
     for (const auto &method : stopped.metrics.storageRpc.methods) EXPECT_EQ(method.entered, 0);
+    for (const auto &method : stopped.metrics.selectedRepairRpc.methods) EXPECT_EQ(method.entered, 0);
+    for (const auto &method : stopped.metrics.healthyCopyRpc.methods) EXPECT_EQ(method.entered, 0);
     auto completed = client->repair(*journal, ctl(), true);
     ASSERT_FALSE(completed.failure);
     ASSERT_TRUE(completed.revalidated);
@@ -161,8 +163,57 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_EQ(rpc.at(EcRpcMethod::Append).entered, 12);
     EXPECT_EQ(rpc.at(EcRpcMethod::Seal).entered, 12);
     EXPECT_EQ(rpc.at(EcRpcMethod::Helper).entered, mode == EcFileRepairMode::HelperChain ? 1 : 0);
+    const auto &repairRpc = metrics.selectedRepairRpc;
+    const auto &copyRpc = metrics.healthyCopyRpc;
+    EXPECT_FALSE(repairRpc.overflow);
+    EXPECT_FALSE(copyRpc.overflow);
+    EXPECT_FALSE(repairRpc.clockAnomaly);
+    EXPECT_FALSE(copyRpc.clockAnomaly);
+    // One block per fragment, two reconstructed outputs and ten copied outputs.
+    // Copy always Reconciles its original allocation; the fresh repair does not.
+    const std::array<uint64_t, 7> repairCalls{
+        mode == EcFileRepairMode::HelperChain ? 0ULL : 10ULL, 2, 2, 0, 0, 2,
+        mode == EcFileRepairMode::HelperChain ? 1ULL : 0ULL};
+    const std::array<uint64_t, 7> copyCalls{10, 10, 10, 0, 10, 10, 0};
     for (size_t i = 0; i != rpc.methods.size(); ++i) {
       const auto &method = rpc.methods[i];
+      const auto &repairMethod = repairRpc.methods[i];
+      const auto &copyMethod = copyRpc.methods[i];
+      EXPECT_EQ(repairMethod.entered, repairCalls[i]);
+      EXPECT_EQ(copyMethod.entered, copyCalls[i]);
+      EXPECT_EQ(repairMethod.active, 0);
+      EXPECT_EQ(copyMethod.active, 0);
+      // All local children have joined. These successful samples do not
+      // overflow; additive fields partition the original total exactly.
+      using storage::client::EcRpcMethodSample;
+      for (auto field : {&EcRpcMethodSample::entered, &EcRpcMethodSample::finished, &EcRpcMethodSample::active,
+                         &EcRpcMethodSample::outerOk, &EcRpcMethodSample::outerError,
+                         &EcRpcMethodSample::withoutResult, &EcRpcMethodSample::messengerInvocations,
+                         &EcRpcMethodSample::withoutMessenger, &EcRpcMethodSample::observedEncodedRequestFrames,
+                         &EcRpcMethodSample::missingEncodedRequestFrames, &EcRpcMethodSample::requestFrameBytes,
+                         &EcRpcMethodSample::compressedRequestFrames, &EcRpcMethodSample::observedEncodedResponseFrames,
+                         &EcRpcMethodSample::missingEncodedResponseFrames, &EcRpcMethodSample::responseFrameBytes,
+                         &EcRpcMethodSample::compressedResponseFrames})
+        EXPECT_EQ(method.*field, repairMethod.*field + copyMethod.*field);
+      for (size_t l = 0; l != method.limiters.size(); ++l) {
+        using storage::client::EcRpcLimiterSample;
+        for (auto field : {&EcRpcLimiterSample::entered, &EcRpcLimiterSample::acquired, &EcRpcLimiterSample::finished,
+                           &EcRpcLimiterSample::withoutPermit, &EcRpcLimiterSample::active,
+                           &EcRpcLimiterSample::acquiredWaitNs, &EcRpcLimiterSample::unacquiredSpanNs,
+                           &EcRpcLimiterSample::heldNs})
+          EXPECT_EQ(method.limiters[l].*field, repairMethod.limiters[l].*field + copyMethod.limiters[l].*field);
+        // peakActive is an observed aggregate, not an additive counter.
+        EXPECT_GE(method.limiters[l].peakActive, repairMethod.limiters[l].peakActive);
+        EXPECT_GE(method.limiters[l].peakActive, copyMethod.limiters[l].peakActive);
+      }
+      for (auto clock : {&EcRpcMethodSample::client, &EcRpcMethodSample::server}) {
+        using storage::client::EcRpcClockSample;
+        for (auto field : {&EcRpcClockSample::valid, &EcRpcClockSample::missing,
+                           &EcRpcClockSample::reversed, &EcRpcClockSample::outOfRange})
+          EXPECT_EQ((method.*clock).*field, (repairMethod.*clock).*field + (copyMethod.*clock).*field);
+        for (size_t n = 0; n != 3; ++n)
+          EXPECT_EQ((method.*clock).spanNs[n], (repairMethod.*clock).spanNs[n] + (copyMethod.*clock).spanNs[n]);
+      }
       EXPECT_EQ(method.active, 0);
       EXPECT_EQ(method.finished, method.entered);
       EXPECT_EQ(method.outerOk, method.entered);
@@ -202,6 +253,11 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
                                  method.client.valid, method.server.valid, method.active,
                                  method.observedEncodedRequestFrames, method.requestFrameBytes,
                                  method.observedEncodedResponseFrames, method.responseFrameBytes));
+      RecordProperty(fmt::format("repair_rpc_phases_{}_{}", uint8_t(mode), storage::client::kEcRpcMethodNames[i]),
+                     fmt::format("selected_frames={},copy_frames={},selected_request_bytes={},copy_request_bytes={},"
+                                 "selected_response_bytes={},copy_response_bytes={}", repairMethod.entered,
+                                 copyMethod.entered, repairMethod.requestFrameBytes, copyMethod.requestFrameBytes,
+                                 repairMethod.responseFrameBytes, copyMethod.responseFrameBytes));
     }
     const auto &child = completed.progress.record->child;
     EXPECT_EQ(child.targetGeneration, child.source.generation);
@@ -219,6 +275,15 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
       EXPECT_EQ(method.observedEncodedResponseFrames, 0);
       EXPECT_EQ(method.requestFrameBytes, 0);
       EXPECT_EQ(method.responseFrameBytes, 0);
+    }
+    for (const auto *group : {&replay.metrics.selectedRepairRpc, &replay.metrics.healthyCopyRpc}) {
+      EXPECT_FALSE(group->overflow);
+      EXPECT_FALSE(group->clockAnomaly);
+      for (const auto &method : group->methods) {
+        EXPECT_EQ(method.entered, 0);
+        EXPECT_EQ(method.requestFrameBytes, 0);
+        EXPECT_EQ(method.responseFrameBytes, 0);
+      }
     }
     EXPECT_EQ(serde::serialize(replay.progress.record->child.publishedRoot), serde::serialize(child.publishedRoot));
     auto acquire = request<AcquireEcTreeReadReq>();
@@ -264,6 +329,8 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_EQ(closed.metrics.at(EcRepairPoint::CloseDebt).succeeded, 1);
     EXPECT_EQ(closed.metrics.at(EcRepairPoint::SelectedRepair).entered, 0);
     for (const auto &method : closed.metrics.storageRpc.methods) EXPECT_EQ(method.entered, 0);
+    for (const auto &method : closed.metrics.selectedRepairRpc.methods) EXPECT_EQ(method.entered, 0);
+    for (const auto &method : closed.metrics.healthyCopyRpc.methods) EXPECT_EQ(method.entered, 0);
     auto historical = client->query(*journal, ctl());
     ASSERT_FALSE(historical.failure);
     EXPECT_FALSE(historical.metrics.available); // Default remains opt-out, including replay.
