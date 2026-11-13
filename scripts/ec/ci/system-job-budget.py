@@ -17,7 +17,7 @@ STAGES = {"repair": (80, 75), "file": (90, 45), "spare": (40, 35),
 PROFILE_REFS = {
     "system": ("refs/heads/feat/ec-system-acceptance",),
     "target-meta": ("refs/heads/feat/ec-target-meta", "refs/heads/fix/ec-retirement-keys",
-                    "refs/heads/fix/ec-meta-reflection"),
+                    "refs/heads/fix/ec-meta-reflection", "refs/heads/fix/ec-repair-recovery"),
 }
 
 

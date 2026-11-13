@@ -196,10 +196,10 @@ class SystemEntrypoints(unittest.TestCase):
                 budget.check(base, Path(temp), identity, "file")
 
     def test_retirement_fix_branch_is_explicit_and_keeps_public_job_identity_gate(self):
-        reflection_ref = "refs/heads/fix/ec-meta-reflection"
-        self.assertEqual(budget.budget_module("target-meta", ref=reflection_ref).REF, reflection_ref)
-        with self.assertRaises(ValueError):
-            budget.budget_module("system", ref=reflection_ref)
+        for ref in ("refs/heads/fix/ec-meta-reflection", "refs/heads/fix/ec-repair-recovery"):
+            self.assertEqual(budget.budget_module("target-meta", ref=ref).REF, ref)
+            with self.assertRaises(ValueError):
+                budget.budget_module("system", ref=ref)
         with mock.patch.object(budget.sys, "argv", ["budget", "check", "--profile", "system",
                                                      "--stage", "service-contracts"]), \
              contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
