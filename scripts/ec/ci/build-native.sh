@@ -79,7 +79,8 @@ sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
     cmake/AddCrate.cmake cmake/ApacheArrow.cmake cmake/Jemalloc.cmake \
     scripts/ec/ci/build-native.sh scripts/ec/ci/run-core-tests.py \
     scripts/ec/ci/prepare-isal.py scripts/ec/reference/downloads.json cmake/EcCodecBackend.cmake \
-    .github/workflows/ec-hosted-native.yml | tee "$work/provenance/build-inputs.sha256"
+    .github/workflows/ec-hosted-native.yml .github/workflows/ec-hosted-system.yml \
+    | tee "$work/provenance/build-inputs.sha256"
 
 # Reuse the repository's dependency set, including Arrow's transitive closure.
 # No system FoundationDB package hooks or services are installed.
