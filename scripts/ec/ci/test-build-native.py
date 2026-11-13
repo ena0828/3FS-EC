@@ -26,6 +26,9 @@ spec.loader.exec_module(isal)
 spec = importlib.util.spec_from_file_location('prepare_local', HERE / 'prepare-local-build.py')
 local = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local)
+spec = importlib.util.spec_from_file_location('container_resources', HERE / 'container-build-resources.py')
+container = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(container)
 
 
 def bash_path():
@@ -65,7 +68,10 @@ class BuildInputs(unittest.TestCase):
                  (['--build-jobs', '4', '--backend', 'isal'], 'isal false false 4'),
                  (['--build-jobs', '1'], 'scalar false false 1'),
                  (['--local-source', '/fixed/source', '--local-work', '/fixed/native',
-                   '--local-revision', 'a' * 40], 'scalar false false 1')]
+                   '--local-revision', 'a' * 40], 'scalar false false 1'),
+                 (['--local-container-build-only', '--local-source', '/fixed/source',
+                   '--local-work', '/fixed/native', '--local-revision', 'a' * 40,
+                   '--build-jobs', '12'], 'scalar false false 12')]
         for argv, expected in cases:
             with self.subTest(argv=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
@@ -82,7 +88,11 @@ class BuildInputs(unittest.TestCase):
                      ['--local-revision', 'a' * 40], ['--local-source', 'relative'],
                      ['--local-source', '/a', '--local-source', '/b'],
                      ['--local-revision', 'a' * 39], ['--local-revision', 'A' * 40],
-                     ['--local-work', '/a', '--local-work', '/b']):
+                     ['--local-work', '/a', '--local-work', '/b'],
+                     ['--local-container-build-only'],
+                     ['--local-container-build-only', '--local-container-build-only'],
+                     ['--local-source', '/a', '--local-work', '/b', '--local-revision', 'a' * 40,
+                      '--build-jobs', '12']):
             with self.subTest(rejected=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 2)
@@ -186,7 +196,7 @@ python3() { cat >/dev/null; }
 '''
             for jobs, full, mode in [(1, False, False), (2, False, False), (4, False, False),
                                      (1, True, False), (2, True, False), (4, True, False),
-                                     (1, True, True), (2, True, True), (4, True, True)]:
+                                     (1, True, True), (2, True, True), (4, True, True), (12, True, True)]:
                 (Path(folder) / 'cmake-argv').write_text('')
                 dependency = '/fixed/work/deps' if mode else '/usr/local'
                 flags = (f'build_jobs={jobs}\nwith_lab={str(full).lower()}\nwith_regression={str(full).lower()}\n'
@@ -399,13 +409,15 @@ rustup() { record "rustup $*"; }
                     self.assertFalse(any('-Dutils=false' in row for row in calls))
                     self.assertIn('rustup toolchain install 1.99.1 --profile minimal', calls)
 
-    def test_real_final_receipt_four_modes_and_loader_mismatch(self):
+    def test_real_final_receipt_profiles_and_loader_mismatch(self):
         blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", SCRIPT.read_text(), re.S)
         block, = [item for item in blocks if "path = work / 'provenance/native-build.json'" in item]
         code = compile(block, str(SCRIPT) + ':actual-final-receipt', 'exec')
         fixed_isal = '40ccd5e5abaff0451feff750d2b011370a546ac4706d1b06b9285ac26eda2c3c'
-        for backend, mode, bad_loader in [('scalar', False, False), ('isal', False, False),
-                                           ('scalar', True, False), ('isal', True, False), ('scalar', True, True)]:
+        for backend, mode, bad_loader, container_mode in [
+                ('scalar', False, False, False), ('isal', False, False, False),
+                ('scalar', True, False, False), ('isal', True, False, False), ('scalar', True, True, False),
+                ('isal', True, False, True), ('scalar', True, True, True)]:
             with self.subTest(backend=backend, local=mode, bad_loader=bad_loader), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder).resolve()
                 source, work, deps = root / 'source', root / 'native', root / 'native/deps'
@@ -416,7 +428,7 @@ rustup() { record "rustup $*"; }
                     return path
                 def sha(path):
                     return hashlib.sha256(path.read_bytes()).hexdigest()
-                for name in ('build-native.sh', 'prepare-isal.py'):
+                for name in ('build-native.sh', 'prepare-isal.py', 'container-build-resources.py'):
                     put(source / 'scripts/ec/ci' / name)
                 put(source / 'scripts/ec/reference/downloads.json')
                 for name in ('libfdb_c.so', 'libfuse3.so.3'):
@@ -443,7 +455,8 @@ rustup() { record "rustup $*"; }
                 put(work / 'build/CMakeCache.txt', cache.encode())
                 for name in ('build-resources.json', 'build-command.json'):
                     put(work / 'provenance' / name, b'{}')
-                put(work / 'provenance/local-preflight.json', b'{"tools":{}}')
+                put(work / 'provenance/local-preflight.json',
+                    b'{"tools":{},"filesystems":[{"path":"/private/work","filesystem":"xfs"}]}')
                 original_digest, original_resolve = hashlib.file_digest, Path.resolve
                 def digest(stream, algorithm):
                     if Path(stream.name) == provider:
@@ -465,7 +478,8 @@ rustup() { record "rustup $*"; }
                     if backend == 'isal':
                         rows.append('libisal.so.2 => ' + str(provider) + ' (0x3)')
                     return '\n'.join(rows)
-                argv = ['-', str(source), str(work), backend, 'true', 'true', 'a' * 40, str(mode).lower(), str(deps)]
+                argv = ['-', str(source), str(work), backend, 'true', 'true', 'a' * 40,
+                        str(mode).lower(), str(deps), str(container_mode).lower()]
                 with mock.patch('sys.argv', argv), mock.patch.object(hashlib, 'file_digest', side_effect=digest), \
                         mock.patch.object(Path, 'resolve', resolve), \
                         mock.patch.object(subprocess, 'check_output', side_effect=ldd), \
@@ -482,8 +496,112 @@ rustup() { record "rustup $*"; }
                 self.assertEqual(native['dependency_prefix'], str(deps))
                 self.assertEqual((len(native['targets']), len(lab['targets'])), (13, 8))
                 self.assertFalse(native['acceptance_executed'])
+                if container_mode:
+                    self.assertTrue(native['build_only'])
+                    self.assertEqual(native['execution_environment'], 'local-linux-container-build-only')
+                    self.assertEqual(native['filesystems'][0]['filesystem'], 'xfs')
+                else:
+                    self.assertNotIn('build_only', native)
                 self.assertEqual(lab['native_build_receipt_sha256'], sha(work / 'provenance/native-build.json'))
                 self.assertEqual(calls, [None, '/usr/local/lib'] * 13 if mode else [])
+
+
+class ContainerBuildResources(unittest.TestCase):
+    def fixture(self):
+        gib = 1024 ** 3
+        files = {
+            '/cg/cpu/cgroup.procs': '123\n', '/cg/cpu/cpu.cfs_quota_us': '1200000',
+            '/cg/cpu/cpu.cfs_period_us': '100000', '/cg/memory/cgroup.procs': '123\n',
+            '/cg/memory/memory.limit_in_bytes': str(43 * gib),
+            '/cg/memory/memory.usage_in_bytes': str(gib),
+            '/cg/memory/memory.stat': 'hierarchical_memory_limit ' + str(43 * gib),
+        }
+        membership = '4:cpu,cpuacct:/docker/one\n8:memory:/docker/one\n0::/docker/one\n'
+        mounts = ('1 0 0:1 /docker/one /cg/cpu ro - cgroup cgroup rw,cpu,cpuacct\n'
+                  '2 0 0:2 /docker/one /cg/memory ro - cgroup cgroup rw,memory\n')
+        return files, membership, mounts
+
+    def observe(self, files, membership, mounts, pid=123):
+        # Emulate proc/cgroup files only, including on Windows. No live cgroup,
+        # service, namespace or native compiler is used by these fixtures.
+        def key(path):
+            return path.as_posix()
+        with mock.patch.object(Path, 'resolve', autospec=True, side_effect=lambda path, **_: path), \
+                mock.patch.object(Path, 'is_dir', autospec=True,
+                                  side_effect=lambda path: key(path) + '/cgroup.procs' in files), \
+                mock.patch.object(Path, 'is_file', autospec=True, side_effect=lambda path: key(path) in files), \
+                mock.patch.object(Path, 'exists', autospec=True, side_effect=lambda path: key(path) in files), \
+                mock.patch.object(Path, 'read_text', autospec=True,
+                                  side_effect=lambda path, **_: files[key(path)]):
+            return container.observe_groups(membership, mounts, pid)
+
+    def test_v1_verified_mapping_caps_host_and_admits_twelve(self):
+        files, membership, mounts = self.fixture()
+        observed = self.observe(files, membership, mounts)
+        self.assertEqual(len(observed['mappings']), 2)
+        memory = {'MemTotal': 375 * container.GIB, 'MemAvailable': 300 * container.GIB}
+        plan = container.resource_plan(12, memory, 96, observed)
+        self.assertEqual(plan['effective_jobs'], 12)
+        self.assertEqual(plan['visible_cpu_budget_limit'], 12)
+        self.assertEqual(plan['visible_memory_headroom_bytes'], 42 * container.GIB)
+        self.assertEqual(plan['visible_memory_limit_bytes'], 43 * container.GIB)
+        self.assertIsNone(container.resource_plan(13, memory, 96, observed)['effective_jobs'])
+        self.assertIsNone(container.resource_plan(12, memory, 11, observed)['effective_jobs'])
+        # The same actual leaf is verifiable under a cgroup namespace too.
+        self.assertEqual(len(self.observe(files, membership.replace('/docker/one', '/'), mounts)['mappings']), 2)
+
+    def test_v1_hierarchical_limit_memory_boundary_and_no_unbounded_fallback(self):
+        files, membership, mounts = self.fixture()
+        memory = {'MemTotal': 375 * container.GIB, 'MemAvailable': 300 * container.GIB}
+        files['/cg/memory/memory.limit_in_bytes'] = str(1 << 63)
+        for used, expected in [(3 * container.GIB, 12), (3 * container.GIB + 1, None)]:
+            files['/cg/memory/memory.usage_in_bytes'] = str(used)
+            self.assertEqual(container.resource_plan(12, memory, 96,
+                             self.observe(files, membership, mounts))['effective_jobs'], expected)
+        for field, value in [('/cg/memory/memory.stat', 'hierarchical_memory_limit ' + str(1 << 63)),
+                             ('/cg/cpu/cpu.cfs_quota_us', '-1')]:
+            bad = dict(files, **{field: value})
+            with self.assertRaises(ValueError):
+                container.resource_plan(1, memory, 96, self.observe(bad, membership, mounts))
+        for jobs in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                container.resource_plan(jobs, memory, 96, self.observe(files, membership, mounts))
+
+    def test_mapping_and_invalid_observations_fail_closed(self):
+        files, membership, mounts = self.fixture()
+        for bad_member, bad_mounts, pid in [
+                (membership, mounts, 456), (membership, mounts + mounts, 123),
+                (membership.replace('/docker/one', '/../escape'), mounts, 123),
+                (membership.replace('4:cpu,cpuacct', '4:cpuacct'), mounts, 123),
+                (membership, mounts.replace('/docker/one', '/foreign'), 123)]:
+            with self.subTest(member=bad_member, mounts=bad_mounts), self.assertRaises(ValueError):
+                self.observe(files, bad_member, bad_mounts, pid)
+        for field, value in [('/cg/cpu/cpu.cfs_quota_us', '0'), ('/cg/cpu/cpu.cfs_period_us', '0'),
+                             ('/cg/memory/memory.stat', 'cache 12'),
+                             ('/cg/memory/memory.usage_in_bytes', '-1')]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.observe(dict(files, **{field: value}), membership, mounts)
+
+    def test_v2_visible_ancestors_restrict_admission(self):
+        files = {'/cg/job/cgroup.procs': '123', '/cg/cgroup.procs': '',
+                 '/cg/job/cpu.max': '1200000 100000', '/cg/job/memory.max': str(43 * container.GIB),
+                 '/cg/job/memory.current': str(container.GIB),
+                 '/cg/cpu.max': '800000 100000', '/cg/memory.max': str(50 * container.GIB),
+                 '/cg/memory.current': str(20 * container.GIB)}
+        groups = self.observe(files, '0::/job', '1 0 0:1 / /cg rw - cgroup2 none rw')
+        plan = container.resource_plan(12, {'MemTotal': 375 * container.GIB,
+                                           'MemAvailable': 300 * container.GIB}, 96, groups)
+        self.assertIsNone(plan['effective_jobs'])
+        self.assertEqual(plan['visible_cpu_budget_limit'], 8)
+        self.assertEqual(plan['visible_memory_headroom_bytes'], 30 * container.GIB)
+
+    def test_filesystem_opt_in_does_not_relax_default(self):
+        local.check_filesystem('ext4', False)
+        for kind in ('ext4', 'xfs'):
+            local.check_filesystem(kind, True)
+        for kind, container_mode in [('xfs', False), ('overlay', True), ('nfs', True), ('tmpfs', False)]:
+            with self.assertRaises(ValueError):
+                local.check_filesystem(kind, container_mode)
 
 
 if __name__ == '__main__':
