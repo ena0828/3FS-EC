@@ -83,6 +83,100 @@ sudo -n cp -a "$work/fdb/fdb-package/usr/include/foundationdb/." /usr/local/incl
 sudo -n install -m 755 "$work/fdb/lib/libfdb_c.so" /usr/local/lib/libfdb_c.so
 cat "$work/fdb/fdb-binaries.sha256"
 
+gcc_toolchain="$work/gcc12"
+python3 - "$gcc_toolchain" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+base = Path(sys.argv[1])
+triple = subprocess.check_output(["g++-12", "-dumpmachine"], text=True).strip()
+links = {
+    f"lib/gcc/{triple}/12": f"/usr/lib/gcc/{triple}/12",
+    "include/c++/12": "/usr/include/c++/12",
+    f"include/{triple}/c++/12": f"/usr/include/{triple}/c++/12",
+    f"lib/{triple}": f"/usr/lib/{triple}",
+}
+for relative, destination in links.items():
+    target = Path(destination)
+    if not target.is_dir():
+        raise SystemExit(f"Missing GCC 12 layout input: {target}")
+    link = base / relative
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target, target_is_directory=True)
+print("Explicit top-level Clang GCC layout:", base)
+PY
+
+# Clang/lld does not use LD_LIBRARY_PATH as a link-time -L search path.
+# Fail before libfuse, Cargo and Arrow builds if the actual compiler/layout/linker
+# cannot link and load the exact installed FDB client. This starts no FDB network.
+cmp -- "$work/fdb/lib/libfdb_c.so" /usr/local/lib/libfdb_c.so
+cat > "$work/provenance/fdb-link-probe.cc" <<'CPP'
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#define FDB_API_VERSION 710
+#include <foundationdb/fdb_c.h>
+#include <dlfcn.h>
+#include <cstdio>
+#include <cstring>
+
+int main() {
+    const int maximum = fdb_get_max_api_version();
+    const char* version = fdb_get_client_version();
+    // dlsym avoids dladdr mistaking an executable PLT trampoline for the DSO.
+    void* symbol = dlsym(RTLD_DEFAULT, "fdb_get_max_api_version");
+    Dl_info provider{};
+    if (maximum != FDB_LATEST_API_VERSION || maximum < FDB_API_VERSION || !version ||
+        std::strlen(version) > 256 || !symbol || !dladdr(symbol, &provider) ||
+        !provider.dli_fname || std::strlen(provider.dli_fname) > 4096) {
+        return 1;
+    }
+    std::printf("%d\n%s\n%s\n", maximum, version, provider.dli_fname);
+    return 0;
+}
+CPP
+fdb_probe_argv=(/usr/bin/clang++-14 "--gcc-toolchain=$gcc_toolchain"
+    -std=c++20 -O0 -g0 -fcoroutines-ts -fuse-ld=lld -I/usr/local/include
+    -L/usr/local/lib "$work/provenance/fdb-link-probe.cc" -lfdb_c -ldl -latomic
+    -o "$work/provenance/fdb-link-probe")
+printf '%q ' "${fdb_probe_argv[@]}" > "$work/provenance/fdb-link-probe.argv"
+printf '\n' >> "$work/provenance/fdb-link-probe.argv"
+"${fdb_probe_argv[@]}"
+"$work/provenance/fdb-link-probe" > "$work/provenance/fdb-link-probe.out"
+python3 - "$work" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+work = Path(sys.argv[1])
+provenance = work / 'provenance'
+rows = (provenance / 'fdb-link-probe.out').read_text().splitlines()
+if len(rows) != 3 or rows[0] != '730':
+    raise SystemExit('FDB probe returned an unexpected 7.3.63 API/record shape')
+provider = Path(rows[2]).resolve(strict=True)
+installed = Path('/usr/local/lib/libfdb_c.so').resolve(strict=True)
+expected = work / 'fdb/lib/libfdb_c.so'
+def sha(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+if provider != installed or sha(provider) != sha(expected):
+    raise SystemExit('FDB probe loaded a different client library')
+record = {'schema': 1, 'status': 'linked-and-loaded-fixed-client',
+          'maximum_api_version': int(rows[0]), 'requested_header_api': 710,
+          'client_version': rows[1], 'provider': str(provider), 'provider_sha256': sha(provider),
+          'expected_package_library_sha256': sha(expected),
+          'gcc_toolchain': str(work / 'gcc12'), 'linker': 'lld',
+          'link_search_directory': '/usr/local/lib', 'fdb_network_started': False,
+          'probe_sha256': sha(provenance / 'fdb-link-probe'),
+          'probe_source_sha256': sha(provenance / 'fdb-link-probe.cc'),
+          'argv_sha256': sha(provenance / 'fdb-link-probe.argv')}
+with (provenance / 'fdb-link-probe.json').open('x') as stream:
+    json.dump(record, stream, indent=2)
+    stream.write('\n')
+print(json.dumps(record))
+PY
+
 # Ubuntu 24.04's libfuse 3.14 is below this tree's required >= 3.16.1.
 fuse_revision=7a92727d97c10290b3501d86a194738973edb61d
 git init -q "$work/libfuse"
@@ -134,37 +228,17 @@ git -C third_party/folly apply --reverse --check ../../patches/folly.patch
 git -C third_party/folly diff --binary | sha256sum
 git -C third_party/rocksdb diff --binary | sha256sum
 
-gcc_toolchain="$work/gcc12"
-python3 - "$gcc_toolchain" <<'PY'
-from pathlib import Path
-import subprocess
-import sys
-base = Path(sys.argv[1])
-triple = subprocess.check_output(["g++-12", "-dumpmachine"], text=True).strip()
-links = {
-    f"lib/gcc/{triple}/12": f"/usr/lib/gcc/{triple}/12",
-    "include/c++/12": "/usr/include/c++/12",
-    f"include/{triple}/c++/12": f"/usr/include/{triple}/c++/12",
-    f"lib/{triple}": f"/usr/lib/{triple}",
-}
-for relative, destination in links.items():
-    target = Path(destination)
-    if not target.is_dir():
-        raise SystemExit(f"Missing GCC 12 layout input: {target}")
-    link = base / relative
-    link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(target, target_is_directory=True)
-print("Explicit top-level Clang GCC layout:", base)
-PY
 ln -s -- "$work/cargo-target" "$source_root/target"
 ulimit -n 65536
 cmake -S "$source_root" -B "$work/build" -G Ninja \
-    -DCMAKE_CXX_COMPILER=clang++-14 -DCMAKE_C_COMPILER=clang-14 \
+    -DCMAKE_CXX_COMPILER=/usr/bin/clang++-14 -DCMAKE_C_COMPILER=/usr/bin/clang-14 \
     "-DCMAKE_C_COMPILER_EXTERNAL_TOOLCHAIN=$gcc_toolchain" \
     "-DCMAKE_CXX_COMPILER_EXTERNAL_TOOLCHAIN=$gcc_toolchain" \
     -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASSERTIONS=ON -DDEBUG_INFO_FLAGS=-g0 \
     '-DCMAKE_C_FLAGS_DEBUG=-O0 -g0' '-DCMAKE_CXX_FLAGS_DEBUG=-O0 -g0' \
     -DFOLLY_CXX_FLAGS=-g0 -DSHUFFLE_METHOD=g++11 -DENABLE_FUSE_APPLICATION=ON \
+    '-DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/lib' \
+    '-DCMAKE_SHARED_LINKER_FLAGS=-L/usr/local/lib' \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DHF3FS_EXTERNAL_BUILD_JOBS=1
 cmake --build "$work/build" --parallel 1 --target test_meta test_fuse_ec
 if "$with_lab"; then
