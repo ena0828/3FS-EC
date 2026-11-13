@@ -122,12 +122,22 @@ cat > "$work/provenance/fdb-link-probe.cc" <<'CPP'
 
 int main() {
     const int maximum = fdb_get_max_api_version();
+    if (maximum != FDB_LATEST_API_VERSION || maximum < FDB_API_VERSION) {
+        std::fprintf(stderr, "unexpected FDB maximum API: %d\n", maximum);
+        return 1;
+    }
+    // FDB 7.3.63 initializes its local client in selectApiVersion. Calling
+    // getClientVersion first dereferences an uninitialized localClient.
+    const fdb_error_t selected = fdb_select_api_version(FDB_API_VERSION);
+    if (selected != 0) {
+        std::fprintf(stderr, "FDB API selection failed: %d\n", selected);
+        return 1;
+    }
     const char* version = fdb_get_client_version();
     // dlsym avoids dladdr mistaking an executable PLT trampoline for the DSO.
     void* symbol = dlsym(RTLD_DEFAULT, "fdb_get_max_api_version");
     Dl_info provider{};
-    if (maximum != FDB_LATEST_API_VERSION || maximum < FDB_API_VERSION || !version ||
-        std::strlen(version) > 256 || !symbol || !dladdr(symbol, &provider) ||
+    if (!version || std::strlen(version) > 256 || !symbol || !dladdr(symbol, &provider) ||
         !provider.dli_fname || std::strlen(provider.dli_fname) > 4096) {
         return 1;
     }
@@ -164,6 +174,7 @@ if provider != installed or sha(provider) != sha(expected):
     raise SystemExit('FDB probe loaded a different client library')
 record = {'schema': 1, 'status': 'linked-and-loaded-fixed-client',
           'maximum_api_version': int(rows[0]), 'requested_header_api': 710,
+          'selected_api_version': 710, 'api_selection_result': 0,
           'client_version': rows[1], 'provider': str(provider), 'provider_sha256': sha(provider),
           'expected_package_library_sha256': sha(expected),
           'gcc_toolchain': str(work / 'gcc12'), 'linker': 'lld',
