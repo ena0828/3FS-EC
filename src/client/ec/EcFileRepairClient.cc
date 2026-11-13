@@ -27,8 +27,9 @@ Result<Void> active(EcStripeControl c) {
   return Void{};
 }
 storage::client::EcRequestControl options(EcStripeControl c, EcRepairObservation *observation) {
+  // This helper belongs only to copyOne, including its recovery primitives.
   return {c.deadline, c.cancellation, storage::client::EcRequestControl::TransportPolicy::TcpOnly,
-          observation ? &observation->storageRpc() : nullptr};
+          observation ? &observation->healthyCopyRpc() : nullptr};
 }
 Result<VersionedChainId> route(hf3fs::client::ICommonMgmtdClient &mgmtd, const meta::EcV2PhysicalEndpoint &e) {
   const auto &p = e.placement;

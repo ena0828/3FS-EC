@@ -65,7 +65,7 @@ Result<Void> stage(const EcRepairFragment &expected,
 }
 storage::client::EcRequestControl options(EcRepairControl control, EcRepairObservation *observation) {
   return {control.deadline, control.cancellation, storage::client::EcRequestControl::TransportPolicy::TcpOnly,
-          observation ? &observation->storageRpc() : nullptr};
+          observation ? &observation->selectedRepairRpc() : nullptr};
 }
 }  // namespace
 
@@ -192,7 +192,7 @@ CoTryTask<std::string> NativeEcRepairTransport::read(Plan plan,
                              bindings_.sources[source].request.vChainId,
                              block);
   CO_RETURN_ON_ERROR(request);
-  NativeEcBlockTransport transport(client_, observation_ ? &observation_->storageRpc() : nullptr);
+  NativeEcBlockTransport transport(client_, observation_ ? &observation_->selectedRepairRpc() : nullptr);
   metric.noteInvocation();
   auto result = co_await transport.read(std::move(*request), {control.deadline, control.cancellation});
   CO_RETURN_ON_ERROR(result);
@@ -299,7 +299,7 @@ CoTryTask<storage::EcRepairBlock> NativeEcRepairTransport::helperBlock(Plan plan
   storage::client::EcRequestControl options{control.deadline,
                                             control.cancellation,
                                             storage::client::EcRequestControl::TransportPolicy::TcpOnly,
-                                            observation_ ? &observation_->storageRpc() : nullptr};
+                                            observation_ ? &observation_->selectedRepairRpc() : nullptr};
   metric.noteInvocation();
   auto response = co_await client_->executeEcHelper(std::move(request), options);
   CO_RETURN_ON_ERROR(response);

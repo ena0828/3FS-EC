@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 
 #include "client/ec/EcRepairPipeline.h"
 #include "common/utils/SemaphoreGuard.h"
@@ -496,6 +497,10 @@ TEST(TestEcRepairPipeline, ObservationSaturatesAndKeepsIndependentCallsSeparate)
 TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOverflow) {
   using storage::client::EcRpcMethod;
   using storage::client::EcRpcObservation;
+  static_assert(!std::is_copy_constructible_v<EcRepairObservation>);
+  static_assert(!std::is_move_constructible_v<EcRepairObservation>);
+  static_assert(!std::is_copy_constructible_v<EcRpcObservation>);
+  static_assert(!std::is_move_constructible_v<EcRpcObservation>);
   serde::Timestamp ts;
   ts.clientCalled = 1000;
   ts.clientSerialized = 1010;
@@ -506,7 +511,8 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
   ts.serverWaked = 900005;
   ts.serverProcessed = 900015;
   ts.serverSerialized = 900020;
-  EcRpcObservation observation;
+  EcRepairObservation phases;
+  auto &observation = phases.selectedRepairRpc();
   {
     EcRpcObservation::Scope frame(&observation, EcRpcMethod::Read);
     EXPECT_EQ(observation.snapshot().at(EcRpcMethod::Read).active, 1);
@@ -638,23 +644,92 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
   EXPECT_EQ(sample.at(EcRpcMethod::Seal).client.valid, 1);
 
   // Each duration is representable; only their aggregate saturates.
-  EcRpcObservation summed;
+  EcRepairObservation summed;
   auto longSpan = ts;
   longSpan.clientCalled = 1;
   longSpan.clientSerialized = int64_t(1 + std::numeric_limits<uint64_t>::max() / 1000);
   longSpan.clientReceived = longSpan.clientSerialized;
   longSpan.clientWaked = longSpan.clientSerialized;
-  for (int i = 0; i != 2; ++i) {
-    EcRpcObservation::Scope frame(&summed, EcRpcMethod::Helper);
+  for (auto *group : {&summed.selectedRepairRpc(), &summed.healthyCopyRpc()}) {
+    EcRpcObservation::Scope frame(group, EcRpcMethod::Helper);
     frame.returned(true, longSpan);
   }
-  const auto sum = summed.snapshot();
+  const auto sum = summed.storageRpc().snapshot();
   EXPECT_TRUE(sum.overflow);
+  EXPECT_FALSE(summed.selectedRepairRpc().snapshot().overflow);
+  EXPECT_FALSE(summed.healthyCopyRpc().snapshot().overflow);
   EXPECT_EQ(sum.at(EcRpcMethod::Helper).client.valid, 2);
   EXPECT_EQ(sum.at(EcRpcMethod::Helper).client.outOfRange, 0);
   EXPECT_EQ(sum.at(EcRpcMethod::Helper).client.spanNs[0], std::numeric_limits<uint64_t>::max());
   EXPECT_EQ(sum.at(EcRpcMethod::Helper).client.spanNs[1], 0);  // Valid equal timestamps.
   EXPECT_EQ(sum.at(EcRpcMethod::Helper).active, 0);
+  // The same method belongs to two actual caller phases. It is not classified
+  // by method name, and a returned error retains the selected-repair sample.
+  {
+    EcRpcObservation::Scope copy(&phases.healthyCopyRpc(), EcRpcMethod::Read);
+    copy.messengerInvocation();
+    copy.returned(true, ts);
+  }
+  const auto grouped = phases.snapshot();
+  const auto &totalRead = grouped.storageRpc.at(EcRpcMethod::Read);
+  EXPECT_EQ(totalRead.entered, 2);
+  EXPECT_EQ(totalRead.finished, 2);
+  EXPECT_EQ(totalRead.active, 0);
+  EXPECT_EQ(totalRead.outerError, 1);
+  EXPECT_EQ(totalRead.outerOk, 1);
+  EXPECT_EQ(grouped.selectedRepairRpc.at(EcRpcMethod::Read).outerError, 1);
+  EXPECT_EQ(grouped.healthyCopyRpc.at(EcRpcMethod::Read).outerError, 0);
+  EXPECT_EQ(grouped.healthyCopyRpc.at(EcRpcMethod::Read).outerOk, 1);
+  EXPECT_EQ(totalRead.client.spanNs, (std::array<uint64_t, 3>{20000, 80000, 20000}));
+  EXPECT_EQ(totalRead.server.spanNs, (std::array<uint64_t, 3>{10000, 20000, 10000}));
+  // Fault, missing result, bad clocks and permit exits above update both sinks
+  // once. Healthy copy has not entered any of these method/limiter slots.
+  const auto &totalAppend = grouped.storageRpc.at(EcRpcMethod::Append);
+  EXPECT_EQ(totalAppend.outerError, append.outerError);
+  EXPECT_EQ(totalAppend.withoutResult, append.withoutResult);
+  EXPECT_EQ(totalAppend.withoutMessenger, append.withoutMessenger);
+  EXPECT_EQ(totalAppend.missingEncodedRequestFrames, append.missingEncodedRequestFrames);
+  EXPECT_EQ(totalAppend.client.missing, append.client.missing);
+  EXPECT_TRUE(grouped.storageRpc.clockAnomaly);
+  EXPECT_TRUE(grouped.storageRpc.overflow);
+  EXPECT_FALSE(grouped.healthyCopyRpc.clockAnomaly);
+  EXPECT_FALSE(grouped.healthyCopyRpc.overflow);
+  const auto &totalPermit = totalRead.limiters[0];
+  EXPECT_EQ(totalPermit.entered, permit.entered);
+  EXPECT_EQ(totalPermit.finished, permit.finished);
+  EXPECT_EQ(totalPermit.acquiredWaitNs, permit.acquiredWaitNs);
+  EXPECT_EQ(totalPermit.unacquiredSpanNs, permit.unacquiredSpanNs);
+  EXPECT_EQ(totalPermit.heldNs, permit.heldNs);
+
+  EcRepairObservation peaks;
+  // Each phase has a peak of two, but their non-overlapping peaks must not be
+  // summed to four. Both sinks receive the identical per-event clock sample.
+  for (auto *group : {&peaks.selectedRepairRpc(), &peaks.healthyCopyRpc()}) {
+    EcRpcObservation::LimiterScope first(group, EcRpcMethod::Read, EcRpcLimiter::Global);
+    EcRpcObservation::LimiterScope second(group, EcRpcMethod::Read, EcRpcLimiter::Global);
+    first.acquired();
+  }
+  // Conversely, simultaneous scopes in distinct phases are counted together.
+  {
+    EcRpcObservation::LimiterScope repair(&peaks.selectedRepairRpc(), EcRpcMethod::Begin, EcRpcLimiter::Global);
+    EcRpcObservation::LimiterScope copy(&peaks.healthyCopyRpc(), EcRpcMethod::Begin, EcRpcLimiter::Global);
+    EXPECT_EQ(peaks.storageRpc().snapshot().at(EcRpcMethod::Begin).limiters[1].active, 2);
+  }
+  const auto peakSamples = peaks.snapshot();
+  for (auto method : {EcRpcMethod::Read, EcRpcMethod::Begin}) {
+    const auto &total = peakSamples.storageRpc.at(method).limiters[1];
+    const auto &repair = peakSamples.selectedRepairRpc.at(method).limiters[1];
+    const auto &copy = peakSamples.healthyCopyRpc.at(method).limiters[1];
+    EXPECT_EQ(total.active, 0);
+    EXPECT_EQ(total.peakActive, 2);
+    EXPECT_EQ(repair.peakActive, method == EcRpcMethod::Read ? 2 : 1);
+    EXPECT_EQ(copy.peakActive, method == EcRpcMethod::Read ? 2 : 1);
+    EXPECT_EQ(total.entered, repair.entered + copy.entered);
+    EXPECT_EQ(total.finished, repair.finished + copy.finished);
+    EXPECT_EQ(total.acquiredWaitNs, repair.acquiredWaitNs + copy.acquiredWaitNs);
+    EXPECT_EQ(total.unacquiredSpanNs, repair.unacquiredSpanNs + copy.unacquiredSpanNs);
+    EXPECT_EQ(total.heldNs, repair.heldNs + copy.heldNs);
+  }
   EcRpcObservation nextCall;
   for (const auto &method : nextCall.snapshot().methods) EXPECT_EQ(method.entered, 0);
 }
@@ -662,7 +737,8 @@ TEST(TestEcRepairPipeline, RpcObservationSeparatesHostClocksMissingErrorsAndOver
 TEST(TestEcRepairPipeline, RpcFrameObservationCountsMissingErrorsExceptionsAndSaturates) {
   using storage::client::EcRpcMethod;
   using storage::client::EcRpcObservation;
-  EcRpcObservation observation;
+  EcRepairObservation phases;
+  auto &observation = phases.selectedRepairRpc();
   {
     EcRpcObservation::Scope disabled(nullptr, EcRpcMethod::Read);
     EcRpcObservation::Scope invalid(&observation, EcRpcMethod::Count);
@@ -707,6 +783,36 @@ TEST(TestEcRepairPipeline, RpcFrameObservationCountsMissingErrorsExceptionsAndSa
   EXPECT_EQ(read.missingEncodedResponseFrames, 4);
   EXPECT_EQ(read.responseFrameBytes, 40);
   EXPECT_EQ(read.compressedResponseFrames, 1);
+  {
+    EcRpcObservation::Scope copy(&phases.healthyCopyRpc(), EcRpcMethod::Read);
+    copy.messengerInvocation();
+    *copy.callSizes() = {{77, true, true}, {88, true, false}};
+    copy.returned(true, {});
+  }
+  const auto grouped = phases.snapshot();
+  const auto &total = grouped.storageRpc.at(EcRpcMethod::Read);
+  const auto &copy = grouped.healthyCopyRpc.at(EcRpcMethod::Read);
+  EXPECT_EQ(copy.entered, 1);
+  EXPECT_EQ(copy.outerOk, 1);
+  EXPECT_EQ(copy.withoutResult, 0);
+  EXPECT_EQ(copy.requestFrameBytes, 77);
+  EXPECT_EQ(copy.responseFrameBytes, 88);
+  EXPECT_EQ(total.entered, 6);
+  EXPECT_EQ(total.finished, 6);
+  EXPECT_EQ(total.active, 0);
+  EXPECT_EQ(total.outerError, 2);
+  EXPECT_EQ(total.outerOk, 1);
+  EXPECT_EQ(total.withoutResult, 3);
+  EXPECT_EQ(total.messengerInvocations, 5);
+  EXPECT_EQ(total.withoutMessenger, 1);
+  EXPECT_EQ(total.observedEncodedRequestFrames, 4);
+  EXPECT_EQ(total.observedEncodedResponseFrames, 2);
+  EXPECT_EQ(total.missingEncodedRequestFrames, 2);
+  EXPECT_EQ(total.missingEncodedResponseFrames, 4);
+  EXPECT_EQ(total.requestFrameBytes, 427);
+  EXPECT_EQ(total.responseFrameBytes, 128);
+  EXPECT_EQ(total.compressedRequestFrames, 2);
+  EXPECT_EQ(total.compressedResponseFrames, 1);
   for (auto bytes : {std::numeric_limits<uint64_t>::max(), uint64_t{1}}) {
     EcRpcObservation::Scope frame(&observation, EcRpcMethod::Helper);
     *frame.callSizes() = {{bytes, true, false}, {bytes, true, false}};
@@ -717,6 +823,27 @@ TEST(TestEcRepairPipeline, RpcFrameObservationCountsMissingErrorsExceptionsAndSa
   EXPECT_EQ(saturated.at(EcRpcMethod::Helper).responseFrameBytes, std::numeric_limits<uint64_t>::max());
   EXPECT_EQ(saturated.at(EcRpcMethod::Helper).observedEncodedRequestFrames, 2);
   EXPECT_EQ(saturated.at(EcRpcMethod::Helper).observedEncodedResponseFrames, 2);
+  EXPECT_TRUE(phases.storageRpc().snapshot().overflow);
+  EXPECT_FALSE(phases.healthyCopyRpc().snapshot().overflow);
+  EXPECT_EQ(phases.storageRpc().snapshot().at(EcRpcMethod::Helper).requestFrameBytes,
+            std::numeric_limits<uint64_t>::max());
+  // Neither phase overflows, but their combined frame-byte total does.
+  EcRepairObservation combined;
+  {
+    EcRpcObservation::Scope repair(&combined.selectedRepairRpc(), EcRpcMethod::Append);
+    repair.callSizes()->request = {std::numeric_limits<uint64_t>::max() - 3, true, false};
+  }
+  {
+    EcRpcObservation::Scope healthy(&combined.healthyCopyRpc(), EcRpcMethod::Append);
+    healthy.callSizes()->request = {4, true, false};
+  }
+  const auto combinedSample = combined.snapshot();
+  EXPECT_FALSE(combinedSample.selectedRepairRpc.overflow);
+  EXPECT_FALSE(combinedSample.healthyCopyRpc.overflow);
+  EXPECT_TRUE(combinedSample.storageRpc.overflow);
+  EXPECT_EQ(combinedSample.storageRpc.at(EcRpcMethod::Append).requestFrameBytes,
+            std::numeric_limits<uint64_t>::max());
+  EXPECT_EQ(combinedSample.storageRpc.at(EcRpcMethod::Append).observedEncodedRequestFrames, 2);
 }
 
 }  // namespace

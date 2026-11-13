@@ -10,6 +10,10 @@
 #include "common/serde/MessagePacket.h"
 #include "common/serde/RpcCallSizes.h"
 
+namespace hf3fs::client::ec {
+class EcRepairObservation;
+}
+
 namespace hf3fs::storage::client {
 
 // Local, opt-in observations of the client -> Storage first hop. No wire or
@@ -69,6 +73,29 @@ class EcRpcObservation {
   };
   std::array<Counter, size_t(EcRpcMethod::Count)> counters_{};
   std::atomic<bool> overflow_{false}, clockAnomaly_{false};
+  EcRpcObservation *aggregate_ = nullptr;
+
+  friend class hf3fs::client::ec::EcRepairObservation;
+  struct AggregateSink {};
+  // Only EcRepairObservation creates these fixed, co-owned groups. Never form
+  // a self/chained sink, and never recurse through another observation. An
+  // invalid internal binding leaves only the local observer enabled.
+  EcRpcObservation(AggregateSink, EcRpcObservation &aggregate) noexcept
+      : aggregate_(&aggregate != this && !aggregate.aggregate_ ? &aggregate : nullptr) {}
+
+  template <typename F>
+  void enterCounter(EcRpcMethod method, F &&update) noexcept {
+    // The aggregate interval encloses its group's interval: enter total first,
+    // leave it last below. Peaks come from real active counters, not sums.
+    if (aggregate_) update(*aggregate_, aggregate_->counters_[size_t(method)]);
+    update(*this, counters_[size_t(method)]);
+  }
+
+  template <typename F>
+  void eachCounter(EcRpcMethod method, F &&update) noexcept {
+    update(*this, counters_[size_t(method)]);
+    if (aggregate_) update(*aggregate_, aggregate_->counters_[size_t(method)]);
+  }
 
   uint64_t add(std::atomic<uint64_t> &value, uint64_t amount) noexcept {
     auto old = value.load(std::memory_order_relaxed);
@@ -85,11 +112,13 @@ class EcRpcObservation {
   uint64_t elapsed(Clock::time_point start, Clock::time_point end) noexcept {
     if (end < start) {
       clockAnomaly_.store(true, std::memory_order_relaxed);
+      if (aggregate_) aggregate_->clockAnomaly_.store(true, std::memory_order_relaxed);
       return 0;
     }
     const auto nanos = std::chrono::duration<long double, std::nano>(end - start).count();
     if (nanos >= std::numeric_limits<uint64_t>::max()) {
       overflow_.store(true, std::memory_order_relaxed);
+      if (aggregate_) aggregate_->overflow_.store(true, std::memory_order_relaxed);
       return std::numeric_limits<uint64_t>::max();
     }
     return uint64_t(nanos);
@@ -132,13 +161,20 @@ class EcRpcObservation {
   }
 
  public:
+  EcRpcObservation() noexcept = default;
+  EcRpcObservation(const EcRpcObservation &) = delete;
+  EcRpcObservation &operator=(const EcRpcObservation &) = delete;
+  EcRpcObservation(EcRpcObservation &&) = delete;
+  EcRpcObservation &operator=(EcRpcObservation &&) = delete;
+
   // Declare BEFORE the matching SemaphoreGuard. Its destructor then observes
   // exit AFTER the real guard releases. Entry includes the fast acquire path;
   // active/peakActive cover waiting AND holding, never queue depth. Unacquired
   // exits are censored separately. nullptr performs no clock/atomic operations.
   class LimiterScope {
     EcRpcObservation *owner_ = nullptr;
-    LimiterCounter *counter_ = nullptr;
+    EcRpcMethod method_ = EcRpcMethod::Count;
+    EcRpcLimiter limiter_ = EcRpcLimiter::Count;
     Clock::time_point start_{}, acquiredAt_{};
     bool acquired_ = false;
 
@@ -148,12 +184,16 @@ class EcRpcObservation {
           size_t(limiter) >= size_t(EcRpcLimiter::Count))
         return;
       owner_ = owner;
-      counter_ = &owner->counters_[size_t(method)].limiters[size_t(limiter)];
+      method_ = method;
+      limiter_ = limiter;
       start_ = Clock::now();
-      owner_->add(counter_->entered, 1);
-      const auto active = owner_->add(counter_->active, 1);
-      auto peak = counter_->peakActive.load(std::memory_order_relaxed);
-      while (peak < active && !counter_->peakActive.compare_exchange_weak(peak, active, std::memory_order_relaxed)) {}
+      owner_->enterCounter(method_, [&](auto &sink, auto &methodCounter) {
+        auto &counter = methodCounter.limiters[size_t(limiter_)];
+        sink.add(counter.entered, 1);
+        const auto active = sink.add(counter.active, 1);
+        auto peak = counter.peakActive.load(std::memory_order_relaxed);
+        while (peak < active && !counter.peakActive.compare_exchange_weak(peak, active, std::memory_order_relaxed)) {}
+      });
     }
     LimiterScope(const LimiterScope &) = delete;
     LimiterScope &operator=(const LimiterScope &) = delete;
@@ -161,20 +201,28 @@ class EcRpcObservation {
       if (!owner_ || acquired_) return;
       acquiredAt_ = Clock::now();
       acquired_ = true;
-      owner_->add(counter_->acquired, 1);
-      owner_->add(counter_->acquiredWaitNs, owner_->elapsed(start_, acquiredAt_));
+      const auto waitNs = owner_->elapsed(start_, acquiredAt_);
+      owner_->eachCounter(method_, [&](auto &sink, auto &methodCounter) {
+        auto &counter = methodCounter.limiters[size_t(limiter_)];
+        sink.add(counter.acquired, 1);
+        sink.add(counter.acquiredWaitNs, waitNs);
+      });
     }
     ~LimiterScope() noexcept {
       if (!owner_) return;
       const auto end = Clock::now();
-      if (acquired_) {
-        owner_->add(counter_->heldNs, owner_->elapsed(acquiredAt_, end));
-      } else {
-        owner_->add(counter_->withoutPermit, 1);
-        owner_->add(counter_->unacquiredSpanNs, owner_->elapsed(start_, end));
-      }
-      owner_->add(counter_->finished, 1);
-      counter_->active.fetch_sub(1, std::memory_order_relaxed);
+      const auto spanNs = owner_->elapsed(acquired_ ? acquiredAt_ : start_, end);
+      owner_->eachCounter(method_, [&](auto &sink, auto &methodCounter) {
+        auto &counter = methodCounter.limiters[size_t(limiter_)];
+        if (acquired_) {
+          sink.add(counter.heldNs, spanNs);
+        } else {
+          sink.add(counter.withoutPermit, 1);
+          sink.add(counter.unacquiredSpanNs, spanNs);
+        }
+        sink.add(counter.finished, 1);
+        counter.active.fetch_sub(1, std::memory_order_relaxed);
+      });
     }
   };
 
@@ -182,7 +230,7 @@ class EcRpcObservation {
   // WriteItem or network task. The owner must outlive every local child join.
   class Scope {
     EcRpcObservation *owner_ = nullptr;
-    Counter *counter_ = nullptr;
+    EcRpcMethod method_ = EcRpcMethod::Count;
     bool recorded_ = false;
     bool messengerInvoked_ = false;
     serde::RpcCallSizes sizes_{};
@@ -191,9 +239,11 @@ class EcRpcObservation {
     Scope(EcRpcObservation *owner, EcRpcMethod method) noexcept {
       if (!owner || size_t(method) >= size_t(EcRpcMethod::Count)) return;
       owner_ = owner;
-      counter_ = &owner->counters_[size_t(method)];
-      owner_->add(counter_->entered, 1);
-      owner_->add(counter_->active, 1);
+      method_ = method;
+      owner_->enterCounter(method_, [](auto &sink, auto &counter) {
+        sink.add(counter.entered, 1);
+        sink.add(counter.active, 1);
+      });
     }
     Scope(const Scope &) = delete;
     Scope &operator=(const Scope &) = delete;
@@ -201,30 +251,32 @@ class EcRpcObservation {
       if (!owner_) return;
       // Gather once on every exit, independently of business Result/timestamps.
       // These values were written only by our joined descendant call frames.
-      if (sizes_.request.available) {
-        owner_->add(counter_->observedEncodedRequestFrames, 1);
-        owner_->add(counter_->requestFrameBytes, sizes_.request.bytes);
-        if (sizes_.request.compressed) owner_->add(counter_->compressedRequestFrames, 1);
-      } else {
-        owner_->add(counter_->missingEncodedRequestFrames, 1);
-      }
-      if (sizes_.response.available) {
-        owner_->add(counter_->observedEncodedResponseFrames, 1);
-        owner_->add(counter_->responseFrameBytes, sizes_.response.bytes);
-        if (sizes_.response.compressed) owner_->add(counter_->compressedResponseFrames, 1);
-      } else {
-        owner_->add(counter_->missingEncodedResponseFrames, 1);
-      }
-      if (!messengerInvoked_) owner_->add(counter_->withoutMessenger, 1);
-      if (!recorded_) {
-        // Local rejection or exception before the await expression produced a
-        // Result. This is not evidence of a network dispatch or remote failure.
-        owner_->add(counter_->withoutResult, 1);
-        owner_->add(counter_->client.missing, 1);
-        owner_->add(counter_->server.missing, 1);
-      }
-      owner_->add(counter_->finished, 1);
-      counter_->active.fetch_sub(1, std::memory_order_relaxed);
+      const auto sizes = sizes_;
+      owner_->eachCounter(method_, [&](auto &sink, auto &counter) {
+        if (sizes.request.available) {
+          sink.add(counter.observedEncodedRequestFrames, 1);
+          sink.add(counter.requestFrameBytes, sizes.request.bytes);
+          if (sizes.request.compressed) sink.add(counter.compressedRequestFrames, 1);
+        } else {
+          sink.add(counter.missingEncodedRequestFrames, 1);
+        }
+        if (sizes.response.available) {
+          sink.add(counter.observedEncodedResponseFrames, 1);
+          sink.add(counter.responseFrameBytes, sizes.response.bytes);
+          if (sizes.response.compressed) sink.add(counter.compressedResponseFrames, 1);
+        } else {
+          sink.add(counter.missingEncodedResponseFrames, 1);
+        }
+        if (!messengerInvoked_) sink.add(counter.withoutMessenger, 1);
+        if (!recorded_) {
+          // Local rejection/exception, not evidence of dispatch or remote failure.
+          sink.add(counter.withoutResult, 1);
+          sink.add(counter.client.missing, 1);
+          sink.add(counter.server.missing, 1);
+        }
+        sink.add(counter.finished, 1);
+        counter.active.fetch_sub(1, std::memory_order_relaxed);
+      });
     }
     serde::RpcCallSizes *callSizes() noexcept { return owner_ ? &sizes_ : nullptr; }
     // Immediately before the actual std::invoke expression, inside the
@@ -233,18 +285,22 @@ class EcRpcObservation {
     void messengerInvocation() noexcept {
       if (!owner_) return;
       messengerInvoked_ = true;
-      owner_->add(counter_->messengerInvocations, 1);
+      owner_->eachCounter(method_, [](auto &sink, auto &counter) { sink.add(counter.messengerInvocations, 1); });
     }
     void returned(bool outerOk, const serde::Timestamp &timestamp) noexcept {
       if (!owner_ || recorded_) return;
       recorded_ = true;
-      owner_->add(outerOk ? counter_->outerOk : counter_->outerError, 1);
+      const std::array<int64_t, 4> client{timestamp.clientCalled, timestamp.clientSerialized,
+                                        timestamp.clientReceived, timestamp.clientWaked};
+      const std::array<int64_t, 4> server{timestamp.serverReceived, timestamp.serverWaked,
+                                        timestamp.serverProcessed, timestamp.serverSerialized};
       // An outer error can carry a valid timestamp. Conversely fault injection
       // or a local/transport failure can return a Result without any timestamp.
-      owner_->observe(counter_->client, {timestamp.clientCalled, timestamp.clientSerialized,
-                                         timestamp.clientReceived, timestamp.clientWaked});
-      owner_->observe(counter_->server, {timestamp.serverReceived, timestamp.serverWaked,
-                                         timestamp.serverProcessed, timestamp.serverSerialized});
+      owner_->eachCounter(method_, [&](auto &sink, auto &counter) {
+        sink.add(outerOk ? counter.outerOk : counter.outerError, 1);
+        sink.observe(counter.client, client);
+        sink.observe(counter.server, server);
+      });
     }
   };
 
