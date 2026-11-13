@@ -4,6 +4,7 @@ import copy
 import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from contextlib import redirect_stdout
 
 spec = importlib.util.spec_from_file_location('file_lab_under_test', Path(__file__).with_name('run-file-lab.py'))
 lab = importlib.util.module_from_spec(spec)
@@ -31,6 +33,131 @@ def passed_mount():
 
 
 class FileLabGates(unittest.TestCase):
+    def test_first_business_failure_survives_cleanup_exception(self):
+        report = {}
+        with mock.patch.object(lab, 'PHASE', 'mode4-lifecycle'):
+            lab.remember_failure(report, ValueError('private business detail'))
+            lab.phase('cleanup')
+            lab.remember_failure(report, OSError(5, 'private cleanup detail'))
+        self.assertEqual(report['failure_phase'], 'mode4-lifecycle')
+        self.assertEqual(report['first_failure'], {'phase': 'mode4-lifecycle', 'error_type': 'ValueError'})
+
+    def test_lifecycle_diagnostic_distinguishes_stages_without_authorizing_cleanup(self):
+        cases = [
+            ({'mounts': [{'phase': 'prepare', 'ready': False}]}, 'first-mount-readiness'),
+            ({'mounts': [{'phase': 'prepare', 'ready': True}, {'phase': 'verify', 'ready': False}]}, 'remount-readiness'),
+            ({'commands': [{'name': 'posix-prepare', 'exitcode': 1, 'joined': True},
+                           {'name': 'unmount-prepare', 'exitcode': 1, 'joined': True}],
+              'errors': ['ValueError: posix-prepare failed, timed out or has an unknown join']}, 'posix-prepare'),
+            ({'commands': [{'name': 'usrbio-verify', 'exitcode': 1, 'joined': True}]}, 'usrbio-verify'),
+            ({'errors': ['ValueError: normal unmount and successful FUSE join are required before continuing']},
+             'unmount-or-join'),
+            ({'errors': ['ValueError: USRBIO receipt did not confirm this file and the actual ABI']}, 'receipt-verification'),
+            ({'errors': ['ValueError: first-start to remount-ready crossed the locked configured session timeout']},
+             'remount-session-window')]
+        for fields, expected in cases:
+            with self.subTest(expected=expected):
+                receipt = dict(passed_mount(), **fields, status='failed', exitcode=1)
+                before = copy.deepcopy(receipt)
+                summary = lab.lifecycle_summary(receipt)
+                self.assertEqual(summary['subphase'], expected)
+                self.assertEqual(receipt, before)
+                with self.assertRaises(lab.GateError):
+                    lab.require_mount_result(receipt)
+        self.assertEqual(lab.lifecycle_summary({})['cleanup'], {})
+        self.assertEqual(lab.lifecycle_summary({'cleanup': {'unmounted': False}})['cleanup'], {'unmounted': False})
+
+    def test_private_receipts_expose_only_bounded_failure_fields(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp).resolve()
+            work = parent / 'mode4'
+            work.mkdir()
+            secret = 'PRIVATE_TOKEN_AND_PATH_' * 64
+            value = dict(passed_mount(), status='failed', exitcode=1,
+                         errors=['ValueError: posix-prepare failed, timed out or has an unknown join'],
+                         commands=[{'name': 'posix-prepare', 'exitcode': 1, 'joined': True, 'argv': [secret]}],
+                         mounts=[{'phase': 'prepare', 'ready': True, 'joined': True, 'exitcode': 0,
+                                  'normal_unmount': True, 'cleanup_error': 'OSError: [Errno 5] ' + secret}],
+                         config={'token': secret})
+            (work / 'result.json').write_text(json.dumps(value), encoding='utf-8')
+            events = [{'operation': 'pwrite', 'state': 'operation_confirmed', 'file': secret, 'payload': secret},
+                      {'operation': 'probe', 'state': 'unconfirmed', 'error': 'OSError: [Errno 5] ' + secret}]
+            (work / 'posix-prepare.jsonl').write_text('\n'.join(map(json.dumps, events)), encoding='utf-8')
+            (work / 'usrbio-prepare').mkdir()
+            (work / 'usrbio-prepare/result.json').write_text(json.dumps(
+                {'state': 'unconfirmed', 'error': 'ValueError: ' + secret, 'driver_argv': [secret]}), encoding='utf-8')
+            before = {p: p.read_bytes() for p in work.rglob('*') if p.is_file()}
+            report = {'failure_phase': 'mode4-lifecycle',
+                      'first_failure': {'phase': 'mode4-lifecycle', 'error_type': 'ValueError'},
+                      'supervisor_exitcode': 0, 'cleanup_blocked': False}
+            output = io.StringIO()
+            with redirect_stdout(output):
+                lab.emit_failure_evidence(parent, report, 'after-native-cleanup')
+            raw = output.getvalue()
+            self.assertLess(len(raw), 24576 + 64)
+            self.assertNotIn('PRIVATE_TOKEN', raw)
+            self.assertNotIn(str(parent), raw)
+            summary = json.loads(raw.removeprefix('FILE_LAB_FAILURE '))
+            self.assertEqual(summary['lifecycle']['subphase'], 'posix-prepare')
+            self.assertEqual(summary['probes'][0]['error'], {'code': 'os_error', 'error_type': 'OSError', 'errno': 5})
+            self.assertEqual(summary['probes'][0]['recent_confirmed_operations'], ['pwrite'])
+            self.assertEqual(summary['probes'][2]['source']['availability'], 'unavailable')
+            self.assertTrue(summary['observations_only_not_acceptance'])
+            self.assertEqual({p: p.read_bytes() for p in before}, before)
+
+    def test_fuse_log_sampling_extracts_static_status_without_leaking_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp).resolve() / 'fuse.log'
+            secret = b'SECRET_CONFIG_TOKEN=/private/key'
+            head = b'Start to init fuse clients\nFull Config:\n' + secret + b'\n'
+            head += b'Try to establish client session failed: Mgmtd::ExtendClientSessionMismatch(5014) ' + secret + b'\n'
+            tail = b'Init application failed: kInvalidArg(13) ' + secret + b'\n'
+            raw = head + b'x' * (128 << 10) + tail
+            path.write_bytes(raw)
+            summary = lab.fuse_log_summary(path)
+            self.assertEqual(summary['events'], [{'event': 'client_session_failed', 'status_code': 5014},
+                                                  {'event': 'application_init_failed', 'status_code': 13}])
+            self.assertEqual(summary['progress_markers'], ['client_initialization_entered'])
+            self.assertTrue(summary['omitted_middle'])
+            self.assertEqual(summary['sampled_bytes'], 65536)
+            for forbidden in ('SECRET', 'Mgmtd', 'ExtendClientSessionMismatch', 'kInvalidArg', str(path), 'Full Config'):
+                self.assertNotIn(forbidden, json.dumps(summary))
+            self.assertEqual(path.read_bytes(), raw)
+            path.write_bytes(b'Init application failed: SecretName(9999999999) hidden\n')
+            self.assertEqual(lab.fuse_log_summary(path)['events'], [])
+
+    def test_diagnostic_inputs_reject_missing_malformed_oversized_and_linked_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp).resolve() / 'result.json'
+            self.assertIsNone(lab.diagnostic_file(path)[0])
+            for text in ('{"token":1,"token":2}', '[]', '{"x":NaN}', 'x' * (lab.DIAGNOSTIC_LIMIT + 1)):
+                path.write_text(text, encoding='utf-8')
+                value, source = lab.diagnostic_file(path)
+                self.assertIsNone(value)
+                self.assertEqual(source['availability'], 'unavailable')
+            path.write_text('{"exitcode":1}', encoding='utf-8')
+            os.link(path, path.with_name('alias.json'))
+            self.assertIsNone(lab.diagnostic_file(path)[0])
+            self.assertEqual(lab.fuse_log_summary(path)['availability'], 'unavailable')
+
+    def test_diagnostic_failure_cannot_mask_business_failure_or_scan_other_phase(self):
+        with mock.patch.object(lab, 'failure_evidence', side_effect=OSError('private failure')), \
+             mock.patch('builtins.print', side_effect=BrokenPipeError('private output failure')):
+            lab.emit_failure_evidence(Path('/not-read'), {}, 'after-native-cleanup')
+        with mock.patch.object(lab, 'diagnostic_file') as read, mock.patch.object(lab, 'fuse_log_summary') as logs:
+            summary = lab.failure_evidence(Path('/not-read'), {'failure_phase': 'cli-basic'})
+            self.assertNotIn('lifecycle', summary)
+            read.assert_not_called()
+            logs.assert_not_called()
+            report = {'failure_phase': 'cli-basic', 'final_supervisor_observation': {'stage': 'stopped'}}
+            self.assertNotIn('supervisor_reported_failure', lab.failure_evidence(Path('/not-read'), report)['cleanup'])
+            report['final_supervisor_observation']['failure'] = None
+            self.assertIs(lab.failure_evidence(Path('/not-read'), report)['cleanup']['supervisor_reported_failure'], False)
+            report['final_supervisor_observation']['failure'] = 'private failure detail'
+            observed = lab.failure_evidence(Path('/not-read'), report)
+            self.assertIs(observed['cleanup']['supervisor_reported_failure'], True)
+            self.assertNotIn('private failure detail', json.dumps(observed))
+
     def test_local_identity_requires_same_nonroot_user_and_binds_distinct_gid(self):
         request = {'execution_mode': 'local-same-user', 'creator_uid': 1234,
                    'target_uid': 1234, 'target_gid': 2345}

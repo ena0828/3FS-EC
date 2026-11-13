@@ -58,7 +58,7 @@ jobs:
               "cluster/test-native-spare-storage.py": 7,
               "cluster/test-portable-experiments.py": 5,
               "cluster/test-prepare-fuse-file.py": 4,
-              "ci/test-run-file-lab.py": 18,
+              "ci/test-run-file-lab.py": 24,
               "ci/test-run-core-tests.py": 16,
               "ci/test-run-spare-lab.py": 10,
               "ci/test-run-fault-matrix.py": 6,

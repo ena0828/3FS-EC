@@ -56,6 +56,283 @@ def diagnostic(error):
     return result
 
 
+DIAGNOSTIC_LIMIT = 1 << 20
+ERROR_TYPES = {'ValueError', 'GateError', 'RuntimeError', 'AssertionError', 'OSError',
+               'FileNotFoundError', 'PermissionError', 'FileExistsError', 'TimeoutExpired',
+               'InterruptedError', 'KeyboardInterrupt', 'JSONDecodeError', 'KeyError', 'TypeError'}
+# Match complete static messages, never echo exception text, paths, argv or log tails.
+ERROR_CODES = {
+    'owned FUSE exited before mount readiness': 'fuse_exited_before_ready',
+    'mount readiness deadline exceeded; probes are forbidden': 'mount_ready_timeout',
+    'normal unmount and successful FUSE join are required before continuing': 'normal_unmount_or_join_failed',
+    'normal unmount did not remove the owned mount': 'mount_remained_after_unmount',
+    'cannot unmount a changed mount': 'mount_identity_changed_before_unmount',
+    'first-start to remount-ready crossed the locked configured session timeout': 'remount_session_window_exceeded',
+    'native supervisor run or service PID/start time changed': 'service_identity_changed',
+    'original namespace/index or state directory changed': 'state_identity_changed',
+    'owned mount or FUSE process changed': 'mount_identity_changed',
+    'ec-lab must belong to this mount': 'mount_directory_mismatch',
+    'USRBIO receipt did not confirm this file and the actual ABI': 'usrbio_receipt_mismatch',
+    'USRBIO verify did not consume the original receipt': 'usrbio_original_receipt_mismatch',
+    'POSIX receipt sequence differs': 'posix_receipt_sequence_mismatch',
+    'POSIX receipt belongs to another invocation': 'posix_receipt_identity_mismatch',
+    'POSIX receipt contains unconfirmed work': 'posix_receipt_unconfirmed',
+    'POSIX bytes or terminal receipt differ': 'posix_receipt_bytes_mismatch',
+    'file data changed across remount': 'remount_bytes_mismatch',
+    'USRBIO inode changed across remount': 'remount_inode_mismatch',
+    'a completed probe receipt changed': 'probe_receipt_changed',
+    'actual file length differs': 'posix_length_mismatch',
+    'actual mounted bytes differ': 'posix_bytes_mismatch',
+    'EOF read returned unexpected bytes': 'posix_eof_mismatch',
+    'FUSE O_APPEND was silently accepted': 'unsupported_open_accepted',
+    'FUSE unsupported CREATE fell back or was accepted; retain the unexpected file': 'unsupported_create_accepted',
+    'Rejected CREATE left an unexpected inode; retain it': 'unsupported_create_left_inode',
+    'Actual FUSE readback differs byte-for-byte': 'usrbio_posix_bytes_mismatch',
+    'Actual FUSE EOF differs': 'usrbio_posix_eof_mismatch',
+    'Probe did not confirm the actual USRBIO ABI, all CQEs, boundaries and bytes': 'usrbio_abi_receipt_mismatch',
+    'usrbio failed; see preserved stdout/stderr': 'usrbio_binary_nonzero',
+}
+LIFECYCLE_COMMANDS = {prefix + suffix for prefix in ('posix-', 'usrbio-', 'unmount-')
+                      for suffix in ('prepare', 'verify')}
+LIFECYCLE_COMMANDS |= {'status-' + label for label in
+                       ('before-first', 'before-prepare', 'before-verify', 'ready-prepare', 'ready-verify',
+                        'before-posix-prepare', 'before-posix-verify', 'before-usrbio-prepare',
+                        'before-usrbio-verify', 'after-prepare', 'after-verify')}
+POSIX_OPERATIONS = {'probe', 'open', 'pwrite', 'ftruncate', 'fsync', 'fstat', 'pread', 'pread_eof',
+                    'close', 'reject_open_append', 'open_append', 'lstat_absent', 'create_append',
+                    'reject_create_append'}
+
+
+def error_summary(text):
+    result = {'code': 'unclassified_private_error'}
+    if type(text) is not str or len(text) > 16384:
+        return result
+    kind, separator, message = text.partition(': ')
+    if separator and kind in ERROR_TYPES:
+        result['error_type'] = kind
+    else:
+        message = text
+    if message in ERROR_CODES:
+        result['code'] = ERROR_CODES[message]
+    elif message.endswith(' failed, timed out or has an unknown join'):
+        name = message.removesuffix(' failed, timed out or has an unknown join')
+        if name in LIFECYCLE_COMMANDS:
+            result.update(code='lifecycle_command_failed', command=name)
+    # Only the numeric errno prefix is public; filenames and message bodies stay private.
+    match = re.match(r'^\[Errno ([0-9]{1,4})\](?: |$)', message)
+    if match and kind in ERROR_TYPES:
+        result.update(code='os_error', errno=int(match.group(1)))
+    return result
+
+
+def diagnostic_fields(row, fields):
+    if type(row) is not dict:
+        return {}
+    return {key: row[key] for key in fields if key in row and
+            (type(row[key]) is bool or row[key] is None or
+             (type(row[key]) is int and -(1 << 63) < row[key] < 1 << 63))}
+
+
+def diagnostic_choice(value, choices):
+    return value if type(value) is str and value in choices else 'unknown'
+
+
+def diagnostic_file(path, *, lines=False):
+    """Read only fixed caller-selected private evidence, bounded before parsing."""
+    try:
+        canonical(path)
+        info = path.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'diagnostic input is not an ordinary file')
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            opened = os.fstat(stream.fileno())
+            require((opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino)
+                    and stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1
+                    and opened.st_size <= DIAGNOSTIC_LIMIT, 'invalid diagnostic input')
+            raw = stream.read(DIAGNOSTIC_LIMIT + 1)
+        require(len(raw) <= DIAGNOSTIC_LIMIT, 'oversized diagnostic input')
+        parts = raw.splitlines() if lines else [raw]
+        require(len(parts) <= 256, 'too many diagnostic records')
+        values = [json.loads(part, object_pairs_hook=unique,
+                             parse_constant=lambda _: (_ for _ in ()).throw(ValueError())) for part in parts]
+        require(all(type(value) is dict for value in values), 'diagnostic object required')
+        return (values if lines else values[0]), {'availability': 'read', 'sha256': hashlib.sha256(raw).hexdigest()}
+    except Exception as error:
+        return None, {'availability': 'unavailable', 'error_type':
+                      type(error).__name__ if type(error).__name__ in ERROR_TYPES else 'other'}
+
+
+def fuse_log_summary(path):
+    """Sample fixed logs without publishing text; markers are observations, not causal proof."""
+    markers = {'Init application failed: ': 'application_init_failed',
+               'Parse flags failed: ': 'flags_parse_failed',
+               'Failed to init launcher: ': 'launcher_init_failed',
+               'Try to establish client session failed: ': 'client_session_failed'}
+    try:
+        canonical(path)
+        before = path.lstat()
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1, 'invalid diagnostic log')
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            require((info.st_dev, info.st_ino) == (before.st_dev, before.st_ino)
+                    and stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'diagnostic log changed')
+            head = stream.read(32768)
+            tail_start = max(len(head), info.st_size - 32768)
+            stream.seek(tail_start)
+            tail = stream.read(32768)
+        events, progress = [], []
+        # Never concatenate samples: a marker must not span an omitted section.
+        for sample in (head, tail):
+            for marker, event in ((b'Start to init fuse clients', 'client_initialization_entered'),
+                                  (b'Init fuse clients finished', 'client_initialization_returned')):
+                if marker in sample and event not in progress:
+                    progress.append(event)
+            for marker, event in markers.items():
+                name = rb'[A-Za-z_][A-Za-z_0-9]{0,127}(?:::[A-Za-z_][A-Za-z_0-9]{0,127}){0,3}'
+                pattern = re.escape(marker.encode()) + name + rb'\(([0-9]{1,10})\)(?: |\r|\n|$)'
+                for match in re.finditer(pattern, sample):
+                    code = int(match.group(1))
+                    row = {'event': event, 'status_code': code}
+                    if code <= 0xffffffff and row not in events and len(events) < 8:
+                        events.append(row)
+        return {'availability': 'sampled', 'size_at_open': info.st_size,
+                'sampled_bytes': len(head) + len(tail), 'omitted_middle': tail_start > len(head),
+                'events': events, 'progress_markers': progress, 'event_limit_reached': len(events) == 8}
+    except Exception as error:
+        return {'availability': 'unavailable', 'error_type':
+                type(error).__name__ if type(error).__name__ in ERROR_TYPES else 'other'}
+
+
+def lifecycle_summary(value):
+    """Observations only: never used to authorize cleanup or declare acceptance."""
+    result = {'subphase': 'unknown', 'subphase_basis': 'inferred_from_private_receipt'}
+    if type(value) is not dict:
+        return result
+    result.update(diagnostic_fields(value, ('exitcode',)))
+    result['status'] = diagnostic_choice(value.get('status'), ('started', 'passed', 'failed'))
+    errors = value.get('errors')
+    result['errors'] = [error_summary(row) for row in errors[:3]] if type(errors) is list else []
+    commands = value.get('commands')
+    result['commands'] = []
+    if type(commands) is list and len(commands) <= 64:
+        for row in commands:
+            if type(row) is not dict or diagnostic_choice(row.get('name'), LIFECYCLE_COMMANDS) == 'unknown':
+                continue
+            item = {'name': row['name'], **diagnostic_fields(row, ('exitcode', 'joined', 'timed_out', 'cancelled', 'join_unknown'))}
+            result['commands'].append(item)
+            if not row['name'].startswith('unmount-'):
+                result['last_noncleanup_command'] = row['name']
+            # Ignore later cleanup errors when locating the first failed business command.
+            if result['subphase'] == 'unknown' and not row['name'].startswith('unmount-') and (
+                    row.get('exitcode') != 0 or row.get('joined') is not True or
+                    row.get('timed_out') is True or row.get('cancelled') is True):
+                result['subphase'] = row['name']
+    mounts = value.get('mounts')
+    result['mounts'] = []
+    if type(mounts) is list and len(mounts) <= 2:
+        for row in mounts:
+            if type(row) is not dict or row.get('phase') not in ('prepare', 'verify'):
+                continue
+            item = {'phase': row['phase'], **diagnostic_fields(row, ('ready', 'joined', 'exitcode', 'normal_unmount',
+                    'normal_join_timed_out', 'join_unknown', 'late_mount_observed', 'unmounted_without_owned_command'))}
+            if 'cleanup_error' in row:
+                item['error'] = error_summary(row['cleanup_error'])
+            result['mounts'].append(item)
+            if result['subphase'] == 'unknown' and row.get('ready') is not True:
+                result['subphase'] = 'first-mount-readiness' if row['phase'] == 'prepare' else 'remount-readiness'
+    cleanup = value.get('cleanup')
+    result['cleanup'] = diagnostic_fields(cleanup, ('all_fuse_joined', 'all_commands_joined', 'unmounted', 'normal_unmounts'))
+    if type(cleanup) is dict and type(cleanup.get('unknown_owned_processes')) is list:
+        result['cleanup']['unknown_owned_process_count'] = len(cleanup['unknown_owned_processes'])
+    if result['errors']:
+        result['first_reported_error'] = result['errors'][0]
+        code = result['errors'][0]['code']
+        if code in ('normal_unmount_or_join_failed', 'mount_remained_after_unmount', 'mount_identity_changed_before_unmount'):
+            result['subphase'] = 'unmount-or-join'
+        elif code == 'remount_session_window_exceeded':
+            result['subphase'] = 'remount-session-window'
+        elif 'receipt' in code or code in ('remount_bytes_mismatch', 'remount_inode_mismatch'):
+            result['subphase'] = 'receipt-verification'
+    if result['subphase'] == 'unknown' and 'last_noncleanup_command' in result:
+        result['subphase'] = 'after-' + result['last_noncleanup_command']
+    return result
+
+
+def failure_evidence(parent, report):
+    """No arbitrary logfile/receipt paths are followed; all output fields are selected."""
+    evidence = {'first_failure': report.get('first_failure'),
+                'cleanup': diagnostic_fields(report, ('cleanup_blocked', 'supervisor_exitcode'))}
+    if 'failed_command' in report:
+        evidence['failed_command'] = report['failed_command']
+    final = report.get('final_supervisor_observation')
+    if type(final) is dict:
+        evidence['cleanup']['supervisor_stage'] = final.get('stage') if final.get('stage') in ('stopped', 'failed') else 'other'
+        if 'failure' in final:
+            evidence['cleanup']['supervisor_reported_failure'] = final['failure'] is not None
+    if report.get('failure_phase') != 'mode4-lifecycle':
+        return evidence
+    value, source = diagnostic_file(parent / 'mode4/result.json')
+    evidence['lifecycle'] = {'source': source, **lifecycle_summary(value)}
+    probes = []
+    for stage in ('prepare', 'verify'):
+        rows, source = diagnostic_file(parent / ('mode4/posix-' + stage + '.jsonl'), lines=True)
+        item = {'kind': 'posix', 'phase': stage, 'source': source}
+        if rows:
+            item['record_count'] = len(rows)
+            item['last_operation'] = diagnostic_choice(rows[-1].get('operation'), POSIX_OPERATIONS)
+            item['last_state'] = diagnostic_choice(rows[-1].get('state'), (
+                'prepared', 'confirmed', 'unconfirmed', 'operation_confirmed', 'unexpected_success'))
+            failed = next((row for row in rows if 'error' in row), None)
+            if failed is not None:
+                item['error'] = error_summary(failed['error'])
+            confirmed = [row for row in rows if row.get('state') == 'operation_confirmed']
+            if confirmed:
+                item['last_confirmed_operation'] = diagnostic_choice(confirmed[-1].get('operation'), POSIX_OPERATIONS)
+                item['recent_confirmed_operations'] = [diagnostic_choice(row.get('operation'), POSIX_OPERATIONS)
+                                                       for row in confirmed[-4:]]
+        probes.append(item)
+        row, source = diagnostic_file(parent / ('mode4/usrbio-' + stage + '/result.json'))
+        item = {'kind': 'usrbio', 'phase': stage, 'source': source}
+        if row is not None:
+            item['state'] = row.get('state') if row.get('state') in ('started', 'confirmed', 'unconfirmed') else 'unknown'
+            if 'error' in row:
+                item['error'] = error_summary(row['error'])
+        probes.append(item)
+    evidence['probes'] = probes
+    evidence['fuse_log_samples'] = {
+        stage + '-stderr': fuse_log_summary(parent / ('mode4/' + stage + '-fuse.stderr'))
+        for stage in ('prepare', 'verify')}
+    # The preparer assigns fixed handler indices. Do not enumerate arbitrary logs or use receipt paths.
+    evidence['fuse_log_samples'].update({
+        'handler-' + str(index): fuse_log_summary(parent / ('fuse-config/logs/fuse-' + str(index) + '.log'))
+        for index in range(2)})
+    return evidence
+
+
+def remember_failure(report, error):
+    # Called before cleanup changes PHASE. Later cleanup failures cannot overwrite this.
+    report.setdefault('failure_phase', PHASE)
+    report.setdefault('first_failure', diagnostic(error))
+
+
+def emit_failure_evidence(parent, report, observation_stage):
+    # Diagnostic failure must never change process ownership, exit status or the first cause.
+    try:
+        evidence = failure_evidence(parent, report)
+        evidence['observation_stage'] = observation_stage
+        evidence['observations_only_not_acceptance'] = True
+        encoded = json.dumps(evidence, sort_keys=True, ensure_ascii=True)
+        if len(encoded) > 24576:
+            encoded = '{"diagnostic_unavailable":"summary_limit"}'
+        print('FILE_LAB_FAILURE ' + encoded, flush=True)
+    except Exception:
+        try:
+            print('FILE_LAB_FAILURE {"diagnostic_unavailable":"observation_or_output_error"}', flush=True)
+        except Exception:
+            pass
+
+
 def require(ok, message):
     if not ok:
         raise GateError(message)
@@ -491,7 +768,15 @@ def runtime(parent):
         def command(name, argv):
             phase(name)
             owner.checkpoint()
-            result = owner.command(name, argv)
+            try:
+                result = owner.command(name, argv)
+            except BaseException:
+                # Owner has already waited its retained child, but its original
+                # ValueError does not expose the actual return code to the parent.
+                row, source = diagnostic_file(output / f'{owner.sequence:03}-{name}.finished.json')
+                report['failed_command'] = {'phase': name, 'source': source,
+                                            **diagnostic_fields(row, ('returncode',))}
+                raise
             owner.checkpoint()
             return result
         command('doctor', [sys.executable, '-B', lab / 'scripts/native-v2.py', 'doctor', '--root', lab])
@@ -576,8 +861,9 @@ def runtime(parent):
             report['receipts'].append({'phase': 'mode4-lifecycle', 'path': str(receipt), 'sha256': sha(receipt)})
             healthy()
             report['business_passed'] = True
-        except BaseException:
-            report['failure_phase'] = PHASE
+        except BaseException as error:
+            remember_failure(report, error)
+            emit_failure_evidence(parent, report, 'before-native-cleanup')
             raise
         finally:
             phase('cleanup')
@@ -599,6 +885,7 @@ def runtime(parent):
                     try:
                         write_new(output / 'cleanup-blocked.json', report)
                         print('file-lab: cleanup unconfirmed; retaining owned supervisor, no forced stop', flush=True)
+                        emit_failure_evidence(parent, report, 'native-cleanup-blocked')
                     finally:
                         supervisor.wait()  # External cancellation is not a cleanup-success receipt.
                 try:
@@ -621,16 +908,19 @@ def runtime(parent):
         report.update(status='passed', exitcode=0, cleanup=cleanup)
     except BaseException as error:
         failure = error
+        remember_failure(report, error)
         report.update(status='failed', error_type=type(error).__name__, error=str(error), exitcode=1,
                       diagnostic=diagnostic(error))
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         write_new(output / 'result.json', report)
+    if report['status'] == 'failed':
+        emit_failure_evidence(parent, report, 'after-native-cleanup')
     print(json.dumps({'status': report['status'], 'exitcode': report['exitcode'], 'revision': report['revision'],
                       'receipt_sha256': sha(output / 'result.json'), 'receipts': report['receipts'],
                       'services_started': report['services_started'], 'diagnostic': report.get('diagnostic'),
-                      'failure_phase': report.get('failure_phase')},
+                      'failure_phase': report.get('failure_phase'), 'first_failure': report.get('first_failure')},
                      sort_keys=True), flush=True)
     return report['exitcode']
 
