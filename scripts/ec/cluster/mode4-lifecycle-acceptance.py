@@ -575,7 +575,7 @@ def preflight(args):
              *(prep_path.parent / name for name in configs),
              *(scripts / name for name in ("fuse-read-acceptance.py", "mode4-mount-acceptance.py",
                "mode4-usrbio-acceptance.py", "prepare-fuse-file.py", "prepare-fuse-read.py",
-               "native-v2.py", "native_v2_config.py", "generate.py", "run-cluster.py"))]
+               "native-v2.py", "native_v2_config.py", "native_managed_domain.py", "generate.py", "run-cluster.py"))]
     locks = {str(helper.absolute(str(path))): helper.digest(path) for path in paths}
     work.mkdir(mode=0o700)
     return Lifecycle(args, helper, usr, prep, config, root, scripts, work, mountpoint, state, binary, unmount, locks)
