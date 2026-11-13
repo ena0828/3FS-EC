@@ -101,6 +101,28 @@ LIFECYCLE_COMMANDS |= {'status-' + label for label in
 POSIX_OPERATIONS = {'probe', 'open', 'pwrite', 'ftruncate', 'fsync', 'fstat', 'pread', 'pread_eof',
                     'close', 'reject_open_append', 'open_append', 'lstat_absent', 'create_append',
                     'reject_create_append'}
+PREFLIGHT_CODES = {
+    'use one ordinary real/effective UID and GID': 'ordinary_identity_required',
+    'timeouts out of range': 'timeout_configuration_invalid',
+    'wrong preparation contract': 'preparation_contract_mismatch',
+    'preparation input changed': 'preparation_input_changed',
+    'preparation belongs to another root': 'preparation_root_mismatch',
+    'prepared config changed': 'prepared_config_changed',
+    'fresh unmounted mountpoint required': 'mountpoint_not_fresh',
+    'original new mount state must not yet exist': 'mount_state_not_fresh',
+    'mode4 requires the same ordinary real/effective UID and GID': 'ordinary_identity_required',
+    'prepared authenticated user differs from the mount user': 'authenticated_user_mismatch',
+    'authenticated client/preparation differs from the mount user': 'authenticated_client_mismatch',
+    'configs differ from the original mode4 preparation contract': 'rendered_config_mismatch',
+    'FUSE binary differs from preparation': 'fuse_binary_mismatch',
+    'prepared mount argv differs': 'mount_arguments_mismatch',
+    'normal fusermount3 -u only': 'unmount_arguments_mismatch',
+    'fusermount3 is required': 'unmount_tool_missing',
+    'fusermount3 is not executable': 'unmount_tool_not_executable',
+    'new local WORK outside the mount required': 'work_directory_invalid',
+    'unsupported native process count': 'native_process_count_invalid',
+    'unsupported configured Mgmtd session timeout': 'session_timeout_invalid',
+}
 
 
 def error_summary(text):
@@ -204,6 +226,31 @@ def fuse_log_summary(path):
                 type(error).__name__ if type(error).__name__ in ERROR_TYPES else 'other'}
 
 
+def lifecycle_preflight_summary(path):
+    """Classify one bounded private child message, never publish its text."""
+    try:
+        canonical(path)
+        before = path.lstat()
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1, 'invalid preflight log')
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            require((info.st_dev, info.st_ino) == (before.st_dev, before.st_ino)
+                    and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                    and info.st_size <= 16384, 'invalid or oversized preflight log')
+            raw = stream.read(16385)
+        require(len(raw) <= 16384, 'oversized preflight log')
+        lines = raw.decode('utf-8').splitlines()
+        prefix = 'mode4 lifecycle preflight failed: '
+        marker = len(lines) == 1 and lines[0].startswith(prefix)
+        code = PREFLIGHT_CODES.get(lines[0][len(prefix):], 'unclassified_private_preflight_error') if marker else 'unknown'
+        return {'availability': 'read', 'sha256': hashlib.sha256(raw).hexdigest(),
+                'single_preflight_message_observed': marker, 'code': code}
+    except Exception as error:
+        return {'availability': 'unavailable', 'error_type':
+                type(error).__name__ if type(error).__name__ in ERROR_TYPES else 'other'}
+
+
 def lifecycle_summary(value):
     """Observations only: never used to authorize cleanup or declare acceptance."""
     result = {'subphase': 'unknown', 'subphase_basis': 'inferred_from_private_receipt'}
@@ -272,6 +319,14 @@ def failure_evidence(parent, report):
             evidence['cleanup']['supervisor_reported_failure'] = final['failure'] is not None
     if report.get('failure_phase') != 'mode4-lifecycle':
         return evidence
+    failed = report.get('failed_command')
+    if (type(failed) is dict and failed.get('phase') == 'mode4-lifecycle'
+            and type(failed.get('returncode')) is int and failed['returncode'] == 2
+            and type(failed.get('sequence')) is int and 1 <= failed['sequence'] <= 4096):
+        # The retained Owner supplies only its ordinal, never an arbitrary log path.
+        # This observation cannot establish cleanup, success, or a historical cause.
+        evidence['lifecycle_preflight'] = lifecycle_preflight_summary(
+            parent / 'runtime' / f"{failed['sequence']:03}-mode4-lifecycle.stderr")
     value, source = diagnostic_file(parent / 'mode4/result.json')
     evidence['lifecycle'] = {'source': source, **lifecycle_summary(value)}
     probes = []
@@ -774,7 +829,7 @@ def runtime(parent):
                 # Owner has already waited its retained child, but its original
                 # ValueError does not expose the actual return code to the parent.
                 row, source = diagnostic_file(output / f'{owner.sequence:03}-{name}.finished.json')
-                report['failed_command'] = {'phase': name, 'source': source,
+                report['failed_command'] = {'phase': name, 'source': source, 'sequence': owner.sequence,
                                             **diagnostic_fields(row, ('returncode',))}
                 raise
             owner.checkpoint()
