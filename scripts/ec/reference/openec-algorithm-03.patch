@@ -1,0 +1,25 @@
+--- a/src/ec/Computation.cc
++++ b/src/ec/Computation.cc
+@@ -1,3 +1,4 @@
++// Local algorithm baseline: own per-call coefficient storage; see baseline-patches.
+ #include "Computation.hh"
+ 
+ mutex Computation::_cLock;
+@@ -16,15 +17,14 @@
+     Computation::_cLock.unlock();
+   } else {
+     // first transfer the mat into char*
+-    char* imatrix;
+-    imatrix = (char*)calloc(rowCnt * colCnt, sizeof(char));
++    vector<unsigned char> imatrix(rowCnt * colCnt);
+     for (int i=0; i<rowCnt * colCnt; i++) {
+       char tmpc = mat[i];
+       imatrix[i] = tmpc;
+     }
+     // call isa-l library
+     unsigned char itable[32 * rowCnt * colCnt];
+-    ec_init_tables(colCnt, rowCnt, (unsigned char*)imatrix, itable);
++    ec_init_tables(colCnt, rowCnt, imatrix.data(), itable);
+     ec_encode_data(len, colCnt, rowCnt, itable, (unsigned char**)src, (unsigned char**)dst);
+   }
+ }

@@ -1,0 +1,32 @@
+--- a/src/ec/RSCONV.cc
++++ b/src/ec/RSCONV.cc
+@@ -1,3 +1,4 @@
++// Local algorithm baseline: GF width and allocation ownership corrected; see baseline-patches.
+ #include "RSCONV.hh"
+ 
+ RSCONV::RSCONV(int n, int k, int w, int opt, vector<string> param) {
+@@ -51,7 +52,7 @@
+   }
+   int _invert_matrix[_k*_k];
+ 
+-  jerasure_invert_matrix(_select_matrix, _invert_matrix, _k, _k); 
++  jerasure_invert_matrix(_select_matrix, _invert_matrix, _k, 8); 
+   for (int i=0; i<to.size(); i++) {
+     int ridx = to[i];
+     int _select_vector[_k];
+--- a/src/ec/RSPIPE.cc
++++ b/src/ec/RSPIPE.cc
+@@ -1,3 +1,4 @@
++// Local algorithm baseline: GF width and allocation ownership corrected; see baseline-patches.
+ #include "RSPIPE.hh"
+ 
+ RSPIPE::RSPIPE(int n, int k, int w, int opt, vector<string> param) {
+@@ -43,7 +44,7 @@
+   }
+   
+   int _invert_matrix[_k*_k];
+-  jerasure_invert_matrix(_select_matrix, _invert_matrix, _k, _k);
++  jerasure_invert_matrix(_select_matrix, _invert_matrix, _k, 8);
+ 
+   int tmpname = _k + _m;
+ 

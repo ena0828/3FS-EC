@@ -1,0 +1,178 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,5 +20,9 @@
+   add_definitions(-DQFS)
+ endif(${FS_TYPE} MATCHES "QFS")
+ 
++if (FS_TYPE STREQUAL "LOCAL_POSIX")
++  add_definitions(-DLOCAL_POSIX)
++endif()
++
+ # subdirectory
+ add_subdirectory(src)
+--- a/src/fs/CMakeLists.txt
++++ b/src/fs/CMakeLists.txt
+@@ -1,3 +1,8 @@
++if (FS_TYPE STREQUAL "LOCAL_POSIX")
++  add_library(fs FSUtil.cc UnderFS.cc UnderFile.cc LocalPosix.cc)
++  return()
++endif()
++
+ aux_source_directory(. DIR_LIB_SRCS)
+ add_library (fs ${DIR_LIB_SRCS})
+ add_library(hdfs SHARED IMPORTED)
+--- a/src/fs/FSUtil.cc
++++ b/src/fs/FSUtil.cc
+@@ -1,8 +1,12 @@
+ #include "FSUtil.hh"
+ 
+ UnderFS* FSUtil::createFS(string type, vector<string> param, Config* conf) { 
+-  UnderFS* toret;
+-  if (type == "HDFS3") {
++  UnderFS* toret = nullptr;
++  if (type == "LOCAL_POSIX") {
++#ifdef LOCAL_POSIX
++    toret = new LocalPosix(param, conf);
++#endif
++  } else if (type == "HDFS3") {
+     #ifdef HDFS3
+     cout << "FSUtil::HDFS3" << endl;
+     toret = new Hadoop3(param, conf);
+@@ -26,7 +30,11 @@
+ }
+ 
+ void FSUtil::deleteFS(string type, UnderFS* fshandler) {
+-  if (type == "HDFS3") {
++  if (type == "LOCAL_POSIX") {
++#ifdef LOCAL_POSIX
++    delete static_cast<LocalPosix*>(fshandler);
++#endif
++  } else if (type == "HDFS3") {
+     #ifdef HDFS3
+     cout << "FSUtil::HDFS3" << endl;
+     delete (Hadoop3*)fshandler;
+--- a/src/fs/FSUtil.hh
++++ b/src/fs/FSUtil.hh
+@@ -13,6 +13,10 @@
+ #include "QuantcastFS.hh"
+ #endif
+ 
++#ifdef LOCAL_POSIX
++#include "LocalPosix.hh"
++#endif
++
+ #include "UnderFS.hh"
+ #include "../common/Config.hh"
+ #include "../inc/include.hh"
+--- /dev/null
++++ b/src/fs/LocalPosix.cc
+@@ -0,0 +1,76 @@
++#include "LocalPosix.hh"
++#include <cerrno>
++#include <climits>
++#include <cstring>
++#include <fcntl.h>
++#include <stdexcept>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace {
++struct File : UnderFile { explicit File(int value) : fd(value) {} int fd; };
++int fd(UnderFile* file) {
++  if (!file) throw std::runtime_error("LocalPosix: null handle");
++  return static_cast<File*>(file)->fd;
++}
++void fail(const char* what) { throw std::runtime_error(string("LocalPosix: ") + what + ": " + strerror(errno)); }
++void length(int n) { if (n < 0) throw std::runtime_error("LocalPosix: negative length"); }
++}
++LocalPosix::LocalPosix(vector<string> params, Config* conf) : UnderFS(params, conf) {
++  if (params.size() != 1 || params[0].empty() || params[0][0] != '/')
++    throw std::runtime_error("LocalPosix requires one absolute private root");
++  root_ = params[0];
++  int dir = open(root_.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++  if (dir < 0) fail("root");
++  close(dir);
++}
++UnderFile* LocalPosix::openFile(string name, string mode) {
++  if (!name.empty() && name[0] == '/') name.erase(0, 1);
++  if (name.empty() || name == "." || name == ".." ||
++      name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != string::npos)
++    throw std::runtime_error("LocalPosix: unsupported object name");
++  if (mode != "read" && mode != "write") throw std::runtime_error("LocalPosix: unsupported mode");
++  int dir = open(root_.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++  if (dir < 0) fail("root");
++  int result = openat(dir, name.c_str(), O_CLOEXEC | O_NOFOLLOW |
++      (mode == "read" ? O_RDONLY : O_WRONLY | O_CREAT | O_TRUNC), 0600);
++  int saved = errno; close(dir); errno = saved;
++  if (result < 0) { if (mode == "read" && errno == ENOENT) return nullptr; fail("open"); }
++  struct stat st;
++  if (fstat(result, &st) || !S_ISREG(st.st_mode)) { close(result); throw std::runtime_error("LocalPosix: not a regular file"); }
++  return new File(result);
++}
++void LocalPosix::writeFile(UnderFile* file, char* data, int len) {
++  length(len);
++  for (int done = 0; done < len;) {
++    ssize_t n = write(fd(file), data + done, len - done);
++    if (n < 0 && errno == EINTR) continue;
++    if (n <= 0) fail("write");
++    done += n;
++  }
++}
++void LocalPosix::flushFile(UnderFile* file) {
++  int result; do { result = fsync(fd(file)); } while (result < 0 && errno == EINTR);
++  if (result < 0) fail("fsync");
++}
++void LocalPosix::closeFile(UnderFile* file) {
++  int result = close(fd(file)); delete static_cast<File*>(file);
++  if (result < 0) fail("close");
++}
++int LocalPosix::readFile(UnderFile* file, char* data, int len) {
++  length(len); ssize_t n;
++  do { n = read(fd(file), data, len); } while (n < 0 && errno == EINTR);
++  if (n < 0) fail("read");
++  return n;
++}
++int LocalPosix::pReadFile(UnderFile* file, int offset, char* data, int len) {
++  length(len); length(offset); ssize_t n;
++  do { n = pread(fd(file), data, len, offset); } while (n < 0 && errno == EINTR);
++  if (n < 0) fail("pread");
++  return n;
++}
++int LocalPosix::getFileSize(UnderFile* file) {
++  struct stat st; if (fstat(fd(file), &st)) fail("fstat");
++  if (st.st_size < 0 || st.st_size > INT_MAX) throw std::runtime_error("LocalPosix: upstream int size exceeded");
++  return static_cast<int>(st.st_size);
++}
+--- /dev/null
++++ b/src/fs/LocalPosix.hh
+@@ -0,0 +1,19 @@
++#ifndef OPENEC_REFERENCE_LOCAL_POSIX_HH
++#define OPENEC_REFERENCE_LOCAL_POSIX_HH
++#include "UnderFS.hh"
++
++// Isolated functional adapter: a shared POSIX namespace, not an HDFS replica.
++class LocalPosix : public UnderFS {
++ public:
++  LocalPosix(vector<string> params, Config* conf);
++  UnderFile* openFile(string filename, string mode) override;
++  void writeFile(UnderFile*, char*, int) override;
++  void flushFile(UnderFile*) override;
++  void closeFile(UnderFile*) override;
++  int readFile(UnderFile*, char*, int) override;
++  int pReadFile(UnderFile*, int, char*, int) override;
++  int getFileSize(UnderFile*) override;
++ private:
++  string root_;
++};
++#endif
+--- a/src/fs/UnderFS.hh
++++ b/src/fs/UnderFS.hh
+@@ -13,7 +13,7 @@
+ 
+     UnderFS();
+     UnderFS(vector<string> param, Config* conf);    
+-    ~UnderFS();
++    virtual ~UnderFS();
+ 
+     virtual UnderFile* openFile(string filename, string mode) = 0;
+     virtual void writeFile(UnderFile* file, char* buffer, int len) = 0;

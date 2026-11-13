@@ -1,0 +1,83 @@
+{
+  "openec": {
+    "commit": "04e91d8c9f94bb9f22b7a98570482dfd0eb767b3",
+    "archive": "openec-04e91d8/openec-04e91d8-source.tar.gz",
+    "archive_sha256": "816e63aa18a92e45c3838d936a6730c380bdb92b66be22f611e2842ab13b1652",
+    "prefix": "openec-04e91d8c9f94bb9f22b7a98570482dfd0eb767b3/",
+    "patches": [
+      {
+        "path": "openec-algorithm-01.patch",
+        "sha256": "7721fe2009253f257c910f5fbd8f41999c0bacd738198fc1655b497f5296982a",
+        "after": [
+          {
+            "path": "src/ec/RSCONV.cc",
+            "sha256": "cf01e197153353df2987f943ce53cb2e33163e755fd000148a2f14695ca604cf"
+          },
+          {
+            "path": "src/ec/RSPIPE.cc",
+            "sha256": "d7c900579fa4880a951770f51023d2b9280a7938e09568071b60e44f98185d49"
+          }
+        ]
+      },
+      {
+        "path": "openec-algorithm-02.patch",
+        "sha256": "dd72ea332c617812137fa0e76e9d00d7b1b1b39f874e74c94f59a51dc35efceb",
+        "after": [
+          {
+            "path": "src/ec/RSCONV.cc",
+            "sha256": "c284890c17445b5c09a4ac3b9579ac6d914f3a84fbc2d45587c8da85ad6be438"
+          },
+          {
+            "path": "src/ec/RSPIPE.cc",
+            "sha256": "be2db128743836eaffc97fb621e47ff3ed172a321ed5fb7be4ba582ffe662709"
+          }
+        ]
+      },
+      {
+        "path": "openec-algorithm-03.patch",
+        "sha256": "d242671fca2ba25f94c48b55c5c262cd65be48e4c3bc253d4b3fc7d879cbc5b9",
+        "after": [
+          {
+            "path": "src/ec/Computation.cc",
+            "sha256": "a283c5e49ba777c397f89b3b85f0cce85a0895447660cd85a878fb528ff8c1ca"
+          }
+        ]
+      },
+      {
+        "path": "openec-posix.patch",
+        "sha256": "e1e212726bb6c6cd3b9be6ee76f13adf83481146b466110a8f36cf5d79a33624",
+        "after": [
+          {
+            "path": "CMakeLists.txt",
+            "sha256": "c9a99f27a2724708c1688ddcab3c8f9aab6eeb66eef79b36779e09683956e5c3"
+          },
+          {
+            "path": "src/fs/CMakeLists.txt",
+            "sha256": "79754b5ced6f45d69622a3b6e4ad25199bcf6d58d70c5b1f17373929ad88d937"
+          },
+          {
+            "path": "src/fs/FSUtil.cc",
+            "sha256": "17ef7d34d1295b41c32a6e28283881b8f193751c2a4fbf2debb9cc4689827acf"
+          },
+          {
+            "path": "src/fs/FSUtil.hh",
+            "sha256": "1354d5d21ff604921f1ae8d7afff3f1bc69e608a35950c4468c5893a13e9512b"
+          },
+          {
+            "path": "src/fs/LocalPosix.cc",
+            "sha256": "858bfe52e263ebbbd5a5c0b3153a0859199ff03b2852d3a5ba1d8427e8f601fe"
+          },
+          {
+            "path": "src/fs/LocalPosix.hh",
+            "sha256": "b5a4c41d88121724623e6be9c4132cdb50dda5ef637c0fad8479b18af7636af0"
+          },
+          {
+            "path": "src/fs/UnderFS.hh",
+            "sha256": "32ff0ab7bcac12dc134e3aef24774ae311ed29d7b8d21565f1404c8e9dc86432"
+          }
+        ]
+      }
+    ],
+    "tree": "36293fbecce474631ca812c2eff9768c80fcb4f6"
+  }
+}

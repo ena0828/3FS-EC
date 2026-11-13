@@ -1,0 +1,40 @@
+--- a/src/ec/RSCONV.cc
++++ b/src/ec/RSCONV.cc
+@@ -1,5 +1,6 @@
+ // Local algorithm baseline: GF width and allocation ownership corrected; see baseline-patches.
+ #include "RSCONV.hh"
++#include <memory>
+ 
+ RSCONV::RSCONV(int n, int k, int w, int opt, vector<string> param) {
+   _n = n;
+@@ -59,8 +60,8 @@
+     memcpy(_select_vector,
+            _encode_matrix + ridx * _k,
+ 	   _k * sizeof(int));
+-    int* _coef_vector = jerasure_matrix_multiply(
+-        _select_vector, _invert_matrix, 1, _k, _k, _k, 8);
++    std::unique_ptr<int[], decltype(&free)> _coef_vector(jerasure_matrix_multiply(
++        _select_vector, _invert_matrix, 1, _k, _k, _k, 8), &free);
+     vector<int> coef;
+     for (int i=0; i<_k; i++) coef.push_back(_coef_vector[i]);
+     ecdag->Join(ridx, data, coef);
+--- a/src/ec/RSPIPE.cc
++++ b/src/ec/RSPIPE.cc
+@@ -1,5 +1,6 @@
+ // Local algorithm baseline: GF width and allocation ownership corrected; see baseline-patches.
+ #include "RSPIPE.hh"
++#include <memory>
+ 
+ RSPIPE::RSPIPE(int n, int k, int w, int opt, vector<string> param) {
+   _n = n;
+@@ -54,8 +55,8 @@
+     memcpy(_select_vector,
+            _encode_matrix + ridx * _k,
+ 	   _k * sizeof(int));
+-    int* _coef_vector = jerasure_matrix_multiply(
+-             _select_vector, _invert_matrix, 1, _k, _k, _k, 8);
++    std::unique_ptr<int[], decltype(&free)> _coef_vector(jerasure_matrix_multiply(
++             _select_vector, _invert_matrix, 1, _k, _k, _k, 8), &free);
+     // prepare data and coef
+     deque<int> dataqueue;
+     deque<int> coefqueue;
