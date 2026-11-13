@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 spec = importlib.util.spec_from_file_location('file_lab_under_test', Path(__file__).with_name('run-file-lab.py'))
 lab = importlib.util.module_from_spec(spec)
@@ -33,6 +33,75 @@ def passed_mount():
 
 
 class FileLabGates(unittest.TestCase):
+    def test_actual_lifecycle_preflight_failure_is_observed_without_a_result_receipt(self):
+        spec = importlib.util.spec_from_file_location(
+            'lifecycle_preflight_under_test', Path(__file__).parents[1] / 'cluster/mode4-lifecycle-acceptance.py')
+        lifecycle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lifecycle)
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp).resolve()
+            stderr = io.StringIO()
+            with mock.patch.object(lifecycle, 'preflight', side_effect=ValueError('fusermount3 is required')), \
+                    mock.patch.object(lifecycle, 'run_sequence') as run, redirect_stderr(stderr):
+                result = lifecycle.main(['--root', str(parent / 'lab'), '--preparation', str(parent / 'prep'),
+                                         '--work', str(parent / 'mode4')])
+            self.assertEqual(result, 2)
+            run.assert_not_called()
+            self.assertFalse((parent / 'mode4').exists())
+            runtime = parent / 'runtime'
+            runtime.mkdir()
+            log = runtime / '007-mode4-lifecycle.stderr'
+            log.write_text(stderr.getvalue(), encoding='utf-8')
+            before_log = log.read_bytes()
+            report = {'failure_phase': 'mode4-lifecycle', 'failed_command':
+                      {'phase': 'mode4-lifecycle', 'returncode': 2, 'sequence': 7}, 'exitcode': 1}
+            before_report = copy.deepcopy(report)
+            summary = lab.failure_evidence(parent, report)
+            self.assertEqual(summary['lifecycle_preflight']['code'], 'unmount_tool_missing')
+            self.assertTrue(summary['lifecycle_preflight']['single_preflight_message_observed'])
+            self.assertEqual(summary['lifecycle']['source']['availability'], 'unavailable')
+            self.assertEqual(summary['lifecycle']['subphase'], 'unknown')
+            self.assertEqual(log.read_bytes(), before_log)
+            self.assertEqual(report, before_report)
+
+    def test_preflight_message_is_bounded_exact_and_never_echoes_private_text(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp).resolve() / 'child.stderr'
+            prefix = 'mode4 lifecycle preflight failed: '
+            cases = [(prefix + 'prepared config changed\n', 'prepared_config_changed'),
+                     (prefix + 'PRIVATE_TOKEN=/private/file\n', 'unclassified_private_preflight_error'),
+                     (prefix + 'prepared config changed PRIVATE_TOKEN\n', 'unclassified_private_preflight_error'),
+                     ('PRIVATE_TOKEN\n' + prefix + 'prepared config changed\n', 'unknown')]
+            for value, expected in cases:
+                path.write_text(value, encoding='utf-8')
+                summary = lab.lifecycle_preflight_summary(path)
+                self.assertEqual(summary['code'], expected)
+                self.assertNotIn('PRIVATE_TOKEN', json.dumps(summary))
+                self.assertNotIn(str(path), json.dumps(summary))
+            for raw in (b'x' * 16385, b'\xff'):
+                path.write_bytes(raw)
+                self.assertEqual(lab.lifecycle_preflight_summary(path)['availability'], 'unavailable')
+            path.write_bytes(b'small')
+            os.link(path, path.with_suffix('.second'))
+            self.assertEqual(lab.lifecycle_preflight_summary(path)['availability'], 'unavailable')
+            self.assertEqual(lab.lifecycle_preflight_summary(path.with_suffix('.missing'))['availability'], 'unavailable')
+
+    def test_preflight_log_is_selected_only_by_failed_owned_command_ordinal(self):
+        base = {'failure_phase': 'mode4-lifecycle', 'failed_command':
+                {'phase': 'mode4-lifecycle', 'returncode': 2, 'sequence': 7, 'path': '/private/arbitrary'}}
+        variants = [('sequence', True), ('sequence', 0), ('sequence', 4097), ('sequence', '../other'),
+                    ('returncode', 1), ('returncode', True), ('phase', 'cli-basic')]
+        with mock.patch.object(lab, 'diagnostic_file', return_value=(None, {'availability': 'unavailable'})), \
+                mock.patch.object(lab, 'fuse_log_summary', return_value={'availability': 'unavailable'}), \
+                mock.patch.object(lab, 'lifecycle_preflight_summary', return_value={'availability': 'read'}) as read:
+            for key, value in variants:
+                report = copy.deepcopy(base)
+                report['failed_command'][key] = value
+                self.assertNotIn('lifecycle_preflight', lab.failure_evidence(Path('/fixed'), report))
+            read.assert_not_called()
+            lab.failure_evidence(Path('/fixed'), base)
+            read.assert_called_once_with(Path('/fixed/runtime/007-mode4-lifecycle.stderr'))
+
     def test_first_business_failure_survives_cleanup_exception(self):
         report = {}
         with mock.patch.object(lab, 'PHASE', 'mode4-lifecycle'):
