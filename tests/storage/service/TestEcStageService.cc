@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <fcntl.h>
 #include <folly/ScopeGuard.h>
@@ -11,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
 
@@ -60,6 +62,8 @@ struct StageReplyDropState {
       bool held = false;
       bool dropped = false;
       bool sameConnection = false;
+      bool tcpConnection = false;
+      int shutdownResult = -1, shutdownErrno = 0;
       size_t readEntered = 0, readFinished = 0, readSucceeded = 0;
       std::array<size_t, 10> helperEntered{}, helperFinished{}, helperSucceeded{}, helperBusy{};
     };
@@ -326,13 +330,27 @@ class StageReplyDropStorageService : public StorageService {
         // The actual Append has succeeded. Wait until the other block is
         // really in a remote handler before disconnecting this shared socket.
         co_await window->entered;
+        const auto transport = ctx.transport();
         {
           std::lock_guard lock(window->mutex);
-          window->state.sameConnection = window->firstHop == ctx.transport();
+          window->state.sameConnection = window->firstHop == transport;
         }
-        ctx.transport()->invalidate(false);
+        // invalidate alone cannot close TCP while held CallContexts (and this
+        // window) keep the Transport alive. Shut down this real connection,
+        // without closing/reusing its fd or changing production cancellation.
+        const bool tcp = transport->isTCP();
+        int shutdownResult = -1, shutdownErrno = ENOTSOCK;
+        if (tcp) {
+          const auto &handler = static_cast<const net::EventLoop::EventHandler &>(*transport);
+          shutdownResult = ::shutdown(handler.fd(), SHUT_RDWR);
+          shutdownErrno = shutdownResult < 0 ? errno : 0;
+        }
+        transport->invalidate(false);
         {
           std::lock_guard lock(window->mutex);
+          window->state.tcpConnection = tcp;
+          window->state.shutdownResult = shutdownResult;
+          window->state.shutdownErrno = shutdownErrno;
           window->state.dropped = true;
           window->changed.notify_all();
         }
@@ -1539,6 +1557,12 @@ TEST_F(TestEcNativeRepairService, WindowTwoLostAppendReplyRecoversBothOriginalTa
     });
     ASSERT_TRUE(window->waitFor([](const auto &s) { return s.held && s.dropped; }));
     ASSERT_TRUE(window->snapshot().sameConnection);
+    const auto disconnected = window->snapshot();
+    RecordProperty(fmt::format("window_two_tcp_shutdown_{}", static_cast<unsigned>(mode)),
+                   fmt::format("tcp={},result={},errno={}", disconnected.tcpConnection,
+                               disconnected.shutdownResult, disconnected.shutdownErrno));
+    ASSERT_TRUE(disconnected.tcpConnection);
+    ASSERT_EQ(disconnected.shutdownResult, 0) << "shutdown errno=" << disconnected.shutdownErrno;
     ASSERT_EQ(running.wait_for(std::chrono::seconds(10)), std::future_status::ready);
     auto failed = running.get();
     ASSERT_ERROR(failed, StorageCode::kEcSealOutcomeUnknown);
