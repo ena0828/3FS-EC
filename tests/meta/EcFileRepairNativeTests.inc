@@ -170,6 +170,19 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
       EXPECT_EQ(method.withoutResult, 0);
       EXPECT_EQ(method.messengerInvocations, method.entered);
       EXPECT_EQ(method.withoutMessenger, 0);
+      EXPECT_EQ(method.observedEncodedRequestFrames, method.entered);
+      EXPECT_EQ(method.observedEncodedResponseFrames, method.entered);
+      EXPECT_EQ(method.missingEncodedRequestFrames, 0);
+      EXPECT_EQ(method.missingEncodedResponseFrames, 0);
+      // These actual TCP frames include framing, independently of payload bytes.
+      EXPECT_GE(method.requestFrameBytes, method.entered * uint64_t{8});
+      EXPECT_GE(method.responseFrameBytes, method.entered * uint64_t{8});
+      EXPECT_LE(method.compressedRequestFrames, method.observedEncodedRequestFrames);
+      EXPECT_LE(method.compressedResponseFrames, method.observedEncodedResponseFrames);
+      if (method.entered == 0) {
+        EXPECT_EQ(method.requestFrameBytes, 0);
+        EXPECT_EQ(method.responseFrameBytes, 0);
+      }
       for (const auto &limiter : method.limiters) {
         const auto expected = i == size_t(EcRpcMethod::Helper) ? 0 : method.entered;
         EXPECT_EQ(limiter.entered, expected);
@@ -184,8 +197,11 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
       EXPECT_EQ(method.client.missing + method.client.reversed + method.client.outOfRange, 0);
       EXPECT_EQ(method.server.missing + method.server.reversed + method.server.outOfRange, 0);
       RecordProperty(fmt::format("repair_rpc_{}_{}", uint8_t(mode), storage::client::kEcRpcMethodNames[i]),
-                     fmt::format("frames={},client_valid={},server_valid={},active={}", method.entered,
-                                 method.client.valid, method.server.valid, method.active));
+                     fmt::format("frames={},client_valid={},server_valid={},active={},request_frames={},"
+                                 "request_frame_bytes={},response_frames={},response_frame_bytes={}", method.entered,
+                                 method.client.valid, method.server.valid, method.active,
+                                 method.observedEncodedRequestFrames, method.requestFrameBytes,
+                                 method.observedEncodedResponseFrames, method.responseFrameBytes));
     }
     const auto &child = completed.progress.record->child;
     EXPECT_EQ(child.targetGeneration, child.source.generation);
@@ -197,7 +213,13 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_EQ(replay.metrics.at(EcRepairPoint::Prepare).entered, 0);
     EXPECT_EQ(replay.metrics.at(EcRepairPoint::SelectedRepair).entered, 0);
     EXPECT_EQ(replay.metrics.at(EcRepairPoint::NativeAppend).apiInvocations, 0);
-    for (const auto &method : replay.metrics.storageRpc.methods) EXPECT_EQ(method.entered, 0);
+    for (const auto &method : replay.metrics.storageRpc.methods) {
+      EXPECT_EQ(method.entered, 0);
+      EXPECT_EQ(method.observedEncodedRequestFrames, 0);
+      EXPECT_EQ(method.observedEncodedResponseFrames, 0);
+      EXPECT_EQ(method.requestFrameBytes, 0);
+      EXPECT_EQ(method.responseFrameBytes, 0);
+    }
     EXPECT_EQ(serde::serialize(replay.progress.record->child.publishedRoot), serde::serialize(child.publishedRoot));
     auto acquire = request<AcquireEcTreeReadReq>();
     acquire.intent.session = open.session;

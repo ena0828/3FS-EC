@@ -58,6 +58,7 @@ jobs:
         run: |
           python3 -B scripts/ec/ci/test-build-native.py -v
           python3 -B scripts/ec/ci/test-system-entrypoints.py -v
+          python3 -B scripts/ec/ci/test-rpc-frame-entrypoints.py -v
           python3 -B scripts/ec/ci/test-run-core-tests.py -v
           python3 -B scripts/ec/ci/test-run-file-lab.py -v
           python3 -B scripts/ec/ci/test-run-spare-lab.py -v

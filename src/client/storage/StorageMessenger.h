@@ -5,6 +5,7 @@
 
 #include "common/net/Client.h"
 #include "common/serde/MessagePacket.h"
+#include "common/serde/RpcCallSizes.h"
 #include "common/utils/Address.h"
 #include "common/utils/Coroutine.h"
 #include "common/utils/Result.h"
@@ -145,31 +146,38 @@ class StorageMessenger {
   CoTryTask<EcHelperHopRsp> executeEcHelper(const net::Address &address,
                                             const EcHelperHopReq &request,
                                             const net::UserRequestOptions *options = nullptr,
-                                            serde::Timestamp *timestamp = nullptr);
+                                            serde::Timestamp *timestamp = nullptr,
+                                            serde::RpcCallSizes *sizes = nullptr);
   CoTryTask<EcReadBlockV2Rsp> readEcBlockV2(const net::Address &address,
                                             const EcReadBlockV2Req &request,
                                             const net::UserRequestOptions *options = nullptr,
-                                            serde::Timestamp *timestamp = nullptr);
+                                            serde::Timestamp *timestamp = nullptr,
+                                            serde::RpcCallSizes *sizes = nullptr);
   CoTryTask<EcStageV2Rsp> beginEcStageV2(const net::Address &address,
                                          const EcBeginStageV2Req &request,
                                          const net::UserRequestOptions *options = nullptr,
-                                         serde::Timestamp *timestamp = nullptr);
+                                         serde::Timestamp *timestamp = nullptr,
+                                         serde::RpcCallSizes *sizes = nullptr);
   CoTryTask<EcStageV2Rsp> appendEcStageV2(const net::Address &address,
                                           const EcAppendStageV2Req &request,
                                           const net::UserRequestOptions *options = nullptr,
-                                          serde::Timestamp *timestamp = nullptr);
+                                          serde::Timestamp *timestamp = nullptr,
+                                          serde::RpcCallSizes *sizes = nullptr);
   CoTryTask<EcStageV2Rsp> queryEcStageV2(const net::Address &address,
                                          const EcQueryStageV2Req &request,
                                          const net::UserRequestOptions *options = nullptr,
-                                         serde::Timestamp *timestamp = nullptr);
+                                         serde::Timestamp *timestamp = nullptr,
+                                         serde::RpcCallSizes *sizes = nullptr);
   CoTryTask<EcStageV2Rsp> reconcileEcStageV2(const net::Address &address,
                                              const EcReconcileStageV2Req &request,
                                              const net::UserRequestOptions *options = nullptr,
-                                             serde::Timestamp *timestamp = nullptr);
+                                             serde::Timestamp *timestamp = nullptr,
+                                             serde::RpcCallSizes *sizes = nullptr);
   CoTryTask<EcSealStageV2Rsp> sealEcStageV2(const net::Address &address,
                                             const EcSealStageV2Req &request,
                                             const net::UserRequestOptions *options = nullptr,
-                                            serde::Timestamp *timestamp = nullptr);
+                                            serde::Timestamp *timestamp = nullptr,
+                                            serde::RpcCallSizes *sizes = nullptr);
 
   CoTryTask<OfflineTargetRsp> offlineTarget(const hf3fs::net::Address &address,
                                             const OfflineTargetReq &request,

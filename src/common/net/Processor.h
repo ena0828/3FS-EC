@@ -112,6 +112,9 @@ class Processor {
   void unpackSerdeMsg(IOBufPtr buf, uint32_t checksumIn, TransportPtr tr) {
     // 1. check checksum. (without timestamp part)
     bool isCompressed = MessageHeader::isCompressed(checksumIn);
+    // Preserve the received frame before decompression replaces the buffer.
+    // Publish only after checksum/outer-packet validation and UUID arbitration.
+    const serde::RpcFrameSize receivedFrame{uint64_t(buf->length()) + kMessageHeaderSize, true, isCompressed};
     auto checksum = Checksum::calcSerde(buf->data(), buf->length(), isCompressed);
     if (UNLIKELY(checksumIn != checksum)) {
       XLOGF(ERR, "checksum is not matched! {:X} != {:X}, peer: {}", checksumIn, checksum, tr->describe());
@@ -151,7 +154,7 @@ class Processor {
     } else {
       // is response.
       XLOGF(DBG, "receive response {}:{}", packet.serviceId, packet.methodId);
-      Waiter::instance().post(packet, std::move(buf));
+      Waiter::instance().post(packet, std::move(buf), receivedFrame);
     }
   }
 

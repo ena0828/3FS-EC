@@ -47,6 +47,19 @@ CLIENT_MANDATORY = {
     )
 }
 
+RPC_FRAME_CASES = tuple("TestEcRpcFrameSizes." + name for name in (
+    "ActualEncodedFramesIncludeHeaderAcrossCompression",
+    "ReverseRepliesOnOneConnectionKeepUuidAttribution",
+    "BusinessAndDecodeErrorsRetainValidFrameSamples",
+    "TimeoutLateAndDuplicateRepliesDoNotRewriteCompletedOutputs",
+    "InvalidOuterFrameHasNoResponseSample",
+))
+RPC_OBSERVER_CASES = (
+    "TestEcRepairPipeline.RpcObservationSeparatesHostClocksMissingErrorsAndOverflow",
+    "TestEcRepairPipeline.RpcFrameObservationCountsMissingErrorsExceptionsAndSaturates",
+)
+CLIENT_MANDATORY |= set(RPC_FRAME_CASES) | set(RPC_OBSERVER_CASES)
+
 SERVICE_MANDATORY = {
     "TestEcStageService.LostSealReplyIsUnknownAndRetryDoesNotDoubleAccount",
     "TestEcNativeRepairService.UnknownSealSurvivesCancellationUntilSameStageIsReconciled",
@@ -144,9 +157,28 @@ def check_suites(record, build, built):
     names = {case["name"] for case in suites[0]["xml_results"]["cases"]}
     require(MANDATORY <= names, "codec/RMW/legacy storage coverage is incomplete")
     client_names = {case["name"] for case in suites[2]["xml_results"]["cases"]}
-    require(CLIENT_MANDATORY <= client_names, "target retirement CLI coverage is incomplete")
+    require(CLIENT_MANDATORY <= client_names, "required client coverage is incomplete")
     service_names = {case["name"] for case in suites[1]["xml_results"]["cases"]}
     require(SERVICE_MANDATORY <= service_names, "native repair unknown-outcome coverage is incomplete")
+    check_rpc_frames(record)
+
+
+def check_rpc_frames(record):
+    rows = [row for row in record.get("suites", []) if row.get("suite") == "client"]
+    require(len(rows) == 1, "RPC frame client suite missing or repeated")
+    cases = rows[0].get("xml_results", {}).get("cases", [])
+    frames = [case for case in cases if case.get("name", "").startswith("TestEcRpcFrameSizes.")]
+    names = [case["name"] for case in frames]
+    require(len(names) == len(RPC_FRAME_CASES) and set(names) == set(RPC_FRAME_CASES),
+            "RPC frame XML does not contain exactly the five real TCP cases")
+    observers = [case for case in cases if case.get("name") in RPC_OBSERVER_CASES]
+    require(len(observers) == len(RPC_OBSERVER_CASES)
+            and {case["name"] for case in observers} == set(RPC_OBSERVER_CASES),
+            "RPC frame observation cases missing or repeated")
+    require(all(case.get("executed") is True and case.get("failed") is False
+                and case.get("skipped") is False for case in frames + observers),
+            "RPC frame or observation case did not execute successfully")
+    return {"tcp_cases": list(RPC_FRAME_CASES), "observation_cases": list(RPC_OBSERVER_CASES)}
 
 
 def check_target_retirement(record):
@@ -202,6 +234,7 @@ def main():
         Path(__file__), source / "scripts/ec/test-native-fragments.py", record_path,
         source / "tests/storage/store/TestEcCodec.cc", source / "tests/storage/store/TestEcRmw.cc",
         source / "tests/client/TestEcTargetRetirementCommands.cc",
+        source / "tests/client/TestEcRpcFrameSizes.cc", source / "tests/client/TestEcRepairPipeline.cc",
         source / "tests/storage/service/TestEcStageService.cc")}
     if args.require_target_retirement:
         inputs.update({str(source / path): digest(source / path) for path in (
@@ -213,6 +246,8 @@ def main():
               "native_build_sha256": digest(record_path), "inputs_sha256": inputs,
               "target_retirement_required": args.require_target_retirement,
               "required_client_cases": sorted(CLIENT_MANDATORY),
+              "required_rpc_frame_cases": list(RPC_FRAME_CASES),
+              "required_rpc_observer_cases": list(RPC_OBSERVER_CASES),
               "required_service_cases": sorted(SERVICE_MANDATORY),
               "scope": "native functional regressions; not a benchmark or real Storage process fault"}
     result = 1

@@ -7,6 +7,7 @@
 #include "common/net/sync/ConnectionPool.h"
 #include "common/serde/ClientContext.h"
 #include "common/serde/MessagePacket.h"
+#include "common/serde/RpcCallSizes.h"
 #include "common/serde/Serde.h"
 #include "common/serde/Service.h"
 #include "common/utils/Duration.h"
@@ -31,6 +32,8 @@ class ClientContext {
 
   ClientContext(const net::TransportPtr &tr);
 
+  // Optional sizes belongs to the awaiting caller and must outlive this joined
+  // call, like timestamp. No pointer to it is retained by Waiter or Transport.
   template <NameWrapper kServiceName,
             NameWrapper kMethodName,
             class Req,
@@ -39,13 +42,16 @@ class ClientContext {
             uint16_t MethodID>
   CoTryTask<Rsp> call(const Req &req,
                       const net::UserRequestOptions *customOptions = nullptr,
-                      Timestamp *timestamp = nullptr) {
+                      Timestamp *timestamp = nullptr,
+                      RpcCallSizes *sizes = nullptr) {
+    if (sizes) *sizes = {};
     auto options = *options_.load(std::memory_order_acquire);
     if (customOptions != nullptr) {
       options.merge(*customOptions);
     }
 
     net::Waiter::Item item;
+    item.collectFrameSizes = sizes != nullptr;
     uint64_t uuid = net::Waiter::instance().bind(item);
 
     Timestamp ts;
@@ -71,6 +77,9 @@ class ClientContext {
     auto writeItem = net::WriteItem::createMessage(packet, options);
     writeItem->uuid = uuid;
     auto requestLength = writeItem->buf->length();
+    // The actual buffer has already selected compression and framing. This is
+    // encoding evidence, not evidence of enqueue, socket write, or remote commit.
+    if (sizes) sizes->request = {uint64_t(requestLength), true, writeItem->buf->header().isCompressed()};
     if (LIKELY(std::holds_alternative<net::IOWorker *>(connectionSource_))) {
       std::get<net::IOWorker *>(connectionSource_)->sendAsync(destAddr_, net::WriteList(std::move(writeItem)));
     } else if (std::holds_alternative<net::Transport *>(connectionSource_)) {
@@ -84,6 +93,9 @@ class ClientContext {
 
     net::Waiter::instance().schedule(uuid, options.timeout);
     co_await item.baton;
+    // Only the joined caller touches its output; late/duplicate UUID replies
+    // cannot reach it. Preserve a correlated frame even if inner Rsp decode fails.
+    if (sizes) sizes->response = item.responseFrame;
 
     if (UNLIKELY(!item.status)) {
       if (item.status.code() == RPCCode::kTimeout && std::holds_alternative<net::IOWorker *>(connectionSource_)) {

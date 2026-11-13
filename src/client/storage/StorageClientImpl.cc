@@ -1,6 +1,7 @@
 #include "StorageClientImpl.h"
 
 #include <boost/core/ignore_unused.hpp>
+#include <type_traits>
 #include <folly/Random.h>
 #include <folly/experimental/coro/Collect.h>
 #include <folly/experimental/coro/Sleep.h>
@@ -965,11 +966,22 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
   // Once invoked, a communication failure cannot prove that the server did
   // not commit. Return this attempt directly; do not try another address.
   if (dispatched) *dispatched = true;
+  // Ordinary forwarding only: the awaited task remains owned by this frame.
+  // The seven observed EC signatures add a local output; all other methods keep
+  // their original arguments. FAULT injection still bypasses the actual invoke.
+  const auto invoke = [&] {
+    if constexpr (std::is_invocable_v<decltype(Method), StorageMessenger &, const net::Address &, const Req &,
+                                      const net::UserRequestOptions *, serde::Timestamp *, serde::RpcCallSizes *>) {
+      return std::invoke(Method, messenger, address, request, &options, &timestamp, rpcMetric.callSizes());
+    } else {
+      return std::invoke(Method, messenger, address, request, &options, &timestamp);
+    }
+  };
   auto response =
       FAULT_INJECTION_POINT(requestCtx.debugFlags.injectClientError(),
                             makeError(StorageClientCode::kCommError),
                             (rpcMetric.messengerInvocation(),
-                             (co_await std::invoke(Method, messenger, address, request, &options, &timestamp))));
+                             (co_await invoke())));
   // Inspect both successful and error Results. Missing/invalid timestamps are
   // counted independently; outer success is not the EC business result.
   rpcMetric.returned(bool(response), timestamp);

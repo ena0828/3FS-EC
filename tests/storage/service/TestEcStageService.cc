@@ -915,10 +915,17 @@ TEST_F(TestEcStageService, ControlledBlockReadUsesRealTcpAndFiniteDeadline) {
   read.blockIndex = 0;
   read.grant = token;
   client::EcRequestControl control;
+  client::EcRpcObservation observation;
+  control.observation = &observation;
   control.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   auto result = blockingWait(client_->readEcBlockV2Controlled(read, control));
   ASSERT_OK(result);
   EXPECT_EQ(result->payload.data, original);
+  auto sizes = observation.snapshot().at(client::EcRpcMethod::Read);
+  EXPECT_EQ(sizes.observedEncodedRequestFrames, 1);
+  EXPECT_EQ(sizes.observedEncodedResponseFrames, 1);
+  EXPECT_GT(sizes.requestFrameBytes, 8);
+  EXPECT_GT(sizes.responseFrameBytes, 8);
   control.deadline = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
   ASSERT_ERROR(blockingWait(client_->readEcBlockV2Controlled(read, control)), StorageClientCode::kTimeout);
   control.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -926,6 +933,11 @@ TEST_F(TestEcStageService, ControlledBlockReadUsesRealTcpAndFiniteDeadline) {
   cancel.requestCancellation();
   control.cancellation = cancel.getToken();
   ASSERT_ERROR(blockingWait(client_->readEcBlockV2Controlled(read, control)), StorageClientCode::kRequestCanceled);
+  // Early control rejection precedes messenger entry and cannot fabricate bytes.
+  sizes = observation.snapshot().at(client::EcRpcMethod::Read);
+  EXPECT_EQ(sizes.entered, 1);
+  EXPECT_EQ(sizes.observedEncodedRequestFrames, 1);
+  EXPECT_EQ(sizes.observedEncodedResponseFrames, 1);
 
   client::StorageClient::Config queuedConfig;
   queuedConfig.set_implementation_type(client::StorageClient::ImplementationType::RPC);
@@ -957,6 +969,11 @@ TEST_F(TestEcStageService, ControlledBlockReadUsesRealTcpAndFiniteDeadline) {
   ASSERT_EQ(entered.wait_for(std::chrono::seconds(5)), std::future_status::ready);
   ASSERT_EQ(pending.wait_for(std::chrono::seconds(4)), std::future_status::ready);
   ASSERT_ERROR(pending.get(), StorageClientCode::kTimeout);
+  sizes = observation.snapshot().at(client::EcRpcMethod::Read);
+  EXPECT_EQ(sizes.active, 0);
+  EXPECT_EQ(sizes.observedEncodedRequestFrames, 2);
+  EXPECT_EQ(sizes.observedEncodedResponseFrames, 1);
+  EXPECT_EQ(sizes.missingEncodedResponseFrames, 1);
   // A local transport timeout is not proof of remote drain. Release the real
   // server handler and let fixture teardown join it before destroying Engine.
   delay->unblock();
@@ -1395,6 +1412,14 @@ TEST_F(TestEcNativeRepairService, ThreeStrategiesRecoverLostAppendReplyOnOrigina
         EXPECT_EQ(point.entered, point.finished);
       }
       EXPECT_EQ(joined.at(EcRepairPoint::NativeSeal).entered, 0);
+      const auto &appendFrames = joined.storageRpc.at(client::EcRpcMethod::Append);
+      EXPECT_EQ(appendFrames.active, 0);
+      EXPECT_EQ(appendFrames.observedEncodedRequestFrames, 1);
+      EXPECT_EQ(appendFrames.missingEncodedRequestFrames, 0);
+      EXPECT_GT(appendFrames.requestFrameBytes, 8);
+      EXPECT_EQ(appendFrames.observedEncodedResponseFrames, 0);
+      EXPECT_EQ(appendFrames.missingEncodedResponseFrames, 1);
+      EXPECT_EQ(appendFrames.responseFrameBytes, 0);  // The server committed; its reply was not observed.
       CancellationSource cancelled;
       cancelled.requestCancellation();
       ASSERT_ERROR(blockingWait((*transport)->begin(value->plan, 0, {ctl.deadline, cancelled.getToken()})),
@@ -1442,6 +1467,15 @@ TEST_F(TestEcNativeRepairService, ThreeStrategiesRecoverLostAppendReplyOnOrigina
       EXPECT_TRUE(serde::equals(*replayed, *reconciled));
       auto repaired = blockingWait(EcRepairPipeline::run(value->plan, *transport, mode, live, executor, &observation));
       ASSERT_OK(repaired);
+      const auto recoveredRpc = observation.snapshot().storageRpc;
+      for (auto method : {client::EcRpcMethod::Query, client::EcRpcMethod::Reconcile}) {
+        const auto &frames = recoveredRpc.at(method);
+        EXPECT_GT(frames.observedEncodedRequestFrames, 0);
+        EXPECT_EQ(frames.observedEncodedRequestFrames, frames.entered);
+        EXPECT_EQ(frames.observedEncodedResponseFrames, frames.entered);
+        EXPECT_GT(frames.requestFrameBytes, 8);
+        EXPECT_GT(frames.responseFrameBytes, 8);
+      }
       EXPECT_EQ(replyDrop_.snapshot().sealCalls, value->plan->input().targetCount);
       ASSERT_NO_FATAL_FAILURE(expectRecovered(*value, *repaired, before));
       // All original allocations remain replayable; a new operation is never
@@ -1642,6 +1676,14 @@ TEST_F(TestEcNativeRepairService, ThreeStrategiesRecoverLostSealReplyAfterEngine
     ASSERT_EQ(dropped.sealCalls, 1);
     ASSERT_TRUE(dropped.droppedReceipt);
     EXPECT_TRUE(serde::equals(*dropped.droppedReceipt, repair_test::receipt(value->plan->input().targets[0])));
+    const auto sealFrames = observation.snapshot().storageRpc.at(client::EcRpcMethod::Seal);
+    EXPECT_EQ(sealFrames.active, 0);
+    EXPECT_EQ(sealFrames.observedEncodedRequestFrames, 1);
+    EXPECT_EQ(sealFrames.missingEncodedRequestFrames, 0);
+    EXPECT_GT(sealFrames.requestFrameBytes, 8);
+    EXPECT_EQ(sealFrames.observedEncodedResponseFrames, 0);
+    EXPECT_EQ(sealFrames.missingEncodedResponseFrames, 1);
+    EXPECT_EQ(sealFrames.responseFrameBytes, 0);
     for (const auto &point : observation.snapshot().points) {
       EXPECT_EQ(point.active, 0);
       EXPECT_EQ(point.entered, point.finished);
