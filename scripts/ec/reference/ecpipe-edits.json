@@ -1,0 +1,229 @@
+{
+  "schema": 1,
+  "upstream_commit": "99e199dddbf4bd803480aa75c1f518579f01f7cb",
+  "semantics": "zero-based half-open original line spans; whole before/after and span SHA; UTF-8 new lines only",
+  "steps": [
+    {
+      "name": "ecpipe-local-address",
+      "files": [
+        {
+          "path": "src/Coordinator.cc",
+          "before_sha256": "5c7444df1b50252768ac1b0d30da0b012a9cad2f42b28d2b6e7d9e789216b581",
+          "after_sha256": "7094e6dc5acfc6e1f2548d4b870aedd94d870e189cf27d68bba5d34831800328",
+          "edits": [
+            {
+              "start_line_0": 207,
+              "end_line_0_exclusive": 208,
+              "before_sha256": "29e860a65836af9918882d0e651901fb890229e7d574948dbe6940b17ea18cac",
+              "replacement": "  redisContext* locCtx = redisConnectWithTimeout(inet_ntoa(in_addr{_conf->_localIP}), 6379, timeout),\n"
+            }
+          ]
+        },
+        {
+          "path": "src/DRWorker.cc",
+          "before_sha256": "e60f6543b0dcd00d74fe10b4ec54d18650cc52d98da537fd26dacd4d88a41018",
+          "after_sha256": "9fc2293d54b56d4c747ffc9dc0249b65ab2cbab5d451c783cb13db61e6b593a4",
+          "edits": [
+            {
+              "start_line_0": 37,
+              "end_line_0_exclusive": 38,
+              "before_sha256": "0639105d032b87b5fcb910b5680335ef208fa0b58f3f5b58a1ee839507d89e04",
+              "replacement": "  _selfCtx = initCtx(sIP);\n"
+            }
+          ]
+        },
+        {
+          "path": "src/ECPipeInputStream.cc",
+          "before_sha256": "d7b4a46754b82c6cac552a6fc0f2ec1c1c4cd74e6c07034937b180b130b1ddce",
+          "after_sha256": "f910f2fe21b35d2fec3b2535dbbeafab3639fae7c7cbbf093531b5e6b473811a",
+          "edits": [
+            {
+              "start_line_0": 19,
+              "end_line_0_exclusive": 20,
+              "before_sha256": "4a529e4aef3f32fea394448ef6bdc2bd34d7a68dc7eaab0164fc64afdb2ec375",
+              "replacement": "  InitRedis(_selfCtx, _locIP, 6379);\n"
+            },
+            {
+              "start_line_0": 45,
+              "end_line_0_exclusive": 46,
+              "before_sha256": "4a529e4aef3f32fea394448ef6bdc2bd34d7a68dc7eaab0164fc64afdb2ec375",
+              "replacement": "  InitRedis(_selfCtx, _locIP, 6379);\n"
+            },
+            {
+              "start_line_0": 86,
+              "end_line_0_exclusive": 87,
+              "before_sha256": "4a529e4aef3f32fea394448ef6bdc2bd34d7a68dc7eaab0164fc64afdb2ec375",
+              "replacement": "  InitRedis(_selfCtx, _locIP, 6379);\n"
+            }
+          ]
+        },
+        {
+          "path": "src/HDFS_MetadataBase.cc",
+          "before_sha256": "bf44d4f3f0f10b33b1ddb582756188e3e92de3102104a8c605f392f2acfd0213",
+          "after_sha256": "c4d472b0a67f48c31c07c1c3a1ac31310a3c026b6e0df859e5959bf9cd117ee4",
+          "edits": [
+            {
+              "start_line_0": 145,
+              "end_line_0_exclusive": 146,
+              "before_sha256": "944fd9b0cbe790ae5724da8c9828dd6d5e6d64fd72ee4eaf4732cc03f1496e94",
+              "replacement": "  redisContext* rContext = redisConnectWithTimeout(inet_ntoa(in_addr{_conf->_localIP}), 6379, timeout);\n"
+            }
+          ]
+        },
+        {
+          "path": "src/PipeCoordinator.cc",
+          "before_sha256": "99f138e90f821accb5fed10d59149fa8b3c98b9a00e0f025e47abe2a3ce4f4b8",
+          "after_sha256": "38155074b82e741352d79b2545831266ed47989ad4889a749df6c106799bdbf4",
+          "edits": [
+            {
+              "start_line_0": 5,
+              "end_line_0_exclusive": 6,
+              "before_sha256": "944fd9b0cbe790ae5724da8c9828dd6d5e6d64fd72ee4eaf4732cc03f1496e94",
+              "replacement": "  redisContext* rContext = redisConnectWithTimeout(inet_ntoa(in_addr{_conf->_localIP}), 6379, timeout);\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ecpipe-array-delete",
+      "files": [
+        {
+          "path": "src/ECPipeInputStream.cc",
+          "before_sha256": "f910f2fe21b35d2fec3b2535dbbeafab3639fae7c7cbbf093531b5e6b473811a",
+          "after_sha256": "4478b3659d2baae45a870e89ab328c9add0d77c53486bf1e8f7c1e5a68130e3f",
+          "edits": [
+            {
+              "start_line_0": 564,
+              "end_line_0_exclusive": 565,
+              "before_sha256": "3ac213eb951774bf68fb90292915a18f9b529fba0c4886aa0d9debf9e9588343",
+              "replacement": "    delete[] _contents[_processedPacket][0];\n"
+            },
+            {
+              "start_line_0": 611,
+              "end_line_0_exclusive": 612,
+              "before_sha256": "11ee29fb3ff927b74f4c92934d4d940b6e165deb6b9d69854e57112b78e3d8f0",
+              "replacement": "\tdelete[] _contents[i][0];\n"
+            },
+            {
+              "start_line_0": 649,
+              "end_line_0_exclusive": 650,
+              "before_sha256": "aa16f6ceaa7a6b5dd87ae56aeb1204cd9e8518745d5fde17b10e105bc47e3b6f",
+              "replacement": "      delete[] _contents[i][0];\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ecpipe-hiredis-headers",
+      "files": [
+        {
+          "path": "src/BlockReporter.hh",
+          "before_sha256": "6ade0240e4db217788730172c015c21c78a41a7238f713ffc0748956c7f8f5c0",
+          "after_sha256": "4721361c4997fbefc400d94ccc9c393f743b36f1d64ca0c47cbb65b215b1f79d",
+          "edits": [
+            {
+              "start_line_0": 9,
+              "end_line_0_exclusive": 10,
+              "before_sha256": "54ac6337c586a3c71bc7945e4c03a75a4c69cd14633ad8f2452e93128ccf9bdf",
+              "replacement": "#include <hiredis/hiredis.h>\n"
+            }
+          ]
+        },
+        {
+          "path": "src/DRWorker.hh",
+          "before_sha256": "b35d86cd41755e3a8a43e4d5c9ae6e7bab6d381d4af9eb880dce6ee525c6694e",
+          "after_sha256": "ae5eb20b87f5eb2f2899a04e88577c3a8dd1c1065a76a7756aeee00635060e16",
+          "edits": [
+            {
+              "start_line_0": 24,
+              "end_line_0_exclusive": 25,
+              "before_sha256": "54ac6337c586a3c71bc7945e4c03a75a4c69cd14633ad8f2452e93128ccf9bdf",
+              "replacement": "#include <hiredis/hiredis.h>\n"
+            }
+          ]
+        },
+        {
+          "path": "src/MetadataBase.hh",
+          "before_sha256": "86c5eeeaf8e4b23d12f738e71014143c0ec711fb41c9833c3828bef806c8e56a",
+          "after_sha256": "3b581def44d3f1823ff4765bfcb62a1c00afa20489ba35d0d70eabd9ee301119",
+          "edits": [
+            {
+              "start_line_0": 16,
+              "end_line_0_exclusive": 17,
+              "before_sha256": "54ac6337c586a3c71bc7945e4c03a75a4c69cd14633ad8f2452e93128ccf9bdf",
+              "replacement": "#include <hiredis/hiredis.h>\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ecpipe-basic-single-sync",
+      "files": [
+        {
+          "path": "src/PipeDRWorker.cc",
+          "before_sha256": "5a3110ca261704c797b0a3dde648b43cb2796676bc2fe24acf8cabbe0a63fbf2",
+          "after_sha256": "64c54c4ad9e8ff99a9cc91ee96eaefe17702a9fc64c424d23efe1ed473d1ee7b",
+          "edits": [
+            {
+              "start_line_0": 10,
+              "end_line_0_exclusive": 11,
+              "before_sha256": "6c9acd8399d12ac618a704f17cbb2b6238b0a355e2057f2d96a79c6222b8ea79",
+              "replacement": "    {\n"
+            },
+            {
+              "start_line_0": 12,
+              "end_line_0_exclusive": 14,
+              "before_sha256": "2089172e0583a3dca05db6713ab993ab636a16d9924d6e639d368766ece6a3c0",
+              "replacement": "      _mainSenderCondVar.wait(lck, [this, i] { return i < _waitingToSend; });\n    }\n"
+            },
+            {
+              "start_line_0": 19,
+              "end_line_0_exclusive": 19,
+              "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "replacement": "      gettimeofday(&tv2, NULL);\n"
+            },
+            {
+              "start_line_0": 104,
+              "end_line_0_exclusive": 105,
+              "before_sha256": "ed7531a0875d79b3f1c31a3583d4ff326c85241ffadc5d022c11d50f97a7d852",
+              "replacement": "    {\n"
+            },
+            {
+              "start_line_0": 106,
+              "end_line_0_exclusive": 107,
+              "before_sha256": "dd36a4fd36be98ba1c63e05a64ddb4513f11dc3297baa03b0be185ed63c2e6e2",
+              "replacement": "      _diskCv.wait(lck, [this, pktId] { return _diskFlag[pktId]; });\n"
+            },
+            {
+              "start_line_0": 121,
+              "end_line_0_exclusive": 123,
+              "before_sha256": "872a60732c09d46ced4a9212cd999dd0a2d816d23562c829996e6ed84d106fa4",
+              "replacement": "    {\n      lock_guard<mutex> lck(_mainSenderMtx);\n      ++_waitingToSend;\n    }\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ecpipe-client-readiness",
+      "files": [
+        {
+          "path": "src/ECPipeInputStream.cc",
+          "before_sha256": "4478b3659d2baae45a870e89ab328c9add0d77c53486bf1e8f7c1e5a68130e3f",
+          "after_sha256": "01e5fb6712006e06a27b50f74b817711d93020f1e79e1066e85fb7e10f20a8cb",
+          "edits": [
+            {
+              "start_line_0": 524,
+              "end_line_0_exclusive": 525,
+              "before_sha256": "f2898bbd0170c9afacdbf60d291beda12b94bfa733bbdc33424d97cb2488ca75",
+              "replacement": "      {\n        lock_guard<mutex> lck(_reader2SenderMtx);\n        ++_completePacketIndex;\n      }\n"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

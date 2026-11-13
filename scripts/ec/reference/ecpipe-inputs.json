@@ -1,0 +1,115 @@
+{
+  "source_scope": {
+    "repository": "https://github.com/ukulililixl/ecpipe-v1.1",
+    "paper": "https://www.usenix.org/conference/atc17/technical-sessions/presentation/li-runhui",
+    "paper_source_entry": "http://adslab.cse.cuhk.edu.hk/software/ecpipe",
+    "project_license_status": "unconfirmed",
+    "archive_scope": "Fixed author-associated public repository; not proven byte-identical to the original laboratory release.",
+    "notice_policy": "Preserve original copyright and third-party notices in the downloaded archive and private work tree.",
+    "distribution_scope": "This repository supplies its own automation and minimal edit recipes; no ECPipe source archive or binary is vendored and no project-wide upstream license is asserted."
+  },
+  "commit": "99e199dddbf4bd803480aa75c1f518579f01f7cb",
+  "archive": "ecpipe-v1.1-99e199d/ecpipe-v1.1-99e199dddbf4bd803480aa75c1f518579f01f7cb.tar.gz",
+  "archive_sha256": "0afd8a53d9acca2559dce17f41496655d3a67dd07335f11022b432963b8cd431",
+  "prefix": "ecpipe-v1.1-99e199dddbf4bd803480aa75c1f518579f01f7cb/",
+  "hiredis_binding": {
+    "version": "1.2.0",
+    "header_relative": "usr/include/hiredis/hiredis.h",
+    "header_sha256": "72336757839241424a866a53c4d567dce64ab95795072dddac75f838c3fbaa6d",
+    "library_link_relative": "usr/lib/x86_64-linux-gnu/libhiredis.so",
+    "library_sha256": "f075a3e97f536723ebfde914e6838ccf8083e6970eb49c5cee00a0be93cc07a1",
+    "packages": {
+      "libhiredis-dev_1.2.0-6ubuntu3_amd64.deb": "178926b5b14988c86f8f359f61894abd4ea6966e852a00349dbeaf3cccda09a2",
+      "libhiredis1.1.0_1.2.0-6ubuntu3_amd64.deb": "912a25553f29a47d1524c0b58a3c5bff2d067109da2adae9fa9c4fb15efaa568"
+    },
+    "source_note": "Existing verified Ubuntu packages; SONAME 1.1.0 does not denote header version 1.1.0."
+  },
+  "tree": "d961551f55f4584b076f966c1882708e92b23e96",
+  "archive_size": 2708500,
+  "archive_url": "https://codeload.github.com/ukulililixl/ecpipe-v1.1/tar.gz/99e199dddbf4bd803480aa75c1f518579f01f7cb",
+  "shared_parent": "fc951c98aa07e32097ccb7f46de76e9fa76959e8",
+  "shared_modules": {
+    "runtime_common.py": "c9a1742553cd33b387ac03ccabfeb05037b8133f9deb4984198aa75ad0f22f4a",
+    "bootstrap_openec.py": "4c87867c6dacb33d48629244ab205d1f7a27eed13d1547e4ff54fcf69df7b39b",
+    "prepare_reference.py": "15438d894ae1fb2f69ab9934c9a29f6f7c3b7dc4e8df4ec7243f7775bf8c154e",
+    "prepare_redis.py": "9be682275606561dad73d21c6b1589f9166de5baf15c5cfe484c01954d2cbef0",
+    "run_openec.py": "078fd9796292f06e30edca86499a1206d8726b9b7d0d78b3e94ddf77ec35d180",
+    "downloads.json": "d865e68bc094d4f8bec1f7dea2a64e8abfbecf72df5141b83549f4e19df45bd1",
+    "test_runtime_contract.py": "29153c25d4e538436ffd84b26a7d87e77baf0678ccdf6c60ffaeee68ee148adb"
+  },
+  "recipes": {
+    "path": "ecpipe-edits.json",
+    "sha256": "3403feea0313173d64b4f503cb9178d43a219cab8bddbf2d94cbe8bcb045438f"
+  },
+  "edit_steps": [
+    {
+      "name": "ecpipe-local-address",
+      "after": [
+        {
+          "path": "src/Coordinator.cc",
+          "sha256": "7094e6dc5acfc6e1f2548d4b870aedd94d870e189cf27d68bba5d34831800328"
+        },
+        {
+          "path": "src/DRWorker.cc",
+          "sha256": "9fc2293d54b56d4c747ffc9dc0249b65ab2cbab5d451c783cb13db61e6b593a4"
+        },
+        {
+          "path": "src/ECPipeInputStream.cc",
+          "sha256": "f910f2fe21b35d2fec3b2535dbbeafab3639fae7c7cbbf093531b5e6b473811a"
+        },
+        {
+          "path": "src/HDFS_MetadataBase.cc",
+          "sha256": "c4d472b0a67f48c31c07c1c3a1ac31310a3c026b6e0df859e5959bf9cd117ee4"
+        },
+        {
+          "path": "src/PipeCoordinator.cc",
+          "sha256": "38155074b82e741352d79b2545831266ed47989ad4889a749df6c106799bdbf4"
+        }
+      ]
+    },
+    {
+      "name": "ecpipe-array-delete",
+      "after": [
+        {
+          "path": "src/ECPipeInputStream.cc",
+          "sha256": "4478b3659d2baae45a870e89ab328c9add0d77c53486bf1e8f7c1e5a68130e3f"
+        }
+      ]
+    },
+    {
+      "name": "ecpipe-hiredis-headers",
+      "after": [
+        {
+          "path": "src/BlockReporter.hh",
+          "sha256": "4721361c4997fbefc400d94ccc9c393f743b36f1d64ca0c47cbb65b215b1f79d"
+        },
+        {
+          "path": "src/DRWorker.hh",
+          "sha256": "ae5eb20b87f5eb2f2899a04e88577c3a8dd1c1065a76a7756aeee00635060e16"
+        },
+        {
+          "path": "src/MetadataBase.hh",
+          "sha256": "3b581def44d3f1823ff4765bfcb62a1c00afa20489ba35d0d70eabd9ee301119"
+        }
+      ]
+    },
+    {
+      "name": "ecpipe-basic-single-sync",
+      "after": [
+        {
+          "path": "src/PipeDRWorker.cc",
+          "sha256": "64c54c4ad9e8ff99a9cc91ee96eaefe17702a9fc64c424d23efe1ed473d1ee7b"
+        }
+      ]
+    },
+    {
+      "name": "ecpipe-client-readiness",
+      "after": [
+        {
+          "path": "src/ECPipeInputStream.cc",
+          "sha256": "01e5fb6712006e06a27b50f74b817711d93020f1e79e1066e85fb7e10f20a8cb"
+        }
+      ]
+    }
+  ]
+}

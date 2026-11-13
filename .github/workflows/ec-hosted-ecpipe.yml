@@ -1,0 +1,76 @@
+name: ECPipe hosted basicSingle reference
+
+on:
+  push:
+    branches: [feat/ec-ecpipe-reference]
+    paths:
+      - .github/workflows/ec-hosted-ecpipe.yml
+      - scripts/ec/reference/bootstrap_ecpipe.py
+      - scripts/ec/reference/run_ecpipe.py
+      - scripts/ec/reference/ecpipe-inputs.json
+      - scripts/ec/reference/ecpipe-edits.json
+      - scripts/ec/reference/test_ecpipe_bootstrap.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ec-hosted-ecpipe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ecpipe:
+    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-ecpipe-reference' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      MAKEFLAGS: '-j1'
+      CC: /usr/bin/gcc
+      CXX: /usr/bin/g++
+    steps:
+      - name: Check out only this adapter revision
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+          persist-credentials: false
+
+      - name: Install tools and run existing ownership guards
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          test "$(id -u)" -ne 0
+          sudo -n apt-get update -qq
+          sudo -n apt-get install -y --no-install-recommends build-essential git python3 libssl3t64 ca-certificates
+          /usr/bin/g++ --version
+          /usr/bin/gcc --version
+          /usr/bin/python3 --version
+          ulimit -n 4096
+          /usr/bin/python3 -B scripts/ec/reference/test_runtime_contract.py -v
+          /usr/bin/python3 -B scripts/ec/reference/test_ecpipe_bootstrap.py -v
+
+      - name: Fetch locked sources and private dependencies and build Redis
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          ulimit -n 4096
+          exec /usr/bin/python3 -B scripts/ec/reference/bootstrap_ecpipe.py prepare --work "$RUNNER_TEMP/ecpipe-reference"
+
+      - name: Build exactly three ECPipe executables
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          ulimit -n 4096
+          exec /usr/bin/python3 -B scripts/ec/reference/bootstrap_ecpipe.py build --work "$RUNNER_TEMP/ecpipe-reference"
+
+      - name: Reconstruct one missing block to client output and join owned processes
+        # No in-place block replacement or durable drain claim. The job cap is
+        # infrastructure termination, never evidence of successful owned cleanup.
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          ulimit -n 4096
+          exec /usr/bin/python3 -B scripts/ec/reference/bootstrap_ecpipe.py run --work "$RUNNER_TEMP/ecpipe-reference"
