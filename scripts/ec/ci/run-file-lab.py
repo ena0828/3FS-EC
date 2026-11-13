@@ -100,7 +100,7 @@ LIFECYCLE_COMMANDS |= {'status-' + label for label in
                         'before-usrbio-verify', 'after-prepare', 'after-verify')}
 POSIX_OPERATIONS = {'probe', 'open', 'pwrite', 'ftruncate', 'fsync', 'fstat', 'pread', 'pread_eof',
                     'close', 'reject_open_append', 'open_append', 'lstat_absent', 'create_append',
-                    'reject_create_append'}
+                    'reject_create_append', 'lstat', 'evidence_close'}
 PREFLIGHT_CODES = {
     'use one ordinary real/effective UID and GID': 'ordinary_identity_required',
     'timeouts out of range': 'timeout_configuration_invalid',
@@ -184,6 +184,45 @@ def diagnostic_file(path, *, lines=False):
                       type(error).__name__ if type(error).__name__ in ERROR_TYPES else 'other'}
 
 
+CALLBACK_STAGES = {
+    'setattr': {'handle', 'open', 'truncate', 'temporary_release', 'error_reply', 'observed_length', 'stat', 'reply'},
+    'flush': {'recover', 'callback'},
+    'release': {'close', 'callback'},
+}
+MOUNT_STAGES = {'guard', 'reopen', 'reserve', 'prepare', 'journal', 'reader', 'deadline', 'advance',
+                'close_debt', 'close_reader', 'archive', 'result'}
+
+
+def ec_failure_markers(sample):
+    """Decode fixed error markers only; arbitrary log contents remain private."""
+    result = []
+    field = rb'([a-z_]{1,24})'
+    callback = (rb'EC_FILE_CALLBACK_FAILURE operation=' + field + rb' stage=' + field +
+                rb' code=([0-9]{1,10}) exception=([01])(?=\r?\n)')
+    mount = (rb'EC_FILE_MOUNT_FAILURE operation=truncate stage=' + field + rb' code=([0-9]{1,10})'
+             rb' debt=([01]) retained_reader=([01]) local_join_unconfirmed=([01]) exception=([01])(?=\r?\n)')
+    # Preserve sample order, including a mount error preceding its callback error.
+    for match in re.finditer(callback + b'|' + mount, sample):
+        if match.group(1) is not None:
+            operation, stage = match.group(1).decode('ascii'), match.group(2).decode('ascii')
+            code = int(match.group(3))
+            if stage not in CALLBACK_STAGES.get(operation, ()) or code > 0xffffffff:
+                continue
+            row = {'layer': 'callback', 'operation': operation, 'stage': stage, 'status_code': code,
+                   'exception': match.group(4) == b'1'}
+        else:
+            stage, code = match.group(5).decode('ascii'), int(match.group(6))
+            if stage not in MOUNT_STAGES or code > 0xffffffff:
+                continue
+            row = {'layer': 'mount', 'operation': 'truncate', 'stage': stage, 'status_code': code,
+                   'debt': match.group(7) == b'1', 'retained_reader': match.group(8) == b'1',
+                   'local_join_unconfirmed': match.group(9) == b'1', 'exception': match.group(10) == b'1'}
+        result.append(row)
+        if len(result) == 8:
+            break
+    return result
+
+
 def fuse_log_summary(path):
     """Sample fixed logs without publishing text; markers are observations, not causal proof."""
     markers = {'Init application failed: ': 'application_init_failed',
@@ -203,9 +242,10 @@ def fuse_log_summary(path):
             tail_start = max(len(head), info.st_size - 32768)
             stream.seek(tail_start)
             tail = stream.read(32768)
-        events, progress = [], []
+        events, progress, ec_failures = [], [], []
         # Never concatenate samples: a marker must not span an omitted section.
         for sample in (head, tail):
+            ec_failures.extend(ec_failure_markers(sample)[:8 - len(ec_failures)])
             for marker, event in ((b'Start to init fuse clients', 'client_initialization_entered'),
                                   (b'Init fuse clients finished', 'client_initialization_returned')):
                 if marker in sample and event not in progress:
@@ -220,7 +260,8 @@ def fuse_log_summary(path):
                         events.append(row)
         return {'availability': 'sampled', 'size_at_open': info.st_size,
                 'sampled_bytes': len(head) + len(tail), 'omitted_middle': tail_start > len(head),
-                'events': events, 'progress_markers': progress, 'event_limit_reached': len(events) == 8}
+                'events': events, 'progress_markers': progress, 'event_limit_reached': len(events) == 8,
+                'ec_failures': ec_failures, 'ec_failure_limit_reached': len(ec_failures) == 8}
     except Exception as error:
         return {'availability': 'unavailable', 'error_type':
                 type(error).__name__ if type(error).__name__ in ERROR_TYPES else 'other'}
@@ -249,6 +290,53 @@ def lifecycle_preflight_summary(path):
     except Exception as error:
         return {'availability': 'unavailable', 'error_type':
                 type(error).__name__ if type(error).__name__ in ERROR_TYPES else 'other'}
+
+
+def probe_sink_summary(path):
+    """Bound one fixed child's stderr; export only evidence failure enums/numbers."""
+    try:
+        canonical(path)
+        before = path.lstat()
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1, 'invalid probe stderr')
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            require((info.st_dev, info.st_ino) == (before.st_dev, before.st_ino)
+                    and stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'probe stderr changed')
+            raw = stream.read(16384)
+        rows = []
+        for line in raw.splitlines(keepends=True):
+            prefix = b'MODE4_PROBE_EVIDENCE_FAILURE '
+            if not line.endswith(b'\n') or not line.startswith(prefix):
+                continue
+            try:
+                row = json.loads(line[len(prefix):], object_pairs_hook=unique,
+                                 parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+            except (ValueError, UnicodeError):
+                continue
+            if type(row) is not dict:
+                continue
+            safe = {'operation': diagnostic_choice(row.get('operation'), POSIX_OPERATIONS),
+                    'state': diagnostic_choice(row.get('state'), ('prepared', 'confirmed', 'unconfirmed',
+                        'operation_entered', 'operation_confirmed', 'operation_failed', 'unexpected_success')),
+                    'evidence_error_type': diagnostic_choice(row.get('evidence_error_type'), ERROR_TYPES)}
+            for key in ('evidence_errno', 'errno'):
+                if type(row.get(key)) is int and 0 < row[key] < 4096:
+                    safe[key] = row[key]
+            if 'failure_source' in row:
+                safe['failure_source'] = diagnostic_choice(row['failure_source'], ('syscall', 'validation', 'evidence', 'probe'))
+            if 'error_type' in row:
+                safe['error_type'] = diagnostic_choice(row['error_type'], ERROR_TYPES)
+            for key in ('expected_failure', 'secondary'):
+                if type(row.get(key)) is bool:
+                    safe[key] = row[key]
+            rows.append(safe)
+            if len(rows) == 4:
+                break
+        return {'availability': 'sampled', 'sampled_bytes': len(raw), 'size_at_open': info.st_size,
+                'truncated': info.st_size > len(raw), 'failures': rows, 'limit_reached': len(rows) == 4}
+    except Exception as error:
+        return {'availability': 'unavailable', 'error_type': diagnostic_choice(type(error).__name__, ERROR_TYPES)}
 
 
 def lifecycle_summary(value):
@@ -337,15 +425,44 @@ def failure_evidence(parent, report):
             item['record_count'] = len(rows)
             item['last_operation'] = diagnostic_choice(rows[-1].get('operation'), POSIX_OPERATIONS)
             item['last_state'] = diagnostic_choice(rows[-1].get('state'), (
-                'prepared', 'confirmed', 'unconfirmed', 'operation_confirmed', 'unexpected_success'))
+                'prepared', 'confirmed', 'unconfirmed', 'operation_confirmed', 'unexpected_success',
+                'operation_entered', 'operation_failed'))
+            failed = next((row for row in rows if row.get('state') == 'operation_failed'
+                           and row.get('expected_failure') is not True), None)
+            if failed is not None:
+                item['first_failed_operation'] = diagnostic_choice(failed.get('operation'), POSIX_OPERATIONS)
+                item['failure_source'] = diagnostic_choice(failed.get('failure_source'), ('syscall', 'validation', 'evidence'))
+                item['error_type'] = diagnostic_choice(failed.get('error_type'), ERROR_TYPES)
+                number = failed.get('errno')
+                if type(number) is int and 0 < number < 4096:
+                    item['errno'] = number
             failed = next((row for row in rows if 'error' in row), None)
             if failed is not None:
                 item['error'] = error_summary(failed['error'])
+            entered = [row for row in rows if row.get('state') == 'operation_entered']
+            if entered:
+                item['last_entered_operation'] = diagnostic_choice(entered[-1].get('operation'), POSIX_OPERATIONS)
+            secondary = [row for row in rows if row.get('operation') == 'close'
+                         and row.get('state') == 'operation_failed' and row.get('secondary') is True]
+            if secondary:
+                item['secondary_close_error'] = {
+                    'error_type': diagnostic_choice(secondary[0].get('error_type'), ERROR_TYPES)}
+                number = secondary[0].get('errno')
+                if type(number) is int and 0 < number < 4096:
+                    item['secondary_close_error']['errno'] = number
             confirmed = [row for row in rows if row.get('state') == 'operation_confirmed']
             if confirmed:
                 item['last_confirmed_operation'] = diagnostic_choice(confirmed[-1].get('operation'), POSIX_OPERATIONS)
                 item['recent_confirmed_operations'] = [diagnostic_choice(row.get('operation'), POSIX_OPERATIONS)
                                                        for row in confirmed[-4:]]
+        commands = value.get('commands') if type(value) is dict else None
+        if type(commands) is list and len(commands) <= 64:
+            matches = [row for row in commands if type(row) is dict and row.get('name') == 'posix-' + stage]
+            if len(matches) == 1:
+                sequence = matches[0].get('sequence')
+                if type(sequence) is int and 1 <= sequence <= 4096:
+                    item['evidence_sink'] = probe_sink_summary(
+                        parent / 'mode4' / f'{sequence:03}-posix-{stage}.stderr')
         probes.append(item)
         row, source = diagnostic_file(parent / ('mode4/usrbio-' + stage + '/result.json'))
         item = {'kind': 'usrbio', 'phase': stage, 'source': source}

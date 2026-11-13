@@ -2,7 +2,7 @@ name: EC native experiment script checks
 
 on:
   push:
-    branches: [feat/ec-spare-faults, feat/ec-local-file, fix/ec-mode4-preflight, fix/ec-local-native-acceptance]
+    branches: [feat/ec-spare-faults, feat/ec-local-file, fix/ec-mode4-preflight, fix/ec-local-native-acceptance, fix/ec-posix-error-evidence]
     paths:
       - .github/workflows/ec-hosted-spare-scripts.yml
       - scripts/ec/**
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   scripts:
-    if: github.repository == 'ena0828/3FS-EC' && (github.ref == 'refs/heads/feat/ec-spare-faults' || github.ref == 'refs/heads/feat/ec-local-file' || github.ref == 'refs/heads/fix/ec-mode4-preflight' || github.ref == 'refs/heads/fix/ec-local-native-acceptance') && github.event.repository.private == false
+    if: github.repository == 'ena0828/3FS-EC' && (github.ref == 'refs/heads/feat/ec-spare-faults' || github.ref == 'refs/heads/feat/ec-local-file' || github.ref == 'refs/heads/fix/ec-mode4-preflight' || github.ref == 'refs/heads/fix/ec-local-native-acceptance' || github.ref == 'refs/heads/fix/ec-posix-error-evidence') && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -58,12 +58,13 @@ jobs:
               "cluster/test-native-spare-storage.py": 7,
               "cluster/test-portable-experiments.py": 5,
               "cluster/test-prepare-fuse-file.py": 4,
-              "ci/test-run-file-lab.py": 27,
+              "ci/test-run-file-lab.py": 29,
               "ci/test-run-core-tests.py": 16,
               "ci/test-run-spare-lab.py": 10,
               "ci/test-run-fault-matrix.py": 6,
               "ci/test-system-entrypoints.py": 11,
-              "test-mode4-lifecycle-acceptance.py": 14,
+              "test-mode4-lifecycle-acceptance.py": 15,
+              "test-mode4-mount-evidence.py": 9,
           }
           rows = []
           for filename, expected in suites.items():

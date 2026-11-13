@@ -5,6 +5,7 @@ The native-v2 services must already be healthy. Their lifecycle is never changed
 Only normal fusermount3 -u is allowed; an unknown join is a failed experiment.
 """
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -104,8 +105,26 @@ def posix_receipt(rows, phase, file, expected_bytes, expected_sha):
             "POSIX receipt sequence differs")
     require(rows[0].get("state") == "prepared" and rows[0].get("command") == phase
             and rows[0].get("file") == str(file), "POSIX receipt belongs to another invocation")
-    require(all(row.get("state") in ("prepared", "operation_confirmed", "confirmed") for row in rows),
-            "POSIX receipt contains unconfirmed work")
+    pending = None
+    for row in rows:
+        state, operation = row.get("state"), row.get("operation")
+        if state == "operation_entered":
+            require(pending is None and type(operation) is str, "POSIX receipt contains unconfirmed work")
+            pending = operation
+        elif state in ("operation_confirmed", "operation_failed"):
+            if state == "operation_failed":
+                expected_errno = {"open_append": errno.EOPNOTSUPP, "create_append": errno.EOPNOTSUPP,
+                                  "lstat": errno.ENOENT}.get(operation)
+                require(pending == operation and row.get("expected_failure") is True
+                        and row.get("failure_source") == "syscall" and expected_errno is not None
+                        and type(row.get("errno")) is int and row["errno"] == expected_errno,
+                        "POSIX receipt contains unconfirmed work")
+            require(pending is None or pending == operation, "POSIX receipt contains unconfirmed work")
+            pending = None
+        else:
+            require(pending is None and state in ("prepared", "confirmed"),
+                    "POSIX receipt contains unconfirmed work")
+    require(pending is None, "POSIX receipt contains unconfirmed work")
     require(rows[-1].get("operation") == "probe" and rows[-1].get("state") == "confirmed"
             and rows[-1].get("bytes") == expected_bytes and rows[-1].get("sha256") == expected_sha,
             "POSIX bytes or terminal receipt differ")
@@ -113,7 +132,8 @@ def posix_receipt(rows, phase, file, expected_bytes, expected_sha):
         require(not any(row.get("operation") in ("pwrite", "ftruncate", "fsync") for row in rows),
                 "verify unexpectedly performed a data mutation")
     else:
-        require(any(row.get("operation") == "fsync" and row.get("file_data_barrier") is True for row in rows),
+        require(any(row.get("operation") == "fsync" and row.get("state") == "operation_confirmed"
+                    and row.get("file_data_barrier") is True for row in rows),
                 "prepare has no real file-data barrier")
     return {"bytes": expected_bytes, "sha256": expected_sha, "confirmed_events": len(rows)}
 
@@ -171,7 +191,7 @@ class Commands:
             self.owner.checkpoint()
         self.owner.sequence += 1
         base = self.owner.result / f"{self.owner.sequence:03}-{name}"
-        row = {"name": name, "argv": list(map(str, argv)), "exitcode": None,
+        row = {"name": name, "sequence": self.owner.sequence, "argv": list(map(str, argv)), "exitcode": None,
                "joined": False, "timeout_seconds": timeout, "timed_out": False,
                "cancelled": False, "started_monotonic_ns": time.monotonic_ns(),
                "allow_setuid_helper": allow_setuid_helper}

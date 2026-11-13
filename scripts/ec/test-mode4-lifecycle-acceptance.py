@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure ordering and evidence tests; no native process, mount or signal."""
 import importlib.util
+import errno
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -43,6 +44,31 @@ class FakeLifecycle:
 
 
 class TestMode4Lifecycle(unittest.TestCase):
+    def test_diagnostic_entries_require_completion_and_exact_expected_refusals(self):
+        path = Path('/mount/file')
+        def receipt(events):
+            result = [dict(state='prepared', command='prepare', file=str(path)), *events,
+                      dict(state='confirmed', operation='probe', bytes=7, sha256='hash')]
+            return [dict(row, schema=1, sequence=i) for i, row in enumerate(result)]
+        barrier = [dict(state='operation_entered', operation='fsync'),
+                   dict(state='operation_confirmed', operation='fsync', file_data_barrier=True)]
+        for operation, code in (('open_append', errno.EOPNOTSUPP), ('create_append', errno.EOPNOTSUPP),
+                                ('lstat', errno.ENOENT)):
+            refused = [dict(state='operation_entered', operation=operation),
+                       dict(state='operation_failed', operation=operation, failure_source='syscall',
+                            expected_failure=True, errno=code)]
+            DRIVER.posix_receipt(receipt(barrier + refused), 'prepare', path, 7, 'hash')
+            for change in ({'errno': 5}, {'errno': True}, {'expected_failure': 1},
+                           {'failure_source': 'evidence'}, {'operation': 'ftruncate'}):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    DRIVER.posix_receipt(receipt(barrier + [refused[0], dict(refused[1], **change)]),
+                                         'prepare', path, 7, 'hash')
+        for events in (barrier[:1], [dict(state='operation_entered', operation='fsync', file_data_barrier=True)],
+                       [barrier[0], dict(state='operation_confirmed', operation='close')],
+                       barrier + [dict(state='operation_failed', operation='ftruncate', errno=5)]):
+            with self.assertRaises(ValueError):
+                DRIVER.posix_receipt(receipt(events), 'prepare', path, 7, 'hash')
+
     def test_mount_identity_binds_prepared_client_and_actual_uid_gid(self):
         user = {"uid": 2345, "gid": 3456}
         client = {"user_info": dict(user)}

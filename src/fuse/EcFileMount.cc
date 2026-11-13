@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <folly/experimental/coro/BlockingWait.h>
+#include <folly/logging/xlog.h>
 
 #include "EcFuseRead.h"
 #include "client/ec/EcFileRunFactory.h"
@@ -459,45 +460,86 @@ CoTryTask<uint64_t> EcFileMount::write(EcMountHandle h,
       });
 }
 Result<uint64_t> EcFileMount::truncateOwned(Session &s, flat::UserInfo u, uint64_t length) {
-  if (readonly(u)) return makeError(StatusCode::kReadOnlyMode);
-  if (s.debt) return makeError(StorageClientCode::kResourceBusy);
-  CHECK_RESULT(current, reopen(s, u));
-  CHECK_RESULT(path, next(s, "truncate"));
-  CHECK_RESULT(record, prepareEcFileTruncate(current.session, current.root, state_->cluster(), length));
-  CHECK_RESULT(j, EcTruncateJournal::create(path, std::move(record)));
-  auto journal = std::shared_ptr<EcTruncateJournal>(std::move(j));
-  s.debt = true;
-  CHECK_RESULT(client, reader(u));
-  const auto deadline = control();
-  Result<meta::EcFileTruncateProgress> progress = makeError(StatusCode::kIOError);
-  do {
-    auto permitted = active(deadline);
-    if (!permitted) {
-      progress = makeError(std::move(permitted.error()));
-      break;
+  const char *stage = "guard";
+  auto observeFailure = [&](status_code_t code, bool exception) noexcept {
+    // This worker owns both the session and retained reader. Fixed scalar
+    // observations cannot authorize cleanup, a retry or a changed reply.
+    try {
+      XLOGF(ERR,
+            "EC_FILE_MOUNT_FAILURE operation=truncate stage={} code={} debt={} retained_reader={} "
+            "local_join_unconfirmed={} exception={}",
+            stage,
+            code,
+            s.debt ? 1 : 0,
+            retainedReader_ ? 1 : 0,
+            retainedReader_ && retainedReader_->localJoinUnconfirmed() ? 1 : 0,
+            exception ? 1 : 0);
+    } catch (...) {
     }
-    progress = blockingWait(client->truncate(journal, deadline));
-    if (!progress || client->localJoinUnconfirmed()) break;
-    if (progress->observed && progress->observed->state != meta::EcFileTruncateState::Planned) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  } while (true);
-  if (progress && progress->observed && progress->observed->state == meta::EcFileTruncateState::Published &&
-      !client->localJoinUnconfirmed()) {
-    auto cleanup = blockingWait(client->closeTruncateDebt(journal, deadline));
-    if (cleanup) progress = std::move(cleanup);
+  };
+  auto run = [&]() -> Result<uint64_t> {
+    if (readonly(u)) return makeError(StatusCode::kReadOnlyMode);
+    if (s.debt) return makeError(StorageClientCode::kResourceBusy);
+    stage = "reopen";
+    CHECK_RESULT(current, reopen(s, u));
+    stage = "reserve";
+    CHECK_RESULT(path, next(s, "truncate"));
+    stage = "prepare";
+    CHECK_RESULT(record, prepareEcFileTruncate(current.session, current.root, state_->cluster(), length));
+    stage = "journal";
+    CHECK_RESULT(j, EcTruncateJournal::create(path, std::move(record)));
+    auto journal = std::shared_ptr<EcTruncateJournal>(std::move(j));
+    s.debt = true;
+    stage = "reader";
+    CHECK_RESULT(client, reader(u));
+    const auto deadline = control();
+    Result<meta::EcFileTruncateProgress> progress = makeError(StatusCode::kIOError);
+    do {
+      stage = "deadline";
+      auto permitted = active(deadline);
+      if (!permitted) {
+        progress = makeError(std::move(permitted.error()));
+        break;
+      }
+      stage = "advance";
+      progress = blockingWait(client->truncate(journal, deadline));
+      if (!progress || client->localJoinUnconfirmed()) break;
+      if (progress->observed && progress->observed->state != meta::EcFileTruncateState::Planned) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (true);
+    if (progress && progress->observed && progress->observed->state == meta::EcFileTruncateState::Published &&
+        !client->localJoinUnconfirmed()) {
+      stage = "close_debt";
+      auto cleanup = blockingWait(client->closeTruncateDebt(journal, deadline));
+      if (cleanup) progress = std::move(cleanup);
+      else observeFailure(cleanup.error().code(), false);
+    }
+    // Preserve the pre-close status even if closing subsequently fails.
+    if (!progress) observeFailure(progress.error().code(), false);
+    stage = "close_reader";
+    RETURN_ON_ERROR(closeReader(client));
+    if (progress && progress->observed && progress->observed->state != meta::EcFileTruncateState::Planned &&
+        progress->observed->outputDrained && progress->observed->sourceReleased) {
+      stage = "archive";
+      RETURN_ON_ERROR(state_->archiveOperation(s.directory,
+                                               path.filename().string(),
+                                               evidence("truncate", journal->record(), *progress->observed)));
+      s.debt = false;
+    }
+    stage = "result";
+    if (!progress) return makeError(std::move(progress.error()));
+    if (!progress->observed || progress->observed->state != meta::EcFileTruncateState::Published)
+      return makeError(StorageCode::kEcSealOutcomeUnknown);
+    return length;
+  };
+  try {
+    auto result = run();
+    if (!result) observeFailure(result.error().code(), false);
+    return result;
+  } catch (...) {
+    observeFailure(StatusCode::kIOError, true);
+    throw;
   }
-  RETURN_ON_ERROR(closeReader(client));
-  if (progress && progress->observed && progress->observed->state != meta::EcFileTruncateState::Planned &&
-      progress->observed->outputDrained && progress->observed->sourceReleased) {
-    RETURN_ON_ERROR(state_->archiveOperation(s.directory,
-                                             path.filename().string(),
-                                             evidence("truncate", journal->record(), *progress->observed)));
-    s.debt = false;
-  }
-  if (!progress) return makeError(std::move(progress.error()));
-  if (!progress->observed || progress->observed->state != meta::EcFileTruncateState::Published)
-    return makeError(StorageCode::kEcSealOutcomeUnknown);
-  return length;
 }
 CoTryTask<uint64_t> EcFileMount::truncate(EcMountHandle h, flat::UserInfo u, uint64_t n) {
   auto held = admit();

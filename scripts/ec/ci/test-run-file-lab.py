@@ -33,6 +33,62 @@ def passed_mount():
 
 
 class FileLabGates(unittest.TestCase):
+    def test_ec_failure_markers_keep_order_and_reject_unknown_or_partial_fields(self):
+        raw = (b'private prefix EC_FILE_MOUNT_FAILURE operation=truncate stage=guard code=100 '
+               b'debt=1 retained_reader=0 local_join_unconfirmed=0 exception=0\n'
+               b'EC_FILE_CALLBACK_FAILURE operation=setattr stage=truncate code=100 exception=0\n'
+               b'EC_FILE_CALLBACK_FAILURE operation=flush stage=recover code=101 exception=1\n')
+        rows = lab.ec_failure_markers(raw)
+        self.assertEqual([row['layer'] for row in rows], ['mount', 'callback', 'callback'])
+        self.assertTrue(rows[0]['debt'])
+        self.assertEqual(rows[1]['stage'], 'truncate')
+        self.assertTrue(rows[2]['exception'])
+        for changed in (raw.replace(b'code=100', b'code=9999999999'),
+                        raw.replace(b'stage=guard', b'stage=private_secret'),
+                        raw.replace(b'debt=1', b'debt=true')):
+            self.assertFalse(any(row['layer'] == 'mount' for row in lab.ec_failure_markers(changed)))
+        self.assertEqual(lab.ec_failure_markers(raw.splitlines()[1]), [])
+        self.assertEqual(len(lab.ec_failure_markers(raw * 10)), 8)
+        self.assertNotIn('private', json.dumps(rows))
+
+    def test_probe_failure_and_close_are_distinct_and_sink_text_stays_private(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp).resolve()
+            work = parent / 'mode4'
+            work.mkdir()
+            receipt = {'commands': [{'name': 'posix-prepare', 'sequence': 7, 'exitcode': 1, 'joined': True}]}
+            (work / 'result.json').write_text(json.dumps(receipt), encoding='utf-8')
+            rows = [dict(operation='open_append', state='operation_failed', expected_failure=True,
+                         failure_source='syscall', error_type='OSError', errno=errno.EOPNOTSUPP),
+                    dict(operation='ftruncate', state='operation_entered'),
+                    dict(operation='ftruncate', state='operation_failed', failure_source='syscall',
+                         expected_failure=False, error_type='OSError', errno=5),
+                    dict(operation='close', state='operation_entered'),
+                    dict(operation='close', state='operation_failed', failure_source='syscall',
+                         expected_failure=False, secondary=True, error_type='OSError', errno=6)]
+            (work / 'posix-prepare.jsonl').write_text('\n'.join(map(json.dumps, rows)), encoding='utf-8')
+            sink = {'operation': 'ftruncate', 'state': 'operation_confirmed',
+                    'evidence_error_type': 'OSError', 'evidence_errno': 28, 'token': 'SECRET'}
+            path = work / '007-posix-prepare.stderr'
+            path.write_text('PRIVATE traceback\nMODE4_PROBE_EVIDENCE_FAILURE ' + json.dumps(sink) + '\n', encoding='utf-8')
+            summary = lab.failure_evidence(parent, {'failure_phase': 'mode4-lifecycle'})['probes'][0]
+            self.assertEqual(summary['first_failed_operation'], 'ftruncate')
+            self.assertEqual(summary['errno'], 5)
+            self.assertEqual(summary['secondary_close_error'], {'error_type': 'OSError', 'errno': 6})
+            self.assertEqual(summary['last_entered_operation'], 'close')
+            self.assertEqual(summary['evidence_sink']['failures'][0]['evidence_errno'], 28)
+            for forbidden in ('SECRET', 'PRIVATE', str(parent)):
+                self.assertNotIn(forbidden, json.dumps(summary))
+            path.write_bytes(b'x' * 16384 + b'MODE4_PROBE_EVIDENCE_FAILURE ' + json.dumps(sink).encode() + b'\n')
+            self.assertEqual(lab.probe_sink_summary(path)['failures'], [])
+            self.assertTrue(lab.probe_sink_summary(path)['truncated'])
+            for sequence in (True, 0, 4097, '../secret'):
+                receipt['commands'][0]['sequence'] = sequence
+                (work / 'result.json').write_text(json.dumps(receipt), encoding='utf-8')
+                with mock.patch.object(lab, 'probe_sink_summary') as read:
+                    lab.failure_evidence(parent, {'failure_phase': 'mode4-lifecycle'})
+                    read.assert_not_called()
+
     def test_actual_lifecycle_preflight_failure_is_observed_without_a_result_receipt(self):
         spec = importlib.util.spec_from_file_location(
             'lifecycle_preflight_under_test', Path(__file__).parents[1] / 'cluster/mode4-lifecycle-acceptance.py')

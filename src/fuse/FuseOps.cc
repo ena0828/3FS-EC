@@ -325,6 +325,23 @@ void handle_ec_error(fuse_req_t req, const hf3fs::Result<T> &ret) {
   handle_error(req, ret, false, true);
 }
 
+// Fixed fields only: never copy a Status message, token, filename or payload
+// into the bounded public failure summary. Observation must not alter replies.
+void observeEcCallbackFailure(const char *operation,
+                              const char *stage,
+                              status_code_t code,
+                              bool exception = false) noexcept {
+  try {
+    XLOGF(ERR,
+          "EC_FILE_CALLBACK_FAILURE operation={} stage={} code={} exception={}",
+          operation,
+          stage,
+          code,
+          exception ? 1 : 0);
+  } catch (...) {
+  }
+}
+
 void notify_inval_inode(InodeId inodeId) { fuse_lowlevel_notify_inval_inode(d.se, linux_ino(inodeId), -1, 0); }
 
 void notify_inval_entry(InodeId parent, std::string name) {
@@ -864,37 +881,52 @@ void hf3fs_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr, int to_se
       fuse_reply_err(req, EINVAL);
       return;
     }
+    const char *stage = "handle";
     try {
       std::optional<EcMountHandle> temporary;
       auto handle = fi->fh ? reinterpret_cast<FileHandle *>(fi->fh)->ecFile : std::optional<EcMountHandle>{};
       if (!handle) {
+        stage = "open";
         auto opened = folly::coro::blockingWait(d.ecFiles->open(pi->inode, userInfo, O_WRONLY));
         if (!opened) {
+          observeEcCallbackFailure("setattr", stage, opened.error().code());
           handle_ec_error(req, opened);
           return;
         }
         handle = opened->handle;
         temporary = handle;
       }
+      stage = "truncate";
       auto result = folly::coro::blockingWait(d.ecFiles->truncate(*handle, userInfo, uint64_t(attr->st_size)));
+      if (!result) observeEcCallbackFailure("setattr", stage, result.error().code());
       if (temporary) {
+        stage = "temporary_release";
         auto closed = folly::coro::blockingWait(d.ecFiles->release(*temporary, userInfo));
-        if (!closed) reportEcLocalMaintenanceFailure();
+        if (!closed) {
+          observeEcCallbackFailure("setattr", stage, closed.error().code());
+          reportEcLocalMaintenanceFailure();
+        }
       }
       if (!result) {
+        stage = "error_reply";
         handle_error(req, result);
         return;
       }
+      stage = "observed_length";
       pi->dynamicAttr.wlock()->ecObservedLength = *result;
+      stage = "stat";
       auto observed = withRequestInfo(req, d.metaClient->stat(userInfo, ino, std::nullopt, false));
       if (!observed) {
+        observeEcCallbackFailure("setattr", stage, observed.error().code());
         handle_error(req, observed);
         return;
       }
+      stage = "reply";
       struct stat value {};
       fillLinuxStat(value, *observed);
       fuse_reply_attr(req, &value, 0);
     } catch (...) {
+      observeEcCallbackFailure("setattr", stage, StatusCode::kIOError, true);
       fuse_reply_err(req, EIO);
     }
     return;
@@ -1958,11 +1990,13 @@ void hf3fs_flush(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fi) {
       try {
         auto u = UserInfo(Uid(fuse_req_ctx(req)->uid), Gid(fuse_req_ctx(req)->gid), d.fuseToken);
         auto done = folly::coro::blockingWait(d.ecFiles->flush(*reinterpret_cast<FileHandle *>(fi->fh)->ecFile, u));
-        if (!done)
+        if (!done) {
+          observeEcCallbackFailure("flush", "recover", done.error().code());
           handle_ec_error(req, done);
-        else
+        } else
           fuse_reply_err(req, 0);
       } catch (...) {
+        observeEcCallbackFailure("flush", "callback", StatusCode::kIOError, true);
         fuse_reply_err(req, EIO);
       }
       return;
@@ -2026,11 +2060,13 @@ void hf3fs_release(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fi) {
         auto user = UserInfo(Uid(fuse_req_ctx(req)->uid), Gid(fuse_req_ctx(req)->gid), d.fuseToken);
         auto done =
             folly::coro::blockingWait(d.ecFiles->release(*reinterpret_cast<FileHandle *>(fi->fh)->ecFile, user));
-        if (!done)
+        if (!done) {
+          observeEcCallbackFailure("release", "close", done.error().code());
           handle_error(req, done);
-        else
+        } else
           fuse_reply_err(req, 0);
       } catch (...) {
+        observeEcCallbackFailure("release", "callback", StatusCode::kIOError, true);
         fuse_reply_err(req, EIO);
       }
       return;
