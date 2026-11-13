@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -117,6 +118,22 @@ def module(path, name):
     return result
 
 
+def revision_binding(revision, local_revision, environment):
+    expected = environment.get("GITHUB_SHA") if local_revision is None else local_revision
+    require(isinstance(expected, str) and re.fullmatch(r"[0-9a-f]{40}", expected)
+            and revision == expected, "source differs from the explicit or triggering revision")
+    return {"mode": "github-revision" if local_revision is None else "local-revision",
+            "expected_revision": expected}
+
+
+def local_build_root(build, uid, gid, euid, egid):
+    require(uid == euid != 0 and gid == egid, "local mode requires unchanged ordinary UID and GID")
+    info = build.parent.stat()
+    require(build.name == "build" and stat.S_ISDIR(info.st_mode)
+            and info.st_uid == euid and not (stat.S_IMODE(info.st_mode) & 0o077),
+            "local build parent must be a private same-user directory")
+
+
 def backend_property(xml, expected):
     require(expected in ("scalar", "isal"), "unknown expected backend")
     cases = [case for case in ET.parse(xml).getroot().iter("testcase")
@@ -202,6 +219,8 @@ def main():
     parser.add_argument("--work", required=True, type=Path)
     parser.add_argument("--backend", required=True, choices=("scalar", "isal"))
     parser.add_argument("--require-target-retirement", action="store_true")
+    parser.add_argument("--local-revision", help="explicit full source commit for an ordinary Linux acceptance host; "
+                        "omitting it keeps the GITHUB_SHA binding")
     args = parser.parse_args()
     require(sys.platform == "linux" and os.getuid() == os.geteuid() != 0, "ordinary Linux UID required")
     sys.dont_write_bytecode = True
@@ -211,7 +230,9 @@ def main():
     require(Path(__file__).resolve() == source / "scripts/ec/ci/run-native-regressions.py",
             "use the source-bound formal entry point")
     revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-    require(revision == os.environ.get("GITHUB_SHA"), "source differs from triggering revision")
+    binding = revision_binding(revision, args.local_revision, os.environ)
+    if args.local_revision is not None:
+        local_build_root(build, os.getuid(), os.getgid(), os.geteuid(), os.getegid())
     subprocess.run(["git", "-C", str(source), "diff", "--exit-code", "HEAD", "--ignore-submodules=all"],
                    check=True, stdout=subprocess.DEVNULL)
     record_path = build.parent / "provenance/native-build.json"
@@ -242,7 +263,8 @@ def main():
             "tests/storage/store/TestEcTargetRetirementExecutor.cc",
             "tests/storage/service/TestEcTargetRetirementService.cc",
         )})
-    report = {"schema": 1, "revision": revision, "backend": args.backend, "status": "incomplete",
+    report = {"schema": 1, "revision": revision, "revision_binding": binding,
+              "backend": args.backend, "status": "incomplete",
               "native_build_sha256": digest(record_path), "inputs_sha256": inputs,
               "target_retirement_required": args.require_target_retirement,
               "required_client_cases": sorted(CLIENT_MANDATORY),

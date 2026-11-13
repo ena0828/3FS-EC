@@ -7,7 +7,10 @@ import fnmatch
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import stat
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -26,6 +29,112 @@ budget = load("checked_system_budget", "system-job-budget.py")
 
 
 class SystemEntrypoints(unittest.TestCase):
+    def test_local_revision_is_explicit_and_never_falls_back_from_missing_hosted_identity(self):
+        revision = "a" * 40
+        self.assertEqual(regression.revision_binding(revision, None, {"GITHUB_SHA": revision}),
+                         {"mode": "github-revision", "expected_revision": revision})
+        for environment in ({}, {"GITHUB_SHA": "b" * 40}, {"GITHUB_SHA": revision[:12]}):
+            with self.subTest(environment=environment), self.assertRaises(ValueError):
+                regression.revision_binding(revision, None, environment)
+        # An explicit local identity never claims that a hosted job verified it.
+        self.assertEqual(regression.revision_binding(revision, revision, {"GITHUB_SHA": "b" * 40}),
+                         {"mode": "local-revision", "expected_revision": revision})
+        for expected in ("", revision[:12], "A" * 40, "b" * 40, True):
+            with self.subTest(expected=expected), self.assertRaises(ValueError):
+                regression.revision_binding(revision, expected, {})
+
+    def test_local_build_requires_private_same_user_parent_and_unchanged_identity(self):
+        build = Path("/private/build")
+        info = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=1100)
+        with mock.patch.object(type(build), "stat", return_value=info):
+            regression.local_build_root(build, 1100, 1200, 1100, 1200)
+            for identity in ((0, 0, 0, 0), (1101, 1200, 1100, 1200), (1100, 1201, 1100, 1200)):
+                with self.subTest(identity=identity), self.assertRaises(ValueError):
+                    regression.local_build_root(build, *identity)
+            with self.assertRaises(ValueError):
+                regression.local_build_root(build.with_name("elsewhere"), 1100, 1200, 1100, 1200)
+            for mode, owner in ((stat.S_IFDIR | 0o750, 1100), (stat.S_IFDIR | 0o700, 1101),
+                                (stat.S_IFREG | 0o700, 1100)):
+                info.st_mode, info.st_uid = mode, owner
+                with self.subTest(mode=mode, owner=owner), self.assertRaises(ValueError):
+                    regression.local_build_root(build, 1100, 1200, 1100, 1200)
+
+    def test_local_main_keeps_receipt_gates_and_original_driver_failure(self):
+        source = Path(__file__).resolve().parents[3]
+        core = load("local_regression_core", "run-core-tests.py")
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory(prefix="local native admission ") as folder:
+            root = Path(folder).resolve()
+            build, work = root / "build", root / "regressions"
+            (build / "tests").mkdir(parents=True)
+            (root / "provenance").mkdir()
+            cache = build / "CMakeCache.txt"
+            cache.write_bytes(b"test fixture, never a compiled binary")
+            binaries = {}
+            for target in regression.TARGETS:
+                path = build / "tests" / target
+                path.write_bytes(target.encode())
+                binaries[target] = regression.digest(path)
+            built = {"schema": 1, "revision": revision, "source": str(source), "build": str(build),
+                     "backend": "scalar", "isal": None, "ec_regression_targets_requested": True,
+                     "targets": list(regression.TARGETS), "binaries": binaries,
+                     "build_script_sha256": regression.digest(source / "scripts/ec/ci/build-native.sh"),
+                     "cmake_cache_sha256": regression.digest(cache)}
+            receipt = root / "provenance/native-build.json"
+            def failed_driver(argv):
+                output = Path(argv[argv.index("--output") + 1])
+                output.mkdir()
+                (output / "results.json").write_text(json.dumps({"status": "failed", "exitcode": 1}))
+                return 1
+            common = SimpleNamespace(main=mock.Mock(side_effect=failed_driver))
+            def selected_module(path, name):
+                return core if path.name == "run-core-tests.py" else common
+            def command(argv, **kwargs):
+                self.assertIn(argv[0], ("git", "ldd"))
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            argv = ["regressions", "--source", str(source), "--build", str(build), "--work", str(work),
+                    "--backend", "scalar", "--local-revision", revision]
+            with mock.patch.object(regression.sys, "argv", argv), \
+                 mock.patch.object(regression.sys, "platform", "linux"), \
+                 mock.patch.object(regression.os, "getuid", return_value=1100, create=True), \
+                 mock.patch.object(regression.os, "geteuid", return_value=1100, create=True), \
+                 mock.patch.object(regression.os, "getgid", return_value=1200, create=True), \
+                 mock.patch.object(regression.os, "getegid", return_value=1200, create=True), \
+                 mock.patch.object(regression.os, "umask"), \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(regression, "module", side_effect=selected_module), \
+                 mock.patch.object(regression, "local_build_root") as private, \
+                 mock.patch.object(regression.subprocess, "check_output", return_value=revision + "\n"), \
+                 mock.patch.object(regression.subprocess, "run", side_effect=command), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                for mutation in ("revision", "binary", "cache", "build-script"):
+                    changed = copy.deepcopy(built)
+                    if mutation == "revision":
+                        changed["revision"] = "b" * 40
+                    elif mutation == "binary":
+                        changed["binaries"][regression.TARGETS[0]] = "0" * 64
+                    elif mutation == "cache":
+                        changed["cmake_cache_sha256"] = "0" * 64
+                    else:
+                        changed["build_script_sha256"] = "0" * 64
+                    receipt.write_text(json.dumps(changed))
+                    with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                        regression.main()
+                    self.assertFalse(work.exists())
+                    common.main.assert_not_called()
+                receipt.write_text(json.dumps(built))
+                self.assertEqual(regression.main(), 1)
+                private.assert_called_with(build, 1100, 1200, 1100, 1200)
+            common.main.assert_called_once_with([
+                "--bin-dir", str(build / "tests"), "--tmp-root", str(work / "tmp"),
+                "--output", str(work / "tests"), "--suite", "all", "--include-legacy", "--timeout", "300"])
+            report = json.loads((work / "result.json").read_text())
+            self.assertEqual(report["revision_binding"], {"mode": "local-revision", "expected_revision": revision})
+            self.assertEqual(report["driver_exitcode"], 1)
+            self.assertEqual(report["status"], "incomplete")
+            self.assertNotIn("passed", report)
+            self.assertEqual(report["native_build_sha256"], regression.digest(receipt))
+
     def test_required_target_retirement_cases_are_selected_by_real_driver(self):
         driver = regression.module(Path(__file__).parent.parent / "test-native-fragments.py", "retirement_native_driver")
         filters = {"storage": driver.STORAGE_FILTER, "service": driver.SERVICE_FILTER, "client": driver.CLIENT_FILTER}
