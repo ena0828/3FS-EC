@@ -1,0 +1,124 @@
+name: EC integrated native and fault acceptance
+
+on:
+  push:
+    branches: [feat/ec-system-acceptance]
+    paths:
+      - .github/workflows/ec-hosted-system.yml
+      - scripts/ec/**
+      - src/**
+      - tests/**
+      - cmake/**
+      - configs/**
+      - patches/**
+      - third_party/**
+      - benchmarks/**/CMakeLists.txt
+      - CMakeLists.txt
+      - Cargo.toml
+      - Cargo.lock
+      - .gitmodules
+      - '!**/*.md'
+      - '!**/*.rst'
+      - '!**/README*'
+      - '!**/docs/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ec-hosted-system-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    if: github.repository == 'ena0828/3FS-EC' && github.ref == 'refs/heads/feat/ec-system-acceptance' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    # Step caps share this limit. The file/spare gates may refuse admission;
+    # neither an estimate nor a platform timeout proves completed cleanup.
+    steps:
+      - name: Check out this revision and pinned submodules
+        timeout-minutes: 10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: recursive
+          lfs: false
+          persist-credentials: false
+
+      - name: Record the running job time anchor
+        timeout-minutes: 2
+        shell: bash
+        run: python3 -B scripts/ec/ci/system-job-budget.py record
+
+      - name: Check changed build and ownership entry points without native services
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          python3 -B scripts/ec/ci/test-build-native.py -v
+          python3 -B scripts/ec/ci/test-system-entrypoints.py -v
+          python3 -B scripts/ec/ci/test-run-file-lab.py -v
+          python3 -B scripts/ec/ci/test-run-spare-lab.py -v
+          python3 -B scripts/ec/cluster/test-native-spare-storage.py -v
+          python3 -B scripts/ec/cluster/test-portable-experiments.py -v
+
+      - name: Build one ISA-L configuration for core regressions and both labs
+        timeout-minutes: 240
+        shell: bash
+        run: bash scripts/ec/ci/build-native.sh --backend isal --with-lab-targets --with-ec-regression-targets
+
+      - name: Run native Storage service client and legacy regressions
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          uid=$(id -u)
+          gid=$(id -g)
+          runner_user=$(id -un)
+          runner_home=$HOME
+          test "$uid" -ne 0
+          sudo -n prlimit --memlock=3221225472:3221225472 --nofile=65536:65536 -- \
+            setpriv --reuid="$uid" --regid="$gid" --init-groups \
+            env HOME="$runner_home" USER="$runner_user" LOGNAME="$runner_user" \
+            GITHUB_SHA="$GITHUB_SHA" LD_LIBRARY_PATH=/usr/local/lib /usr/bin/python3 -B \
+            "$GITHUB_WORKSPACE/scripts/ec/ci/run-native-regressions.py" \
+            --source "$GITHUB_WORKSPACE" --build "$RUNNER_TEMP/ec-native/build" \
+            --work "$RUNNER_TEMP/ec-native/regressions" --backend isal
+
+      - name: Run private FDB native file cases and FUSE components
+        timeout-minutes: 95
+        shell: bash
+        run: |
+          uid=$(id -u)
+          gid=$(id -g)
+          runner_user=$(id -un)
+          runner_home=$HOME
+          test "$uid" -ne 0
+          sudo -n prlimit --memlock=3221225472:3221225472 --nofile=65536:65536 -- \
+            setpriv --reuid="$uid" --regid="$gid" --init-groups \
+            env HOME="$runner_home" USER="$runner_user" LOGNAME="$runner_user" \
+            LD_LIBRARY_PATH=/usr/local/lib /usr/bin/python3 -B \
+            "$GITHUB_WORKSPACE/scripts/ec/ci/run-core-tests.py" \
+            --source "$GITHUB_WORKSPACE" --build "$RUNNER_TEMP/ec-native/build" \
+            --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
+            --work "$RUNNER_TEMP/ec-native/acceptance"
+
+      - name: Run file CLI and same-state POSIX and USRBIO remount
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          python3 -B scripts/ec/ci/system-job-budget.py check --stage file
+          exec python3 -B scripts/ec/ci/run-file-lab.py \
+            --source "$GITHUB_WORKSPACE" --build "$RUNNER_TEMP/ec-native/build" \
+            --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
+            --core-record "$RUNNER_TEMP/ec-native/acceptance/results.json"
+
+      - name: Run central two-Storage faults with spare placement and original-instance recovery
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          python3 -B scripts/ec/ci/system-job-budget.py check --stage spare
+          exec python3 -B scripts/ec/ci/run-spare-lab.py \
+            --source "$GITHUB_WORKSPACE" --build "$RUNNER_TEMP/ec-native/build" \
+            --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
+            --core-record "$RUNNER_TEMP/ec-native/acceptance/results.json" \
+            --strategy central --failures 2

@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Bind existing Storage/service/client regressions to one native build.
+
+This delegates the actual tests and process cleanup to test-native-fragments.py.
+It checks the production C++ wrapper's backend property and loader resolution;
+it does not run a benchmark or certify the SIMD kernel chosen by ISA-L.
+"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+
+TARGETS = ("test_storage_store", "test_storage_service", "test_client")
+BACKEND_CASE = "TestEcCodec.IndependentGoldenVectorEmptyInputAndOwnedOutput"
+MANDATORY = {
+    "TestEcCodec." + name for name in (
+        "IndependentGoldenVectorEmptyInputAndOwnedOutput",
+        "RecoversAllSixtySixTenSourceSetsInArbitraryOrder",
+        "RejectsParityCorruptionAndEvenSelfConsistentNonzeroPadding",
+        "HelperContributionsReconstructOrderedTargetsAndSlices",
+        "RejectsInvalidShapeSourcesAndUnsupportedFormats",
+        "ContributionValidatesPlanAndOneMiBInputBound",
+    )
+} | {
+    "TestEcRmw." + name for name in (
+        "ExactPlanRightsPatchAndSparseTail",
+        "DataRecoveryUsesParityAndKeepsReadOomDistinctFromMutationUnknown",
+        "ShortSubmitAndStopJoinTheActualOwnedTask",
+    )
+} | {"TestChunkEngine.ReadWrite", "TestStorageTarget.ReadWrite", "TestStorageTarget.Uncommitted"}
+
+
+def require(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(result)
+    return result
+
+
+def backend_property(xml, expected):
+    require(expected in ("scalar", "isal"), "unknown expected backend")
+    cases = [case for case in ET.parse(xml).getroot().iter("testcase")
+             if case.get("classname", "") + "." + case.get("name", "") == BACKEND_CASE]
+    require(len(cases) == 1, "production backend observation case missing or repeated")
+    case = cases[0]
+    require(case.get("status") == "run" and case.get("result") != "skipped"
+            and not any(case.findall(tag) for tag in ("failure", "error", "skipped")),
+            "backend observation case did not execute successfully")
+    values = [prop.get("value") for prop in case.findall("./properties/property")
+              if prop.get("name") == "ec_codec_backend"]
+    require(values == [expected], "production C++ wrapper backend differs from build choice")
+    return values[0]
+
+
+def check_suites(record, build, built):
+    require(record.get("status") == "passed" and record.get("exitcode") == 0
+            and record.get("failures") == [], "native regression driver failed")
+    suites = record.get("suites", [])
+    require([row.get("suite") for row in suites] == ["storage", "service", "client"],
+            "required regression suites omitted or repeated")
+    for row, target in zip(suites, TARGETS, strict=True):
+        require(row.get("status") == "passed" and row.get("failures") == []
+                and row.get("binary") == str(build / "tests" / target)
+                and row.get("binary_sha256") == row.get("binary_sha256_after") == built["binaries"][target],
+                "regression result is not bound to the current target")
+        selected = [case["name"] for case in row["listed_tests"] if not case["disabled"]]
+        cases = row["xml_results"]["cases"]
+        actual = [case["name"] for case in cases]
+        require(selected and len(set(selected)) == len(selected) and sorted(actual) == sorted(selected)
+                and all(case["executed"] and not case["failed"] and not case["skipped"] for case in cases),
+                "regression XML differs from the actual nonempty listing")
+        for phase in ("listing", "execution"):
+            cmd = row[phase]
+            require(cmd.get("exitcode") == 0 and not any(cmd.get(key) for key in
+                    ("timed_out", "interrupted", "launch_error", "termination")),
+                    "regression command was incomplete or required forced cleanup")
+    names = {case["name"] for case in suites[0]["xml_results"]["cases"]}
+    require(MANDATORY <= names, "codec/RMW/legacy storage coverage is incomplete")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--build", required=True, type=Path)
+    parser.add_argument("--work", required=True, type=Path)
+    parser.add_argument("--backend", required=True, choices=("scalar", "isal"))
+    args = parser.parse_args()
+    require(sys.platform == "linux" and os.getuid() == os.geteuid() != 0, "ordinary Linux UID required")
+    sys.dont_write_bytecode = True
+    os.umask(0o077)
+    core = module(Path(__file__).with_name("run-core-tests.py"), "regression_core")
+    source, build = map(core.existing_path, (args.source, args.build))
+    require(Path(__file__).resolve() == source / "scripts/ec/ci/run-native-regressions.py",
+            "use the source-bound formal entry point")
+    revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    require(revision == os.environ.get("GITHUB_SHA"), "source differs from triggering revision")
+    subprocess.run(["git", "-C", str(source), "diff", "--exit-code", "HEAD", "--ignore-submodules=all"],
+                   check=True, stdout=subprocess.DEVNULL)
+    record_path = build.parent / "provenance/native-build.json"
+    built = json.loads(record_path.read_text(encoding="utf-8"))
+    require(built.get("schema") == 1 and built.get("revision") == revision
+            and built.get("source") == str(source) and built.get("build") == str(build)
+            and built.get("backend") == args.backend and built.get("ec_regression_targets_requested") is True,
+            "explicit regression build receipt differs")
+    require(built["build_script_sha256"] == digest(source / "scripts/ec/ci/build-native.sh")
+            and built["cmake_cache_sha256"] == digest(build / "CMakeCache.txt"), "build inputs changed")
+    for target in TARGETS:
+        require(target in built["targets"] and digest(core.existing_path(build / "tests" / target)) == built["binaries"][target],
+                "regression executable differs from build receipt")
+    work = args.work
+    require(work.is_absolute() and work == build.parent / "regressions" and not os.path.lexists(work),
+            "fresh fixed regression directory required")
+    work.mkdir(mode=0o700)
+    (work / "tmp").mkdir(mode=0o700)
+    inputs = {str(path): digest(path) for path in (
+        Path(__file__), source / "scripts/ec/test-native-fragments.py", record_path,
+        source / "tests/storage/store/TestEcCodec.cc", source / "tests/storage/store/TestEcRmw.cc")}
+    report = {"schema": 1, "revision": revision, "backend": args.backend, "status": "incomplete",
+              "native_build_sha256": digest(record_path), "inputs_sha256": inputs,
+              "scope": "native functional regressions; not a benchmark or real Storage process fault"}
+    result = 1
+    try:
+        os.environ.pop("LD_PRELOAD", None)
+        os.environ.pop("LD_AUDIT", None)
+        os.environ["LD_LIBRARY_PATH"] = "/usr/local/lib"
+        loader = subprocess.run(["ldd", str(build / "tests/test_storage_store")], capture_output=True,
+                                text=True, timeout=30, check=True)
+        (work / "ldd.stdout").write_text(loader.stdout, encoding="utf-8")
+        (work / "ldd.stderr").write_text(loader.stderr, encoding="utf-8")
+        require("not found" not in loader.stdout, "native test loader dependency missing")
+        providers = re.findall(r"^\s*libisal\.so(?:\.\d+)*\s+=>\s+(/\S+)\s+\(", loader.stdout, re.M)
+        if args.backend == "isal":
+            require(len(providers) == 1, "exactly one ISA-L dependency required")
+            provider = Path(providers[0]).resolve(strict=True)
+            require(str(provider) == built["isal"]["provider"]["path"]
+                    and digest(provider) == built["isal"]["provider"]["sha256"], "ISA-L loader provider differs")
+            report["isal_provider"] = built["isal"]["provider"]
+        else:
+            require(not providers and built.get("isal") is None, "Scalar build unexpectedly links ISA-L")
+        common = module(source / "scripts/ec/test-native-fragments.py", "system_native_fragments")
+        report["driver_exitcode"] = common.main([
+            "--bin-dir", str(build / "tests"), "--tmp-root", str(work / "tmp"),
+            "--output", str(work / "tests"), "--suite", "all", "--include-legacy", "--timeout", "300"])
+        receipt = work / "tests/results.json"
+        actual = json.loads(receipt.read_text(encoding="utf-8"))
+        report["regressions"] = actual
+        report["regression_receipt_sha256"] = digest(receipt)
+        require(report["driver_exitcode"] == 0, "existing native regression driver returned nonzero")
+        check_suites(actual, build, built)
+        report["actual_backend"] = backend_property(work / "tests/storage.xml", args.backend)
+        report["evidence_sha256"] = {str(path): digest(path) for path in sorted((work / "tests").glob("*"))
+                                     if path.is_file()}
+        if args.backend == "isal":
+            require(digest(provider) == built["isal"]["provider"]["sha256"], "ISA-L library changed during tests")
+        require(all(digest(Path(path)) == value for path, value in inputs.items()), "regression input changed")
+        report.update(status="passed", passed=sum(row["executed_count"] for row in actual["suites"]))
+        result = 0
+    except BaseException as error:
+        report["error"] = {"type": type(error).__name__, "message": str(error)[:500]}
+    finally:
+        path = work / "result.json"
+        with path.open("x", encoding="utf-8") as stream:
+            json.dump(report, stream, indent=2)
+            stream.write("\n")
+        print(json.dumps({"native_ec_regressions": report, "receipt_sha256": digest(path)}), flush=True)
+    return result
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print(json.dumps({"native_regression_admission": "failed", "error_type": type(error).__name__}))
+        sys.exit(1)

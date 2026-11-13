@@ -3,11 +3,35 @@
 set -euo pipefail
 umask 077
 with_lab=false
-if [[ "${1:-}" == --with-lab-targets && "$#" == 1 ]]; then
-    with_lab=true
-elif (($#)); then
-    echo 'Usage: build-native.sh [--with-lab-targets]' >&2; exit 2
-fi
+with_regression=false
+backend=scalar
+backend_seen=false
+usage() {
+    echo 'Usage: build-native.sh [--backend scalar|isal] [--with-lab-targets] [--with-ec-regression-targets]' >&2
+}
+while (($#)); do
+    case "$1" in
+        --backend)
+            if "$backend_seen" || (($# < 2)) || [[ "$2" != scalar && "$2" != isal ]]; then
+                usage; exit 2
+            fi
+            backend="$2"
+            backend_seen=true
+            shift 2
+            ;;
+        --with-lab-targets)
+            if "$with_lab"; then usage; exit 2; fi
+            with_lab=true
+            shift
+            ;;
+        --with-ec-regression-targets)
+            if "$with_regression"; then usage; exit 2; fi
+            with_regression=true
+            shift
+            ;;
+        *) usage; exit 2 ;;
+    esac
+done
 
 [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_OS:-}" == Linux ]] || {
     echo "This entry point requires a fresh Linux GitHub-hosted job" >&2; exit 2;
@@ -44,6 +68,7 @@ sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
     patches/apply.sh patches/folly.patch patches/rocksdb.patch patches/rocksdb.patch.2 \
     cmake/AddCrate.cmake cmake/ApacheArrow.cmake cmake/Jemalloc.cmake \
     scripts/ec/ci/build-native.sh scripts/ec/ci/run-core-tests.py \
+    scripts/ec/ci/prepare-isal.py scripts/ec/reference/downloads.json cmake/EcCodecBackend.cmake \
     .github/workflows/ec-hosted-native.yml | tee "$work/provenance/build-inputs.sha256"
 
 # Reuse the repository's dependency set, including Arrow's transitive closure.
@@ -188,6 +213,16 @@ with (provenance / 'fdb-link-probe.json').open('x') as stream:
 print(json.dumps(record))
 PY
 
+# Prepare the same official private provider validated by run-codec-tests.py.
+# The codec runner's preparation is inside main; keep that passed entry unchanged.
+backend_cmake_args=("-DHF3FS_EC_BACKEND=$backend")
+if [[ "$backend" == isal ]]; then
+    python3 -B "$source_root/scripts/ec/ci/prepare-isal.py" --source "$source_root" --work "$work"
+    backend_cmake_args+=("-DHF3FS_EC_ISAL_ROOT=$work/isal-prefix")
+else
+    backend_cmake_args+=("-DHF3FS_EC_ISAL_ROOT=")
+fi
+
 # Ubuntu 24.04's libfuse 3.14 is below this tree's required >= 3.16.1.
 fuse_revision=7a92727d97c10290b3501d86a194738973edb61d
 git init -q "$work/libfuse"
@@ -204,8 +239,8 @@ sudo -n ldconfig
 printf 'libfuse_revision=%s libfuse_version=%s\n' "$fuse_revision" "$(pkg-config --modversion fuse3)"
 sha256sum /usr/local/lib/libfuse3.so.3 /usr/local/lib/libfdb_c.so
 
-# Preserve both checked-in locks. The local wrapper also adds --locked to
-# CMake's existing cargo build commands; no production CMake edit is needed.
+# Preserve both checked-in locks. AddCrate already passes --locked; the wrapper
+# adds it only when absent from another build caller, without duplicating it.
 export RUSTUP_TOOLCHAIN=1.99.1
 rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 export EC_REAL_CARGO
@@ -221,6 +256,11 @@ cat > "$work/bin/cargo" <<'SH'
 set -euo pipefail
 if [[ "${1:-}" == build ]]; then
     shift
+    for argument in "$@"; do
+        if [[ "$argument" == --locked ]]; then
+            exec "${EC_REAL_CARGO:?}" build "$@"
+        fi
+    done
     exec "${EC_REAL_CARGO:?}" build --locked "$@"
 fi
 exec "${EC_REAL_CARGO:?}" "$@"
@@ -250,8 +290,11 @@ cmake -S "$source_root" -B "$work/build" -G Ninja \
     -DFOLLY_CXX_FLAGS=-g0 -DSHUFFLE_METHOD=g++11 -DENABLE_FUSE_APPLICATION=ON \
     '-DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/lib' \
     '-DCMAKE_SHARED_LINKER_FLAGS=-L/usr/local/lib' \
-    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DHF3FS_EXTERNAL_BUILD_JOBS=1
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DHF3FS_EXTERNAL_BUILD_JOBS=1 "${backend_cmake_args[@]}"
 cmake --build "$work/build" --parallel 1 --target test_meta test_fuse_ec
+if "$with_regression"; then
+    cmake --build "$work/build" --parallel 1 --target test_storage_store test_storage_service test_client
+fi
 if "$with_lab"; then
     cmake --build "$work/build" --parallel 1 --target storage_main mgmtd_main meta_main admin_cli \
         ec_stripe_cli ec_file_cli hf3fs_fuse_main ec_mount_read_probe
@@ -264,28 +307,70 @@ git diff --exit-code HEAD --ignore-submodules=all
 sha256sum "$work/build/CMakeCache.txt" "$work/build/compile_commands.json" \
     "$work/build/tests/test_meta" "$work/build/tests/test_fuse_ec"
 du -sh -- "$work/build" "$work/cargo-target" "$work/cargo-home" "$work/fdb"
-if "$with_lab"; then
-    python3 - "$source_root" "$work" <<'PY'
+# Keep the existing eight-binary lab receipt contract; additionally bind every
+# requested test target and the selected backend in an always-written receipt.
+python3 - "$source_root" "$work" "$backend" "$with_lab" "$with_regression" <<'PY'
 from pathlib import Path
 import hashlib
 import json
 import os
 import sys
-source, work = map(Path, sys.argv[1:])
-names = ('storage_main', 'mgmtd_main', 'meta_main', 'admin_cli', 'ec_stripe_cli',
-         'ec_file_cli', 'hf3fs_fuse_main', 'ec_mount_read_probe')
+source, work = map(Path, sys.argv[1:3])
+backend, with_lab, with_regression = sys.argv[3:]
+lab_names = ('storage_main', 'mgmtd_main', 'meta_main', 'admin_cli', 'ec_stripe_cli',
+             'ec_file_cli', 'hf3fs_fuse_main', 'ec_mount_read_probe')
+tests = ['test_meta', 'test_fuse_ec']
+if with_regression == 'true':
+    tests += ['test_storage_store', 'test_storage_service', 'test_client']
 def sha(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
-record = {'schema': 1, 'source': str(source), 'revision': os.environ['GITHUB_SHA'],
-          'build': str(work / 'build'), 'targets': list(names),
-          'binaries': {name: sha(work / 'build/bin' / name) for name in names},
+cache = (work / 'build/CMakeCache.txt').read_text()
+if ('HF3FS_EC_BACKEND:STRING=' + backend + '\n') not in cache:
+    raise SystemExit('Configured CMake backend differs from request')
+isal = None
+if backend == 'isal':
+    receipt = work / 'provenance/isal-prepare.json'
+    isal = json.loads(receipt.read_text())
+    provider = Path(isal['provider']['path'])
+    prefix = work / 'isal-prefix'
+    if (isal['status'] != 'private-packages-prepared-not-executed' or isal['backend'] != 'isal'
+            or isal['prefix'] != str(prefix) or provider.resolve(strict=True) != provider
+            or provider != prefix / 'usr/lib/x86_64-linux-gnu/libisal.so.2.0.31'
+            or (prefix / 'usr/lib/x86_64-linux-gnu/libisal.so').resolve(strict=True) != provider
+            or sha(provider) != isal['provider']['sha256']
+            or sha(provider) != '40ccd5e5abaff0451feff750d2b011370a546ac4706d1b06b9285ac26eda2c3c'
+            or sha(source / 'scripts/ec/reference/downloads.json') != isal['source_lock_sha256']
+            or sha(source / 'scripts/ec/ci/prepare-isal.py') != isal['helper_sha256']
+            or ('HF3FS_EC_ISAL_ROOT:PATH=' + str(prefix) + '\n') not in cache):
+        raise SystemExit('Private ISA-L build input/provider changed')
+    isal = {'prefix': str(prefix), 'provider': isal['provider'], 'prepare_receipt_sha256': sha(receipt),
+            'source_lock_sha256': isal['source_lock_sha256']}
+paths = {name: work / 'build/tests' / name for name in tests}
+if with_lab == 'true':
+    paths.update({name: work / 'build/bin' / name for name in lab_names})
+if not all(path.is_file() and os.access(path, os.X_OK) for path in paths.values()):
+    raise SystemExit('A requested build target is not an executable file')
+common = {'schema': 1, 'source': str(source), 'revision': os.environ['GITHUB_SHA'],
+          'build': str(work / 'build'), 'backend': backend, 'isal': isal,
           'build_script_sha256': sha(source / 'scripts/ec/ci/build-native.sh'),
+          'cmake_cache_sha256': sha(work / 'build/CMakeCache.txt'),
           'acceptance_executed': False}
-with (work / 'provenance/lab-build.json').open('x') as out:
+record = dict(common, targets=list(paths), binaries={name: sha(path) for name, path in paths.items()},
+              ec_regression_targets_requested=with_regression == 'true', lab_targets_requested=with_lab == 'true')
+path = work / 'provenance/native-build.json'
+with path.open('x') as out:
     json.dump(record, out, indent=2)
     out.write('\n')
-print('lab-build receipt sha256=' + sha(work / 'provenance/lab-build.json'))
+print(json.dumps({'native_build': record, 'receipt_sha256': sha(path)}))
+if with_lab == 'true':
+    lab = dict(common, targets=list(lab_names),
+               binaries={name: record['binaries'][name] for name in lab_names},
+               native_build_receipt_sha256=sha(path))
+    path = work / 'provenance/lab-build.json'
+    with path.open('x') as out:
+        json.dump(lab, out, indent=2)
+        out.write('\n')
+    print('lab-build receipt sha256=' + sha(path))
 PY
-fi
 printf 'Requested build targets completed; acceptance and actual mounts are separate.\n'

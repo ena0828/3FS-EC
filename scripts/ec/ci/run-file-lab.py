@@ -166,34 +166,46 @@ def tree_rows(root, uid, *, retain=False):
                 os.close(fd)
 
 
-def handoff_shape(parent, request):
-    require(re.fullmatch(r'ec-h-[1-9][0-9]*-[1-9][0-9]*', parent.name) is not None
+def handoff_shape(parent, request, *, suffix=''):
+    require(suffix == '' or re.fullmatch(r'-spare-(central|pipeline|helper)-[12]', suffix) is not None,
+            'invalid fixed handoff suffix')
+    if suffix:
+        require(request.get('strategy') in ('central', 'pipeline', 'helper')
+                and type(request.get('failures')) is int and request['failures'] in (1, 2)
+                and suffix == '-spare-' + request['strategy'] + '-' + str(request['failures']),
+                'handoff suffix differs from the requested fault case')
+    require(re.fullmatch(r'ec-h-[1-9][0-9]*-[1-9][0-9]*' + re.escape(suffix), parent.name) is not None
             and parent.parent == Path('/tmp'), 'handoff path must be the fixed fresh CI root')
     require(type(request['schema']) is int and request['schema'] == 1 and request['parent'] == str(parent)
             and request['creator_uid'] == 1001 and request['target_uid'] == 1000,
             'handoff identity differs')
-    require(parent.name == 'ec-h-' + request['run_id'] + '-' + request['run_attempt'], 'run identity differs')
+    require(parent.name == 'ec-h-' + request['run_id'] + '-' + request['run_attempt'] + suffix, 'run identity differs')
     paths = [row['path'] for row in request['inventory']]
     require(len(paths) == len(set(paths)) and '.' in paths, 'duplicate or missing inventory root')
     require(all(p == '.' or (not p.startswith('/') and all(part not in ('', '.', '..')
                 for part in p.split('/'))) for p in paths), 'inventory path escapes root')
 
 
-def privileged_handoff(parent, expected_sha):
+def privileged_handoff(parent, expected_sha, *, suffix='', driver_name='run-file-lab.py'):
     phase('uid-handoff')
     require(os.getuid() == os.geteuid() == 0, 'handoff requires the scoped sudo invocation')
     private(parent, 1001)
     request_path = parent / 'handoff-request.json'
     require(sha(request_path) == expected_sha, 'handoff request hash differs')
     request = read_json(request_path)
-    handoff_shape(parent, request)
+    require((not suffix and driver_name == 'run-file-lab.py')
+            or (bool(suffix) and driver_name == 'run-spare-lab.py'), 'unexpected handoff driver')
+    handoff_shape(parent, request, suffix=suffix)
     info = parent.stat()
     require([info.st_dev, info.st_ino] == request['parent_identity'], 'original directory was replaced')
     rows, fds = tree_rows(parent, 1001, retain=True)
     try:
         require([row for row in rows if row['path'] != 'handoff-request.json'] == request['inventory'],
                 'fresh tree differs from the pre-handoff inventory')
-        require(sha(parent / 'tools/run-file-lab.py') == request['driver_sha256'], 'copied driver differs')
+        require(sha(parent / 'tools' / driver_name) == request['driver_sha256'], 'copied driver differs')
+        if suffix:
+            require(sha(parent / 'tools/run-file-lab.py') == request['shared_driver_sha256'],
+                    'copied shared handoff driver differs')
         # Refuse to borrow an account that already owns unrelated live work.
         for path in Path('/proc').iterdir():
             if path.name.isdecimal():
@@ -270,6 +282,31 @@ def require_cli_result(value):
     require(value.get('success') is True and value.get('failure') is None
             and value.get('all_owned_children_joined') is True and value.get('steps'), 'CLI phase incomplete')
     require(all(step.get('checks_complete') is True for step in value['steps']), 'CLI step lacks checks')
+
+
+def package_backend_gate(built, package, lab):
+    """Bind an explicitly selected codec provider; legacy receipts stay unlabelled."""
+    if 'backend' not in built and 'isal' not in built:
+        return {'backend': 'unrecorded', 'provider_verified': False}
+    require(built.get('backend') in ('scalar', 'isal') and 'isal' in built, 'incomplete codec backend receipt')
+    files = package.get('files', {})
+    isal_files = {name for name in files if Path(name).name.startswith('libisal')}
+    if built['backend'] == 'scalar':
+        require(built['isal'] is None and not isal_files, 'Scalar package must not carry ISA-L')
+        return {'backend': 'scalar', 'provider_verified': False}
+    require(isal_files == {'lib/libisal.so.2'} and type(built['isal']) is dict, 'ISA-L package provider missing or ambiguous')
+    provider = built['isal'].get('provider', {})
+    require(type(provider.get('path')) is str and type(provider.get('sha256')) is str
+            and re.fullmatch(r'[0-9a-f]{64}', provider['sha256']) is not None, 'invalid bound ISA-L provider')
+    item = files['lib/libisal.so.2']
+    expected = canonical(Path(provider['path']))
+    actual = canonical(Path(item['source']))
+    require(actual == expected and item.get('kind') == 'shared-library'
+            and item.get('sha256') == provider['sha256']
+            and sha(actual) == sha(canonical(lab / 'lib/libisal.so.2')) == provider['sha256'],
+            'packaged ISA-L source or bytes differ from the selected build')
+    return {'backend': 'isal', 'provider_verified': True, 'provider_source': str(expected),
+            'packaged_provider': str(lab / 'lib/libisal.so.2'), 'provider_sha256': provider['sha256']}
 
 
 def require_mount_result(value):
@@ -554,6 +591,7 @@ def prepare(args):
         require({Path(p).name for p, item in package['files'].items() if item['kind'] == 'service'} == set(TARGETS),
                 'package runtime target set differs')
         require('scripts/mode4-lifecycle-acceptance.py' in package['files'], 'lifecycle must be in formal package manifest')
+        backend_validation = package_backend_gate(built, package, lab)
         phase('copy-fdb')
         for name in ('fdbserver', 'fdbcli'):
             copy_new(fdb / name, lab / 'bin' / name, 0o755)
@@ -565,6 +603,7 @@ def prepare(args):
         request = {'schema': 1, 'parent': str(parent), 'parent_identity': [parent.stat().st_dev, parent.stat().st_ino],
                    'creator_uid': 1001, 'target_uid': 1000, 'run_id': run_id, 'run_attempt': attempt,
                    'revision': revision, 'core': core, 'driver_sha256': driver_sha,
+                   'backend_validation': backend_validation,
                    'package_manifest_sha256': sha(manifests[0]), 'lab_build_sha256': sha(work / 'provenance/lab-build.json'),
                    'inventory': tree_rows(parent, 1001)}
         write_new(parent / 'handoff-request.json', request)

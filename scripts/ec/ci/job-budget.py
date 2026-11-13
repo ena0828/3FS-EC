@@ -23,6 +23,7 @@ import urllib.request
 
 REPO = 'ena0828/3FS-EC'
 JOB = 'native'  # The workflow must keep this unique display name as well.
+REF = 'refs/heads/feat/ec-distributed'
 API_VERSION = '2026-03-10'
 JOB_MINUTES = 350
 REQUIRED_MINUTES = 50
@@ -72,7 +73,7 @@ def context():
             'ordinary hosted Linux UID1001 required')
     expected = {'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'Linux', 'RUNNER_ENVIRONMENT': 'github-hosted',
                 'GITHUB_REPOSITORY': REPO, 'GITHUB_JOB': JOB, 'GITHUB_EVENT_NAME': 'push',
-                'GITHUB_REF': 'refs/heads/feat/ec-distributed'}
+                'GITHUB_REF': REF}
     require(all(os.environ.get(k) == v for k, v in expected.items()), 'unexpected hosted job context')
     run, attempt = (os.environ.get(k, '') for k in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'))
     require(all(re.fullmatch(r'[1-9][0-9]*', x) for x in (run, attempt)), 'invalid run identity')

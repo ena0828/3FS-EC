@@ -20,6 +20,11 @@ std::vector<EcCodecShardView> views(const EcCodec::Shards &shards) {
 }
 
 TEST(TestEcCodec, IndependentGoldenVectorEmptyInputAndOwnedOutput) {
+  const auto backend = EcCodec::backendName();
+  ASSERT_TRUE(backend == "scalar" || backend == "isal");
+  // The acceptance runner compares this actual bridge value with its explicit
+  // build choice. This property does not identify which SIMD kernel ran.
+  RecordProperty("ec_codec_backend", std::string(backend));
   // Independent carryless polynomial multiplication/long division over 0x11d,
   // inverses by exhaustive search: data bytes 1..10 give parity 53 and 170.
   std::string data;

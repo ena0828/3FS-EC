@@ -693,7 +693,7 @@ def main():
             cluster.launch()
             while not cluster.halt.wait(1):
                 cluster.fault_control.execute_one()
-                cluster.healthy()
+                cluster.fault_control.healthy()
         except BaseException as error:
             cluster.failure = {"type": type(error).__name__, "message": str(error), "stage": cluster.stage}
             raise
