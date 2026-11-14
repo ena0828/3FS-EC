@@ -9,9 +9,12 @@ import os
 from pathlib import Path
 import re
 import signal
+import shlex
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.dont_write_bytecode = True
@@ -91,15 +94,67 @@ def tree_files(root):
     return result
 
 
-def compatible_source_inputs(source):
-    files = git(source, 'ls-files', '-z').decode().split('\0')
+MANAGER = 'scripts/ec/ci/local-incremental-build.py'
+PATCHES = {'third_party/folly': ('folly.patch',),
+           'third_party/rocksdb': ('rocksdb.patch', 'rocksdb.patch.2')}
+ARCHIVED_NAMES = ('native-build.json', 'lab-build.json', 'build-resources.json', 'build-command.json',
+                  'source-head.txt', 'submodules.txt', 'build-inputs.sha256', 'cargo-locks.sha256')
+
+
+def compatible_source_inputs(source, revision=None):
+    files = git(source, *(['ls-tree', '-r', '--name-only', '-z', revision] if revision
+                         else ['ls-files', '-z'])).decode().split('\0')
     selected = [p for p in files if p and (p.startswith(('cmake/', 'patches/'))
                 or Path(p).name in ('Cargo.lock', 'Cargo.toml', 'CMakeLists.txt', '.gitmodules')
                 or p in ('scripts/ec/ci/build-native.sh', 'scripts/ec/ci/prepare-local-build.py',
                          'scripts/ec/ci/local-incremental-build.py', 'scripts/ec/install-build-deps.sh',
                          'scripts/ec/reference/downloads.json', 'scripts/ec/cluster/fetch-fdb.sh')
                 or p.startswith('scripts/ec/ci/prepare-') or p == 'scripts/ec/cluster/prepare-fdb-cache.py')]
-    return {p: sha(source / p) for p in selected}
+    return {p: hashlib.sha256(git(source, 'show', revision + ':' + p)).hexdigest()
+            if revision else sha(source / p) for p in selected}
+
+
+def verified_submodule(path, commit, patches):
+    """Reconstruct the expected patched index without changing the checkout/index/object store."""
+    require(git(path, 'rev-parse', 'HEAD').decode().strip() == commit, 'submodule HEAD changed')
+    require(not git(path, 'diff', '--cached', '--binary', 'HEAD'), 'staged submodule input is unsupported')
+    untracked = set(filter(None, git(path, 'ls-files', '--others', '--exclude-standard', '-z').decode().split('\0')))
+    objects = git(path, 'rev-parse', '--git-path', 'objects').decode().strip()
+    objects = (path / objects).resolve()
+    with tempfile.TemporaryDirectory(prefix='ec-patch-index-') as temporary:
+        private = Path(temporary)
+        (private / 'objects').mkdir()
+        environment = dict(os.environ, GIT_INDEX_FILE=str(private / 'index'),
+                           GIT_OBJECT_DIRECTORY=str(private / 'objects'),
+                           GIT_ALTERNATE_OBJECT_DIRECTORIES=str(objects))
+        def expected(*args):
+            return subprocess.check_output(['git', '-c', 'core.autocrlf=false', '-C', str(path), *args],
+                                           env=environment, stderr=subprocess.PIPE)
+        expected('read-tree', commit)
+        for patch in patches:
+            expected('apply', '--cached', '--whitespace=nowarn', str(patch))
+        added = set(filter(None, expected('diff', '--cached', '--name-only', '--diff-filter=A', '-z', commit).decode().split('\0')))
+        require(untracked == added, 'untracked submodule input differs from exact patch additions')
+        additions = {}
+        for name in sorted(added):
+            target = path / name
+            info = target.lstat()
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and not target.is_symlink(),
+                    'patch addition must be a regular single-link file')
+            mode = expected('ls-files', '--stage', '--', name).decode().split()[0]
+            require(mode in ('100644', '100755'), 'unsupported patch addition mode')
+            if os.name == 'posix':
+                require(bool(info.st_mode & 0o111) == (mode == '100755'), 'patch addition executable mode changed')
+            wanted = expected('show', ':' + name)
+            require(target.read_bytes() == wanted, 'patch addition bytes differ: ' + name)
+            additions[name] = {'mode': mode, 'sha256': hashlib.sha256(wanted).hexdigest()}
+        # --no-ext-diff and the private expected index check every tracked hunk,
+        # including unrelated edits that reverse --check would not reject.
+        require(not expected('diff', '--no-ext-diff', '--binary', '--ignore-submodules=all'),
+                'submodule worktree differs from the complete expected patch')
+        return {'commit': commit, 'expected_patch_diff_sha256': hashlib.sha256(
+                    expected('diff', '--cached', '--binary', commit)).hexdigest(),
+                'patches': {p.name: sha(p) for p in patches}, 'added_files': additions}
 
 
 def epoch_inputs(source, work):
@@ -114,9 +169,8 @@ def epoch_inputs(source, work):
     for line in modules:
         commit, relative = line.strip().split()[:2]
         path = source / relative
-        require(not git(path, 'ls-files', '--others', '--exclude-standard'), 'untracked submodule input')
-        module_records[relative] = {'commit': commit, 'tracked_diff_sha256': hashlib.sha256(
-            git(path, 'diff', '--binary', 'HEAD')).hexdigest()}
+        module_records[relative] = verified_submodule(path, commit,
+            [source / 'patches' / name for name in PATCHES.get(relative, ())])
     preflight = read(work / 'provenance/local-preflight.json')
     for item in preflight['tools'].values():
         require(sha(item['path']) == item['sha256'], 'prepared tool bytes changed')
@@ -206,12 +260,109 @@ def verify_prepared(source, work, state):
     return checkpoint
 
 
+def verify_source_snapshot(source, path, revision, expected_names):
+    rows = {}
+    for line in path.read_text(encoding='utf-8').splitlines():
+        match = re.fullmatch(r'([0-9a-f]{64})  (.+)', line)
+        require(match is not None and match[2] not in rows, 'invalid or duplicate source input snapshot')
+        rows[match[2]] = match[1]
+    require(set(rows) == set(expected_names), 'source input snapshot inventory differs')
+    for name, digest in rows.items():
+        require(hashlib.sha256(git(source, 'show', revision + ':' + name)).hexdigest() == digest,
+                'original source input snapshot differs from its Git revision: ' + name)
+
+
+def verify_configured_recovery(source, work, state):
+    """Explicit recovery of the old post-configure patch-addition rejection only.
+
+    There was no prepared epoch. Revalidate original recorded inputs/providers and
+    snapshot the current private Rust/provider trees as a NEW epoch; never claim
+    their full-tree hashes existed before the failed checkpoint.
+    """
+    require(state['status'] == 'failed' and type(state['exit_code']) is int and state['exit_code'] != 0,
+            'configured recovery requires an owned failed attempt')
+    previous = Path(state['attempt'])
+    require(previous == Path(state['state_root']) / f"attempt-{state['generation']:06d}", 'previous attempt path differs')
+    intent, outcome = read(previous / 'intent.json'), read(previous / 'outcome.json')
+    require(outcome == state and all(outcome.get(k) == v for k, v in intent.items()), 'failed attempt identity differs')
+    require(intent['source'] == str(source) and intent['work'] == str(work)
+            and intent['mode'] == 'fresh', 'only the original fresh configured failure is recoverable')
+    process, monitor = read(previous / 'process.json'), read(previous / 'monitor.json')
+    require(type(process['pid']) is int and process['pid'] > 0 and process['process_group'] == process['pid']
+            and monitor['remaining_group_pids'] == [], 'original owned process group was not joined')
+    # A new lock alone is not proof that an abandoned builder exited.
+    require(not sample_group(process['process_group'])['live_pids'], 'original process group is still live')
+    expected_argv = ['bash', str(source / 'scripts/ec/ci/build-native.sh'), '--backend', 'isal',
+                     '--build-jobs', str(intent['jobs']), '--with-lab-targets', '--with-ec-regression-targets',
+                     '--local-source', str(source), '--local-work', str(work), '--local-revision', intent['revision']]
+    require(read(previous / 'command.json') == {'argv': expected_argv}, 'original build invocation differs')
+    error = (previous / 'build.stderr').read_bytes()
+    require(error.endswith(b'ValueError: untracked submodule input\n') and b'in checkpoint\n' in error
+            and b'in epoch_inputs\n' in error, 'not the known post-configure patch-addition failure')
+    for path in (work / 'provenance/local-build-ready.json', previous / 'configured.json',
+                 work / 'provenance/build-command.json', work / 'provenance/native-build.json',
+                 work / 'provenance/lab-build.json'):
+        require(not os.path.lexists(path), 'configured recovery must not replace a prepared/build/success record')
+    cache = work / 'build/CMakeCache.txt'
+    require(sha(cache) == state['cmake_cache_sha256'], 'original configured cache changed')
+    old_revision = intent['revision']
+    require(re.fullmatch(r'[0-9a-f]{40}', old_revision) is not None, 'invalid original revision')
+    subprocess.run(['git', '-C', str(source), 'merge-base', '--is-ancestor', old_revision, 'HEAD'], check=True)
+    before, after = compatible_source_inputs(source, old_revision), compatible_source_inputs(source)
+    require(set(before) == set(after) and all(before[p] == after[p] for p in before if p != MANAGER),
+            'configured recovery permits only the managed producer fix among dependency inputs')
+    provenance = work / 'provenance'
+    require((provenance / 'source-head.txt').read_text().strip() == old_revision, 'original source-head differs')
+    original_preflight = read(provenance / 'local-preflight.json')
+    require(original_preflight['revision'] == old_revision and original_preflight['source'] == str(source)
+            and original_preflight['work'] == str(work) and original_preflight['backend'] == 'isal'
+            and original_preflight['container_build_only'] is False, 'original preflight differs')
+    modules = (provenance / 'submodules.txt').read_bytes()
+    require(modules == original_preflight['submodules'].encode()
+            and modules == git(source, 'submodule', 'status', '--recursive'), 'original gitlinks changed')
+    builder = git(source, 'show', old_revision + ':scripts/ec/ci/build-native.sh').decode()
+    block = builder.split('sha256sum scripts/ec/install-build-deps.sh', 1)[1].split('| tee "$work/provenance/build-inputs.sha256"', 1)[0]
+    names = shlex.split('scripts/ec/install-build-deps.sh' + block.replace('\\\n', ' '))
+    verify_source_snapshot(source, provenance / 'build-inputs.sha256', old_revision, names)
+    verify_source_snapshot(source, provenance / 'cargo-locks.sha256', old_revision,
+                           ('Cargo.lock', 'src/storage/ec/Cargo.lock'))
+    isal = read(provenance / 'isal-prepare.json')
+    require(isal['source_lock_sha256'] == after['scripts/ec/reference/downloads.json']
+            and isal['helper_sha256'] == after['scripts/ec/ci/prepare-isal.py']
+            and isal['prefix'] == str(work / 'isal-prefix'), 'original ISA-L source binding differs')
+    require(Path(isal['provider']['path']).is_relative_to(work / 'isal-prefix')
+            and sha(isal['provider']['path']) == isal['provider']['sha256'], 'original ISA-L provider changed')
+    for package in isal['packages']:
+        archive = work / 'isal-downloads' / (package['package'] + '.deb')
+        require(archive.stat().st_size == package['size'] and sha(archive) == package['sha256'],
+                'original ISA-L archive changed')
+    fdb = read(provenance / 'fdb-link-probe.json')
+    require(fdb['status'] == 'linked-and-loaded-fixed-client'
+            and fdb['provider'] == str(work / 'deps/lib/libfdb_c.so')
+            and sha(fdb['provider']) == fdb['provider_sha256'] == fdb['expected_package_library_sha256'],
+            'original FDB provider changed')
+    inputs = epoch_inputs(source, work)  # Exact patch tree, tools/packages, private paths/libraries, Rust and provider bytes.
+    evidence = [previous / name for name in ('intent.json', 'outcome.json', 'command.json', 'process.json',
+                                            'monitor.json', 'build.stdout', 'build.stderr')]
+    evidence += [p for p in sorted(provenance.iterdir()) if p.is_file()]
+    evidence.append(cache)
+    return {'schema': 1, 'kind': 'verified-configured-failure-recovery', 'previous_attempt': str(previous),
+            'original_revision': old_revision, 'original_evidence': {str(p): sha(p) for p in evidence},
+            'original_source_inputs': before, 'inputs': inputs,
+            'epoch_scope': 'new full-tree baseline after recorded-input/provider revalidation; no previous full-tree epoch existed',
+            'reconfigure_required': True, 'build_success': False}
+
+
 def checkpoint():
     attempt, intent = context()
     source, work = Path(intent['source']), Path(intent['work'])
     source_identity(source, intent['revision'])
     data = {'schema': 1, 'source': str(source), 'work': str(work), 'initial_revision': intent['revision'],
             'inputs': epoch_inputs(source, work)}
+    if intent['mode'] == 'recover-configured':
+        recovery = read(attempt / 'recovery.json')
+        require(data['inputs'] == recovery['inputs'], 'recovery input drift during configure')
+        data['recovery_sha256'] = sha(attempt / 'recovery.json')
     path = work / 'provenance/local-build-ready.json'
     if path.exists():
         prior = read(path)
@@ -285,12 +436,18 @@ def publish(attempt, intent, monitor):
 def archive_previous(attempt, work):
     archive = attempt / 'previous'
     archive.mkdir(mode=0o700)
-    for name in ('native-build.json', 'lab-build.json', 'build-resources.json', 'build-command.json',
-                 'source-head.txt', 'submodules.txt', 'build-inputs.sha256', 'cargo-locks.sha256'):
+    for name in ARCHIVED_NAMES:
         path = work / 'provenance' / name
         if path.exists():
             require(path.is_file() and not path.is_symlink(), 'invalid old receipt')
             os.rename(path, archive / name)
+    cache = work / 'build/CMakeCache.txt'
+    if cache.exists():
+        require(cache.is_file() and not cache.is_symlink(), 'invalid previous CMake cache')
+        with cache.open('rb') as source, (archive / 'CMakeCache.txt').open('xb') as target:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
     sync_dir(work / 'provenance')
     sync_dir(archive)
 
@@ -324,12 +481,17 @@ def run(args):
         if state:
             require(state['status'] in ('failed', 'complete'), 'prior owner/attempt is unresolved; no PID adoption')
             require(state['source'] == str(source) and state['work'] == str(work), 'managed workspace identity changed')
-        mode = 'resume' if work.exists() else 'fresh'
-        if mode == 'resume':
+            require(state['state_root'] == str(state_root), 'managed state root changed')
+        recovery = None
+        mode = 'recover-configured' if args.operation == 'recover-configured' else ('resume' if work.exists() else 'fresh')
+        if mode != 'fresh':
             require(state is not None, 'existing work has no managed owner/checkpoint; cannot adopt')
             preflight.canonical(work)
             refreshed = preflight.managed_existing_paths(source, work, read(work / 'provenance/local-preflight.json'))
-            verify_prepared(source, work, state)
+            if mode == 'recover-configured':
+                recovery = verify_configured_recovery(source, work, state)
+            else:
+                verify_prepared(source, work, state)
         else:
             require(state is None, 'managed work disappeared')
         ordinal = 1 if state is None else state['generation'] + 1
@@ -340,14 +502,24 @@ def run(args):
                   'jobs': args.build_jobs, 'mode': mode, 'generation': ordinal, 'state_root': str(state_root),
                   'previous_attempt': None if state is None else state['attempt']}
         write_new(attempt / 'intent.json', intent)
-        if mode == 'resume':
+        if mode != 'fresh':
             write_new(attempt / 'host-preflight.json', refreshed)
+        if recovery is not None:
+            recovery['preserved_evidence'] = {
+                str(attempt / 'previous' / Path(p).name)
+                if (Path(p).parent == work / 'provenance' and Path(p).name in ARCHIVED_NAMES)
+                or Path(p) == work / 'build/CMakeCache.txt' else p: digest
+                for p, digest in recovery['original_evidence'].items()}
+            write_new(attempt / 'recovery.json', recovery)
         current = dict(intent, attempt=str(attempt), status='running')
         replace_record(state_path, current)
-        if mode == 'resume':
+        if mode != 'fresh':
             archive_previous(attempt, work)
+        if recovery is not None:
+            require(all(sha(p) == digest for p, digest in recovery['preserved_evidence'].items()),
+                    'preserved original recovery evidence changed')
         environment = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', EC_LOCAL_BUILD_ATTEMPT=str(attempt), EC_LOCAL_BUILD_LOCK_FD=str(lock),
-                           EC_LOCAL_BUILD_MODE=mode)
+                           EC_LOCAL_BUILD_MODE='fresh' if mode == 'fresh' else 'resume')
         argv = ['bash', str(source / 'scripts/ec/ci/build-native.sh'), '--backend', 'isal',
                 '--build-jobs', str(args.build_jobs), '--with-lab-targets', '--with-ec-regression-targets',
                 '--local-source', str(source), '--local-work', str(work), '--local-revision', args.revision]
@@ -401,13 +573,13 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('run', 'child-check', 'checkpoint'))
+    parser.add_argument('operation', choices=('run', 'recover-configured', 'child-check', 'checkpoint'))
     parser.add_argument('--source', type=Path)
     parser.add_argument('--work', type=Path)
     parser.add_argument('--revision')
     parser.add_argument('--build-jobs', type=int, choices=JOBS, default=8)
     args = parser.parse_args()
-    if args.operation == 'run':
+    if args.operation in ('run', 'recover-configured'):
         require(all((args.source, args.work, args.revision)), 'source/work/revision required')
         return run(args)
     if args.operation == 'child-check':

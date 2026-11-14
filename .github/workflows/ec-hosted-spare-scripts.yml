@@ -82,7 +82,7 @@ jobs:
               "test-mode4-lifecycle-acceptance.py": 16,
               "test-mode4-mount-evidence.py": 9,
               "ci/test-build-native.py": 34,
-              "ci/test-local-incremental-build.py": 6,
+              "ci/test-local-incremental-build.py": 9,
           }
           rows = []
           for filename, expected in suites.items():
