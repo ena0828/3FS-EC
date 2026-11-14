@@ -11,8 +11,8 @@
 namespace hf3fs::meta::server {
 // Internal dependency, not a user callback or an authorization decision. An
 // implementation owns the entire request until its actual local RPC completes,
-// including timeout/cancellation cleanup. There is no production RPC28 adapter
-// in this candidate; tests using this interface are transport models only.
+// including timeout/cancellation cleanup. NativeEcGcTransport supplies the
+// production StorageClient/Messenger RPC path; test transports remain models.
 class EcGcTransport {
  public:
   virtual ~EcGcTransport() = default;

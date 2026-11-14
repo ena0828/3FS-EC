@@ -760,6 +760,19 @@ pub mod ffi {
         status: RawEcScopeStatus,
         receipt: RawEcStageGcReceipt,
     }
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcStageAbsentClaim {
+        gc: RawEcStageGcClaim,
+        closure_digest: [u8; 32],
+        scope: RawEcScopeRevocation,
+        retirement_id: [u8; 16],
+        retirement: bool,
+    }
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    struct RawEcStageAbsentReceipt {
+        claim_id: [u8; 16], ledger_sha256: [u8; 32], record_revision: u64,
+    }
+    struct RawEcStageAbsentResult { status: RawEcScopeStatus, receipt: RawEcStageAbsentReceipt }
     struct RawEcStageFormatResult {
         status: RawEcScopeStatus,
         disk_format: u16,
@@ -831,6 +844,8 @@ pub mod ffi {
             prefix_len: u32,
             limits: &RawEcStageLimits,
         ) -> RawEcStageOpenResult;
+        fn stage_absent_confirm(handle: &EcStageHandle, key: &[u8], claim: &RawEcStageAbsentClaim) -> RawEcStageAbsentResult;
+        fn stage_absent_query(handle: &EcStageHandle, key: &[u8], claim: &RawEcStageAbsentClaim) -> RawEcStageAbsentResult;
         fn stage_gc_collect(
             handle: &EcStageHandle,
             key: &[u8],

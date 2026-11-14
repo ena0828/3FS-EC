@@ -20,6 +20,7 @@
 namespace hf3fs::storage {
 
 class EcGcExecutor;
+class EcGcAbsentExecutor;
 
 class StorageTarget : public enable_shared_from_this<StorageTarget> {
  protected:
@@ -201,8 +202,10 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
 
  private:
   friend class EcGcExecutor;
+  friend class EcGcAbsentExecutor;
   Result<EcGcLocalTarget> gcLocalTarget(NodeId actualLocalNode) const;
   Result<EcGcLedgerReceipt> executeGc(const VerifiedEcGcRequest &, NodeId actualLocalNode) const;
+  Result<EcGcAbsentLedgerReceipt> executeGcAbsent(const VerifiedEcGcAbsentRequest &, NodeId actualLocalNode) const;
   const Config &config_;
   std::shared_ptr<bool> alive_ = std::make_shared<bool>();
   uint32_t diskIndex_;

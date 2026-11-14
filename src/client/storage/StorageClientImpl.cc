@@ -3321,6 +3321,137 @@ CoTryTask<ChunkMetaVector> StorageClientImpl::getAllChunkMetadata(const ChainId 
   co_return response->chunkMetaVec;
 }
 
+CoTryTask<EcGcAbsentAck> StorageClientImpl::exchangeEcGcAbsentControlled(EcGcAbsentRequest request,
+                                                             std::shared_ptr<const EcGcKey> key,
+                                                             EcRequestControl control) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  if (!key) co_return makeError(StatusCode::kAuthenticationFail, "GC transport requires the configured G key");
+  const bool collect = request.claims.action == EcGcAbsentAction::ConfirmAbsent;
+  bool dispatched = false;
+  const auto unknown = [](Status error) noexcept {
+    try {
+      return error.convert(StorageCode::kEcSealOutcomeUnknown);
+    } catch (...) {
+      return Status(StorageCode::kEcSealOutcomeUnknown);
+    }
+  };
+  const auto check = [&]() -> Result<Void> {
+    if (control.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
+    if (std::chrono::steady_clock::now() >= control.deadline) return makeError(StorageClientCode::kTimeout);
+    return Void{};
+  };
+  try {
+    CO_RETURN_ON_ERROR(check());
+    if (!isExplicitEcTransportPolicy(control.transport) ||
+        control.deadline - std::chrono::steady_clock::now() > std::chrono::seconds(kEcGcMaxTtlSeconds))
+      co_return makeError(StatusCode::kInvalidArg, "GC requires an explicit transport and a finite deadline within 300 seconds");
+    const auto &claims = request.claims;
+    if (claims.version != kEcGcAbsentProtocol || (!collect && claims.action != EcGcAbsentAction::QueryAbsent) ||
+        claims.keyId != key->keyId() || claims.authority.is_nil() || claims.nonce.is_nil() ||
+        claims.expiresAtSeconds <= claims.issuedAtSeconds ||
+        claims.expiresAtSeconds - claims.issuedAtSeconds > kEcGcMaxTtlSeconds)
+      co_return makeError(StatusCode::kInvalidArg, "invalid fixed GC request shape");
+    CO_RETURN_ON_ERROR(ec_gc_control_detail::Codec::claimDigest(claims.certificate));
+    // Structural checking here is not a fabricated actual-target observation.
+    // Storage verifies the request MAC against its own loaded target/format.
+    if (!ecGcConcurrency_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy);
+    auto budget = folly::makeGuard([this] { ecGcConcurrency_.signal(); });
+    auto routing = getCurrentRoutingInfo();
+    if (!routing || !routing->raw()) co_return makeError(StorageClientCode::kRoutingError);
+    const auto nodeId = claims.certificate.endpoint.nodeId;
+    auto node = getNodeInfo(routing, nodeId);
+    CO_RETURN_ON_ERROR(node);
+    if (node->app.nodeId != nodeId || node->type != flat::NodeType::STORAGE)
+      co_return makeError(StorageClientCode::kRoutingVersionMismatch);
+    CO_RETURN_ON_ERROR(check());
+    const auto remaining = control.deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) co_return makeError(StorageClientCode::kTimeout);
+    const DebugOptions debug;
+    ClientRequestContext context(MethodType::exchangeEcGcAbsent, flat::UserInfo(), debug, config_, 1, 0, Duration(remaining));
+    // Resolve only the signed historical node's selected transport; no current
+    // chain/target failover and no retry after dispatch. Waiter owns its timer.
+    auto response = co_await folly::coro::co_withCancellation(
+        {}, callMessengerMethod<EcGcAbsentRequest, EcGcAbsentRsp, &StorageMessenger::exchangeEcGcAbsent>(
+                messenger_, context, *node, request, 0, &dispatched, true,
+                control.transport == EcTransportPolicy::TcpOnly, nullptr,
+                control.transport == EcTransportPolicy::RdmaOnly));
+    if (!response) {
+      if (collect && dispatched) co_return makeError(unknown(std::move(response.error())));
+      if (response.error().code() == RPCCode::kTimeout)
+        co_return makeError(response.error().convert(StorageClientCode::kTimeout));
+      co_return makeError(std::move(response.error()));
+    }
+    if (!response->result) {
+      if (collect && dispatched) co_return makeError(unknown(std::move(response->result.error())));
+      co_return makeError(std::move(response->result.error()));
+    }
+    auto verified = ec_gc_absent_detail::Codec::verifyAck(*key, *response->result, request);
+    if (!verified) {
+      if (collect && dispatched) co_return makeError(unknown(std::move(verified.error())));
+      co_return makeError(std::move(verified.error()));
+    }
+    // A valid historical ACK observed within the exact request lifetime remains
+    // evidence even if local cancellation arrives now. Meta still re-verifies
+    // the full permanent claim and must commit G2 before reporting completion.
+    co_return std::move(*response->result);
+  } catch (const std::bad_alloc &) {
+    co_return makeError(dispatched ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kNotEnoughMemory);
+  } catch (...) {
+    co_return makeError(dispatched ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kIOError);
+  }
+}
+
+CoTryTask<EcGcAbsentDiscoveryObservation> StorageClientImpl::getEcGcAbsentCapabilityControlled(EcGcAbsentDiscoveryRequest request,
+                                                                                   std::shared_ptr<const EcGcKey> key,
+                                                                                   EcRequestControl control) {
+  if (!clientStarted_) co_return makeError(StorageClientCode::kNotInitialized);
+  if (!key) co_return makeError(StatusCode::kAuthenticationFail, "discovery requires a configured G key");
+  const auto wall = [] {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  };
+  const auto check = [&]() -> Result<Void> {
+    if (std::chrono::steady_clock::now() >= control.deadline) return makeError(StorageClientCode::kTimeout);
+    if (control.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
+    return Void{};
+  };
+  CO_RETURN_ON_ERROR(check());
+  if (control.deadline - std::chrono::steady_clock::now() > std::chrono::seconds(kEcGcAbsentDiscoveryMaxTtlSeconds) ||
+      !isExplicitEcTransportPolicy(control.transport))
+    co_return makeError(StatusCode::kInvalidArg, "discovery requires an explicit transport and a deadline within 60 seconds");
+  CO_RETURN_ON_ERROR(verifyEcGcAbsentDiscovery(*key, request, request.claims.authority, request.claims.nodeId, wall()));
+  if (!ecControlConcurrency_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy);
+  auto release = folly::makeGuard([this] { ecControlConcurrency_.signal(); });
+  auto routing = getCurrentRoutingInfo();
+  if (!routing || !routing->raw()) co_return makeError(StorageClientCode::kRoutingError);
+  auto node = getNodeInfo(routing, request.claims.nodeId);
+  CO_RETURN_ON_ERROR(node);
+  if (node->app.nodeId != request.claims.nodeId || node->type != flat::NodeType::STORAGE)
+    co_return makeError(StorageClientCode::kRoutingVersionMismatch);
+  CO_RETURN_ON_ERROR(check());
+  const auto remaining = control.deadline - std::chrono::steady_clock::now();
+  if (remaining <= std::chrono::steady_clock::duration::zero()) co_return makeError(StorageClientCode::kTimeout);
+  const DebugOptions debug;
+  ClientRequestContext
+      context(MethodType::getEcGcAbsentCapability, flat::UserInfo(), debug, config_, 1, 0, Duration(remaining));
+  // No asynchronous task is detached. Once dispatched, the native Waiter owns
+  // its finite timer and the coroutine retains request/key until it returns.
+  auto response = co_await callMessengerMethod<EcGcAbsentDiscoveryRequest, EcGcAbsentDiscoveryRsp,
+      &StorageMessenger::getEcGcAbsentCapability>(
+          messenger_, context, *node, request, 0, nullptr, true,
+          control.transport == EcTransportPolicy::TcpOnly, nullptr,
+          control.transport == EcTransportPolicy::RdmaOnly);
+  if (!response) {
+    if (response.error().code() == RPCCode::kTimeout)
+      co_return makeError(response.error().convert(StorageClientCode::kTimeout));
+    co_return makeError(response.error());
+  }
+  CO_RETURN_ON_ERROR(response->result);
+  CO_RETURN_ON_ERROR(check());
+  CO_RETURN_ON_ERROR(verifyEcGcAbsentDiscoveryObservation(*key, *response->result, request, wall()));
+  co_return std::move(*response->result);
+}
+
 CoTryTask<EcGcAck> StorageClientImpl::exchangeEcGcControlled(EcGcRequest request,
                                                              std::shared_ptr<const EcGcKey> key,
                                                              EcRequestControl control) {

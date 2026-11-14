@@ -88,6 +88,8 @@ IMPL_META_STUB_METHOD(prepareEcRepairDirectV2, PrepareEcRepairDirectV2Req, Prepa
 IMPL_META_STUB_METHOD(queryEcFileOutput, QueryEcFileOutputReq, QueryEcFileOutputRsp);
 IMPL_META_STUB_METHOD(confirmEcFileOutputResolution, ConfirmEcFileOutputResolutionReq, ConfirmEcFileOutputResolutionRsp);
 IMPL_META_STUB_METHOD(queryEcFileOutputResolution, QueryEcFileOutputResolutionReq, QueryEcFileOutputResolutionRsp);
+IMPL_META_STUB_METHOD(confirmEcFragmentAbsent, ConfirmEcFragmentAbsentReq, EcAbsentAdminRsp);
+IMPL_META_STUB_METHOD(queryEcFragmentAbsent, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
 IMPL_META_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 template class MetaServiceStub<serde::ClientContext>;

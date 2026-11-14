@@ -341,6 +341,31 @@ CoTryTask<GetAllChunkMetadataRsp> StorageMessenger::getAllChunkMetadata(const hf
       timestamp);
 }
 
+CoTryTask<EcGcAbsentRsp> StorageMessenger::exchangeEcGcAbsent(const net::Address &address,
+                                                  const EcGcAbsentRequest &request,
+                                                  const net::UserRequestOptions *options,
+                                                  serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcGcAbsentRequest, EcGcAbsentRsp, StorageSerde<>::exchangeEcGcAbsent<serde::ClientContext>>(
+      client_,
+      address,
+      request,
+      options,
+      timestamp);
+}
+
+CoTryTask<EcGcAbsentDiscoveryRsp> StorageMessenger::getEcGcAbsentCapability(const net::Address &address,
+                                                                const EcGcAbsentDiscoveryRequest &request,
+                                                                const net::UserRequestOptions *options,
+                                                                serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<EcGcAbsentDiscoveryRequest,
+                                        EcGcAbsentDiscoveryRsp,
+                                        StorageSerde<>::getEcGcAbsentCapability<serde::ClientContext>>(client_,
+                                                                                                 address,
+                                                                                                 request,
+                                                                                                 options,
+                                                                                                 timestamp);
+}
+
 CoTryTask<EcGcRsp> StorageMessenger::exchangeEcGc(const net::Address &address,
                                                   const EcGcRequest &request,
                                                   const net::UserRequestOptions *options,

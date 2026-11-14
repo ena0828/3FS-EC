@@ -105,6 +105,8 @@ class StorageClientImpl : public StorageClient {
   CoTryTask<EcGcDiscoveryObservation> getEcGcCapabilityControlled(EcGcDiscoveryRequest,
                                                                   std::shared_ptr<const EcGcKey>,
                                                                   EcRequestControl) override;
+  CoTryTask<EcGcAbsentAck> exchangeEcGcAbsentControlled(EcGcAbsentRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) override;
+  CoTryTask<EcGcAbsentDiscoveryObservation> getEcGcAbsentCapabilityControlled(EcGcAbsentDiscoveryRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) override;
   CoTryTask<EcGcAck> exchangeEcGcControlled(EcGcRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) override;
   CoTryTask<EcTargetRetirementObservation> prepareEcTargetRetirement(
       EcTargetRetirementRequest, std::shared_ptr<const EcScopeControlKey>, EcRequestControl) override;

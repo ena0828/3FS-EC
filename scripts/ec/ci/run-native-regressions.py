@@ -71,6 +71,13 @@ MANDATORY |= {
         "BoundedWireRejectsArrayCountsOversizeAndEmptyActiveAuthority",
     )
 }
+MANDATORY |= {
+    'TestEcGcAbsentExecutor.' + name for name in (
+        'MissingRequiresOriginalDurableCloseAndQueryNeverCreatesLedger',
+        'OriginalInFlightTicketBlocksAbsenceUntilItsOwnedRelease',
+        'ExistingStageAndCollectedLedgerCannotBecomeAbsentAndReadOnlyBlocksConfirm',
+    )
+}
 
 RPC_FRAME_CASES = tuple("TestEcRpcFrameSizes." + name for name in (
     "ActualEncodedFramesIncludeHeaderAcrossCompression",
@@ -113,6 +120,13 @@ CLIENT_MANDATORY |= {
         'TruncateDistinguishesUnknownRequiredAndUnusedTailWithoutAbsenceProof',
         'ExistingLocksRejectWritersMissingLocksAndReadonlyAppendForAllKinds',
         'HashesOriginalBytesAndPreservesSourceOnOutputAndStateFailures',
+    )
+}
+CLIENT_MANDATORY |= {
+    'TestEcAbsentCommands.' + name for name in (
+        'UnknownConfirmAndMissingQueryRetainIdsWithoutRetryOrFallback',
+        'WrongProofIdentityOrCollectionClaimNeverProducesEligibleArchive',
+        'ExistingArchiveInvalidIdentityAndNamespaceMismatchDoNotDispatch',
     )
 }
 

@@ -39,7 +39,7 @@ impl ImmutableStagingEngine {
         Self::open_format_with_hook(config, limits, EcStagingFormat::ExactGc, |_, _| Ok(()))
     }
 
-    fn require_gc(&self, claim: &EcStageGcClaim) -> ImmutableStageResult<()> {
+    pub(super) fn require_gc(&self, claim: &EcStageGcClaim) -> ImmutableStageResult<()> {
         if self.0.format != EcStagingFormat::ExactGc {
             return Err(ImmutableStageError::Invalid(
                 "exact GC requires explicit disk format 3",
@@ -186,6 +186,9 @@ impl ImmutableStagingEngine {
     ) -> ImmutableStageResult<EcStageGcReceipt> {
         self.check_key(key)?;
         self.require_gc(claim)?;
+        if self.0.engine.meta_store.stage_absent_record(key)?.is_some() {
+            return Err(ImmutableStageError::Conflict);
+        }
         let _permit = self.permit()?;
         let handle = self.slot(key)?;
         let mut slot = handle.lock().map_err(|_| ImmutableStageError::Busy)?;
@@ -303,6 +306,9 @@ impl ImmutableStagingEngine {
     ) -> ImmutableStageResult<EcStageGcReceipt> {
         self.check_key(key)?;
         self.require_gc(claim)?;
+        if self.0.engine.meta_store.stage_absent_record(key)?.is_some() {
+            return Err(ImmutableStageError::Conflict);
+        }
         let _permit = self.permit()?;
         let handle = self.slot(key)?;
         let mut slot = handle.lock().map_err(|_| ImmutableStageError::Busy)?;

@@ -59,6 +59,15 @@ CoTryTask<std::optional<EcGcCompletion>> getWithClaim(kv::IReadWriteTransaction 
                                                       const EcGcClaim &claim,
                                                       const storage::EcGcKey &key,
                                                       const Uuid &authority) {
+  if (claim.version == 2) {
+    auto chunk = claim.allocation.fragment.identity.chunkId();
+    CO_RETURN_ON_ERROR(chunk);
+    std::string absentKey(kv::toStr(kv::KeyPrefix::EcGcAbsentCompletion));
+    absentKey.append(chunk->data());
+    auto absent = co_await txn.get(absentKey);
+    CO_RETURN_ON_ERROR(absent);
+    if (*absent) co_return makeError(StatusCode::kTokenStale, "AbsentAfterClose cannot become Collected");
+  }
   auto ledgerKey = completionKey(claim.allocation.fragment.identity);
   CO_RETURN_ON_ERROR(ledgerKey);
   auto value = co_await load<EcGcCompletion>(txn, *ledgerKey);

@@ -526,3 +526,27 @@ mod tests {
         );
     }
 }
+
+fn absent(handle:&EcStageHandle,key:&[u8],v:&ffi::RawEcStageAbsentClaim,query:bool)->ffi::RawEcStageAbsentResult {
+    use crate::ec_scope::{EcScopeBinding,EcScopeKind,EcScopeRevocation,EcTargetRetirement};
+    let r=boundary(true,|| {
+        let gc=claim(&v.gc)?;
+        validate_3fs_key(key,gc.target.chain)?;
+        if v.scope.binding.kind!=2 || v.scope.binding.target!=v.gc.target {
+            return Err(ImmutableStageError::Conflict);
+        }
+        let scope=EcScopeRevocation { binding:EcScopeBinding {target:gc.target,object:v.scope.binding.object,
+            kind:EcScopeKind::WriteOperation,scope:v.scope.binding.scope,owner_uid:v.scope.binding.owner_uid,
+            client_namespace:v.scope.binding.client_namespace},id:v.scope.id,endpoint_set_digest:v.scope.endpoint_set_digest};
+        let retirement=v.retirement.then_some(EcTargetRetirement {target:gc.target,id:v.retirement_id});
+        let c=EcStageAbsentClaim {gc,closure_digest:v.closure_digest,scope,retirement};
+        engine(handle)?.confirm_absent_after_close(key,&c,query)
+    });
+    match r {
+        Ok(r)=>ffi::RawEcStageAbsentResult {status:error(0,""),receipt:ffi::RawEcStageAbsentReceipt {
+            claim_id:r.claim_id,ledger_sha256:r.ledger_sha256,record_revision:r.record_revision}},
+        Err(status)=>ffi::RawEcStageAbsentResult {status,receipt:ffi::RawEcStageAbsentReceipt::default()},
+    }
+}
+pub(crate) fn stage_absent_confirm(h:&EcStageHandle,k:&[u8],c:&ffi::RawEcStageAbsentClaim)->ffi::RawEcStageAbsentResult {absent(h,k,c,false)}
+pub(crate) fn stage_absent_query(h:&EcStageHandle,k:&[u8],c:&ffi::RawEcStageAbsentClaim)->ffi::RawEcStageAbsentResult {absent(h,k,c,true)}

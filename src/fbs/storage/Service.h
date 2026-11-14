@@ -6,6 +6,7 @@
 #include "fbs/storage/EcAuthorized.h"
 #include "fbs/storage/EcGcDiscovery.h"
 #include "fbs/storage/EcGcRpc.h"
+#include "fbs/storage/EcGcAbsentDiscovery.h"
 #include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcHelperDirect.h"
 #include "fbs/storage/EcRmwRpc.h"
@@ -56,6 +57,8 @@ SERDE_SERVICE(StorageSerde, 3) {
   SERDE_SERVICE_METHOD(putEcRmw, 48, EcRmwPutReq, EcRmwStatusRsp);
   SERDE_SERVICE_METHOD(actionEcRmw, 49, EcRmwActionReq, EcRmwStatusRsp);
   SERDE_SERVICE_METHOD(executeEcHelperDirect, 50, EcHelperDirectHopReq, EcHelperDirectHopRsp);
+  SERDE_SERVICE_METHOD(exchangeEcGcAbsent, 51, EcGcAbsentRequest, EcGcAbsentRsp);
+  SERDE_SERVICE_METHOD(getEcGcAbsentCapability, 52, EcGcAbsentDiscoveryRequest, EcGcAbsentDiscoveryRsp);
 };
 
 }  // namespace hf3fs::storage

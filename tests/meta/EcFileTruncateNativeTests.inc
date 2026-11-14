@@ -94,15 +94,15 @@ TEST_F(TestEcFileNativeWrite, TruncateTailLostReplyAndExtensionDoNotResurrectByt
   ASSERT_TRUE(observed->observed->tailRequired);
   EXPECT_TRUE(observed->observed->outputDrained);
   EXPECT_FALSE(observed->observed->sourceReleased);
-  auto output = observeFileOutput(run->intent.object, run->intent.operation, run->intent.child,
-                                  EcFileOutputOwner::TruncateTail);
-  ASSERT_OK(output);
-  EXPECT_EQ(output->observation.state, EcFileOutputState::Published);
-  EXPECT_TRUE(output->observation.outputT2Confirmed);
-  EXPECT_FALSE(output->observation.physicalReclamationConfirmed);
-  ASSERT_TRUE(output->observation.allocations);
-  EXPECT_EQ(output->observation.allocations->size(), 12);
-  EXPECT_EQ(output->observation.identity.ownerKind, EcFileOutputOwner::TruncateTail);
+  auto outputObservation = observeFileOutput(run->intent.object, run->intent.operation, run->intent.child,
+                                             EcFileOutputOwner::TruncateTail);
+  ASSERT_OK(outputObservation);
+  EXPECT_EQ(outputObservation->observation.state, EcFileOutputState::Published);
+  EXPECT_TRUE(outputObservation->observation.outputT2Confirmed);
+  EXPECT_FALSE(outputObservation->observation.physicalReclamationConfirmed);
+  ASSERT_TRUE(outputObservation->observation.allocations);
+  EXPECT_EQ(outputObservation->observation.allocations->size(), 12);
+  EXPECT_EQ(outputObservation->observation.identity.ownerKind, EcFileOutputOwner::TruncateTail);
   EXPECT_EQ(serde::serialize(journal->record()), serde::serialize(*run));
   const auto published = *observed->observed->publishedRoot;
   auto replay = blockingWait(client->truncate(journal, deadline()));

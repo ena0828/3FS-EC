@@ -26,6 +26,7 @@
 #include "fbs/storage/EcStageResultV2.h"
 #include "storage/aio/AioReadWorker.h"
 #include "storage/ec_gc/EcGcExecutor.h"
+#include "storage/ec_gc/EcGcAbsentExecutor.h"
 #include "storage/ec_helper/EcHelperRuntime.h"
 #include "storage/ec_rmw/EcRmwRuntime.h"
 #include "storage/ec_scope/EcScopeControlExecutor.h"
@@ -145,6 +146,8 @@ class StorageOperator {
   CoTryTask<EcTargetRetirementRsp> queryEcTargetRetirement(const EcTargetRetirementRequest &req);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const EcScopeControlRequest &req);
   CoTryTask<EcScopeControlRsp> queryEcScopeDrain(const EcScopeControlRequest &req);
+  CoTryTask<EcGcAbsentRsp> exchangeEcGcAbsent(const EcGcAbsentRequest &);
+  CoTryTask<EcGcAbsentDiscoveryRsp> getEcGcAbsentCapability(const EcGcAbsentDiscoveryRequest &);
   CoTryTask<EcGcRsp> exchangeEcGc(const EcGcRequest &request);
   CoTryTask<EcTargetDiscoveryRsp> getEcTargetIdentity(const EcTargetDiscoveryRequest &req);
   CoTryTask<EcGcDiscoveryRsp> getEcGcCapability(const EcGcDiscoveryRequest &request);
@@ -236,6 +239,7 @@ class StorageOperator {
   std::shared_ptr<client::EcRmwTransport> ecRmwTransport_;
   std::optional<EcKeyFileIdentity> ecGcKeyFileIdentity_;
   std::unique_ptr<EcGcExecutor> ecGc_;
+  std::unique_ptr<EcGcAbsentExecutor> ecGcAbsent_;
   std::optional<EcKeyFileIdentity> ecControlKeyFileIdentity_;
   std::optional<EcKeyFileIdentity> ecHelperKeyFileIdentity_;
 

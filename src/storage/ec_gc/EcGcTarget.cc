@@ -47,4 +47,23 @@ Result<EcGcLedgerReceipt> StorageTarget::executeGc(const VerifiedEcGcRequest &ve
   RETURN_ON_ERROR(checkEcScopeTarget(identity));
   return staging_->executeGc(verified, chainId());
 }
+Result<EcGcAbsentLedgerReceipt> StorageTarget::executeGcAbsent(const VerifiedEcGcAbsentRequest &verified, NodeId node) const {
+  CHECK_RESULT(actual, gcLocalTarget(node));
+  const auto &expected = verified.certificate().endpoint;
+  const auto &observed = actual.endpoint;
+  if (observed.nodeId != expected.nodeId || observed.chainId != expected.chainId ||
+      observed.targetId != expected.targetId || observed.engineUuid != expected.engineUuid ||
+      observed.targetIncarnation != expected.targetIncarnation) {
+    return makeError(StorageCode::kTargetStateInvalid, "GC verified target changed before dispatch");
+  }
+  EcScopeTargetIdentity identity{};
+  std::copy(std::begin(expected.engineUuid.data), std::end(expected.engineUuid.data), identity.engine.begin());
+  std::copy(std::begin(expected.targetIncarnation.data),
+            std::end(expected.targetIncarnation.data),
+            identity.incarnation.begin());
+  identity.chain = expected.chainId.toUnderType();
+  identity.target = expected.targetId.toUnderType();
+  RETURN_ON_ERROR(checkEcScopeTarget(identity));
+  return staging_->executeGcAbsent(verified, chainId());
+}
 }  // namespace hf3fs::storage

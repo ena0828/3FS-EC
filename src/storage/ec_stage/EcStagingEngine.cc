@@ -226,4 +226,63 @@ Result<EcGcLedgerReceipt> EcStagingEngine::executeGc(const VerifiedEcGcRequest &
   receipt.terminalRevision = result.receipt.terminal_revision;
   return receipt;
 }
+Result<EcGcAbsentLedgerReceipt> EcStagingEngine::executeGcAbsent(const VerifiedEcGcAbsentRequest &verified, ChainId actualChain) const {
+  const auto &certificate = verified.certificate();
+  if (actualChain != certificate.endpoint.chainId) {
+    return makeError(StorageCode::kTargetStateInvalid, "GC actual chain differs from certificate");
+  }
+  CHECK_RESULT(format, actualDiskFormat());
+  if (format != 3) return makeError(StorageCode::kTargetStateInvalid, "GC requires disk format 3");
+  CHECK_RESULT(id, certificate.fragment.chunkId());
+  // Native ChainId prefix, exactly as execute()/stage_begin. Neither caller
+  // supplied bytes nor a route table can replace the signed fragment identity.
+  std::string key(reinterpret_cast<const char *>(&actualChain), sizeof(actualChain));
+  key.append(id.data());
+  chunk_engine::RawEcStageAbsentClaim absent{};
+  auto &claim = absent.gc;
+  std::copy(std::begin(certificate.claimId.data), std::end(certificate.claimId.data), claim.claim_id.begin());
+  claim.claim_digest = verified.claimDigest();
+  claim.eligibility_digest = certificate.eligibilityDigest;
+  std::copy(std::begin(certificate.endpoint.engineUuid.data),
+            std::end(certificate.endpoint.engineUuid.data),
+            claim.target.engine.begin());
+  std::copy(std::begin(certificate.endpoint.targetIncarnation.data),
+            std::end(certificate.endpoint.targetIncarnation.data),
+            claim.target.incarnation.begin());
+  claim.target.chain = actualChain.toUnderType();
+  claim.target.target = certificate.endpoint.targetId.toUnderType();
+  std::copy(std::begin(certificate.fragmentOperation.data),
+            std::end(certificate.fragmentOperation.data),
+            claim.binding.operation.begin());
+  claim.binding.length = certificate.integrity.wholeLength;
+  claim.binding.checksum = certificate.integrity.wholeCrc32c;
+  std::copy(std::begin(certificate.writerClient.data), std::end(certificate.writerClient.data), claim.writer.begin());
+  absent.closure_digest = verified.closureDigest();
+  const auto &w = verified.request().claims.closure;
+  absent.scope.binding.target = claim.target;
+  std::copy(std::begin(certificate.objectIncarnation.data), std::end(certificate.objectIncarnation.data), absent.scope.binding.object.begin());
+  absent.scope.binding.kind = static_cast<uint8_t>(w.scopeKind);
+  std::copy(std::begin(w.scopeId.data), std::end(w.scopeId.data), absent.scope.binding.scope.begin());
+  absent.scope.binding.owner_uid = w.ownerUid.toUnderType();
+  std::copy(std::begin(w.clientNamespace.data), std::end(w.clientNamespace.data), absent.scope.binding.client_namespace.begin());
+  std::copy(std::begin(w.revocationId.data), std::end(w.revocationId.data), absent.scope.id.begin());
+  absent.scope.endpoint_set_digest = w.endpointSetDigest;
+  absent.retirement = w.kind == EcGcClosureKind::TargetRetirement;
+  if (absent.retirement) {
+    const auto &id = w.retirementRequest->claims.retirementId;
+    std::copy(std::begin(id.data), std::end(id.data), absent.retirement_id.begin());
+  }
+  auto result = verified.action() == EcGcAbsentAction::ConfirmAbsent
+      ? chunk_engine::stage_absent_confirm(*handle_, bytes(key), absent)
+      : chunk_engine::stage_absent_query(*handle_, bytes(key), absent);
+  RETURN_ON_ERROR(check(result.status));
+  if (result.receipt.claim_id != claim.claim_id || result.receipt.record_revision != 1 ||
+      std::all_of(result.receipt.ledger_sha256.begin(), result.receipt.ledger_sha256.end(), [](uint8_t b) { return b == 0; }))
+    return makeError(StorageCode::kEcSealOutcomeUnknown);
+  EcGcAbsentLedgerReceipt receipt;
+  std::copy(result.receipt.claim_id.begin(), result.receipt.claim_id.end(), std::begin(receipt.claimId.data));
+  receipt.ledgerSha256 = result.receipt.ledger_sha256;
+  receipt.recordRevision = result.receipt.record_revision;
+  return receipt;
+}
 }  // namespace hf3fs::storage

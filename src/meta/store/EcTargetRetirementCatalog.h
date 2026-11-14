@@ -49,5 +49,12 @@ class EcTargetRetirementCatalog {
                                         const Uuid &authority,
                                         const EcTargetRetirementRef &,
                                         const storage::EcScopeControlKey &);
+  // Return the original, fully verified exchange for this exact retained ref.
+  // Never substitute a later target/retirement or reconstruct a new C request.
+  static CoTryTask<EcTargetRetirementCompletion> getVerifiedCompletion(kv::IReadWriteTransaction &,
+                                                                      const EcV2PhysicalEndpoint &,
+                                                                      const Uuid &authority,
+                                                                      const EcTargetRetirementRef &,
+                                                                      const storage::EcScopeControlKey &);
 };
 }  // namespace hf3fs::meta::server

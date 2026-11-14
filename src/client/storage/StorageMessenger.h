@@ -13,6 +13,7 @@
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
 #include "fbs/storage/EcGcDiscovery.h"
+#include "fbs/storage/EcGcAbsentDiscovery.h"
 #include "fbs/storage/EcGcRpc.h"
 #include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcHelperDirect.h"
@@ -113,6 +114,16 @@ class StorageMessenger {
                                                           const EcAuthorizedReconcileReq &request,
                                                           const net::UserRequestOptions *options = nullptr,
                                                           serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcGcAbsentRsp> exchangeEcGcAbsent(const net::Address &address,
+                                  const EcGcAbsentRequest &request,
+                                  const net::UserRequestOptions *options = nullptr,
+                                  serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<EcGcAbsentDiscoveryRsp> getEcGcAbsentCapability(const net::Address &address,
+                                                const EcGcAbsentDiscoveryRequest &request,
+                                                const net::UserRequestOptions *options = nullptr,
+                                                serde::Timestamp *timestamp = nullptr);
 
   CoTryTask<EcGcRsp> exchangeEcGc(const net::Address &address,
                                   const EcGcRequest &request,

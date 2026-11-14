@@ -13,3 +13,6 @@ pub use immutable_stage::*;
 
 mod immutable_gc;
 pub(crate) use immutable_gc::*;
+
+mod immutable_absent;
+pub(crate) use immutable_absent::*;

@@ -51,6 +51,7 @@
 #include "meta/store/EcFileExecutionCatalog.h"
 #include "meta/store/EcFileOutputResolutionCatalog.h"
 #include "meta/store/EcFileTruncateCatalog.h"
+#include "meta/store/EcGcAbsentCompletionCatalog.h"
 #include "meta/store/EcNamespaceGuard.h"
 #include "meta/store/EcOwnedMutationCatalog.h"
 #include "meta/store/EcRangeCatalog.h"
@@ -445,6 +446,13 @@ struct ControlFailure {
   size_t actualGcCollects = 0;
   size_t actualGcQueries = 0;
   std::optional<storage::EcGcAck> observedGcCollect;
+  Uuid dropGcAbsentReply = Uuid::zero();
+  size_t actualAbsentConfirms = 0;
+  size_t actualAbsentQueries = 0;
+  std::optional<storage::EcGcAbsentAck> observedAbsent;
+  int absentShutdownResult = -1;
+  bool absentShutdownFinished = false;
+  std::condition_variable absentShutdown;
 };
 // Only replaces a real, already durable control response with an error. It
 // cannot fabricate a positive ACK, and does not skip the actual revoke.
@@ -494,6 +502,42 @@ class ControlFailureStorageService : public storage::StorageService {
       std::lock_guard lock(fault_.mutex);
       if (req.request.operationId == fault_.observedRepair && req.request.identity.shard < 12)
         ++fault_.actualPartialReconciles[req.request.identity.shard];
+    }
+    co_return response;
+  }
+  CoTryTask<storage::EcGcAbsentRsp> exchangeEcGcAbsent(serde::CallContext &ctx,
+                                                    const storage::EcGcAbsentRequest &req) {
+    auto response = co_await storage::StorageService::exchangeEcGcAbsent(ctx, req);
+    bool drop = false;
+    if (response && response->result) {
+      std::lock_guard lock(fault_.mutex);
+      if (req.claims.action == storage::EcGcAbsentAction::ConfirmAbsent) {
+        ++fault_.actualAbsentConfirms;
+        fault_.observedAbsent = *response->result;
+        if (fault_.dropGcAbsentReply == req.claims.certificate.claimId) {
+          fault_.dropGcAbsentReply = Uuid::zero();
+          drop = true;
+        }
+      } else {
+        ++fault_.actualAbsentQueries;
+      }
+    }
+    if (drop) {
+      // Preserve the actual descriptor owner. The genuine Rust WAL result is
+      // complete before shutdown makes this one reply unavailable to Meta.
+      const auto transport = ctx.transport();
+      int result = -1;
+      if (transport->isTCP()) {
+        const auto &handler = static_cast<const net::EventLoop::EventHandler &>(*transport);
+        result = ::shutdown(handler.fd(), SHUT_RDWR);
+      }
+      transport->invalidate(false);
+      {
+        std::lock_guard lock(fault_.mutex);
+        fault_.absentShutdownResult = result;
+        fault_.absentShutdownFinished = true;
+      }
+      fault_.absentShutdown.notify_all();
     }
     co_return response;
   }
@@ -1406,6 +1450,7 @@ class TestEcV2NativeHelperPlan : public TestEcV2NativeLifecycle {
 #include "EcFileOutputNativeTests.inc"
 #include "EcFileOutputResolutionNativeTests.inc"
 #include "EcFileRepairNativeTests.inc"
+#include "EcGcAbsentNativeTests.inc"
 #include "EcFileHelperDirectNativeTests.inc"
 #include "EcFileRepairPendingNativeTests.inc"
 #include "EcFileAppendNativeTests.inc"

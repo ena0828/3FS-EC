@@ -17,6 +17,7 @@
 #include "fbs/storage/Ec.h"
 #include "fbs/storage/EcAuthorized.h"
 #include "fbs/storage/EcGcDiscovery.h"
+#include "fbs/storage/EcGcAbsentDiscovery.h"
 #include "fbs/storage/EcGcRpc.h"
 #include "fbs/storage/EcHelper.h"
 #include "fbs/storage/EcHelperDirect.h"
@@ -389,6 +390,8 @@ class StorageClient : public folly::MoveOnly {
     getEcTargetIdentity,
     exchangeEcGc,
     getEcGcCapability,
+    exchangeEcGcAbsent,
+    getEcGcAbsentCapability,
   };
 
   class RetryConfig : public hf3fs::ConfigBase<RetryConfig> {
@@ -685,6 +688,14 @@ class StorageClient : public folly::MoveOnly {
   }
   virtual CoTryTask<EcGcAck> exchangeEcGcControlled(EcGcRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) {
     co_return makeError(StatusCode::kNotImplemented, "GC requires native RPC28 transport");
+  }
+  virtual CoTryTask<EcGcAbsentDiscoveryObservation> getEcGcAbsentCapabilityControlled(
+      EcGcAbsentDiscoveryRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented);
+  }
+  virtual CoTryTask<EcGcAbsentAck> exchangeEcGcAbsentControlled(
+      EcGcAbsentRequest, std::shared_ptr<const EcGcKey>, EcRequestControl) {
+    co_return makeError(StatusCode::kNotImplemented);
   }
   // Independent local target observation. No scope ACK or distributed effect
   // guarantee is implied. Both request and control key outlive the finite RPC.

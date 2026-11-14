@@ -115,6 +115,14 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.authorizedReconcileEcFragment(req);
   }
 
+  CoTryTask<EcGcAbsentRsp> exchangeEcGcAbsent(serde::CallContext &ctx, const EcGcAbsentRequest &request) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.exchangeEcGcAbsent(request);
+  }
+  CoTryTask<EcGcAbsentDiscoveryRsp> getEcGcAbsentCapability(serde::CallContext &ctx, const EcGcAbsentDiscoveryRequest &request) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.getEcGcAbsentCapability(request);
+  }
   CoTryTask<EcGcRsp> exchangeEcGc(serde::CallContext &ctx, const EcGcRequest &request) {
     reportDefaultQueueLatency(ctx);
     return storageOperator_.exchangeEcGc(request);

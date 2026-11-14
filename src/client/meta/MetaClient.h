@@ -156,6 +156,8 @@ class MetaClient {
   CoTryTask<QueryEcFileOutputRsp> queryEcFileOutput(QueryEcFileOutputReq req);
   CoTryTask<ConfirmEcFileOutputResolutionRsp> confirmEcFileOutputResolution(ConfirmEcFileOutputResolutionReq req);
   CoTryTask<QueryEcFileOutputResolutionRsp> queryEcFileOutputResolution(QueryEcFileOutputResolutionReq req);
+  CoTryTask<EcAbsentAdminRsp> confirmEcFragmentAbsent(ConfirmEcFragmentAbsentReq req);
+  CoTryTask<EcAbsentAdminRsp> queryEcFragmentAbsent(QueryEcFragmentAbsentReq req);
   CoTryTask<EcFileRepairRsp> closeEcFileRepairDebt(CloseEcFileRepairDebtReq req);
 
   CoTryTask<Inode> stat(const UserInfo &userInfo,

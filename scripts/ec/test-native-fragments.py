@@ -24,12 +24,14 @@ SERVICE_FILTER = "TestEcService.*:TestEcServiceWithoutEngine.*:TestEcAuthorizedS
 CLIENT_FILTER = "TestEcStripeRead.*:TestEcBlockRead.*:TestEcRepairPipeline.*:TestFakeMgmtdRoutingListeners.*:TestEcStripeClient.*:TestEcStripeRunRecord.*:TestEcStripeFragmentRecovery.*:TestEcStripeCompletion.*:TestEcGcCommands.*:TestEcRevisionRetirementCommands.*:TestEcAllocationExport.*:TestEcFilePlanning.*:TestEcFilePayload.*:TestEcFileRunJournal.*:TestEcFileClient.*:TestEcReadDispatcher.*:TestEcTreeReadJournal.*:TestEcTreeReadClient.*:TestEcFilePwriteClient.*:TestEcTruncateJournal.*:TestEcAppendJournal.*:TestEcTreeRepairJournal.*:TestEcMetadataRouting.*"
 STORAGE_FILTER += ":TestEcTargetRetirementControl.*:TestEcTargetRetirementExecutor.*"
 STORAGE_FILTER += ":TestEcHelperDirectAuthorization.*"
+STORAGE_FILTER += ":TestEcGcAbsentExecutor.*"
 SERVICE_FILTER += ":TestEcTargetRetirementService.*:TestEcTargetRetirementDisabledService.*"
 CLIENT_FILTER += ":TestEcTargetRetirementCommands.*"
 CLIENT_FILTER += ":TestEcRpcFrameSizes.*"
 CLIENT_FILTER += ":TestEcTransportPolicy.*:TestEcNativeTransportPolicy.*"
 CLIENT_FILTER += ":TestEcNamespaceJournal.*:TestEcNamespaceClient.*"
 CLIENT_FILTER += ":TestEcFileOutputIdentity.*"
+CLIENT_FILTER += ":TestEcAbsentCommands.*"
 LEGACY_FILTER = "TestChunkEngine.ReadWrite:TestStorageTarget.ReadWrite:TestStorageTarget.Uncommitted"
 # TestChunkEngine.ReadWrite retains default 4 MiB/64 MiB buffers and 32 AIO
 # workers: (4 * 4 + 64) * 32 = 2560 MiB of repeated ring registration accounting.

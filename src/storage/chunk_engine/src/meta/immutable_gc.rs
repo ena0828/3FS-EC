@@ -60,7 +60,7 @@ pub(crate) fn stage_gc_key(key: &[u8]) -> Vec<u8> {
     out
 }
 
-fn spec_digest(spec: &ImmutableStageSpec) -> [u8; 32] {
+pub(crate) fn spec_digest(spec: &ImmutableStageSpec) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"3FSGCSPEC1");
     hash.update(spec.stage_id);

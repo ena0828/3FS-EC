@@ -6,6 +6,7 @@
 
 #include "common/utils/Path.h"
 #include "fbs/storage/EcGcControl.h"
+#include "fbs/storage/EcGcAbsentControl.h"
 #include "fbs/storage/EcIntegrity.h"
 #include "storage/ec_scope/EcScope.h"
 
@@ -77,6 +78,7 @@ class EcStagingEngine {
   // Only the loaded target adapter supplies its actual chain. The key is
   // constructed here from that chain and the authenticated fragment identity.
   Result<EcGcLedgerReceipt> executeGc(const VerifiedEcGcRequest &, ChainId actualChain) const;
+  Result<EcGcAbsentLedgerReceipt> executeGcAbsent(const VerifiedEcGcAbsentRequest &, ChainId actualChain) const;
   explicit EcStagingEngine(rust::Box<chunk_engine::EcStageHandle> handle)
       : handle_(std::move(handle)) {}
   rust::Box<chunk_engine::EcStageHandle> handle_;

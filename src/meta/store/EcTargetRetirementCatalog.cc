@@ -225,4 +225,20 @@ CoTryTask<Void> EcTargetRetirementCatalog::verifyReference(Tx &txn,
     co_return makeError(StatusCode::kTokenMismatch, "immutable retirement reference differs");
   co_return Void{};
 }
+CoTryTask<EcTargetRetirementCompletion> EcTargetRetirementCatalog::getVerifiedCompletion(
+    Tx &txn, const EcV2PhysicalEndpoint &endpoint, const Uuid &authority,
+    const EcTargetRetirementRef &reference, const storage::EcScopeControlKey &key) {
+  auto record = co_await loadTarget(txn, endpoint);
+  CO_RETURN_ON_ERROR(record);
+  if (!*record || !(**record).completion)
+    co_return makeError(StatusCode::kDataCorruption, "referenced target retirement completion is missing");
+  const auto &r = **record;
+  if (r.intent.authority != authority || r.intent.retirementId != reference.retirementId)
+    co_return makeError(StatusCode::kTokenMismatch, "exact retirement witness identity differs");
+  auto digest = checkCompletion(r.intent, r.completion->request, r.completion->observation, &key);
+  CO_RETURN_ON_ERROR(digest);
+  if (*digest != reference.completionDigest || *digest != r.completion->digest)
+    co_return makeError(StatusCode::kDataCorruption, "exact retirement witness digest differs");
+  co_return *r.completion;
+}
 }  // namespace hf3fs::meta::server

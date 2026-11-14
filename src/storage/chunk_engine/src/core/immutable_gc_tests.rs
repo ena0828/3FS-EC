@@ -609,3 +609,89 @@ fn gc_joint_provision_reopens_after_both_initialization_boundaries() {
             .is_err());
     }
 }
+
+fn absent_claim(engine:&ImmutableStagingEngine,id:u8)->EcStageAbsentClaim {
+    use crate::ec_scope::{EcScopeBinding,EcScopeKind,EcScopeRevocation};
+    let gc=claim(engine,&spec(&data(),id),id.wrapping_add(10));
+    let scope=EcScopeRevocation {binding:EcScopeBinding {target:gc.target,object:[90;16],
+        kind:EcScopeKind::WriteOperation,scope:gc.spec.stage_id,owner_uid:1000,client_namespace:[91;16]},
+        id:[92;16],endpoint_set_digest:[93;32]};
+    EcStageAbsentClaim {gc,closure_digest:[94;32],scope,retirement:None}
+}
+#[test]
+fn absence_query_is_not_confirmation_and_original_close_survives_reopen() {
+    let _serial=ENGINE_TEST.lock().unwrap();
+    let (_root,config)=root(true);let engine=open(&config);let key=b"ec-absent";
+    let c=absent_claim(&engine,4);
+    assert!(engine.confirm_absent_after_close(key,&c,false).is_err());
+    assert!(engine.0.engine.meta_store.stage_absent_record(key).unwrap().is_none());
+    engine.scopes().revoke(c.scope).unwrap();
+    assert!(matches!(engine.confirm_absent_after_close(key,&c,true),Err(ImmutableStageError::Missing)));
+    assert!(engine.0.engine.meta_store.stage_absent_record(key).unwrap().is_none());
+    let first=engine.confirm_absent_after_close(key,&c,false).unwrap();
+    assert_eq!(first.record_revision,1);
+    assert!(engine.begin(key,&c.gc.spec).is_err());
+    assert!(engine.collect_known_stage_after_claim(key,&c.gc).is_err());
+    assert!(engine.0.engine.meta_store.stage_record(key).unwrap().is_none());
+    drop(engine);let engine=open(&config);
+    let queried=engine.confirm_absent_after_close(key,&c,true).unwrap();
+    assert_eq!(first.ledger_sha256,queried.ledger_sha256);
+    let mut changed=c;changed.closure_digest=[7;32];
+    assert!(matches!(engine.confirm_absent_after_close(key,&changed,true),Err(ImmutableStageError::Conflict)));
+}
+#[test]
+fn absence_rejects_inflight_stage_unknown_holders_and_reverse_indexes() {
+    let _serial=ENGINE_TEST.lock().unwrap();
+    let (_root,config)=root(true);let engine=open(&config);let key=b"ec-held";
+    let c=absent_claim(&engine,5);
+    engine.scopes().prepare_scope(c.scope.binding).unwrap();
+    let ticket=engine.scopes().try_admit(c.scope.binding).unwrap();
+    engine.scopes().revoke(c.scope).unwrap();
+    assert!(engine.confirm_absent_after_close(key,&c,false).is_err());
+    drop(ticket);
+    // A reverse entry alone is not invisible absence. No accounting is changed.
+    let mut batch=RocksDB::new_write_batch();
+    batch.put(stage_position_key(Position(0)),stage_key(key));
+    engine.0.engine.meta_store.write(batch,true).unwrap();
+    assert!(matches!(engine.confirm_absent_after_close(key,&c,false),Err(ImmutableStageError::Conflict)));
+    assert!(engine.0.engine.meta_store.stage_absent_record(key).unwrap().is_none());
+    let mut batch=RocksDB::new_write_batch();batch.delete(stage_position_key(Position(0)));
+    engine.0.engine.meta_store.write(batch,true).unwrap();
+    // A separate legitimate live scope starts the real stage BEFORE closing.
+    // Never clear the reverse-check slot or bypass its original closed scope.
+    let key2=b"ec-actual-stage";
+    let c2=absent_claim(&engine,7);
+    engine.scopes().prepare_scope(c2.scope.binding).unwrap();
+    let ticket=engine.scopes().try_admit(c2.scope.binding).unwrap();
+    engine.begin(key2,&c2.gc.spec).unwrap();
+    drop(ticket);
+    engine.scopes().revoke(c2.scope).unwrap();
+    assert!(engine.confirm_absent_after_close(key2,&c2,false).is_err());
+    assert!(engine.0.engine.meta_store.stage_absent_record(key2).unwrap().is_none());
+    let key3=b"ec-unknown-reservation";
+    let c3=absent_claim(&engine,8);
+    engine.scopes().prepare_scope(c3.scope.binding).unwrap();
+    let ticket=engine.scopes().try_admit(c3.scope.binding).unwrap();
+    *engine.0.fault.lock().unwrap()=Some(StageFault {point:StageWritePoint::Reservation,after_commit:false});
+    assert!(engine.begin(key3,&c3.gc.spec).is_err());
+    drop(ticket);
+    engine.scopes().revoke(c3.scope).unwrap();
+    assert!(engine.0.engine.meta_store.stage_record(key3).unwrap().is_none());
+    assert!(engine.confirm_absent_after_close(key3,&c3,false).is_err());
+    assert!(engine.0.engine.meta_store.stage_absent_record(key3).unwrap().is_none());
+}
+#[test]
+fn absence_lost_confirmation_reconciles_same_ledger_and_target_retirement_is_exact() {
+    let _serial=ENGINE_TEST.lock().unwrap();
+    let (_root,config)=root(true);let engine=open(&config);let key=b"ec-retired";
+    let mut c=absent_claim(&engine,6);
+    let retirement=crate::ec_scope::EcTargetRetirement {target:c.gc.target,id:[81;16]};
+    c.retirement=Some(retirement);
+    assert!(engine.confirm_absent_after_close(key,&c,false).is_err());
+    engine.scopes().prepare_target_retirement(retirement).unwrap();
+    *engine.0.fault.lock().unwrap()=Some(StageFault {point:StageWritePoint::Absent,after_commit:true});
+    assert!(engine.confirm_absent_after_close(key,&c,false).is_err());
+    let r=engine.confirm_absent_after_close(key,&c,true).unwrap();assert_eq!(r.record_revision,1);
+    c.retirement.as_mut().unwrap().id=[82;16];
+    assert!(engine.confirm_absent_after_close(key,&c,true).is_err());
+}

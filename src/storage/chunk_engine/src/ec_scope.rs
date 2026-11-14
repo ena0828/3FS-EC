@@ -962,6 +962,47 @@ impl EcScopeRegistry {
         }
     }
 
+    /// Reconfirm an ORIGINAL deny on the same owned store. Unlike revoke,
+    /// this never creates a fence. Cache visibility alone is not durability.
+    pub(crate) fn confirm_closed_for_absence(
+        &self,
+        request: EcScopeRevocation,
+        retirement: Option<EcTargetRetirement>,
+    ) -> EcScopeResult<()> {
+        request.validate()?;
+        if let Some(target) = retirement {
+            if target.target != request.binding.target {
+                return Err(EcScopeError::IdentityMismatch);
+            }
+            return match self.query_target_retirement(target)? {
+                EcTargetRetirementStatus::DataDrained => Ok(()),
+                _ => Err(EcScopeError::Busy),
+            };
+        }
+        let gate = self.get_gate(request.binding)?;
+        // No gate/global lock across disk I/O. An irreversible persistent deny
+        // cannot reopen; the final mutex observation excludes existing tickets.
+        if self.load_fence(request.binding)? != Some(request) {
+            return Err(EcScopeError::MissingFence);
+        }
+        let mut state = lock(&gate.state)?;
+        state.ensure_live()?;
+        if state.phase == Phase::Loading {
+            return Err(EcScopeError::Busy);
+        }
+        if state.revocation.is_some_and(|prior| prior != request) {
+            return Err(EcScopeError::RevocationMismatch);
+        }
+        state.phase = Phase::Denied;
+        state.revocation = Some(request);
+        state.durable = true;
+        gate.loaded.notify_all();
+        match state.drain_status() {
+            EcDrainStatus::Drained => Ok(()),
+            _ => Err(EcScopeError::Busy),
+        }
+    }
+
     fn load_fence(&self, binding: EcScopeBinding) -> EcScopeResult<Option<EcScopeRevocation>> {
         let target = self.load_target(binding.target.chain, binding.target.target)?;
         if target != binding.target {

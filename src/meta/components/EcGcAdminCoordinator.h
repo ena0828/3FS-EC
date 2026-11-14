@@ -3,6 +3,7 @@
 #include "meta/components/EcCoordinator.h"
 #include "meta/components/EcV2Coordinator.h"
 #include "meta/components/NativeEcGcTransport.h"
+#include "meta/components/NativeEcGcAbsentTransport.h"
 
 namespace hf3fs::meta::server {
 // Service-owned runtime. Authorization is performed by MetaOperator before
@@ -19,10 +20,13 @@ class EcGcAdminCoordinator {
   Result<storage::EcKeyFileIdentity> loadedKeyFileIdentity() const;
   CoTryTask<EcGcAdminRsp> collect(EcGcAdminReq) const;
   CoTryTask<EcGcAdminRsp> query(EcGcAdminReq) const;
+  CoTryTask<EcAbsentAdminRsp> confirmAbsent(EcGcAdminReq) const;
+  CoTryTask<EcAbsentAdminRsp> queryAbsent(EcGcAdminReq) const;
 
  private:
   struct State;
   static CoTryTask<EcGcAdminRsp> executeOwned(std::shared_ptr<State>, EcGcAdminReq, storage::EcGcAction);
+  static CoTryTask<EcAbsentAdminRsp> executeAbsentOwned(std::shared_ptr<State>, EcGcAdminReq, storage::EcGcAbsentAction);
   const Config &config_;
   std::optional<Status> initializationError_;
   std::shared_ptr<State> state_;

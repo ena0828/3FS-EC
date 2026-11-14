@@ -250,13 +250,13 @@ class FileLabGates(unittest.TestCase):
             with self.subTest(check_changes=changes), self.assertRaises(lab.GateError):
                 lab.require_flat_direct_result(bad, root)
 
-    def test_core_gate_accepts_current_exact_32_and_rejects_stale_failed_or_incomplete_evidence(self):
+    def test_core_gate_accepts_current_exact_34_and_rejects_stale_failed_or_incomplete_evidence(self):
         # Synthetic private receipts/files exercise the actual parsers and
         # validators. No ELF, FDB process or acceptance workload is executed.
         source = Path(__file__).resolve().parents[3]
         core = lab.module(source / 'scripts/ec/ci/run-core-tests.py', 'core_gate_fixture')
         common = lab.module(source / 'scripts/ec/test-native-fragments.py', 'core_gate_common_fixture')
-        self.assertEqual((len(core.META_CASES), len(core.FUSE_CASES)), (17, 15))
+        self.assertEqual((len(core.META_CASES), len(core.FUSE_CASES)), (19, 15))
         with tempfile.TemporaryDirectory() as temp:
             parent = Path(temp).resolve()
             build, fdb, output = parent / 'build', parent / 'fdb', parent / 'acceptance'
@@ -286,7 +286,7 @@ class FileLabGates(unittest.TestCase):
                     lines.append('  ' + method)
                 path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
-            record = {'status': 'passed', 'exitcode': 0, 'passed_tests': 32, 'failures': [], 'signals': [],
+            record = {'status': 'passed', 'exitcode': 0, 'passed_tests': 34, 'failures': [], 'signals': [],
                       'source': str(source), 'build': str(build), 'work': str(output),
                       'runner_sha256': lab.sha(source / 'scripts/ec/ci/run-core-tests.py'),
                       'helpers_sha256': {name: lab.sha(source / 'scripts/ec' / name)
@@ -322,7 +322,7 @@ class FileLabGates(unittest.TestCase):
                 return lab.core_gate(source, build, fdb, path)
 
             accepted = check(record)
-            self.assertEqual(accepted['passed_tests'], 32)
+            self.assertEqual(accepted['passed_tests'], 34)
             self.assertEqual(accepted['binaries']['test_meta'], lab.sha(build / 'tests/test_meta'))
             for update in ({'passed_tests': 21}, {'passed_tests': 26}, {'status': 'failed'}, {'exitcode': 1}, {'failures': ['synthetic']}):
                 with self.subTest(update=update), self.assertRaises(ValueError):

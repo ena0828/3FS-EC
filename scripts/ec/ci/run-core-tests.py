@@ -17,7 +17,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 
-META_FILTER = "TestEcFileNativeWrite.*:TestEcMountedTruncateRecovery.*:TestEcStorageTransportConfig.*:TestEcFileOutputResolution.*"
+META_FILTER = "TestEcFileNativeWrite.*:TestEcMountedTruncateRecovery.*:TestEcStorageTransportConfig.*:TestEcFileOutputResolution.*:TestEcFileNativeAbsent.*"
 FUSE_FILTER = "TestEcFuseRead.*:TestEcFuseShutdown.*:TestEcFileMount.*:TestEcFuseTransportConfig.*"
 META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
     "AppendLostAcceptanceUsesSameEofAndFsyncRequiresPublishedData",
@@ -39,6 +39,9 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
         "UnissuedZeroAndIssuedDataCloseBeforePermanentQualification",
         "BoundAndInconsistentPermanentEvidenceNeverQualify",
         "OriginalFenceConflictsWithLateIssuanceAndCannotReopen",
+    )) + tuple("TestEcFileNativeAbsent." + name for name in (
+        "MixedBoundCandidatesRequireDistinctCollectedOrAbsentFacts",
+        "LostAbsentReplyReopensAndQueryRecordsTheOriginalFact",
     ))
 # The two flat manager cases also verify opt-in repair metrics, joined failure
 # scopes and history/default-off isolation against real Meta/FDB + Storage.
@@ -55,7 +58,7 @@ REPAIR_CASES = (
 AUTH_USER_CASES = tuple(f"TestAuth/{backend}.{case}" for backend in (0, 1)
                         for case in ("Basic", "ExplicitPrimaryGroup"))
 SERVICE_CONTRACT_CASES = AUTH_USER_CASES + (
-    "TestMetaServiceReflection.RegistersAll74IncludingBeyondDefaultFieldRank",
+    "TestMetaServiceReflection.RegistersAll76IncludingBeyondDefaultFieldRank",
 )
 TARGET_META_CASES = (
     "TestEcTargetRetirementCatalog.RealFdbImmutableIntentAndRequestIdentity",

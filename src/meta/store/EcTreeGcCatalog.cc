@@ -7,6 +7,7 @@
 
 #include "EcFileExecutionCatalog.h"
 #include "EcFileRepairCatalog.h"
+#include "EcFileTruncateCatalog.h"
 #include "EcFileTreeGcGuard.h"
 #include "EcV2LifecycleUtils.h"
 #include "common/utils/SerDeser.h"
@@ -319,6 +320,72 @@ CoTryTask<EcGcClaim> EcTreeGcCatalog::claim(kv::IReadWriteTransaction &raw,
   CO_RETURN_ON_ERROR(co_await store(t, *ek, proof));
   CO_RETURN_ON_ERROR(co_await store(t, *ck, *next));
   co_return next;
+}
+
+CoTryTask<EcGcBoundClosure> EcTreeGcCatalog::closureForClaim(
+    kv::IReadWriteTransaction &raw, const EcObjectRef &object,
+    const storage::EcFragmentIdentity &identity, const Uuid &claimId,
+    const storage::EcScopeControlKey &control) {
+  if (claimId.is_nil()) co_return makeError(StatusCode::kInvalidArg);
+  EcGcTxnScope scope(raw);
+  auto &tx = scope.transaction();
+  auto loaded = co_await getClaim(tx, object, identity);
+  CO_RETURN_ON_ERROR(loaded);
+  if (!*loaded) co_return makeError(StatusCode::kTokenStale, "no committed G2 claim for absence observation");
+  const auto &claim = **loaded;
+  if (claim.claimId != claimId) co_return makeError(StatusCode::kTokenMismatch);
+  auto execution = co_await EcFileExecutionCatalog::get(tx, claim.allocation.writer, object,
+                                                       claim.allocation.fragment.operation);
+  CO_RETURN_ON_ERROR(execution);
+  const auto &r = execution->record;
+  if (!r.drain || !r.allocations) co_return makeError(StatusCode::kDataCorruption);
+  if (r.state == State::Aborted) {
+    // The V1 G2 history gate does not itself require an explicit typed fence.
+    // Absence qualification adds this check without changing old G2 semantics.
+    std::optional<EcFileChildRecord> typed;
+    if (r.ownerKind == EcFileExecutionOwner::Repair) {
+      auto child = co_await EcFileRepairCatalog::executionChild(tx, r.child.owner, object, r.child.intent.child);
+      CO_RETURN_ON_ERROR(child);
+      typed = std::move(*child);
+    } else if (r.ownerKind == EcFileExecutionOwner::TruncateTail) {
+      auto child = co_await EcFileTruncateCatalog::executionChild(tx, r.child.owner, object, r.child.intent.child);
+      CO_RETURN_ON_ERROR(child);
+      typed = std::move(*child);
+    } else if (r.ownerKind == EcFileExecutionOwner::Pwrite) {
+      auto child = co_await EcFileMutationCatalog::queryChild(tx, object, r.child.intent.child, r.child.owner);
+      CO_RETURN_ON_ERROR(child);
+      typed = std::move(*child);
+    }
+    if (!typed || typed->state != EcFileChildState::Fenced)
+      co_return makeError(StatusCode::kDataCorruption, "absence requires the actual original typed abort fence");
+  } else if (r.state != State::Published) {
+    co_return makeError(StatusCode::kTokenStale, "absence requires an original terminal execution");
+  }
+  CO_RETURN_ON_ERROR(co_await verifyEcTerminalEvidence(tx, *r.drain, control,
+      r.state == State::Published ? EcTerminalPurpose::Publication : EcTerminalPurpose::FencedAbort));
+  auto origin = digest(r.drain->version == kEcV2LifecycleVersion ? "3FS-TREE-GC-ORIGIN-T2-v2"
+                                                               : "3FS-TREE-GC-ORIGIN-T2-v3", *r.drain);
+  CO_RETURN_ON_ERROR(origin);
+  if (*origin != claim.originDrainEvidence)
+    co_return makeError(StatusCode::kDataCorruption, "absence origin differs from permanent G2 claim");
+  const auto endpoint = claim.allocation.endpoint();
+  std::optional<uint16_t> index;
+  for (uint16_t n = 0; n < r.drain->identity.endpoints.count; ++n) {
+    if (r.drain->identity.endpoints.endpoints[n] != endpoint) continue;
+    if (index) co_return makeError(StatusCode::kDataCorruption, "ambiguous original closure endpoint");
+    index = n;
+  }
+  if (!index) co_return makeError(StatusCode::kDataCorruption, "original closure omitted claimed endpoint");
+  EcGcBoundClosure out{claim, *r.drain, *index, std::nullopt};
+  if (r.drain->retirements[*index]) {
+    auto retired = co_await EcTargetRetirementCatalog::getVerifiedCompletion(tx, endpoint,
+        r.drain->identity.clusterAuthority, *r.drain->retirements[*index], control);
+    CO_RETURN_ON_ERROR(retired);
+    out.retirement = std::move(*retired);
+  } else if (!r.drain->observations[*index]) {
+    co_return makeError(StatusCode::kDataCorruption, "local closure has no original terminal exchange");
+  }
+  co_return out;
 }
 
 CoTryTask<EcRevisionRetirementRsp> EcTreeGcCatalog::retire(kv::IReadWriteTransaction &raw,

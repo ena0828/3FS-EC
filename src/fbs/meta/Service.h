@@ -23,6 +23,7 @@
 #include "fbs/meta/EcFileAppend.h"
 #include "fbs/meta/EcFileOutput.h"
 #include "fbs/meta/EcFileOutputResolution.h"
+#include "fbs/meta/EcGcAbsentCompletion.h"
 #include "fbs/meta/EcFileRange.h"
 #include "fbs/meta/EcFileRepairRpc.h"
 #include "fbs/meta/EcFileRpc.h"
@@ -889,6 +890,47 @@ struct EcGcAdminRsp : RspBase {
   SERDE_STRUCT_FIELD(ledgerSha256, storage::EcSha256{});
   SERDE_STRUCT_FIELD(terminalRevision, uint64_t{});
 };
+struct ConfirmEcFragmentAbsentReq : EcGcAdminReq {
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcGcAdminReq::valid());
+    if (client.uuid.is_nil()) return makeError(StatusCode::kInvalidArg);
+    return Void{};
+  }
+};
+struct QueryEcFragmentAbsentReq : EcGcAdminReq {
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcGcAdminReq::valid());
+    if (client.uuid.is_nil()) return makeError(StatusCode::kInvalidArg);
+    return Void{};
+  }
+};
+struct EcAbsentAdminRsp : RspBase {
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(identity, storage::EcFragmentIdentity{});
+  SERDE_STRUCT_FIELD(claimId, Uuid::zero());
+  SERDE_STRUCT_FIELD(clientNamespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(state, storage::EcGcAbsentState::AbsentAfterClose);
+  SERDE_STRUCT_FIELD(claimDigest, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(closureDigest, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(ledgerSha256, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(recordRevision, uint64_t{});
+  SERDE_STRUCT_FIELD(candidateReservationReleaseEligible, false);
+  SERDE_STRUCT_FIELD(collected, false);
+  SERDE_STRUCT_FIELD(physicalReclamationConfirmed, false);
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(identity.validate());
+    if (identity.object != object.incarnation || !object.inode.u64() || object.inode.isTreeRoot() ||
+        object.inode > InodeId::normalMax() || claimId.is_nil() || clientNamespace.is_nil() || requestId.is_nil() ||
+        state != storage::EcGcAbsentState::AbsentAfterClose || recordRevision != 1 ||
+        claimDigest == storage::EcSha256{} || closureDigest == storage::EcSha256{} || ledgerSha256 == storage::EcSha256{} ||
+        !candidateReservationReleaseEligible || collected || physicalReclamationConfirmed)
+      return makeError(StatusCode::kDataCorruption, "invalid absent candidate observation");
+    return Void{};
+  }
+};
 
 // Authenticated root observes an exact original owner; its own client namespace
 // is independent from the owner whose immutable output is being inspected.
@@ -1442,6 +1484,8 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(queryEcFileOutput, 72, QueryEcFileOutputReq, QueryEcFileOutputRsp);
   META_SERVICE_METHOD(confirmEcFileOutputResolution, 73, ConfirmEcFileOutputResolutionReq, ConfirmEcFileOutputResolutionRsp);
   META_SERVICE_METHOD(queryEcFileOutputResolution, 74, QueryEcFileOutputResolutionReq, QueryEcFileOutputResolutionRsp);
+  META_SERVICE_METHOD(confirmEcFragmentAbsent, 75, ConfirmEcFragmentAbsentReq, EcAbsentAdminRsp);
+  META_SERVICE_METHOD(queryEcFragmentAbsent, 76, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
   META_SERVICE_METHOD(bindEcRmwOutput, 52, BindEcRmwOutputReq, BindEcRmwOutputRsp);

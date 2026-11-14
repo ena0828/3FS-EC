@@ -366,7 +366,9 @@ auto MetaClient::retry(Func &&func, Req &&req, RetryConfig retryConfig, std::fun
                 std::is_same_v<std::remove_cvref_t<Req>, PrepareEcFileRepairDirectReq> ||
                 std::is_same_v<std::remove_cvref_t<Req>, PrepareEcRepairDirectV2Req> ||
                 std::is_same_v<std::remove_cvref_t<Req>, ConfirmEcFileOutputResolutionReq> ||
-                std::is_same_v<std::remove_cvref_t<Req>, QueryEcFileOutputResolutionReq>) {
+                std::is_same_v<std::remove_cvref_t<Req>, QueryEcFileOutputResolutionReq> ||
+                std::is_same_v<std::remove_cvref_t<Req>, ConfirmEcFragmentAbsentReq> ||
+                std::is_same_v<std::remove_cvref_t<Req>, QueryEcFragmentAbsentReq>) {
     // Disable the network sender's own retransmission as well as the explicit
     // caller's zero-backoff policy. Recovery belongs to the original request ID.
     options.sendRetryTimes = 0;
@@ -588,6 +590,18 @@ CoTryTask<QueryEcFileOutputResolutionRsp> MetaClient::queryEcFileOutputResolutio
   auto once = config_.retry_default();
   once.set_retry_init_wait(0_ms);
   co_return co_await retry(&IMetaServiceStub::queryEcFileOutputResolution, req, std::move(once));
+}
+CoTryTask<EcAbsentAdminRsp> MetaClient::confirmEcFragmentAbsent(ConfirmEcFragmentAbsentReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "fixed absence request UUID is required");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::confirmEcFragmentAbsent, req, std::move(once));
+}
+CoTryTask<EcAbsentAdminRsp> MetaClient::queryEcFragmentAbsent(QueryEcFragmentAbsentReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "fixed absence request UUID is required");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcFragmentAbsent, req, std::move(once));
 }
 
 CoTryTask<EcTargetRetirementRsp> MetaClient::prepareEcTargetRetirement(PrepareEcTargetRetirementReq req) {

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "storage/ec_gc/EcGcExecutor.h"
+#include "storage/ec_gc/EcGcAbsentExecutor.h"
 #include "storage/store/StorageTarget.h"
 #include "storage/store/StorageTargets.h"
 #include "tests/GtestHelpers.h"
@@ -238,6 +239,8 @@ class TestEcGcExecutor : public ::testing::Test {
   EcStageRequest request;
   std::string data;
 };
+
+#include "EcGcAbsentExecutorTests.inc"
 
 TEST_F(TestEcGcExecutor, CollectAndQueryUseSameHandleAndSurviveCleanReopen) {
   ASSERT_NO_FATAL_FAILURE(seal());

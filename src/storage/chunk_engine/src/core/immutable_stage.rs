@@ -8,6 +8,9 @@ use crate::ec_scope::EcStagingFormat;
 use crate::*;
 #[path = "immutable_gc.rs"]
 mod immutable_gc;
+#[path = "immutable_absent.rs"]
+mod immutable_absent;
+pub(crate) use immutable_absent::{EcStageAbsentClaim, EcStageAbsentReceipt};
 use immutable_gc::StageGcPending;
 pub(crate) use immutable_gc::{
     EcStageGcReceipt, IMMUTABLE_GC_ROOT_MARKER, IMMUTABLE_GC_V1_BLOCKER,
@@ -175,6 +178,7 @@ enum StageWritePoint {
     Seal,
     Abort,
     ExactGc,
+    Absent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -408,6 +412,7 @@ impl ImmutableStagingEngine {
         }
         if format == EcStagingFormat::ExactGc {
             Self::validate_gc_ledger_on_open(&engine, &scopes)?;
+            Self::validate_absence_on_open(&engine, &scopes)?;
         }
         Ok(Self(Arc::new(StageInner {
             engine,
@@ -576,6 +581,9 @@ impl ImmutableStagingEngine {
                 return None;
             }
             let guard = slot.try_lock().ok()?;
+            if guard.record.is_none() && !guard.unknown && guard.chunk.is_none() && guard.gc_pending.is_none() {
+                return Some(key.clone());
+            }
             let record = guard.record.as_ref()?;
             if guard.chunk.is_none()
                 && guard.gc_pending.is_none()
@@ -757,6 +765,9 @@ impl ImmutableStagingEngine {
         self.check_key(key)?;
         spec.validate()?;
         let _permit = self.permit()?;
+        if self.0.engine.meta_store.stage_absent_record(key)?.is_some() {
+            return Err(ImmutableStageError::Conflict);
+        }
         let existing = self.lookup_slot(key)?;
         let (slot, inserted) = if let Some(slot) = existing {
             (slot, false)

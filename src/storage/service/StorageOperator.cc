@@ -89,6 +89,7 @@ Result<Void> StorageOperator::stopAndJoin() {
   ecRmwTransport_.reset();
   ecRmwStorage_.reset();
   ecRmwMgmtd_.reset();
+  if (ecGcAbsent_) RETURN_ON_ERROR(ecGcAbsent_->stopAndJoin());
   if (ecGc_) RETURN_ON_ERROR(ecGc_->stopAndJoin());
   if (ecHelpers_) ecHelpers_->stopAndJoin();
   if (ecDiscovery_) ecDiscovery_->stopAndJoin();

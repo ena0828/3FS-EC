@@ -100,6 +100,8 @@ class DummyMetaServiceStub : public IMetaServiceStub {
   NOT_IMPLEMENTED_FUNC(queryEcFileOutput, QueryEcFileOutputReq, QueryEcFileOutputRsp);
   NOT_IMPLEMENTED_FUNC(confirmEcFileOutputResolution, ConfirmEcFileOutputResolutionReq, ConfirmEcFileOutputResolutionRsp);
   NOT_IMPLEMENTED_FUNC(queryEcFileOutputResolution, QueryEcFileOutputResolutionReq, QueryEcFileOutputResolutionRsp);
+  NOT_IMPLEMENTED_FUNC(confirmEcFragmentAbsent, ConfirmEcFragmentAbsentReq, EcAbsentAdminRsp);
+  NOT_IMPLEMENTED_FUNC(queryEcFragmentAbsent, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
   NOT_IMPLEMENTED_FUNC(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
   virtual CoTryTask<AuthRsp> authenticate(const AuthReq &req) { co_return AuthRsp{req.user}; }
@@ -239,6 +241,8 @@ class MetaServiceStub<hf3fs::stubs::StubMockContext<IMetaServiceStub>> : public 
   FORWARD_RPC_FUNC(queryEcFileOutput, QueryEcFileOutputReq, QueryEcFileOutputRsp);
   FORWARD_RPC_FUNC(confirmEcFileOutputResolution, ConfirmEcFileOutputResolutionReq, ConfirmEcFileOutputResolutionRsp);
   FORWARD_RPC_FUNC(queryEcFileOutputResolution, QueryEcFileOutputResolutionReq, QueryEcFileOutputResolutionRsp);
+  FORWARD_RPC_FUNC(confirmEcFragmentAbsent, ConfirmEcFragmentAbsentReq, EcAbsentAdminRsp);
+  FORWARD_RPC_FUNC(queryEcFragmentAbsent, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
   FORWARD_RPC_FUNC(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 #undef FORWARD_RPC_FUNC

@@ -8,6 +8,8 @@ class EcGcCoordinator;
 
 namespace hf3fs::storage {
 class EcGcExecutor;
+namespace ec_gc_absent_detail { class Codec; }
+namespace ec_gc_absent_discovery_detail { class Codec; }
 namespace ec_gc_discovery_detail {
 class Codec;
 }
@@ -57,6 +59,8 @@ class EcGcKey final {
 
  private:
   friend class ec_gc_control_detail::Codec;
+  friend class ec_gc_absent_detail::Codec;
+  friend class ec_gc_absent_discovery_detail::Codec;
   friend class ec_gc_discovery_detail::Codec;
   EcGcKey(std::unique_ptr<EcCapabilityKey> key, Uuid keyId, EcGcRoleFileIdentity fileIdentity)
       : key_(std::move(key)),
