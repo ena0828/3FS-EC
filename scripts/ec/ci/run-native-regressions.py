@@ -96,6 +96,8 @@ SERVICE_MANDATORY |= {
         "HelperDirectMissingPredecessorAndDuplicateHaveFiniteOwnedLifetime",
         "HelperDirectMaskSkipsSealedTargetAndBadDataMacCannotAppend",
         "HelperDirectCancellationAndSourceFenceKeepRealDownstreamJoined",
+        "HelperDirectPendingWriteEioReopensAndReplaysSameAllocation",
+        "HelperDirectGlobalBudgetSaturationKeepsControlResponsive",
     )
 }
 
