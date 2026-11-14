@@ -65,7 +65,7 @@ jobs:
               "ci/test-run-core-tests.py": 16,
               "ci/test-run-spare-lab.py": 10,
               "ci/test-run-fault-matrix.py": 6,
-              "ci/test-system-entrypoints.py": 11,
+              "ci/test-system-entrypoints.py": 17,
               "test-mode4-lifecycle-acceptance.py": 15,
               "test-mode4-mount-evidence.py": 9,
           }

@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ec-hosted-native-${{ github.ref }}
@@ -47,6 +48,8 @@ jobs:
       - name: Record the API job start and admission timing
         timeout-minutes: 2
         shell: bash
+        env:
+          EC_JOB_BUDGET_TOKEN: ${{ github.token }}
         run: python3 -B scripts/ec/ci/job-budget.py record
 
       - name: Check acceptance gates and Linux directory descriptors before building

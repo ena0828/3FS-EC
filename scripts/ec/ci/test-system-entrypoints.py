@@ -311,7 +311,7 @@ class SystemEntrypoints(unittest.TestCase):
         # A same-named foreign exception is not a trusted base gate message.
         foreign_gate = type("GateError", (ValueError,), {})
         reasons = {"context": "unexpected hosted job context",
-                   "record": "anonymous API unavailable after bounded retries",
+                   "record": "GitHub API unavailable after bounded retries",
                    "check": "budget receipt context or constants differ"}
         for phase, reason in reasons.items():
             for kind in ("gate", "unknown", "foreign"):
@@ -399,6 +399,200 @@ class SystemEntrypoints(unittest.TestCase):
             selected.assert_called_once_with("target-meta", ref=ref)
             owned.context.assert_called_once_with()
             owned.record.assert_called_once_with(Path("/private"), {"system_driver_sha256": "wrapper"})
+
+
+class BudgetApiRequests(unittest.TestCase):
+    TOKEN = "explicitly-fake-budget-token.123"
+
+    def setUp(self):
+        self.base = load("checked_authenticated_budget", "job-budget.py")
+        self.identity = {"repo": "ena0828/3FS-EC", "run_id": "123", "attempt": "2",
+                         "head_sha": "a" * 40, "runner_name": "owned-runner", "job_name": "native",
+                         "uid": 1001, "gid": 1001, "boot_id": "fixed-boot", "time_namespace": "time:[7]"}
+        self.url = "https://api.github.com/repos/ena0828/3FS-EC/actions/runs/123/attempts/2/jobs?per_page=100&page=1"
+        self.job = {"id": 456, "name": "native", "run_id": 123, "head_sha": "a" * 40,
+                    "runner_name": "owned-runner", "runner_id": 789, "status": "in_progress",
+                    "conclusion": None, "run_url": "https://api.github.com/repos/ena0828/3FS-EC/actions/runs/123",
+                    "started_at": "2026-11-14T09:59:30Z"}
+        self.data = json.dumps({"total_count": 1, "jobs": [self.job]}).encode()
+        real_datetime = self.base.dt.datetime
+
+        class FixedDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 11, 14, 10, 0, 0, tzinfo=self.base.dt.timezone.utc)
+                return value.astimezone(tz) if tz is not None else value.replace(tzinfo=None)
+
+        self.fixed_datetime = FixedDatetime
+
+    def reply(self, *, data=None, url=None, date="Sat, 14 Nov 2026 10:00:00 GMT", age="0"):
+        response = mock.MagicMock()
+        response.status = 200
+        response.geturl.return_value = self.url if url is None else url
+        response.headers = {"Date": date, "Age": age}
+        body = self.data if data is None else data
+        response.read.side_effect = lambda limit: body[:limit]
+        response.__enter__.return_value = response
+        response.__exit__.side_effect = lambda *_: response.close() and False
+        return response
+
+    @contextlib.contextmanager
+    def session(self, response=None, *, failures=None, token=TOKEN, clocks=(1_000_000_000, 2_000_000_000)):
+        opener = mock.Mock()
+        if failures is not None:
+            opener.open.side_effect = failures
+        else:
+            opener.open.return_value = response if response is not None else self.reply()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {} if token is None else {"EC_JOB_BUDGET_TOKEN": token},
+                                                clear=True))
+            factory = stack.enter_context(mock.patch.object(self.base.urllib.request, "build_opener", return_value=opener))
+            deadline = stack.enter_context(mock.patch.object(self.base, "request_deadline", side_effect=contextlib.nullcontext))
+            stack.enter_context(mock.patch.object(self.base, "clock", side_effect=clocks))
+            stack.enter_context(mock.patch.object(self.base.dt, "datetime", self.fixed_datetime))
+            sleep = stack.enter_context(mock.patch.object(self.base.time, "sleep"))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            yield SimpleNamespace(opener=opener, factory=factory, deadline=deadline, sleep=sleep, output=output)
+
+    def test_authenticated_fetch_uses_exact_get_and_keeps_token_out_of_evidence(self):
+        response = self.reply()
+        with self.session(response) as calls:
+            result = self.base.fetch(self.identity)
+            self.assertNotIn("EC_JOB_BUDGET_TOKEN", os.environ)
+        request = calls.opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, self.url)
+        self.assertEqual(request.get_method(), "GET")
+        self.assertIsNone(request.data)
+        self.assertEqual(dict((key.lower(), value) for key, value in request.header_items()), {
+            "accept": "application/vnd.github+json", "x-github-api-version": self.base.API_VERSION,
+            "user-agent": "3FS-EC-job-budget", "cache-control": "no-cache", "pragma": "no-cache",
+            "authorization": "Bearer " + self.TOKEN})
+        calls.opener.open.assert_called_once_with(request, timeout=20)
+        handlers = calls.factory.call_args.args
+        self.assertEqual(len(handlers), 2)
+        self.assertIsInstance(handlers[0], self.base.urllib.request.ProxyHandler)
+        self.assertEqual(handlers[0].proxies, {})
+        self.assertIsInstance(handlers[1], self.base.NoRedirect)
+        response.read.assert_called_once_with((2 << 20) + 1)
+        response.close.assert_called_once_with()
+        calls.deadline.assert_called_once_with()
+        calls.sleep.assert_not_called()
+        self.assertEqual(result, (self.data, self.job, "Sat, 14 Nov 2026 10:00:00 GMT",
+                                  1_000_000_000, 2_000_000_000, 93_000_000_000))
+        self.assertEqual(calls.output.getvalue(), "")
+        self.assertNotIn(self.TOKEN, json.dumps([result[0].decode(), *result[1:]]))
+
+    def test_missing_or_invalid_token_is_removed_and_rejected_before_opener(self):
+        for token in (None, "", "fake\ncredential", "fake\rcredential", "fake credential", "x" * 4097):
+            with self.subTest(token_kind=type(token).__name__, length=0 if token is None else len(token)):
+                with self.session(token=token) as calls:
+                    with self.assertRaisesRegex(self.base.GateError, "token missing or invalid"):
+                        self.base.fetch(self.identity)
+                    self.assertNotIn("EC_JOB_BUDGET_TOKEN", os.environ)
+                calls.factory.assert_not_called()
+                calls.opener.open.assert_not_called()
+                calls.deadline.assert_not_called()
+                calls.sleep.assert_not_called()
+                self.assertEqual(calls.output.getvalue(), "")
+
+    def test_three_api_failures_are_bounded_classified_and_do_not_leak(self):
+        for status in (403, 429, True, 700):
+            with self.subTest(status=status):
+                body = io.BytesIO((self.TOKEN + " private response body").encode())
+                http_error = self.base.urllib.error.HTTPError(self.url, status, self.TOKEN,
+                                                             {"Secret": self.TOKEN}, body)
+                failures = [http_error, TimeoutError(self.TOKEN), self.base.urllib.error.URLError(self.TOKEN)]
+                with self.session(failures=failures, clocks=(1, 2, 3)) as calls:
+                    with self.assertRaisesRegex(self.base.GateError, "GitHub API unavailable after bounded retries") as caught:
+                        self.base.fetch(self.identity)
+                    self.assertNotIn("EC_JOB_BUDGET_TOKEN", os.environ)
+                self.assertTrue(body.closed)
+                self.assertEqual(calls.factory.call_count, 1)
+                self.assertEqual(calls.opener.open.call_count, 3)
+                self.assertEqual(calls.deadline.call_count, 3)
+                self.assertEqual(calls.sleep.call_args_list, [mock.call(1), mock.call(1)])
+                requests = [call.args[0] for call in calls.opener.open.call_args_list]
+                self.assertTrue(all(request is requests[0] and request.full_url == self.url for request in requests))
+                expected_status = status if type(status) is int and 100 <= status <= 599 else None
+                self.assertEqual([json.loads(line) for line in calls.output.getvalue().splitlines()], [
+                    {"status": "job-api-request-failed", "attempt": 1,
+                     "failure": {"kind": "http", "status_code": expected_status}},
+                    {"status": "job-api-request-failed", "attempt": 2, "failure": {"kind": "timeout"}},
+                    {"status": "job-api-request-failed", "attempt": 3, "failure": {"kind": "transport"}}])
+                self.assertNotIn(self.TOKEN, calls.output.getvalue() + str(caught.exception))
+                self.assertNotIn("private response body", calls.output.getvalue())
+
+    def test_invalid_response_identity_or_freshness_fails_once_without_fallback(self):
+        wrong_job = dict(self.job, head_sha="b" * 40)
+        cases = [
+            (self.reply(data=json.dumps({"total_count": 1, "jobs": [wrong_job]}).encode()), "uniquely match"),
+            (self.reply(date="Sat, 14 Nov 2026 10:02:00 GMT"), "not plausibly fresh"),
+            (self.reply(url="https://example.invalid/elsewhere"), "unexpected API response"),
+            (self.reply(age="1"), "cached API response refused"),
+            (self.reply(data=b"x" * ((2 << 20) + 1)), "oversized API response"),
+        ]
+        for response, reason in cases:
+            with self.subTest(reason=reason), self.session(response) as calls:
+                with self.assertRaisesRegex(self.base.GateError, reason):
+                    self.base.fetch(self.identity)
+                self.assertNotIn("EC_JOB_BUDGET_TOKEN", os.environ)
+                calls.opener.open.assert_called_once()
+                calls.sleep.assert_not_called()
+                response.close.assert_called_once_with()
+                self.assertEqual(calls.output.getvalue(), "")
+
+    def test_redirect_handler_closes_response_and_never_reissues_bearer(self):
+        response = io.BytesIO((self.TOKEN + " redirect body").encode())
+        with self.session() as calls:
+            def redirect(request, timeout):
+                self.assertEqual(request.full_url, self.url)
+                self.assertEqual(timeout, 20)
+                handler = calls.factory.call_args.args[1]
+                return handler.redirect_request(request, response, 302, self.TOKEN,
+                                                {"Location": "https://example.invalid/elsewhere"},
+                                                "https://example.invalid/elsewhere")
+            calls.opener.open.side_effect = redirect
+            with self.assertRaisesRegex(self.base.GateError, "API redirect refused"):
+                self.base.fetch(self.identity)
+            self.assertNotIn("EC_JOB_BUDGET_TOKEN", os.environ)
+        self.assertTrue(response.closed)
+        calls.opener.open.assert_called_once()
+        calls.sleep.assert_not_called()
+        self.assertEqual(calls.output.getvalue(), "")
+
+    def test_record_and_remaining_check_keep_complete_evidence_without_token(self):
+        parent = Path("/private-budget-fixture")
+        written = {}
+        def save(path, data):
+            self.assertNotIn(path, written)
+            written[path] = data
+        with self.session() as calls, mock.patch.object(self.base.os.path, "lexists", return_value=False), \
+             mock.patch.object(self.base, "write_new", side_effect=save):
+            self.assertEqual(self.base.record(parent, self.identity), 0)
+            self.assertNotIn("EC_JOB_BUDGET_TOKEN", os.environ)
+        self.assertEqual(set(written), {parent / self.base.BODY_NAME, parent / self.base.RECORD_NAME})
+        data = written[parent / self.base.BODY_NAME]
+        value = json.loads(written[parent / self.base.RECORD_NAME])
+        self.assertEqual(data, self.data)
+        self.assertEqual(value["identity"], self.identity)
+        self.assertEqual(value["raw_sha256"], self.base.digest(data))
+        self.assertEqual(value["job_id"], 456)
+        self.assertEqual(value["started_at"], self.job["started_at"])
+        self.assertNotIn(self.TOKEN, b"".join(written.values()).decode() + calls.output.getvalue())
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(self.base.urllib.request, "build_opener") as opener, \
+             mock.patch.object(self.base, "read_private", side_effect=lambda path, limit: written[path]), \
+             mock.patch.object(self.base, "clock", return_value=3_000_000_000), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.base.remaining(value, data, self.identity, 3_000_000_000), 20_906_000_000_000)
+            self.assertEqual(self.base.check(parent, self.identity), 0)
+            with self.assertRaises(self.base.GateError):
+                self.base.remaining(value, data, dict(self.identity, head_sha="b" * 40), 3_000_000_000)
+            with self.assertRaises(self.base.GateError):
+                self.base.remaining(value, data + b" ", self.identity, 3_000_000_000)
+            opener.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())["status"], "admitted")
+        self.assertNotIn(self.TOKEN, output.getvalue())
 
 
 if __name__ == "__main__":

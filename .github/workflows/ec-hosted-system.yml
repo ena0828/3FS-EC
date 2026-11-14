@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ec-hosted-system-${{ github.ref }}
@@ -49,6 +50,8 @@ jobs:
       - name: Record the running job time anchor
         timeout-minutes: 2
         shell: bash
+        env:
+          EC_JOB_BUDGET_TOKEN: ${{ github.token }}
         run: python3 -B scripts/ec/ci/system-job-budget.py record
 
       - name: Check changed build and ownership entry points without native services

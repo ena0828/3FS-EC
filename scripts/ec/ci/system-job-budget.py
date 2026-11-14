@@ -3,7 +3,7 @@
 
 STAGES controls admission; the workflow sets each step timeout. Legacy 90/80
 receipt constants do not reserve a combined file/matrix budget or guarantee
-completion or cleanup. No workflow cancellation, credential, build or service
+completion or cleanup. No workflow cancellation, build or service
 operation is performed.
 """
 import argparse

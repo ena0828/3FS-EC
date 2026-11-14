@@ -3,7 +3,8 @@
 
 This is an admission estimate, not a scheduling or cleanup guarantee. GitHub's
 350-minute job cap remains authoritative; the lab step has its own 45-minute cap.
-Only an anonymous, fixed-repository GET is used. No token or logs are requested.
+Only a fixed-repository GET is used, with the recording step's short-lived,
+read-only Actions token. Credentials and authorization headers are never recorded.
 """
 import argparse
 import contextlib
@@ -149,14 +150,15 @@ def elapsed_anchor(started, date_header, request_start, request_end):
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        fp.close()
         raise GateError('API redirect refused')
 
 
 @contextlib.contextmanager
 def request_deadline():
     def expired(*_):
-        raise TimeoutError('anonymous API deadline')
+        raise TimeoutError('job API deadline')
     previous = signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
     try:
@@ -167,10 +169,15 @@ def request_deadline():
 
 
 def fetch(identity):
+    token = os.environ.pop('EC_JOB_BUDGET_TOKEN', '')
+    require(re.fullmatch(r'[A-Za-z0-9._~+/-]{1,4096}={0,2}', token) is not None,
+            'recording step Actions token missing or invalid')
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    request = urllib.request.Request(endpoint(identity), headers={
+    request = urllib.request.Request(endpoint(identity), method='GET', headers={
         'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': API_VERSION,
-        'User-Agent': '3FS-EC-job-budget', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache'})
+        'User-Agent': '3FS-EC-job-budget', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache',
+        'Authorization': 'Bearer ' + token})
+    del token
     for attempt in range(3):
         try:
             start = clock()
@@ -188,10 +195,21 @@ def fetch(identity):
             require(abs((dt.datetime.now(dt.timezone.utc) - server).total_seconds()) <= DATE_FRESHNESS_SECONDS,
                     'HTTP Date not plausibly fresh')
             return data, job, date_header, start, end, age
-        except (TimeoutError, urllib.error.URLError):
-            if attempt == 2:
-                raise GateError('anonymous API unavailable after bounded retries') from None
-            time.sleep(1)
+        except urllib.error.HTTPError as error:
+            code = error.code
+            failure = {'kind': 'http', 'status_code': code if type(code) is int and 100 <= code <= 599 else None}
+            error.close()
+        except TimeoutError:
+            failure = {'kind': 'timeout'}
+        except urllib.error.URLError:
+            failure = {'kind': 'transport'}
+        # Only a closed set of categories and a bounded integer are published.
+        # Never stringify exceptions, response bodies, headers or request objects.
+        print(json.dumps({'status': 'job-api-request-failed', 'attempt': attempt + 1,
+                          'failure': failure}, sort_keys=True))
+        if attempt == 2:
+            raise GateError('GitHub API unavailable after bounded retries') from None
+        time.sleep(1)
     raise GateError('API request did not complete')
 
 
