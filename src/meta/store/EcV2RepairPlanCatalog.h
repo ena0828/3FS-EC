@@ -21,7 +21,9 @@ class EcV2RepairPlanCatalog {
  public:
   using Transaction = kv::IReadWriteTransaction;
   // Pure consistency checking and reconstruction; no authentication or signing.
-  static Result<EcV2RepairPlanRecord> build(const EcV2RepairSnapshot &, const EcV2RepairSelection &);
+  static Result<EcV2RepairPlanRecord> build(
+      const EcV2RepairSnapshot &, const EcV2RepairSelection &,
+      EcV2RepairDelivery delivery = EcV2RepairDelivery::ClientAppend);
   static Result<std::shared_ptr<const storage::EcRepairPlan>> validate(const EcV2RepairPlanRecord &);
 
   // The caller authenticates UID and checks WRITE, inode incarnation/flags and
@@ -29,10 +31,13 @@ class EcV2RepairPlanCatalog {
   // durable bindings, retains the implicit base pin, saves/replays ECRP, and
   // performs a genuine ECVI increment even on an identical renewal. It does
   // not commit. Discard a failed transaction; sign only after commit succeeds.
-  static CoTryTask<EcV2RepairPlanRecord> prepare(Transaction &,
-                                                 const EcObjectRef &,
-                                                 const Uuid &operation,
-                                                 const EcOwner &authenticatedOwner,
-                                                 const EcV2RepairSelection &);
+  static CoTryTask<EcV2RepairPlanRecord> prepare(
+      Transaction &, const EcObjectRef &, const Uuid &operation, const EcOwner &authenticatedOwner,
+      const EcV2RepairSelection &, EcV2RepairDelivery delivery = EcV2RepairDelivery::ClientAppend);
+  // WRITE-authenticated history observation: never creates a plan or increments ECVI.
+  // The caller restricts this to Preparing+drain or Published in the same transaction.
+  static CoTryTask<EcV2RepairPlanRecord> observe(Transaction &, const EcObjectRef &, const Uuid &,
+                                               const EcOwner &, const EcV2RepairSelection &,
+                                               EcV2RepairDelivery);
 };
 }  // namespace hf3fs::meta::server

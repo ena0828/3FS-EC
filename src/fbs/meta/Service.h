@@ -852,6 +852,13 @@ struct PrepareEcRepairV2Rsp : RspBase {
   SERDE_STRUCT_FIELD(helpers, (std::optional<std::array<storage::EcHelperCapability, 10>>{}));
 };
 
+// Separate method and response preserve the old Prepare wire shape.
+struct PrepareEcRepairDirectV2Req : PrepareEcRepairV2Req {};
+struct PrepareEcRepairDirectV2Rsp : RspBase {
+  SERDE_STRUCT_FIELD(base, PrepareEcRepairV2Rsp{});
+  SERDE_STRUCT_FIELD(delegation, (std::optional<storage::EcHelperDirectDelegation>{}));
+};
+
 // Root-only GC accepts identities, never a caller endpoint, claim certificate,
 // receipt, eligibility flag or allocator position. Success is committed G2.
 struct EcGcAdminReq : ReqBase {
@@ -1379,6 +1386,7 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(prepareEcTargetRetirement, 68, PrepareEcTargetRetirementReq, EcTargetRetirementRsp);
   META_SERVICE_METHOD(queryEcTargetRetirement, 69, QueryEcTargetRetirementReq, EcTargetRetirementRsp);
   META_SERVICE_METHOD(prepareEcFileRepairDirect, 70, PrepareEcFileRepairDirectReq, EcFileRepairDirectRsp);
+  META_SERVICE_METHOD(prepareEcRepairDirectV2, 71, PrepareEcRepairDirectV2Req, PrepareEcRepairDirectV2Rsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
   META_SERVICE_METHOD(bindEcRmwOutput, 52, BindEcRmwOutputReq, BindEcRmwOutputRsp);

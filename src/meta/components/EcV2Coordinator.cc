@@ -241,6 +241,35 @@ Result<std::optional<std::array<storage::EcHelperCapability, 10>>> EcV2Coordinat
                              std::min(config_.ec_grant_ttl_seconds(), config_.ec_v2_helper_grant_ttl_seconds())));
   return std::optional<std::array<storage::EcHelperCapability, 10>>(std::move(grants));
 }
+Result<storage::EcHelperDirectDelegation> EcV2Coordinator::issueFlatRepairDirect(
+    const EcV2RepairPlanRecord &record, const EcV2MutationRsp &mutation) const {
+  if (record.version != kEcV2RepairDirectVersion || !mutation.allocations || mutation.drain ||
+      mutation.record.state != EcOperationState::Preparing ||
+      mutation.record.intent.kind != EcMutationKind::Repair || record.object != mutation.record.intent.object ||
+      record.operation != mutation.record.intent.operation || record.owner.uid != mutation.record.owner.uid ||
+      record.owner.client != mutation.record.owner.client)
+    return makeError(StatusCode::kTokenMismatch, "direct delegation requires committed open ECRP2");
+  CHECK_RESULT(plan, EcV2RepairPlanCatalog::validate(record));
+  std::array<storage::EcCapabilityV2, 2> appends{}, queries{};
+  for (size_t i = 0; i != plan->input().targetCount; ++i) {
+    const auto &target = plan->input().targets[i];
+    const auto &allocation = (*mutation.allocations)[target.identity.shard];
+    const auto endpoint = allocation.endpoint().controlEndpoint();
+    if (!serde::equals(allocation.fragment.identity, target.identity) ||
+        allocation.fragment.operation != target.operationId || allocation.writer.client != target.writerNamespace ||
+        endpoint.nodeId != target.endpoint.nodeId || endpoint.chainId != target.endpoint.chainId ||
+        endpoint.targetId != target.endpoint.targetId || endpoint.engineUuid != target.endpoint.engineUuid ||
+        endpoint.targetIncarnation != target.endpoint.targetIncarnation)
+      return makeError(StatusCode::kDataCorruption, "direct target differs from committed allocation");
+    CHECK_RESULT(append, issueGrant(allocation, record.owner, storage::EcGrantScope::WriteOperation,
+                                   record.operation, static_cast<uint16_t>(storage::EcGrantRightV2::Append)));
+    CHECK_RESULT(query, issueGrant(allocation, record.owner, storage::EcGrantScope::WriteOperation,
+                                  record.operation, static_cast<uint16_t>(storage::EcGrantRightV2::Query)));
+    appends[i] = std::move(append);
+    queries[i] = std::move(query);
+  }
+  return issueRepairDirect(record, std::move(appends), std::move(queries));
+}
 Result<storage::EcHelperDirectDelegation> EcV2Coordinator::issueRepairDirect(
     const EcV2RepairPlanRecord &record, std::array<storage::EcCapabilityV2, 2> appends,
     std::array<storage::EcCapabilityV2, 2> queries) const {

@@ -93,7 +93,7 @@ class TestEcAllocationExport : public ::testing::Test {
                                                    nullptr,
                                                    false);
   }
-  void prepare(bool repair = false, std::string state = "Published") {
+  void prepare(bool repair = false, std::string state = "Published", bool direct = false) {
     run_ = {};
     run_.action = repair ? "repair" : "write";
     run_.cluster = "allocation-export-unit";
@@ -125,6 +125,10 @@ class TestEcAllocationExport : public ::testing::Test {
     object.creator = {flat::Uid(123), run_.clientNamespace};
     object.createRequest = run_.createRequest;
     if (repair) {
+      if (direct) {
+        run_.version = 3;
+        run_.delivery = "direct";
+      }
       run_.object = object;
       run_.expectedOwnerUid = 123;
       run_.expectedRevision = 18;
@@ -310,6 +314,23 @@ TEST_F(TestEcAllocationExport, WrongAuthenticatedOwnerOrActualNamespaceNeverQuer
   EXPECT_EQ(calls_->auth.load(), 1);
   EXPECT_EQ(calls_->get.load(), 0);
   EXPECT_FALSE(std::filesystem::exists(path("wrong-namespace.json")));
+}
+
+TEST_F(TestEcAllocationExport, PublishedHelperDirectJournalExportsOriginalAllocationsAfterReadRelease) {
+  prepare(true, "ReadReleased", true);
+  ASSERT_EQ(journal_->record().version, 3);
+  ASSERT_EQ(journal_->record().delivery, "direct");
+  const auto original = serde::serialize(journal_->record());
+  ASSERT_OK(exportTo("direct.json"));
+  EXPECT_EQ(calls_->get.load(), 1);
+  EXPECT_EQ(calls_->mutations.load(), 0);
+  const auto json = folly::parseJson(read("direct.json"));
+  ASSERT_EQ(json["allocations"].size(), 12);
+  EXPECT_EQ(json["operation"].asString(), run_.operation.toHexString());
+  EXPECT_EQ(json["request_id"].asString(), run_.getRequest.toHexString());
+  EXPECT_EQ(json["query_rpc"].asInt(), 33);
+  EXPECT_FALSE(json["gc_authorized"].asBool());
+  EXPECT_EQ(serde::serialize(journal_->record()), original);
 }
 
 TEST_F(TestEcAllocationExport, RejectsMixedMetadataRemoteStatesAndUnavailableHistoricalPermissions) {

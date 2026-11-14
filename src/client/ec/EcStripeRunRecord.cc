@@ -60,7 +60,8 @@ std::string journalJson(const T &value) {
   const auto table = out.tableBegin(false);
   refl::Helper::iterate<T>([&](auto field) {
     if constexpr (std::is_same_v<T, EcStripeRunRecord>) {
-      if (value.version == 1 && field.name == "recoverySource") return;
+      if (value.version != 2 && field.name == "recoverySource") return;
+      if (value.version != 3 && field.name == "delivery") return;
     }
     out.key(field.name);
     const auto &item = value.*field.getter;
@@ -76,7 +77,7 @@ std::string journalJson(const T &value) {
   return out.toString(true, true);
 }
 
-// Both journal versions contain only unsigned integral numbers, represented exactly in
+// All journal versions contain only unsigned integral numbers, represented exactly in
 // JSON's signed int64 range. Check before native Serde can narrow an integer.
 // This is a local persistence contract, not a change to the RPC JSON formatter.
 bool exactJournalNumbers(const folly::dynamic &value, unsigned depth = 0) {
@@ -171,9 +172,12 @@ EcStripePinIds EcStripeRunRecord::pinIds(const meta::EcObjectRef &value) const {
 }
 Result<Void> EcStripeRunRecord::validate() const {
   const bool recovery = version == 2 && action == "recovery-write" && recoverySource.has_value();
-  if ((!recovery &&
+  const bool direct =
+      version == 3 && action == "repair" && strategy == "helper" && delivery == "direct" && !recoverySource;
+  if ((!direct && !recovery &&
        (version != 1 || recoverySource || (action != "write" && action != "read" && action != "repair"))) ||
-      cluster.empty() || cluster.size() > 1024 || inputPath.size() > 4096 || remotePath.size() > 4096 ||
+      (!direct && delivery != "return") || cluster.empty() || cluster.size() > 1024 || inputPath.size() > 4096 ||
+      remotePath.size() > 4096 ||
       sourceOrder.size() > 10 || command.size() > 16384 || resumeCommand.size() > 16384 || clientNamespace.is_nil() ||
       !shardBytes || shardBytes > (1u << 20) || inputBytes > uint64_t(shardBytes) * 10 || !inputBytes ||
       createRequest.is_nil() || operation.is_nil() || beginRequest.is_nil() || bindRequest.is_nil() ||

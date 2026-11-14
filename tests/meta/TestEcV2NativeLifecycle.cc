@@ -55,6 +55,8 @@
 #include "meta/store/EcTargetRetirementCatalog.h"
 #include "meta/store/EcTerminalEvidence.h"
 #include "meta/store/EcV2GcCatalog.h"
+#include "meta/store/EcV2LifecycleUtils.h"
+#include "meta/store/EcV2RepairPlanCatalog.h"
 #include "meta/store/EcV2PublishedCatalog.h"
 #include "meta/store/Inode.h"
 #include "meta/store/detail/EcFileTreeKeys.h"
@@ -133,6 +135,11 @@ struct PublishReplyDrop {
   bool directShutdownObserved = false;
   std::condition_variable directChanged;
   std::optional<EcFileRepairDirectRsp> directPrepared;
+  Uuid flatDirectDropOperation = Uuid::zero();
+  size_t flatDirectDrops = 0;
+  int flatDirectShutdown = -1;
+  bool flatDirectFinished = false;
+  std::optional<PrepareEcRepairDirectV2Rsp> flatDirectPrepared;
 };
 
 // The real operator has returned from its FDB commit before this one-shot
@@ -282,6 +289,37 @@ class DropPublishMetaService : public MetaSerdeService {
       }
     }
     if (drop) ctx.transport()->invalidate(false);
+    co_return response;
+  }
+
+  CoTryTask<PrepareEcRepairDirectV2Rsp> prepareEcRepairDirectV2(
+      serde::CallContext &ctx, const PrepareEcRepairDirectV2Req &req) {
+    auto response = co_await MetaSerdeService::prepareEcRepairDirectV2(ctx, req);
+    bool drop = false;
+    if (response && response->delegation) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.flatDirectDropOperation == req.operation) {
+        fault_.flatDirectDropOperation = Uuid::zero();
+        fault_.flatDirectPrepared = *response;
+        ++fault_.flatDirectDrops;
+        drop = true;
+      }
+    }
+    if (drop) {
+      const auto transport = ctx.transport();
+      int result = -1;
+      if (transport->isTCP()) {
+        const auto &handler = static_cast<const net::EventLoop::EventHandler &>(*transport);
+        result = ::shutdown(handler.fd(), SHUT_RDWR);
+      }
+      transport->invalidate(false);
+      {
+        std::lock_guard lock(fault_.mutex);
+        fault_.flatDirectShutdown = result;
+        fault_.flatDirectFinished = true;
+      }
+      fault_.directChanged.notify_all();
+    }
     co_return response;
   }
 
@@ -1904,7 +1942,21 @@ TEST_F(TestEcV2NativeHelperPlan, CommittedPlanRenewalRetainsSelectionAndClosingS
   ASSERT_TRUE(closing->drain);
   EXPECT_EQ(closing->record.state, EcOperationState::Preparing);
   EXPECT_EQ(closing->drain->state, EcV2DrainState::Closing);
-  ASSERT_ERROR(blockingWait(metaClient_->prepareEcRepairV2(planReq)), StatusCode::kTokenStale);
+  auto historyTxn = kv_->createReadWriteTransaction();
+  auto beforeHistory = blockingWait(ec_v2_lifecycle::readIssuanceSequence(
+      *historyTxn, object, storage::EcGrantScope::WriteOperation, replacement.begin.operation));
+  ASSERT_OK(beforeHistory);
+  historyTxn.reset();
+  auto history = blockingWait(metaClient_->prepareEcRepairV2(planReq));
+  ASSERT_OK(history);
+  EXPECT_FALSE(history->helpers);
+  for (const auto &grant : history->mutation.grants) EXPECT_FALSE(grant);
+  historyTxn = kv_->createReadWriteTransaction();
+  auto afterHistory = blockingWait(ec_v2_lifecycle::readIssuanceSequence(
+      *historyTxn, object, storage::EcGrantScope::WriteOperation, replacement.begin.operation));
+  ASSERT_OK(afterHistory);
+  EXPECT_EQ(*beforeHistory, *afterHistory);
+  historyTxn.reset();
   {
     std::lock_guard lock(controlFault_.mutex);
     EXPECT_GE(controlFault_.actualRevokes, 1u);
@@ -2157,6 +2209,14 @@ TEST_F(TestEcV2NativeHelperPlan, StripeManagerRunsAllExplicitRepairStrategiesThr
     auto replay = blockingWait(manager->repair(repair, control()));
     ASSERT_TRUE(replay.published()) << (replay.failure ? replay.failure->describe() : "not published");
     EXPECT_EQ(replay.observation->record.candidate.revision, revision);
+    PrepareEcRepairDirectV2Req wrongDelivery;
+    static_cast<PrepareEcRepairV2Req &>(wrongDelivery) = request<PrepareEcRepairV2Req>();
+    wrongDelivery.object = repair.object.object;
+    wrongDelivery.operation = repair.ids.operation;
+    wrongDelivery.planId = repair.planId;
+    wrongDelivery.maxBlocksInFlight = repair.blockWindow;
+    for (size_t i = 0; i != repair.sources.size(); ++i) wrongDelivery.sourceOrder[i] = repair.sources[i];
+    ASSERT_ERROR(blockingWait(metaClient_->prepareEcRepairDirectV2(wrongDelivery)), StatusCode::kTokenMismatch);
     RecordProperty(fmt::format("native_strategy_{}", round), static_cast<int>(modes[round]));
   }
   blockingWait(manager->close());
@@ -4128,6 +4188,7 @@ TEST_F(TestEcV2NativeOwnedMutation, MissingBirthTamperedHistoricalProofAndWrongC
   ASSERT_OK(blockingWait(metaClient_->queryEcOwnedMutationV2(preparingReq)));
 }
 
+#include "EcFlatDirectNativeTests.inc"
 #include "EcTargetRetirementNativeTests.inc"
 #include "EcFileClientNativeTests.inc"
 #include "EcReadDispatcherNativeTests.inc"

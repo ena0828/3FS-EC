@@ -87,6 +87,7 @@ class IMetaServiceStub {
   IMETA_STUB_METHOD(queryEcFileRepair, QueryEcFileRepairReq, EcFileRepairRsp);
   IMETA_STUB_METHOD(advanceEcFileRepair, AdvanceEcFileRepairReq, EcFileRepairRsp);
   IMETA_STUB_METHOD(prepareEcFileRepairDirect, PrepareEcFileRepairDirectReq, EcFileRepairDirectRsp);
+  IMETA_STUB_METHOD(prepareEcRepairDirectV2, PrepareEcRepairDirectV2Req, PrepareEcRepairDirectV2Rsp);
   IMETA_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 #undef IMETA_STUB_METHOD

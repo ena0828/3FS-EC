@@ -84,6 +84,7 @@ class MetaServiceStub : public IMetaServiceStub {
   META_STUB_METHOD(queryEcFileRepair, QueryEcFileRepairReq, EcFileRepairRsp);
   META_STUB_METHOD(advanceEcFileRepair, AdvanceEcFileRepairReq, EcFileRepairRsp);
   META_STUB_METHOD(prepareEcFileRepairDirect, PrepareEcFileRepairDirectReq, EcFileRepairDirectRsp);
+  META_STUB_METHOD(prepareEcRepairDirectV2, PrepareEcRepairDirectV2Req, PrepareEcRepairDirectV2Rsp);
   META_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 #undef META_STUB_METHOD

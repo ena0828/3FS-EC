@@ -325,7 +325,7 @@ CoTryTask<Void> MetaClient::waitRoutingInfo(const Rsp &rsp, const RetryConfig &r
                 std::is_same_v<Rsp, AcquireEcReadRsp> || std::is_same_v<Rsp, ReleaseEcReadRsp> ||
                 std::is_same_v<Rsp, EcV2MutationRsp> || std::is_same_v<Rsp, AcquireEcReadV2Rsp> ||
                 std::is_same_v<Rsp, ReleaseEcReadV2Rsp> || std::is_same_v<Rsp, PrepareEcRepairV2Rsp> ||
-                std::is_same_v<Rsp, EcTargetRetirementRsp>) {
+                std::is_same_v<Rsp, EcTargetRetirementRsp> || std::is_same_v<Rsp, PrepareEcRepairDirectV2Rsp>) {
     co_return Void{};
   }
   auto begin = SteadyClock::now();
@@ -363,7 +363,8 @@ auto MetaClient::retry(Func &&func, Req &&req, RetryConfig retryConfig, std::fun
   options.timeout = retryConfig.rpc_timeout();
   if constexpr (std::is_same_v<std::remove_cvref_t<Req>, PrepareEcTargetRetirementReq> ||
                 std::is_same_v<std::remove_cvref_t<Req>, QueryEcTargetRetirementReq> ||
-                std::is_same_v<std::remove_cvref_t<Req>, PrepareEcFileRepairDirectReq>) {
+                std::is_same_v<std::remove_cvref_t<Req>, PrepareEcFileRepairDirectReq> ||
+                std::is_same_v<std::remove_cvref_t<Req>, PrepareEcRepairDirectV2Req>) {
     // Disable the network sender's own retransmission as well as the explicit
     // caller's zero-backoff policy. Recovery belongs to the original request ID.
     options.sendRetryTimes = 0;
@@ -1291,6 +1292,12 @@ CoTryTask<EcFileRepairDirectRsp> MetaClient::prepareEcFileRepairDirect(PrepareEc
   auto once = config_.retry_default();
   once.set_retry_init_wait(0_ms);
   co_return co_await retry(&IMetaServiceStub::prepareEcFileRepairDirect, req, std::move(once));
+}
+CoTryTask<PrepareEcRepairDirectV2Rsp> MetaClient::prepareEcRepairDirectV2(PrepareEcRepairDirectV2Req req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist fixed repair request before dispatch");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::prepareEcRepairDirectV2, req, std::move(once));
 }
 CoTryTask<EcFileRepairRsp> MetaClient::closeEcFileRepairDebt(CloseEcFileRepairDebtReq req) {
   if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "persist fixed repair request before dispatch");

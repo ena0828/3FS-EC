@@ -25,6 +25,7 @@ import uuid
 SAMPLES = {"kv112": (112 * 1024, 11469), "multi": (1024 * 1024, 131072),
            "max16": (10 * 1024 * 1024, 1048576)}
 STRATEGIES = ("central", "pipeline", "helper")
+DELIVERIES = ("return", "direct")
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 MAX_JSON = 65536
 
@@ -134,8 +135,7 @@ def object_identity(observation):
 def journal(path, allow_record_only=False):
     path = private_directory(path)
     record = load_json(path / "record.json")
-    require(number(record, "version") == 1 and record.get("action") in ("write", "repair", "read"),
-            "Unsupported record version/action")
+    record_delivery(record)
     names = sorted(p.name for p in path.iterdir() if p.name.startswith("state-"))
     require(len(names) <= 100000, "Excessive observation count")
     if not names:
@@ -149,6 +149,18 @@ def journal(path, allow_record_only=False):
     require(number(latest, "version") == 1 and number(latest, "sequence") == len(names) - 1,
             "Observation version/sequence mismatch")
     return record, latest
+
+
+def record_delivery(record):
+    version = number(record, "version")
+    require(record.get("action") in ("write", "repair", "read"), "Unsupported record action")
+    if version == 1:
+        require("delivery" not in record, "Legacy record cannot change delivery")
+        return "return"
+    require(version == 3 and record["action"] == "repair" and record.get("strategy") == "helper"
+            and record.get("delivery") == "direct" and "recoverySource" not in record,
+            "Unsupported record version/delivery")
+    return "direct"
 
 
 def sample_bytes(name):
@@ -354,16 +366,20 @@ class Runner:
         for path in paths:
             require(not canonical(path).exists(), f"Run directory already exists; explicit resume required: {path}")
 
-    def case_paths(self, label, sample, strategy, replacements):
+    def case_paths(self, label, sample, strategy, replacements, delivery="return"):
         require(LABEL.fullmatch(label), "Invalid experiment label")
+        require(strategy in STRATEGIES and replacements in (1, 2), "Unsupported repair choice")
+        require(delivery in DELIVERIES and (delivery == "return" or strategy == "helper"),
+                "Direct delivery requires helper strategy")
         suffix = "one" if replacements == 1 else "two"
         stem = f"{label}-{sample}-{strategy}-{suffix}"
+        if delivery == "direct":
+            stem += "-direct"
         return stem, [self.runs / (kind + "-" + stem) for kind in ("write", "repair", "read")]
 
-    def case(self, label, sample, strategy, replacements):
-        require(strategy in STRATEGIES and replacements in (1, 2), "Unsupported repair choice")
+    def case(self, label, sample, strategy, replacements, delivery="return"):
+        stem, (write, repair, read) = self.case_paths(label, sample, strategy, replacements, delivery)
         info = sample_info(self.root, sample)
-        stem, (write, repair, read) = self.case_paths(label, sample, strategy, replacements)
         self.fresh([write, repair, read])
         mask = 1 if replacements == 1 else 3
         order = list(range(1, 11)) if replacements == 1 else list(range(2, 12))
@@ -372,8 +388,10 @@ class Runner:
         require(wr.get("inputPath") == str(info[0]) and wr.get("remotePath") == "/ec-lab/" + stem,
                 "Write journal does not bind requested paths")
         self.invoke(repair, "new-repair", source_run=write, strategy=strategy, replacement_mask=mask,
-                    source_order=json.dumps(order, separators=(",", ":")), block_window=2)
+                    source_order=json.dumps(order, separators=(",", ":")), block_window=2,
+                    **({"delivery": "direct"} if delivery == "direct" else {}))
         rr, ro = published(repair, info)
+        require(record_delivery(rr) == delivery, "Repair journal changed requested delivery")
         require(rr.get("strategy") == strategy and number(rr, "replacementMask") == mask
                 and rr.get("sourceOrder") == order and number(rr, "blockWindow") == 2,
                 "Repair journal differs from requested fixed plan")
@@ -382,7 +400,7 @@ class Runner:
                 and object_identity(ro) == object_identity(wo), "Repair source/object/revision binding mismatch")
         self.release(repair)
         result = self.read_from(repair, read, info)
-        self.checked.append({"case": stem, "strategy": strategy, "replacement_count": replacements,
+        self.checked.append({"case": stem, "strategy": strategy, "delivery": delivery, "replacement_count": replacements,
                              "fault_injected": False, "readback": result, "repair_pin_released": True})
 
     def read_from(self, source, read, info):
@@ -445,6 +463,8 @@ def parser():
         q.add_argument("--label", required=True)
         if name == "case":
             q.add_argument("--strategy", choices=STRATEGIES, required=True)
+            q.add_argument("--delivery", choices=DELIVERIES, default="return",
+                           help="Helper result delivery; direct requires --strategy helper")
             q.add_argument("--replacements", type=int, choices=(1, 2), required=True)
             q.add_argument("--sample", choices=SAMPLES, default="multi")
     q = sub.add_parser("after-restart")
@@ -480,7 +500,7 @@ def main():
             elif args.command == "boundaries":
                 runner.boundaries(args.label)
             elif args.command == "case":
-                runner.case(args.label, args.sample, args.strategy, args.replacements)
+                runner.case(args.label, args.sample, args.strategy, args.replacements, args.delivery)
             elif args.command == "after-restart":
                 require(LABEL.fullmatch(args.read_label), "Invalid read label")
                 result = runner.read_from(canonical(args.source_run), runner.runs / ("read-" + args.read_label),

@@ -45,10 +45,23 @@ std::string planKey(const EcObjectRef &object, const Uuid &operation) {
   key.append(operation.asStringView());
   return key;
 }
+uint16_t planVersion(EcV2RepairDelivery delivery) {
+  return delivery == EcV2RepairDelivery::HelperDirect ? kEcV2RepairDirectVersion : kEcV2LifecycleVersion;
+}
+CoTryTask<std::optional<EcV2RepairPlanRecord>> loadPlan(kv::IReadWriteTransaction &txn, const std::string &key) {
+  auto bytes = co_await txn.get(key);
+  CO_RETURN_ON_ERROR(bytes);
+  if (!*bytes) co_return std::nullopt;
+  EcV2RepairPlanRecord record;
+  if ((**bytes).size() > (64u << 10) || !serde::deserialize(record, **bytes))
+    co_return makeError(StatusCode::kDataCorruption, "invalid ECRP record");
+  CO_RETURN_ON_ERROR(EcV2RepairPlanCatalog::validate(record));
+  co_return record;
+}
 }  // namespace
 
-Result<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::build(const EcV2RepairSnapshot &snapshot,
-                                                          const EcV2RepairSelection &selection) {
+Result<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::build(
+    const EcV2RepairSnapshot &snapshot, const EcV2RepairSelection &selection, EcV2RepairDelivery delivery) {
   const auto &[op, reservation, binding, base, bases, content] = snapshot;
   const auto &intent = op.intent;
   const auto &candidate = op.candidate;
@@ -106,6 +119,7 @@ Result<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::build(const EcV2RepairSnapsh
     return makeError(StatusCode::kDataCorruption, "repair drain set must include every base and candidate instance");
 
   EcV2RepairPlanRecord result;
+  result.version = planVersion(delivery);
   result.object = intent.object;
   result.operation = intent.operation;
   result.owner = op.owner;
@@ -137,7 +151,8 @@ Result<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::build(const EcV2RepairSnapsh
 Result<std::shared_ptr<const storage::EcRepairPlan>> EcV2RepairPlanCatalog::validate(
     const EcV2RepairPlanRecord &record) {
   const auto &plan = record.plan;
-  if (record.version != kEcV2LifecycleVersion || record.object.incarnation.is_nil() ||
+  if ((record.version != kEcV2LifecycleVersion && record.version != kEcV2RepairDirectVersion) ||
+      record.object.incarnation.is_nil() ||
       record.operation != plan.operationId || record.owner.uid != plan.ownerUid ||
       record.owner.client != plan.clientNamespace || record.selection.planId != plan.planId ||
       record.selection.maxBlocksInFlight != plan.maxBlocksInFlight || !plan.logicalLength ||
@@ -169,11 +184,9 @@ Result<std::shared_ptr<const storage::EcRepairPlan>> EcV2RepairPlanCatalog::vali
   return compiled;
 }
 
-CoTryTask<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::prepare(Transaction &txn,
-                                                               const EcObjectRef &object,
-                                                               const Uuid &operation,
-                                                               const EcOwner &owner,
-                                                               const EcV2RepairSelection &selection) {
+CoTryTask<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::prepare(
+    Transaction &txn, const EcObjectRef &object, const Uuid &operation, const EcOwner &owner,
+    const EcV2RepairSelection &selection, EcV2RepairDelivery delivery) {
   auto op = co_await EcCatalog::getOperation(txn, object, operation);
   CO_RETURN_ON_ERROR(op);
   CO_RETURN_ON_ERROR(ownerMatches(op->owner, owner));
@@ -199,14 +212,14 @@ CoTryTask<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::prepare(Transaction &txn,
     CO_RETURN_ON_ERROR(allocation);
     bases[i] = std::move(*allocation);
   }
-  auto expected = build({*op, *reservation, *binding, base->manifest, bases, *content}, selection);
+  auto expected = build({*op, *reservation, *binding, base->manifest, bases, *content}, selection, delivery);
   CO_RETURN_ON_ERROR(expected);
   const auto key = planKey(object, operation);
-  auto previous = co_await load<EcV2RepairPlanRecord>(txn, key);
+  auto previous = co_await loadPlan(txn, key);
   CO_RETURN_ON_ERROR(previous);
   if (*previous) {
     CO_RETURN_ON_ERROR(validate(**previous));
-    if (!same((**previous).selection, selection))
+    if ((**previous).version != planVersion(delivery) || !same((**previous).selection, selection))
       co_return makeError(StatusCode::kTokenMismatch, "repair operation already has a different permanent plan");
     if (!same(**previous, *expected))
       co_return makeError(StatusCode::kDataCorruption, "persistent repair plan differs from durable provenance");
@@ -221,5 +234,27 @@ CoTryTask<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::prepare(Transaction &txn,
                                                                         operation,
                                                                         owner));
   co_return expected;
+}
+CoTryTask<EcV2RepairPlanRecord> EcV2RepairPlanCatalog::observe(
+    Transaction &txn, const EcObjectRef &object, const Uuid &operation, const EcOwner &owner,
+    const EcV2RepairSelection &selection, EcV2RepairDelivery delivery) {
+  auto op = co_await EcCatalog::getOperation(txn, object, operation);
+  CO_RETURN_ON_ERROR(op);
+  CO_RETURN_ON_ERROR(ownerMatches(op->owner, owner));
+  if (op->intent.kind != EcMutationKind::Repair ||
+      (op->state != EcOperationState::Preparing && op->state != EcOperationState::Published))
+    co_return makeError(StatusCode::kTokenStale, "repair history is not observable");
+  auto stored = co_await loadPlan(txn, planKey(object, operation));
+  CO_RETURN_ON_ERROR(stored);
+  if (!*stored) co_return makeError(StatusCode::kTokenStale, "repair history has no permanent ECRP");
+  const auto &record = **stored;
+  CO_RETURN_ON_ERROR(ownerMatches(record.owner, owner));
+  if (record.version != planVersion(delivery) || !same(record.selection, selection))
+    co_return makeError(StatusCode::kTokenMismatch, "permanent repair delivery or selection differs");
+  if (record.object != object || record.operation != operation ||
+      record.plan.baseEpoch != op->intent.expectedEpoch || record.plan.baseRevision != op->intent.expectedRevision ||
+      record.plan.logicalLength != op->intent.logicalLength)
+    co_return makeError(StatusCode::kDataCorruption, "repair history contradicts its operation");
+  co_return record;
 }
 }  // namespace hf3fs::meta::server

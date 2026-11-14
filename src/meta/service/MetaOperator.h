@@ -126,6 +126,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<EcFileRepairRsp> queryEcFileRepair(QueryEcFileRepairReq req);
   CoTryTask<EcFileRepairRsp> advanceEcFileRepair(AdvanceEcFileRepairReq req);
   CoTryTask<EcFileRepairDirectRsp> prepareEcFileRepairDirect(PrepareEcFileRepairDirectReq req);
+  CoTryTask<PrepareEcRepairDirectV2Rsp> prepareEcRepairDirectV2(PrepareEcRepairDirectV2Req req);
   CoTryTask<EcFileRepairRsp> closeEcFileRepairDebt(CloseEcFileRepairDebtReq req);
 
   CoTryTask<MkdirsRsp> mkdirs(MkdirsReq req);

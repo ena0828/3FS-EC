@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <bit>
 #include <folly/CancellationToken.h>
 #include <folly/hash/Checksum.h>
@@ -44,6 +45,51 @@ EcFragmentAccessV2 access(const meta::EcV2AllocationBinding &allocation, Version
   result.targetId = allocation.fragment.placement.target;
   result.integrity = allocation.fragment.integrity;
   return result;
+}
+Result<std::shared_ptr<const EcRepairPlan>> fixedRepairPlan(const EcStripeRepair &input,
+                                                         const meta::EcOwner &owner,
+                                                         const meta::PrepareEcRepairV2Rsp &issued) {
+  if (!issued.mutation.allocations || !issued.mutation.reservation)
+    return makeError(StatusCode::kDataCorruption, "repair plan has no immutable allocation binding");
+  CHECK_RESULT(plan, EcRepairPlan::create(issued.plan));
+  const auto &fixed = plan->input();
+  const auto &intent = issued.mutation.record.intent;
+  const auto &reservation = *issued.mutation.reservation;
+  if (fixed.planId != input.planId || fixed.operationId != input.ids.operation || fixed.ownerUid != owner.uid ||
+      fixed.clientNamespace != owner.client || fixed.baseEpoch != input.object.epoch ||
+      fixed.baseRevision != input.expectedRevision || fixed.logicalLength != intent.logicalLength ||
+      fixed.logicalSha256 != reservation.contentSha256 || fixed.maxBlocksInFlight != input.blockWindow ||
+      fixed.targetCount != std::popcount(input.replacementMask) ||
+      fixed.operationEndpointCount != reservation.operationEndpoints.count ||
+      plan->endpointSetDigest() != reservation.operationEndpoints.digest)
+    return makeError(StatusCode::kTokenMismatch, "repair plan differs from fixed intent or complete endpoint set");
+  auto sameFragment = [&](const EcRepairFragment &fragment, size_t index) {
+    const auto &allocation = (*issued.mutation.allocations)[index];
+    const auto endpoint = allocation.endpoint().controlEndpoint();
+    return serde::equals(fragment.identity, allocation.fragment.identity) &&
+           fragment.operationId == allocation.fragment.operation &&
+           fragment.writerNamespace == allocation.writer.client &&
+           fragment.endpoint.nodeId == endpoint.nodeId && fragment.endpoint.chainId == endpoint.chainId &&
+           fragment.endpoint.targetId == endpoint.targetId && fragment.endpoint.engineUuid == endpoint.engineUuid &&
+           fragment.endpoint.targetIncarnation == endpoint.targetIncarnation &&
+           fragment.integrity == allocation.fragment.integrity &&
+           fragment.integrity.wholeLength == input.object.shardBytes &&
+           fragment.integrity.wholeCrc32c == intent.fragmentCrc32c[index];
+  };
+  for (size_t i = 0; i != input.sources.size(); ++i) {
+    const auto index = input.sources[i];
+    if (fixed.sources[i].identity.shard != index || !sameFragment(fixed.sources[i], index))
+      return makeError(StatusCode::kTokenMismatch, "repair history source order or allocation changed");
+  }
+  uint16_t targets = 0;
+  for (size_t i = 0; i != fixed.targetCount; ++i) {
+    const auto index = fixed.targets[i].identity.shard;
+    if (index >= 12 || !(input.replacementMask & (1u << index)) || !sameFragment(fixed.targets[i], index))
+      return makeError(StatusCode::kTokenMismatch, "repair history target allocation changed");
+    targets |= uint16_t(1u << index);
+  }
+  if (targets != input.replacementMask) return makeError(StatusCode::kTokenMismatch);
+  return plan;
 }
 }  // namespace
 
@@ -338,6 +384,12 @@ CoTask<EcStripeMutationOutcome> EcStripeClientCore::repairOwned(EcStripeRepair i
   for (const auto &check :
        {validControl(control), validIds(input.ids), mutationShape(input.object), validPin(input.baseRead)})
     if (!check) co_return fail(check.error());
+  if ((input.mode != EcRepairMode::CentralSerial && input.mode != EcRepairMode::ClientPipeline &&
+       input.mode != EcRepairMode::HelperChain) ||
+      (input.delivery != EcRepairDelivery::ClientAppend && input.delivery != EcRepairDelivery::HelperDirect) ||
+      (input.delivery == EcRepairDelivery::HelperDirect && input.mode != EcRepairMode::HelperChain) ||
+      !input.blockWindow || input.blockWindow > 4)
+    co_return fail(Status(StatusCode::kInvalidArg, "invalid fixed repair mode, delivery or window"));
   if (input.planId.is_nil() || input.ids.prepareRepairRequest.is_nil() ||
       input.baseRead.object != input.object.object || !input.replacementMask ||
       (input.replacementMask & ~meta::kEcAllShards) || std::popcount(input.replacementMask) > 2)
@@ -348,6 +400,43 @@ CoTask<EcStripeMutationOutcome> EcStripeClientCore::repairOwned(EcStripeRepair i
       co_return fail(Status(StatusCode::kInvalidArg, "invalid fixed repair sources"));
     seen |= uint16_t(1u << index);
   }
+  auto prepareFixed = [&]() -> CoTryTask<meta::PrepareEcRepairDirectV2Rsp> {
+    meta::PrepareEcRepairV2Req prepare;
+    request(prepare, input.ids.prepareRepairRequest);
+    prepare.object = input.object.object;
+    prepare.operation = input.ids.operation;
+    prepare.planId = input.planId;
+    prepare.maxBlocksInFlight = input.blockWindow;
+    for (size_t i = 0; i != 10; ++i) prepare.sourceOrder[i] = static_cast<uint8_t>(input.sources[i]);
+    if (auto activeNow = active(control); !activeNow) co_return makeError(activeNow.error());
+    if (input.delivery == EcRepairDelivery::HelperDirect) {
+      meta::PrepareEcRepairDirectV2Req direct;
+      static_cast<meta::PrepareEcRepairV2Req &>(direct) = std::move(prepare);
+      co_return co_await meta->prepareEcRepairDirectV2(std::move(direct));
+    }
+    auto issued = co_await meta->prepareEcRepairV2(std::move(prepare));
+    if (!issued) co_return makeError(issued.error());
+    meta::PrepareEcRepairDirectV2Rsp result;
+    result.base = std::move(*issued);
+    co_return result;
+  };
+  auto observeDelivery = [&](const meta::BeginEcMutationV2Req &original) -> CoTryTask<meta::EcV2MutationRsp> {
+    auto historical = co_await prepareFixed();
+    if (!historical) co_return makeError(historical.error());
+    const auto &issued = historical->base;
+    auto matching = validateObservation(issued.mutation, original);
+    if (!matching) co_return makeError(matching.error());
+    auto plan = fixedRepairPlan(input, owner, issued);
+    if (!plan) co_return makeError(plan.error());
+    if ((issued.mutation.record.state != meta::EcOperationState::Published &&
+         !(issued.mutation.record.state == meta::EcOperationState::Preparing && issued.mutation.drain)) ||
+        historical->delegation || issued.helpers ||
+        std::any_of(issued.mutation.grants.begin(), issued.mutation.grants.end(), [](const auto &grant) {
+          return grant.has_value();
+        }))
+      co_return makeError(StatusCode::kDataCorruption, "repair history is not an unsigned terminal observation");
+    co_return issued.mutation;
+  };
   out.phase = EcStripePhase::Observe;
   // Resolve a prior Publish before re-acquiring the auxiliary base pin. That
   // pin may already have been explicitly released after a successful earlier
@@ -377,7 +466,14 @@ CoTask<EcStripeMutationOutcome> EcStripeClientCore::repairOwned(EcStripeRepair i
     out.observation = *prior;
     if (prior->record.state == meta::EcOperationState::Aborted)
       co_return fail(Status(StatusCode::kTokenStale, "original repair is aborted"));
-    if (prior->drain && prior->record.state == meta::EcOperationState::Preparing) {
+    // Both methods observe their own immutable plan version in Closing/Published.
+    // This must precede early success and Publish, even after the base pin was released.
+    if (prior->record.state == meta::EcOperationState::Published || prior->drain) {
+      auto historical = co_await observeDelivery(original);
+      if (!historical) co_return fail(historical.error());
+      out.observation = std::move(*historical);
+    }
+    if (out.observation->drain && out.observation->record.state == meta::EcOperationState::Preparing) {
       out.phase = EcStripePhase::Publish;
       auto resumed = co_await publish(input.object.object, input.ids, control);
       if (!resumed) co_return fail(resumed.error());
@@ -429,6 +525,11 @@ CoTask<EcStripeMutationOutcome> EcStripeClientCore::repairOwned(EcStripeRepair i
   out.observation = *begun;
   if (begun->record.state == meta::EcOperationState::Aborted)
     co_return fail(Status(StatusCode::kInvalidArg, "original repair operation is aborted"));
+  if (begun->record.state == meta::EcOperationState::Published || begun->drain) {
+    auto historical = co_await observeDelivery(beginReq);
+    if (!historical) co_return fail(historical.error());
+    out.observation = std::move(*historical);
+  }
   if (begun->record.state == meta::EcOperationState::Preparing && !begun->drain) {
     // Content descriptors omit allocation identity by definition. Repair keeps
     // generation/content fixed, so use the trusted base table without a full
@@ -437,17 +538,15 @@ CoTask<EcStripeMutationOutcome> EcStripeClientCore::repairOwned(EcStripeRepair i
     auto bound = co_await bind(beginReq, input.ids, descriptors, control);
     if (!bound) co_return fail(bound.error());
     out.observation = *bound;
+    if (bound->record.state == meta::EcOperationState::Published || bound->drain) {
+      auto historical = co_await observeDelivery(beginReq);
+      if (!historical) co_return fail(historical.error());
+      out.observation = std::move(*historical);
+    }
     if (bound->record.state == meta::EcOperationState::Preparing && !bound->drain) {
-      meta::PrepareEcRepairV2Req prepare;
-      request(prepare, input.ids.prepareRepairRequest);
-      prepare.object = input.object.object;
-      prepare.operation = input.ids.operation;
-      prepare.planId = input.planId;
-      prepare.maxBlocksInFlight = input.blockWindow;
-      for (size_t i = 0; i != 10; ++i) prepare.sourceOrder[i] = static_cast<uint8_t>(input.sources[i]);
-      if (auto activeNow = active(control); !activeNow) co_return fail(activeNow.error());
-      auto issued = co_await meta->prepareEcRepairV2(std::move(prepare));
-      if (!issued) co_return fail(issued.error());
+      auto prepared = co_await prepareFixed();
+      if (!prepared) co_return fail(prepared.error());
+      auto *issued = &prepared->base;
       auto observation = validateObservation(issued->mutation, beginReq);
       if (!observation) co_return fail(observation.error());
       out.observation = issued->mutation;
@@ -456,7 +555,9 @@ CoTask<EcStripeMutationOutcome> EcStripeClientCore::repairOwned(EcStripeRepair i
         co_return fail(Status(StatusCode::kTokenStale, "repair issuance is already closing"));
       if (input.mode == EcRepairMode::HelperChain && !issued->helpers)
         co_return fail(Status(StatusCode::kNotImplemented, "Meta helper signing is unavailable; no fallback selected"));
-      auto plan = EcRepairPlan::create(issued->plan);
+      if (prepared->delegation.has_value() != (input.delivery == EcRepairDelivery::HelperDirect))
+        co_return fail(Status(StatusCode::kTokenMismatch, "repair delivery delegation differs from fixed selection"));
+      auto plan = fixedRepairPlan(input, owner, *issued);
       if (!plan) co_return fail(plan.error());
       const auto &fixed = (*plan)->input();
       if (fixed.planId != input.planId || fixed.operationId != input.ids.operation || fixed.ownerUid != owner.uid ||
@@ -507,15 +608,22 @@ CoTask<EcStripeMutationOutcome> EcStripeClientCore::repairOwned(EcStripeRepair i
         bindings.targets[i] = std::move(*stage);
       }
       if (actualTargets != input.replacementMask) co_return fail(Status(StatusCode::kDataCorruption));
-      auto transport = NativeEcRepairTransport::create(*plan, storage, std::move(bindings), std::move(issued->helpers));
+      auto transport = NativeEcRepairTransport::create(*plan,
+                                                      storage,
+                                                      std::move(bindings),
+                                                      std::move(issued->helpers),
+                                                      nullptr,
+                                                      std::move(prepared->delegation));
       if (!transport) co_return fail(transport.error());
       out.phase = EcStripePhase::Repair;
       const auto dataStarted = std::chrono::steady_clock::now();
       auto repaired = co_await EcRepairPipeline::run(*plan,
-                                                     *transport,
-                                                     input.mode,
-                                                     {control.deadline, control.cancellation},
-                                                     executor);
+                                                    *transport,
+                                                    input.mode,
+                                                    {control.deadline, control.cancellation},
+                                                    executor,
+                                                    nullptr,
+                                                    input.delivery);
       out.dataPhaseElapsed = std::chrono::steady_clock::now() - dataStarted;
       if (!repaired) co_return fail(repaired.error());
     }

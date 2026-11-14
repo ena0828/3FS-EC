@@ -236,14 +236,29 @@ class EcV2PhaseOp : public Operation<EcV2PhaseRsp> {
       CO_RETURN_ON_ERROR(current);
       CO_RETURN_ON_ERROR(checkOwner(req_, current->owner));
       switch (req_.phase) {
-        case EcV2Phase::PrepareRepair: {
-          if (current->state != EcOperationState::Preparing || current->intent.kind != EcMutationKind::Repair ||
-              current->intent.expectedEpoch != file->object.epoch)
-            co_return makeError(StatusCode::kTokenStale, "V2 repair plan requires the current Preparing epoch");
-          auto plan =
-              co_await EcV2RepairPlanCatalog::prepare(txn, req_.object, req_.operation, owner, req_.repairSelection);
-          CO_RETURN_ON_ERROR(plan);
-          repairPlan = std::move(*plan);
+        case EcV2Phase::PrepareRepair:
+        case EcV2Phase::PrepareRepairDirect: {
+          const auto delivery = req_.phase == EcV2Phase::PrepareRepairDirect
+                                    ? EcV2RepairDelivery::HelperDirect : EcV2RepairDelivery::ClientAppend;
+          if (current->intent.kind != EcMutationKind::Repair ||
+              (current->state != EcOperationState::Preparing && current->state != EcOperationState::Published))
+            co_return makeError(StatusCode::kTokenStale, "repair operation is no longer observable");
+          auto drain = co_await EcV2DrainCatalog::get(
+              txn, req_.object, storage::EcGrantScope::WriteOperation, req_.operation, owner);
+          CO_RETURN_ON_ERROR(drain);
+          if (current->state == EcOperationState::Published || *drain) {
+            auto plan = co_await EcV2RepairPlanCatalog::observe(
+                txn, req_.object, req_.operation, owner, req_.repairSelection, delivery);
+            CO_RETURN_ON_ERROR(plan);
+            repairPlan = std::move(*plan);
+          } else {
+            if (current->intent.expectedEpoch != file->object.epoch)
+              co_return makeError(StatusCode::kTokenStale, "V2 repair issuance requires the current epoch");
+            auto plan = co_await EcV2RepairPlanCatalog::prepare(
+                txn, req_.object, req_.operation, owner, req_.repairSelection, delivery);
+            CO_RETURN_ON_ERROR(plan);
+            repairPlan = std::move(*plan);
+          }
           break;
         }
         case EcV2Phase::Bind:

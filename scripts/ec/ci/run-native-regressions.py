@@ -79,6 +79,12 @@ CLIENT_MANDATORY |= {
         "DirectMutationFailureJoinsOtherStartedDirectBlock",
     )
 }
+CLIENT_MANDATORY |= {
+    "TestEcStripeClient.InvalidRepairDeliveryIsRejectedBeforeAnyMetadataCall",
+    "TestEcStripeRunRecord.HelperDirectV3PersistsSelectionAndRejectsDowngradedJson",
+    "TestEcStripeRunRecord.PublishedHelperDirectSourceCreatesIndependentRecoveryWrite",
+    "TestEcAllocationExport.PublishedHelperDirectJournalExportsOriginalAllocationsAfterReadRelease",
+}
 
 SERVICE_MANDATORY = {
     "TestEcStageService.LostSealReplyIsUnknownAndRetryDoesNotDoubleAccount",

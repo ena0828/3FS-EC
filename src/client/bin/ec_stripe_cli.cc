@@ -65,6 +65,7 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(remote_path, "");
   CONFIG_ITEM(shard_bytes, uint32_t{0});
   CONFIG_ITEM(strategy, "");
+  CONFIG_ITEM(delivery, "");
   CONFIG_ITEM(replacement_mask, uint16_t{0});
   CONFIG_ITEM(source_order, std::vector<uint16_t>{});
   CONFIG_ITEM(block_window, uint8_t{0});
@@ -130,6 +131,11 @@ Result<std::string> tokenFile(const std::string &path) {
 Result<std::unique_ptr<EcStripeRunJournal>> journal(const Config &config,
                                                     std::string_view command,
                                                     std::string_view executable) {
+  if ((!config.delivery().empty() && command != "new-repair") ||
+      (!config.delivery().empty() && config.delivery() != "return" && config.delivery() != "direct") ||
+      (config.delivery() == "direct" && config.strategy() != "helper"))
+    return makeError(StatusCode::kInvalidArg,
+                     "delivery is new-repair-only; direct requires helper; resume uses the persisted delivery");
   if (command == "resume" || command == "release" || command == "inspect" || command == "export-allocations") {
     CHECK_RESULT(value, EcStripeRunJournal::resume(config.run_dir()));
     const auto &record = value->record();
@@ -206,6 +212,10 @@ Result<std::unique_ptr<EcStripeRunJournal>> journal(const Config &config,
     record.shardBytes = record.object->shardBytes;
     if (record.action == "repair") {
       record.strategy = config.strategy();
+      if (config.delivery() == "direct") {
+        record.version = 3;
+        record.delivery = "direct";
+      }
       record.replacementMask = config.replacement_mask();
       record.sourceOrder = config.source_order();
       // The resulting fixed order is persisted before Begin. It will not be
@@ -239,6 +249,7 @@ Result<std::unique_ptr<EcStripeRunJournal>> journal(const Config &config,
           record.replacementMask,
           fmt::join(record.sourceOrder, ","),
           record.blockWindow);
+    if (record.action == "repair" && record.delivery == "direct") record.command += " --config.delivery=direct";
   }
   return EcStripeRunJournal::create(config.run_dir(), std::move(record));
 }
@@ -366,6 +377,7 @@ Result<Void> run(EcStripeRunJournal &journal,
     request.mode = record.strategy == "central"    ? EcRepairMode::CentralSerial
                    : record.strategy == "pipeline" ? EcRepairMode::ClientPipeline
                                                    : EcRepairMode::HelperChain;
+    request.delivery = record.delivery == "direct" ? EcRepairDelivery::HelperDirect : EcRepairDelivery::ClientAppend;
     auto result = blockingWait(manager.repair(std::move(request), control()));
     state.coreElapsedNanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(result.elapsed).count();
     if (result.dataPhaseElapsed)
@@ -416,7 +428,8 @@ int execute(int argc, char **argv) {
            "new-write: --config.input_file=... --config.remote_path=/... --config.shard_bytes=...\n"
            "new-read: --config.source_run=/absolute/published-run\n"
            "new-repair: source_run plus --config.strategy=central|pipeline|helper, replacement_mask, optional "
-           "source_order and block_window\n"
+           "source_order and block_window; helper accepts --config.delivery=return|direct (default return)\n"
+           "resume/release/inspect/export-allocations reject delivery overrides and use the immutable run record.\n"
            "Uses actual mgmtd/Meta/Storage clients and a real user token_file (owner-only). No signing keys are "
            "accepted.\n"
            "Single stripe only; no FUSE, multi-stripe mapping or physical GC. Input preparation, output files "

@@ -34,6 +34,44 @@ def passed_mount():
 
 
 class FileLabGates(unittest.TestCase):
+    def test_flat_direct_gate_rejects_other_delivery_missing_commands_and_unjoined_children(self):
+        # Synthetic receipt checks only; the runtime also parses native journals
+        # and rereads the real output after this gate.
+        root = Path('/private/lab')
+        stem = 'hosted-kv112-helper-two-direct'
+        sequence = (('new-write', 'write'), ('new-repair', 'repair'), ('release', 'repair'),
+                    ('new-read', 'read'), ('release', 'read'))
+        value = {'schema': 1, 'state': 'passed', 'error': None,
+                 'all_started_cli_processes_exited': True, 'interruption_requests': 0,
+                 'commands': [{'index': index, 'command': command,
+                    'run_dir': str(root / 'client/runs' / (kind + '-' + stem)),
+                    'process_started': True, 'process_exited': True, 'interrupted': False, 'returncode': 0}
+                    for index, (command, kind) in enumerate(sequence)],
+                 'checks': [{'case': stem, 'strategy': 'helper', 'delivery': 'direct', 'replacement_count': 2,
+                    'fault_injected': False, 'repair_pin_released': True,
+                    'readback': {'byte_equal': True, 'remote_released': True}}]}
+        self.assertEqual(lab.require_flat_direct_result(value, root), stem)
+        for changes in ({'schema': True}, {'state': 'failed'}, {'error': 'actual failure'},
+                        {'all_started_cli_processes_exited': False}, {'interruption_requests': 1},
+                        {'interruption_requests': False}, {'commands': value['commands'][:-1]}, {'checks': []}):
+            with self.subTest(changes=changes), self.assertRaises(lab.GateError):
+                lab.require_flat_direct_result(dict(value, **changes), root)
+        for changes in ({'index': True}, {'command': 'resume'}, {'run_dir': str(root / 'another')},
+                        {'process_started': False}, {'process_exited': False}, {'interrupted': True},
+                        {'returncode': 1}, {'returncode': False}):
+            bad = copy.deepcopy(value)
+            bad['commands'][1].update(changes)
+            with self.subTest(command_changes=changes), self.assertRaises(lab.GateError):
+                lab.require_flat_direct_result(bad, root)
+        for changes in ({'case': 'other'}, {'strategy': 'central'}, {'delivery': 'return'},
+                        {'replacement_count': 1}, {'fault_injected': True}, {'repair_pin_released': False},
+                        {'readback': {'byte_equal': False, 'remote_released': True}},
+                        {'readback': {'byte_equal': True, 'remote_released': False}}):
+            bad = copy.deepcopy(value)
+            bad['checks'][0].update(changes)
+            with self.subTest(check_changes=changes), self.assertRaises(lab.GateError):
+                lab.require_flat_direct_result(bad, root)
+
     def test_core_gate_accepts_current_exact_26_and_rejects_stale_failed_or_incomplete_evidence(self):
         # Synthetic private receipts/files exercise the actual parsers and
         # validators. No ELF, FDB process or acceptance workload is executed.

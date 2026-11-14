@@ -64,6 +64,8 @@ jobs:
           python3 -B scripts/ec/ci/test-run-spare-lab.py -v
           python3 -B scripts/ec/cluster/test-native-spare-storage.py -v
           python3 -B scripts/ec/cluster/test-portable-experiments.py -v
+          python3 -B scripts/ec/cluster/test-experiment-runner.py -v
+          python3 -B scripts/ec/cluster/test-experiment-menu.py -v
 
       - name: Build one ISA-L configuration for core regressions and both labs
         timeout-minutes: 240

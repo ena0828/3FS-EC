@@ -147,6 +147,7 @@ TEST(TestEcStripeRunRecord, RecoveryWritePersistsIndependentIdentityAndKeepsV1Re
   auto oldBytes = readEcStripeInput(parent / "source" / "record.json", 65536);
   ASSERT_OK(oldBytes);
   EXPECT_EQ(oldBytes->find("recoverySource"), std::string::npos);
+  EXPECT_EQ(oldBytes->find("delivery"), std::string::npos);
   auto oldAgain = EcStripeRunJournal::resume(parent / "source");
   ASSERT_OK(oldAgain);
   EXPECT_EQ(serde::serialize((*oldAgain)->record()), serde::serialize(source));
@@ -176,6 +177,10 @@ TEST(TestEcStripeRunRecord, RecoveryWritePersistsIndependentIdentityAndKeepsV1Re
   created->reset();
   auto resumed = EcStripeRunJournal::resume(parent / "recovery");
   ASSERT_OK(resumed);
+  auto recoveryBytes = readEcStripeInput(parent / "recovery" / "record.json", 65536);
+  ASSERT_OK(recoveryBytes);
+  EXPECT_EQ(recoveryBytes->find("delivery"), std::string::npos);
+  EXPECT_NE(recoveryBytes->find("recoverySource"), std::string::npos);
   EXPECT_EQ(serde::serialize((*resumed)->record()), serde::serialize(*fresh));
   EXPECT_EQ((*resumed)->latest()->errorCode, unknown.errorCode);
   auto overlap = *fresh;
@@ -190,6 +195,164 @@ TEST(TestEcStripeRunRecord, RecoveryWritePersistsIndependentIdentityAndKeepsV1Re
   auto oldBytesAfter = readEcStripeInput(parent / "source" / "record.json", 65536);
   ASSERT_OK(oldBytesAfter);
   EXPECT_EQ(*oldBytes, *oldBytesAfter);
+}
+
+TEST(TestEcStripeRunRecord, HelperDirectV3PersistsSelectionAndRejectsDowngradedJson) {
+  folly::test::TemporaryDirectory temporary;
+  const auto path = std::filesystem::path(temporary.path().string()) / "direct";
+  auto initial = record();
+  initial.version = 3;
+  initial.action = "repair";
+  initial.strategy = "helper";
+  initial.delivery = "direct";
+  initial.object = completeObject(initial);
+  initial.expectedOwnerUid = 123;
+  initial.expectedRevision = 18;
+  initial.replacementMask = (1u << 10) | (1u << 11);
+  initial.sourceOrder = {9, 8, 7, 6, 5, 4, 3, 2, 1, 0};
+  initial.blockWindow = 4;
+  auto created = EcStripeRunJournal::create(path, initial);
+  ASSERT_OK(created);
+  EcStripeRunObservation published;
+  published.state = "Published";
+  published.object = initial.object;
+  published.ownerUid = 123;
+  published.revision = 19;
+  published.mutationPublished = true;
+  ASSERT_OK((*created)->append(published));
+  created->reset();
+  auto encoded = readEcStripeInput(path / "record.json", 65536);
+  ASSERT_OK(encoded);
+  const auto original = folly::parseJson(*encoded);
+  EXPECT_EQ(original["version"].asInt(), 3);
+  EXPECT_EQ(original["delivery"].asString(), "direct");
+  EXPECT_EQ(encoded->find("recoverySource"), std::string::npos);
+  auto resumed = EcStripeRunJournal::resume(path);
+  ASSERT_OK(resumed);
+  EXPECT_EQ(serde::serialize((*resumed)->record()), serde::serialize(initial));
+  EXPECT_EQ((*resumed)->record().mutationIds().prepareRepairRequest, initial.prepareRepairRequest);
+  ASSERT_TRUE((*resumed)->latest());
+  EXPECT_TRUE((*resumed)->latest()->mutationPublished);
+  resumed->reset();
+  auto unchanged = readEcStripeInput(path / "record.json", 65536);
+  ASSERT_OK(unchanged);
+  EXPECT_EQ(*unchanged, *encoded);
+
+  for (int fault = 0; fault != 8; ++fault) {
+    SCOPED_TRACE(fault);
+    auto changed = original;
+    switch (fault) {
+      case 0:
+        changed.erase("delivery");
+        break;
+      case 1:
+        changed["delivery"] = "return";
+        break;
+      case 2:
+        changed["delivery"] = "automatic";
+        break;
+      case 3:
+        changed["version"] = 1;
+        break;
+      case 4:
+        changed["version"] = 2;
+        break;
+      case 5:
+        changed["strategy"] = "pipeline";
+        break;
+      case 6:
+        changed["action"] = "read";
+        break;
+      case 7:
+        changed["recoverySource"] = nullptr;
+        break;
+    }
+    {
+      std::ofstream file(path / "record.json", std::ios::binary | std::ios::trunc);
+      file << folly::toJson(changed);
+      ASSERT_TRUE(file.good());
+    }
+    EXPECT_FALSE(EcStripeRunJournal::resume(path));
+  }
+  auto legacy = initial;
+  legacy.version = 1;
+  legacy.delivery = "return";
+  const auto legacyPath = path.parent_path() / "legacy";
+  auto old = EcStripeRunJournal::create(legacyPath, legacy);
+  ASSERT_OK(old);
+  old->reset();
+  auto oldText = readEcStripeInput(legacyPath / "record.json", 65536);
+  ASSERT_OK(oldText);
+  EXPECT_EQ(oldText->find("delivery"), std::string::npos);
+  auto injected = folly::parseJson(*oldText);
+  injected["delivery"] = "return";
+  {
+    std::ofstream file(legacyPath / "record.json", std::ios::binary | std::ios::trunc);
+    file << folly::toJson(injected);
+    ASSERT_TRUE(file.good());
+  }
+  // An apparently harmless default field still changes the immutable v1 encoding.
+  ASSERT_ERROR(EcStripeRunJournal::resume(legacyPath), StatusCode::kInvalidFormat);
+}
+
+TEST(TestEcStripeRunRecord, PublishedHelperDirectSourceCreatesIndependentRecoveryWrite) {
+  folly::test::TemporaryDirectory temporary;
+  const auto parent = std::filesystem::path(temporary.path().string());
+  auto source = record();
+  source.version = 3;
+  source.action = "repair";
+  source.strategy = "helper";
+  source.delivery = "direct";
+  source.object = completeObject(source);
+  source.expectedOwnerUid = 123;
+  source.expectedRevision = 18;
+  source.replacementMask = (1u << 10) | (1u << 11);
+  source.sourceOrder = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  const std::string input = "hello world";
+  std::array<std::string_view, 10> parts{};
+  parts[0] = input;
+  auto hash = meta::computeEcLogicalSha256(parts, input.size());
+  ASSERT_OK(hash);
+  source.inputSha256 = *hash;
+  EcStripeRunObservation published;
+  published.state = "ReadReleased";
+  published.object = source.object;
+  published.ownerUid = 123;
+  published.revision = 19;
+  published.mutationPublished = true;
+  const auto path = parent / "direct-source";
+  auto created = EcStripeRunJournal::create(path, source);
+  ASSERT_OK(created);
+  ASSERT_OK((*created)->append(published));
+  created->reset();
+  auto before = readEcStripeInput(path / "record.json", 65536);
+  ASSERT_OK(before);
+  auto reopened = EcStripeRunJournal::resume(path);
+  ASSERT_OK(reopened);
+  ASSERT_TRUE((*reopened)->latest());
+  auto recovery = prepareEcRecoveryWrite(record(),
+                                         (*reopened)->record(),
+                                         *(*reopened)->latest(),
+                                         path.string(),
+                                         *hash,
+                                         *hash,
+                                         (parent / "input").string(),
+                                         input);
+  ASSERT_OK(recovery);
+  EXPECT_EQ(recovery->version, 2);
+  EXPECT_EQ(recovery->delivery, "return");
+  EXPECT_NE(recovery->operation, source.operation);
+  EXPECT_EQ(recovery->object->object, source.object->object);
+  EXPECT_EQ(recovery->recoverySource->operation, source.operation);
+  auto recoveryJournal = EcStripeRunJournal::create(parent / "recovery", *recovery);
+  ASSERT_OK(recoveryJournal);
+  recoveryJournal->reset();
+  auto recoveryAgain = EcStripeRunJournal::resume(parent / "recovery");
+  ASSERT_OK(recoveryAgain);
+  EXPECT_EQ(serde::serialize((*recoveryAgain)->record()), serde::serialize(*recovery));
+  auto after = readEcStripeInput(path / "record.json", 65536);
+  ASSERT_OK(after);
+  EXPECT_EQ(*before, *after);
 }
 
 TEST(TestEcStripeRunRecord, RecoveryWriteRejectsUnconfirmedSourceChangedInputAndReusedRequests) {

@@ -52,7 +52,7 @@ def main():
     store = root / "fake-store"
     store.mkdir(exist_ok=True)
     with (root / "fake-invocations.jsonl").open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps({"command": command, "run": str(run)}) + "\n")
+        stream.write(json.dumps({"command": command, "run": str(run), "options": options}) + "\n")
     if mode == "delayed":
         (root / "fake-started").write_text("started")
         time.sleep(0.7)
@@ -87,6 +87,8 @@ def main():
                 record.update(strategy=options["config.strategy"], replacementMask=int(options["config.replacement_mask"]),
                               sourceOrder=json.loads(options["config.source_order"]),
                               blockWindow=int(options["config.block_window"]))
+                if options.get("config.delivery") == "direct" and mode != "delivery-downgrade":
+                    record.update(version=3, delivery="direct")
                 revision += 1
         dump(run / "record.json", record)
         if mode == "record-only":

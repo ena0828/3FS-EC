@@ -146,6 +146,44 @@ TEST(TestEcStripeClient, FixedRequestIdsAndManagerDeadlineAreMandatory) {
   ASSERT_ERROR(rejected, StorageClientCode::kResourceBusy);
 }
 
+TEST(TestEcStripeClient, InvalidRepairDeliveryIsRejectedBeforeAnyMetadataCall) {
+  folly::CPUThreadPoolExecutor pool(1);
+  auto core = manager(pool, 1u << 20);
+  EcStripeRepair input;
+  EXPECT_EQ(input.delivery, EcRepairDelivery::ClientAppend);
+  input.object.object = {meta::InodeId(123), Uuid::random()};
+  input.object.epoch = 1;
+  input.object.shardBytes = 4096;
+  input.expectedRevision = 1;
+  input.ids = {Uuid::random(), Uuid::random(), Uuid::random(), Uuid::random(), Uuid::random(), Uuid::random()};
+  input.baseRead = {input.object.object, 0, Uuid::random(), Uuid::random(), Uuid::random()};
+  input.planId = Uuid::random();
+  input.sources = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  input.replacementMask = (1u << 10) | (1u << 11);
+  const EcStripeControl control{std::chrono::steady_clock::now() + std::chrono::seconds(30), {}};
+  ASSERT_TRUE(core->validIds(input.ids));
+  ASSERT_TRUE(core->validPin(input.baseRead));
+  ASSERT_TRUE(core->validControl(control));
+  for (const auto mode : {EcRepairMode::CentralSerial, EcRepairMode::ClientPipeline,
+                          static_cast<EcRepairMode>(255)}) {
+    input.mode = mode;
+    input.delivery = EcRepairDelivery::HelperDirect;
+    const auto result = blockingWait(core->repairOwned(input, control));
+    ASSERT_TRUE(result.failure);
+    EXPECT_EQ(result.failure->code(), StatusCode::kInvalidArg);
+    EXPECT_EQ(result.phase, EcStripePhase::Validate);
+    EXPECT_FALSE(result.observation);
+  }
+  input.mode = EcRepairMode::HelperChain;
+  input.delivery = static_cast<EcRepairDelivery>(255);
+  const auto result = blockingWait(core->repairOwned(input, control));
+  ASSERT_TRUE(result.failure);
+  EXPECT_EQ(result.failure->code(), StatusCode::kInvalidArg);
+  EXPECT_EQ(result.phase, EcStripePhase::Validate);
+  // core intentionally has null Meta/Storage clients: reaching an RPC is a test failure.
+  blockingWait(Core::close(core));
+}
+
 TEST(TestEcStripeClient, CancelledCloseWaiterStillJoinsItsStartedWork) {
   folly::CPUThreadPoolExecutor pool(2);
   auto core = manager(pool, 100);

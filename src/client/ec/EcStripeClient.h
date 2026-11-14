@@ -19,7 +19,7 @@ struct EcStripeMutationIds {
   Uuid bindRequest = Uuid::zero();
   Uuid publishRequest = Uuid::zero();
   Uuid getRequest = Uuid::zero();
-  Uuid prepareRepairRequest = Uuid::zero();  // Required for Repair only (Meta37).
+  Uuid prepareRepairRequest = Uuid::zero();  // Required for Repair only (Meta37 or Meta71).
 };
 struct EcStripePinIds {
   meta::EcObjectRef object;
@@ -46,6 +46,8 @@ struct EcStripeRepair {
   uint16_t replacementMask = 0;
   uint8_t blockWindow = 1;
   EcRepairMode mode = EcRepairMode::CentralSerial;
+  // Persist before any RPC; Direct is HelperChain-only and never falls back.
+  EcRepairDelivery delivery = EcRepairDelivery::ClientAppend;
 };
 
 enum class EcStripePhase { Validate, Observe, Encode, Begin, Bind, Stage, Repair, Publish, Published, Indeterminate };

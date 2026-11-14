@@ -102,14 +102,42 @@ CoTryTask<PrepareEcRepairV2Rsp> MetaOperator::prepareEcRepairV2(PrepareEcRepairV
       co_await driveV2(makeEcV2PhaseOp(*metaStore_, context), context, *kvEngine_, config_, createRetryConfig());
   CO_RETURN_ON_ERROR(result);
   if (!result->repair) co_return makeError(StatusCode::kDataCorruption);
-  // No signature is produced before the authenticating transaction commits.
-  CO_RETURN_ON_ERROR(ecV2Coordinator_->addMutationGrants(result->mutation));
-  auto helpers = ecV2Coordinator_->issueRepairHelpers(*result->repair);
-  CO_RETURN_ON_ERROR(helpers);
   PrepareEcRepairV2Rsp response;
+  // History has already passed the same WRITE and permanent-delivery checks,
+  // but neither increments ECVI nor renews any data/helper authority.
+  if (result->mutation.record.state == EcOperationState::Preparing && !result->mutation.drain) {
+    CO_RETURN_ON_ERROR(ecV2Coordinator_->addMutationGrants(result->mutation));
+    auto helpers = ecV2Coordinator_->issueRepairHelpers(*result->repair);
+    CO_RETURN_ON_ERROR(helpers);
+    response.helpers = std::move(*helpers);
+  }
   response.mutation = std::move(result->mutation);
   response.plan = std::move(result->repair->plan);
-  response.helpers = std::move(*helpers);
+  co_return response;
+}
+CoTryTask<PrepareEcRepairDirectV2Rsp> MetaOperator::prepareEcRepairDirectV2(PrepareEcRepairDirectV2Req req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEcV2(req));
+  CO_RETURN_ON_ERROR(req.valid());
+  auto context = phaseRequest(req, EcV2Phase::PrepareRepairDirect, ecV2Coordinator_.get());
+  context.repairSelection.planId = req.planId;
+  context.repairSelection.sourceOrder = req.sourceOrder;
+  context.repairSelection.maxBlocksInFlight = req.maxBlocksInFlight;
+  auto result = co_await driveV2(makeEcV2PhaseOp(*metaStore_, context), context, *kvEngine_, config_, createRetryConfig());
+  CO_RETURN_ON_ERROR(result);
+  if (!result->repair) co_return makeError(StatusCode::kDataCorruption);
+  PrepareEcRepairDirectV2Rsp response;
+  if (result->mutation.record.state == EcOperationState::Preparing && !result->mutation.drain) {
+    // Actual ECVI/ECRP commit above precedes every signature below.
+    auto delegation = ecV2Coordinator_->issueFlatRepairDirect(*result->repair, result->mutation);
+    CO_RETURN_ON_ERROR(delegation);
+    response.delegation = std::move(*delegation);
+    CO_RETURN_ON_ERROR(ecV2Coordinator_->addMutationGrants(result->mutation));
+    auto helpers = ecV2Coordinator_->issueRepairHelpers(*result->repair);
+    CO_RETURN_ON_ERROR(helpers);
+    response.base.helpers = std::move(*helpers);
+  }
+  response.base.mutation = std::move(result->mutation);
+  response.base.plan = std::move(result->repair->plan);
   co_return response;
 }
 CoTryTask<EcV2MutationRsp> MetaOperator::getEcOperationV2(GetEcOperationV2Req req) {

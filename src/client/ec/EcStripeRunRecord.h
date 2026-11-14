@@ -56,6 +56,9 @@ struct EcStripeRunRecord {
   // Absent from the exact persisted v1 representation. Version 2 is reserved
   // for recovery-write and requires this complete fixed source commitment.
   SERDE_STRUCT_FIELD(recoverySource, (std::optional<EcStripeRecoverySource>{}));
+  // Only v3 persists this field; v1/v2 retain their exact old JSON shape.
+  // Version 3 is exclusively repair/helper/direct, never recovery-write.
+  SERDE_STRUCT_FIELD(delivery, std::string{"return"});
 
  public:
   EcStripeMutationIds mutationIds() const;

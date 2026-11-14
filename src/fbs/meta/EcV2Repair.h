@@ -10,6 +10,10 @@ struct hf3fs::serde::SerdeMethod<std::array<uint8_t, 10>>
     : hf3fs::storage::ec_helper_detail::FixedArraySerde<uint8_t, 10> {};
 
 namespace hf3fs::meta {
+// ECRP alone versions delivery; all other V2 catalogs retain their original version.
+inline constexpr uint16_t kEcV2RepairDirectVersion = 2;
+enum class EcV2RepairDelivery { ClientAppend, HelperDirect };
+
 struct EcV2RepairSelection {
   SERDE_STRUCT_FIELD(planId, Uuid::zero());
   SERDE_STRUCT_FIELD(sourceOrder, (std::array<uint8_t, 10>{}));

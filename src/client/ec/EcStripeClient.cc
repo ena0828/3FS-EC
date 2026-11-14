@@ -152,7 +152,11 @@ CoTask<EcStripeMutationOutcome> EcStripeClient::repair(EcStripeRepair request, E
   const auto object = request.object.object;
   const auto operation = request.ids.operation;
   const auto shard = request.object.shardBytes;
-  if (!shard || shard > storage::EcCodec::kMaxShardBytes || !request.blockWindow || request.blockWindow > 4) {
+  if (!shard || shard > storage::EcCodec::kMaxShardBytes || !request.blockWindow || request.blockWindow > 4 ||
+      (request.mode != EcRepairMode::CentralSerial && request.mode != EcRepairMode::ClientPipeline &&
+       request.mode != EcRepairMode::HelperChain) ||
+      (request.delivery != EcRepairDelivery::ClientAppend && request.delivery != EcRepairDelivery::HelperDirect) ||
+      (request.delivery == EcRepairDelivery::HelperDirect && request.mode != EcRepairMode::HelperChain)) {
     return detail::EcStripeClientCore::immediate(failed(object, operation, Status(StatusCode::kInvalidArg)));
   }
   // Central mode can retain ten complete sources and twelve recovered shards.

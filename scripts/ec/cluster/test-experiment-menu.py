@@ -54,6 +54,21 @@ class MenuAcceptance(unittest.TestCase):
                                            "--root", str(self.root), "--label", "sample-1", phase])
                 self.assertEqual(self.snapshot(), before)
 
+    def test_flat_helper_delivery_is_explicit_and_six_case_matrix_stays_unchanged(self):
+        before = self.snapshot()
+        for choice, delivery in (("1", "return"), ("2", "direct")):
+            with self.subTest(delivery=delivery):
+                command = self.choose(menu.selection, ["3", "single", "3", choice, "2", "1"])
+                self.assertEqual(command, [sys.executable, "-B", str(self.scripts / "experiment-runner.py"),
+                    "--root", str(self.root), "case", "--label", "single", "--strategy", "helper",
+                    "--delivery", delivery, "--replacements", "2", "--sample", "kv112"])
+        central = self.choose(menu.selection, ["3", "single", "1", "1", "1"])
+        self.assertNotIn("--delivery", central)
+        matrix = self.choose(menu.selection, ["4", "six"])
+        self.assertEqual(matrix[-3:], ["matrix", "--label", "six"])
+        self.assertNotIn("--delivery", matrix)
+        self.assertEqual(self.snapshot(), before)
+
     def test_explicit_file_api_profile_is_required_and_not_modified(self):
         for changed in ({"file_api": False}, {"file_api": 1}, {"profile": "native-v2-local-1-storage-12-targets"},
                         {"profile": []}, {"root": str(self.root / "another")}):

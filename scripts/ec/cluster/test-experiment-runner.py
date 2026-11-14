@@ -127,6 +127,73 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual([c["command"] for c in self.calls()], ["new-write"])
         self.assertTrue((r.runs / "write-bad-multi-central-one/record.json").is_file())
 
+    def test_direct_case_preserves_delivery_through_release_read_and_same_record_resume(self):
+        r = self.runner()
+        for count in (1, 2):
+            with self.subTest(replacements=count):
+                stem, paths = r.case_paths("direct", "kv112", "helper", count, "direct")
+                self.assertTrue(stem.endswith("-direct"))
+                self.assertNotEqual(paths, r.case_paths("direct", "kv112", "helper", count)[1])
+                r.case("direct", "kv112", "helper", count, "direct")
+                repair = paths[1]
+                fixed = (repair / "record.json").read_bytes()
+                record, state = mod.journal(repair)
+                self.assertEqual((record["version"], record["delivery"], state["state"]),
+                                 (3, "direct", "ReadReleased"))
+                self.assertTrue(r.checked[-1]["readback"]["byte_equal"])
+                self.assertTrue(r.checked[-1]["readback"]["remote_released"])
+                self.assertEqual(r.checked[-1]["delivery"], "direct")
+                r.invoke(repair, "resume")
+                mod.published(repair, mod.sample_info(self.root, "kv112"))
+                self.assertEqual((repair / "record.json").read_bytes(), fixed)
+                r.release(repair)
+                self.assertEqual((repair / "record.json").read_bytes(), fixed)
+        for call in self.calls():
+            options = call["options"]
+            if call["command"] == "new-repair":
+                self.assertEqual(options["config.delivery"], "direct")
+            else:
+                self.assertNotIn("config.delivery", options)
+
+    def test_direct_cannot_be_downgraded_to_a_successful_return_record(self):
+        r = self.runner("delivery-downgrade")
+        with self.assertRaisesRegex(mod.CheckError, "changed requested delivery"):
+            r.case("downgrade", "kv112", "helper", 1, "direct")
+        self.assertEqual([c["command"] for c in self.calls()], ["new-write", "new-repair"])
+        _, paths = r.case_paths("downgrade", "kv112", "helper", 1, "direct")
+        record, state = mod.journal(paths[1])
+        self.assertEqual((record["version"], state["state"]), (1, "Published"))
+        self.assertEqual(r.checked, [])
+
+    def test_delivery_and_version_mismatches_are_rejected_before_another_process(self):
+        r = self.runner()
+        for strategy, delivery in (("central", "direct"), ("pipeline", "direct"), ("helper", "unknown")):
+            with self.subTest(strategy=strategy, delivery=delivery), self.assertRaises(mod.CheckError):
+                r.case("invalid", "kv112", strategy, 1, delivery)
+        self.assertFalse((self.root / "fake-invocations.jsonl").exists())
+        r.case("record", "kv112", "helper", 1, "direct")
+        _, paths = r.case_paths("record", "kv112", "helper", 1, "direct")
+        record_path = paths[1] / "record.json"
+        fixed = record_path.read_bytes()
+        original = json.loads(fixed)
+        calls = self.calls()
+        changes = ({"version": 1}, {"version": 2}, {"version": 4}, {"delivery": "return"},
+                   {"delivery": None}, {"strategy": "central"}, {"action": "write"},
+                   {"recoverySource": None})
+        for changed in changes:
+            with self.subTest(changed=changed):
+                record_path.write_text(json.dumps(dict(original, **changed)), encoding="utf-8")
+                with self.assertRaises(mod.CheckError):
+                    r.invoke(paths[1], "resume")
+                self.assertEqual(self.calls(), calls)
+        missing = dict(original)
+        del missing["delivery"]
+        record_path.write_text(json.dumps(missing), encoding="utf-8")
+        with self.assertRaises(mod.CheckError):
+            r.release(paths[1])
+        self.assertEqual(self.calls(), calls)
+        record_path.write_bytes(fixed)
+
     def test_incomplete_ack_does_not_become_remote_released(self):
         r = self.runner("incomplete-release")
         with self.assertRaisesRegex(mod.CheckError, "ACK"):

@@ -62,7 +62,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
         self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 26)
         combined, combined_filter, combined_fuse = RUNNER.selection("service-contracts")
         self.assertEqual(combined, expected + (
-            "TestMetaServiceReflection.RegistersAll70IncludingBeyondDefaultFieldRank",))
+            "TestMetaServiceReflection.RegistersAll71IncludingBeyondDefaultFieldRank",))
         self.assertEqual(combined_filter, ":".join(combined))
         self.assertEqual(combined_fuse, ())
         RUNNER.check_meta_receipt(receipt(binary, output, combined, combined_filter), binary, output,
@@ -200,6 +200,11 @@ class TestCoreAcceptanceContract(unittest.TestCase):
             "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
             "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
             "TestEcFileNativeRepair.HelperDirectCommittedIssuanceLostReplyAndFreshTwelvePublication",
+            "TestEcV2NativeHelperPlan.FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery",
+            "TestEcV2NativeHelperPlan.FlatDirectCommittedReplyLossAndClosingOnlyObserve",
+            "TestEcV2RepairPlanCatalog.DirectDeliveryVersionsOnlyPermanentRecord",
+            "TestEcV2NativeHelperPlan.StripeManagerRunsAllExplicitRepairStrategiesThroughMetaIssuedPlan",
+            "TestEcV2NativeHelperPlan.CommittedPlanRenewalRetainsSelectionAndClosingStopsEveryGrant",
         ))
         self.assertEqual(test_filter, ":".join(cases))
         self.assertEqual(fuse, ())

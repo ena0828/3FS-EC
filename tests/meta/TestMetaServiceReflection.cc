@@ -13,19 +13,20 @@ namespace {
 using VoidMethods = refl::Helper::FieldInfoList<MetaSerde<>>;
 using BoundMethods = refl::Helper::FieldInfoList<MetaSerde<server::MetaSerdeService>>;
 using WrappedMethods = refl::Helper::FieldInfoList<server::MetaSerdeService>;
-static_assert(std::tuple_size_v<VoidMethods> == 70);
-static_assert(std::tuple_size_v<BoundMethods> == 70);
+static_assert(std::tuple_size_v<VoidMethods> == 71);
+static_assert(std::tuple_size_v<BoundMethods> == 71);
 static_assert(std::is_same_v<BoundMethods, WrappedMethods>);
-static_assert(serde::MaxMethodId<VoidMethods> == 70);
+static_assert(serde::MaxMethodId<VoidMethods> == 71);
 static_assert(MetaSerde<>::testRpcMethodId == 50);
 static_assert(MetaSerde<>::bindEcRmwOutputMethodId == 52);
 static_assert(MetaSerde<>::closeEcFileRepairDebtMethodId == 67);
 static_assert(MetaSerde<>::prepareEcTargetRetirementMethodId == 68);
 static_assert(MetaSerde<>::queryEcTargetRetirementMethodId == 69);
 static_assert(MetaSerde<>::prepareEcFileRepairDirectMethodId == 70);
+static_assert(MetaSerde<>::prepareEcRepairDirectV2MethodId == 71);
 
-// Expected wire mapping, preserving IDs 1..69 independently of declaration order.
-constexpr std::array<std::string_view, 70> kNamesByWireId{
+// Expected wire mapping, preserving IDs 1..70 independently of declaration order.
+constexpr std::array<std::string_view, 71> kNamesByWireId{
     "statFs",                       // 1
     "stat",                         // 2
     "create",                       // 3
@@ -96,10 +97,11 @@ constexpr std::array<std::string_view, 70> kNamesByWireId{
     "prepareEcTargetRetirement",    // 68
     "queryEcTargetRetirement",      // 69
     "prepareEcFileRepairDirect",     // 70
+    "prepareEcRepairDirectV2",        // 71
 };
 template <class... M>
 consteval bool exactWireMap(std::tuple<M...> *) {
-  std::array<bool, 71> seen{};
+  std::array<bool, 72> seen{};
   bool valid = true;
   const auto add = [&](uint16_t id, std::string_view name) {
     if (id == 0 || id >= seen.size() || seen[id]) {
@@ -132,17 +134,17 @@ struct DispatchProbe {
     return Info::id;
   }
 };
-TEST(TestMetaServiceReflection, RegistersAll70IncludingBeyondDefaultFieldRank) {
+TEST(TestMetaServiceReflection, RegistersAll71IncludingBeyondDefaultFieldRank) {
   // Instantiate the same ID extraction used by real service dispatch, rather
   // than only counting sender constants or source declaration lines.
   using Extractor = serde::MethodExtractor<server::MetaSerdeService, DispatchProbe>;
-  for (uint16_t id = 1; id <= 70; ++id) {
+  for (uint16_t id = 1; id <= 71; ++id) {
     const auto method = Extractor::get(id);
     ASSERT_NE(method, nullptr) << id;
     EXPECT_EQ(method(), id);
   }
   EXPECT_EQ(Extractor::get(0), nullptr);
-  EXPECT_EQ(Extractor::get(71), nullptr);
+  EXPECT_EQ(Extractor::get(72), nullptr);
   EXPECT_EQ(Extractor::get(65535), nullptr);
   EXPECT_EQ(MetaSerde<>::getRpcName(TestRpcReq{}), "testRpc");
   EXPECT_EQ(MetaSerde<>::getRpcName(BindEcRmwOutputReq{}), "bindEcRmwOutput");
@@ -150,6 +152,7 @@ TEST(TestMetaServiceReflection, RegistersAll70IncludingBeyondDefaultFieldRank) {
   EXPECT_EQ(MetaSerde<>::getRpcName(PrepareEcTargetRetirementReq{}), "prepareEcTargetRetirement");
   EXPECT_EQ(MetaSerde<>::getRpcName(QueryEcTargetRetirementReq{}), "queryEcTargetRetirement");
   EXPECT_EQ(MetaSerde<>::getRpcName(PrepareEcFileRepairDirectReq{}), "prepareEcFileRepairDirect");
+  EXPECT_EQ(MetaSerde<>::getRpcName(PrepareEcRepairDirectV2Req{}), "prepareEcRepairDirectV2");
 }
 }  // namespace
 }  // namespace hf3fs::meta

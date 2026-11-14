@@ -29,7 +29,8 @@ SERVICE_NAMES = {'fdb', 'mgmtd', 'storage', 'meta'}
 PHASE = 'arguments'
 PHASES = {'arguments', 'source', 'core', 'lab-build', 'prepare', 'package', 'copy-fdb',
           'inventory', 'handoff', 'uid-handoff', 'exec-uid1000', 'exec-same-user', 'runtime-preflight',
-          'doctor', 'packaged-loader', 'bootstrap', 'cli-basic', 'cli-repair', 'dump-fuse-default.toml',
+          'doctor', 'packaged-loader', 'bootstrap', 'cli-basic', 'cli-repair', 'flat-inputs', 'flat-direct',
+          'dump-fuse-default.toml',
           'dump-launcher-default.toml', 'prepare-fuse', 'mode4-lifecycle', 'cleanup',
           'cleanup-unknown', 'receipt'}
 
@@ -815,6 +816,37 @@ def require_cli_result(value):
     require(all(step.get('checks_complete') is True for step in value['steps']), 'CLI step lacks checks')
 
 
+def require_flat_direct_result(value, lab):
+    require(type(value.get('schema')) is int and value['schema'] == 1
+            and value.get('state') == 'passed' and value.get('error') is None
+            and value.get('all_started_cli_processes_exited') is True
+            and type(value.get('interruption_requests')) is int and value['interruption_requests'] == 0,
+            'flat Direct wrapper incomplete')
+    stem = 'hosted-kv112-helper-two-direct'
+    choices = (('new-write', 'write'), ('new-repair', 'repair'), ('release', 'repair'),
+               ('new-read', 'read'), ('release', 'read'))
+    commands = value.get('commands')
+    require(type(commands) is list and len(commands) == len(choices), 'flat Direct command set differs')
+    for index, (row, (command, kind)) in enumerate(zip(commands, choices)):
+        require(type(row) is dict and type(row.get('index')) is int and row['index'] == index
+                and row.get('command') == command
+                and row.get('run_dir') == str(lab / 'client/runs' / (kind + '-' + stem))
+                and row.get('process_started') is True and row.get('process_exited') is True
+                and row.get('interrupted') is False
+                and type(row.get('returncode')) is int and row['returncode'] == 0,
+                'flat Direct command missing or unconfirmed')
+    checks = value.get('checks')
+    require(type(checks) is list and len(checks) == 1 and type(checks[0]) is dict,
+            'flat Direct check set differs')
+    check = checks[0]
+    require(check.get('case') == stem and check.get('strategy') == 'helper' and check.get('delivery') == 'direct'
+            and type(check.get('replacement_count')) is int and check['replacement_count'] == 2
+            and check.get('fault_injected') is False and check.get('repair_pin_released') is True
+            and type(check.get('readback')) is dict and check['readback'].get('byte_equal') is True
+            and check['readback'].get('remote_released') is True, 'flat Direct readback or release incomplete')
+    return stem
+
+
 def require_shutdown(final, cleanup, ready_run, supervisor_code):
     codes = cleanup.get('exit_codes') if type(cleanup) is dict else None
     require(type(final) is dict and {'run', 'stage', 'failure'} <= set(final)
@@ -1006,6 +1038,31 @@ def runtime(parent):
                 receipt = lab / 'client/file-cli-acceptance' / ('hosted-' + cli_phase) / cli_phase / 'report/result.json'
                 require_cli_result(read_json(receipt))
                 report['receipts'].append({'phase': cli_phase, 'path': str(receipt), 'sha256': sha(receipt)})
+            healthy()
+            command('flat-inputs', [sys.executable, '-B', lab / 'scripts/experiment-runner.py',
+                                    '--root', lab, 'inputs'])
+            flat_report = lab / 'client/reports/hosted-flat-direct'
+            command('flat-direct', [sys.executable, '-B', lab / 'scripts/experiment-runner.py',
+                                   '--root', lab, '--report-dir', flat_report, 'case', '--label', 'hosted',
+                                   '--strategy', 'helper', '--delivery', 'direct', '--replacements', '2',
+                                   '--sample', 'kv112'])
+            receipt = flat_report / 'result.json'
+            stem = require_flat_direct_result(read_json(receipt), lab)
+            # Re-read the actual native journals and bytes; a passed wrapper label
+            # cannot replace fixed delivery, complete ACKs or a content check.
+            flat = module(lab / 'scripts/experiment-runner.py', 'file_lab_flat_direct')
+            info = flat.sample_info(lab, 'kv112')
+            repair = lab / 'client/runs' / ('repair-' + stem)
+            read = lab / 'client/runs' / ('read-' + stem)
+            fixed, _ = flat.published(repair, info, allow_released=True)
+            require(flat.record_delivery(fixed) == 'direct' and fixed['replacementMask'] == 3
+                    and fixed['sourceOrder'] == list(range(2, 12)) and fixed['blockWindow'] == 2,
+                    'flat Direct immutable plan differs')
+            flat.released(repair)
+            require(flat.verify_read(read, info)['remote_released'] is True,
+                    'flat Direct read pin is not released in its actual journal')
+            report['receipts'].append({'phase': 'flat-direct', 'path': str(receipt), 'sha256': sha(receipt),
+                                      'record_sha256': sha(repair / 'record.json')})
             healthy()
             mountpoint = parent / 'mount'
             mountpoint.mkdir(mode=0o700)

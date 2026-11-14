@@ -8,6 +8,7 @@ namespace hf3fs::meta::server {
 class EcV2Coordinator;
 enum class EcV2Phase {
   PrepareRepair,
+  PrepareRepairDirect,
   Begin,
   Bind,
   Get,

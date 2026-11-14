@@ -10,6 +10,17 @@ namespace {
 using namespace ec_v2_lifecycle;
 using Plans = EcV2RepairPlanCatalog;
 
+// Independent pre-direct ECRP shape: no new field and a literal uint16 v1.
+struct LegacyRepairPlanRecordV1 {
+  SERDE_STRUCT_FIELD(version, uint16_t{1});
+  SERDE_STRUCT_FIELD(object, EcObjectRef{});
+  SERDE_STRUCT_FIELD(operation, Uuid::zero());
+  SERDE_STRUCT_FIELD(owner, EcOwner{});
+  SERDE_STRUCT_FIELD(selection, EcV2RepairSelection{});
+  SERDE_STRUCT_FIELD(plan, storage::EcRepairPlanInput{});
+  SERDE_STRUCT_FIELD(digest, storage::EcSha256{});
+};
+
 // These are internally consistent synthetic metadata snapshots, not proofs of
 // authentication, committed issuance, TCP forwarding or distributed drain.
 // The byte oracle is independent of the production EC codec.
@@ -125,6 +136,31 @@ TEST(TestEcV2RepairPlanCatalog, ReconstructsFullPlanAndKeepsAllOldAndNewInstance
   auto replay = state.build();
   ASSERT_OK(replay);
   EXPECT_TRUE(same(*record, *replay));
+}
+
+TEST(TestEcV2RepairPlanCatalog, DirectDeliveryVersionsOnlyPermanentRecord) {
+  RepairSnapshot state;
+  auto legacy = state.build();
+  auto direct = Plans::build({state.operation, state.reservation, state.binding, state.base, state.bases, state.content},
+                            state.selection, EcV2RepairDelivery::HelperDirect);
+  ASSERT_OK(legacy);
+  ASSERT_OK(direct);
+  LegacyRepairPlanRecordV1 old;
+  old.object = legacy->object;
+  old.operation = legacy->operation;
+  old.owner = legacy->owner;
+  old.selection = legacy->selection;
+  old.plan = legacy->plan;
+  old.digest = legacy->digest;
+  EXPECT_EQ(serde::serialize(old), serde::serialize(*legacy));
+  EXPECT_EQ(legacy->version, 1);
+  EXPECT_EQ(direct->version, 2);
+  EXPECT_EQ(serde::serialize(legacy->plan), serde::serialize(direct->plan));
+  EXPECT_EQ(legacy->digest, direct->digest);
+  EXPECT_NE(serde::serialize(*legacy), serde::serialize(*direct));
+  ASSERT_OK(Plans::validate(*direct));
+  direct->version = 3;
+  ASSERT_ERROR(Plans::validate(*direct), StatusCode::kDataCorruption);
 }
 
 TEST(TestEcV2RepairPlanCatalog, RejectsSourcesThatAreDuplicateMissingOrOutOfBounds) {

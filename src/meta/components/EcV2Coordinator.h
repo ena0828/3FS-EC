@@ -41,7 +41,10 @@ class EcV2Coordinator {
   Result<Void> addReadGrants(AcquireEcReadV2Rsp &) const;
   Result<std::optional<std::array<storage::EcHelperCapability, 10>>> issueRepairHelpers(
       const EcV2RepairPlanRecord &) const;
-  // Only the internal mode4 Prepare path may call this after committed issuance.
+  // Flat ECRP2, only after its authenticating issuance transaction commits.
+  Result<storage::EcHelperDirectDelegation> issueFlatRepairDirect(
+      const EcV2RepairPlanRecord &, const EcV2MutationRsp &) const;
+  // Internal File mode4 or flat Prepare path, only after committed issuance.
   Result<storage::EcHelperDirectDelegation> issueRepairDirect(
       const EcV2RepairPlanRecord &, std::array<storage::EcCapabilityV2, 2>,
       std::array<storage::EcCapabilityV2, 2>) const;

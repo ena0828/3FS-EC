@@ -101,9 +101,16 @@ def selection(root, script_directory):
         if action == "5":
             return command + ["boundaries", "--label", name]
         strategy = choose("修复策略", STRATEGIES)
+        delivery = []
+        if strategy == "helper":
+            delivery = ["--delivery", choose("Helper 结果交付方式", {
+                "1": ("return", "回传客户端，由客户端写入目标"),
+                "2": ("direct", "末站直接写入目标，客户端接收小回执"),
+            })]
         count = choose("替换片数", {"1": ("1", "单片"), "2": ("2", "双片")})
         sample = choose("输入数据", SAMPLES)
-        return command + ["case", "--label", name, "--strategy", strategy, "--replacements", count, "--sample", sample]
+        return command + ["case", "--label", name, "--strategy", strategy, *delivery,
+                          "--replacements", count, "--sample", sample]
     if action == "8":
         print("此操作只发起新读取，不能单独证明服务已重启；重启证据须另行核对。")
         source = existing_path("已发布写入或修复日志目录：")
