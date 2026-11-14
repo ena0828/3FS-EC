@@ -98,6 +98,23 @@ struct EcReadState {
 };
 }  // namespace detail
 
+EcStripeSelection &EcStripeSelection::operator=(EcStripeSelection &&other) noexcept {
+  if (this != &other) {
+    // Keep both charges while retiring the old payloads. Direct string move
+    // assignment may transfer old capacity into a moved-from source instead.
+    {
+      auto old = std::move(shards);
+    }
+    shards = std::move(other.shards);
+    payloadReservation = std::move(other.payloadReservation);
+    manifest = std::move(other.manifest);
+    attempted = other.attempted;
+    rejected = other.rejected;
+    quorumElapsed = other.quorumElapsed;
+  }
+  return *this;
+}
+
 struct EcStripeRead::Impl {
   Kernel kernel;
   Impl(std::shared_ptr<EcReadTransport> reader, folly::CPUThreadPoolExecutor &pool, Limits limits)

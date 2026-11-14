@@ -49,6 +49,12 @@ class RpcFrameEntrypoints(unittest.TestCase):
         observer = (SOURCE / "tests/client/TestEcRepairPipeline.cc").read_text(encoding="utf-8")
         for name in regression.RPC_OBSERVER_CASES:
             self.assertRegex(observer, r"TEST\(TestEcRepairPipeline,\s*" + name.split(".")[1] + r"\)")
+        selection = "TestEcStripeRead.ReplacementAndSelfMoveRetainOutputChargeAcrossLateCleanupAndClose"
+        selection_source = (SOURCE / "tests/client/TestEcStripeRead.cc").read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"TEST\(TestEcStripeRead,\s*" + selection.split(".")[1] + r"\)",
+                                       selection_source)), 1)
+        self.assertIn(selection, regression.CLIENT_MANDATORY)
+        self.assertTrue(any(fnmatch.fnmatchcase(selection, part) for part in driver.CLIENT_FILTER.split(":")))
 
     def test_real_xml_parser_accepts_all_and_rejects_skip_failure_or_missing_execution(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -117,7 +123,8 @@ class RpcFrameEntrypoints(unittest.TestCase):
                          "listing": {"exitcode": 0}, "execution": {"exitcode": 0}})
         original = {"status": "passed", "exitcode": 0, "failures": [], "suites": rows}
         regression.check_suites(original, build, built)
-        for mutation in ("nonzero", "timeout", "interrupted", "termination", "missing_listing", "changed_binary"):
+        for mutation in ("nonzero", "timeout", "interrupted", "termination", "missing_listing", "changed_binary",
+                         "missing_selection"):
             value = copy.deepcopy(original)
             row = value["suites"][2]
             if mutation == "nonzero":
@@ -126,6 +133,10 @@ class RpcFrameEntrypoints(unittest.TestCase):
                 row["listed_tests"].pop()
             elif mutation == "changed_binary":
                 row["binary_sha256_after"] = "f" * 64
+            elif mutation == "missing_selection":
+                selected = "TestEcStripeRead.ReplacementAndSelfMoveRetainOutputChargeAcrossLateCleanupAndClose"
+                row["listed_tests"] = [item for item in row["listed_tests"] if item["name"] != selected]
+                row["xml_results"]["cases"] = [item for item in row["xml_results"]["cases"] if item["name"] != selected]
             else:
                 row["execution"][{"timeout": "timed_out"}.get(mutation, mutation)] = True
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):

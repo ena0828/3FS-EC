@@ -51,9 +51,16 @@ struct EcSelectedShard {
 // Ten verified sources, not decoded logical file bytes. The caller may use the
 // existing EcCodec::recover with these actual indices. No remote pin is freed.
 struct EcStripeSelection {
+ private:
+  friend class EcStripeRead;
+  friend struct detail::EcReadState;
+  // Declared first: payloads are destroyed before their shared charge.
+  std::shared_ptr<const detail::EcReadReservation> payloadReservation;
+
+ public:
   EcStripeSelection() = default;
   EcStripeSelection(EcStripeSelection &&) noexcept = default;
-  EcStripeSelection &operator=(EcStripeSelection &&) noexcept = default;
+  EcStripeSelection &operator=(EcStripeSelection &&) noexcept;
   EcStripeSelection(const EcStripeSelection &) = delete;
   EcStripeSelection &operator=(const EcStripeSelection &) = delete;
   meta::EcManifest manifest;
@@ -61,12 +68,6 @@ struct EcStripeSelection {
   size_t attempted = 0;
   size_t rejected = 0;
   std::chrono::steady_clock::duration quorumElapsed{};
-
- private:
-  friend class EcStripeRead;
-  friend struct detail::EcReadState;
-  // Shared with outstanding attempts until cleanup, and retained with output.
-  std::shared_ptr<const detail::EcReadReservation> payloadReservation;
 };
 
 class EcStripeReadHandle {

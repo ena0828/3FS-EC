@@ -80,6 +80,7 @@ CLIENT_MANDATORY |= {
     )
 }
 CLIENT_MANDATORY |= {
+    "TestEcStripeRead.ReplacementAndSelfMoveRetainOutputChargeAcrossLateCleanupAndClose",
     "TestEcStripeClient.InvalidRepairDeliveryIsRejectedBeforeAnyMetadataCall",
     "TestEcStripeRunRecord.HelperDirectV3PersistsSelectionAndRejectsDowngradedJson",
     "TestEcStripeRunRecord.PublishedHelperDirectSourceCreatesIndependentRecoveryWrite",

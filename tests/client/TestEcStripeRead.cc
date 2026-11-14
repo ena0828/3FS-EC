@@ -157,6 +157,63 @@ TEST(TestEcStripeRead, InvalidFastResponseStartsTwelfthAndNeverCountsAsValid) {
   folly::coro::blockingWait(handle.waitLocalCleanup());
 }
 
+TEST(TestEcStripeRead, ReplacementAndSelfMoveRetainOutputChargeAcrossLateCleanupAndClose) {
+  folly::CPUThreadPoolExecutor executor(2);
+  auto oldTransport = std::make_shared<GatedTransport>();
+  auto newTransport = std::make_shared<GatedTransport>();
+  newTransport->blocked = 1u << 10;
+  EcStripeRead oldReader(oldTransport, executor, {});
+  EcStripeRead newReader(newTransport, executor, {});
+  SCOPE_EXIT {
+    oldTransport->blocked = 0;
+    newTransport->blocked = 0;
+    folly::coro::blockingWait(oldReader.close());
+    folly::coro::blockingWait(newReader.close());
+  };
+  {
+    auto oldStarted = oldReader.start(input(), options());
+    ASSERT_TRUE(oldStarted);
+    auto oldOutput = folly::coro::blockingWait(oldStarted->takeReady());
+    ASSERT_TRUE(oldOutput);
+    folly::coro::blockingWait(oldStarted->waitLocalCleanup());
+    EXPECT_EQ(oldReader.snapshot().reservedPayloadBytes, 12 * 128);
+
+    auto newStarted = newReader.start(input(), options());
+    ASSERT_TRUE(newStarted);
+    auto newOutput = folly::coro::blockingWait(newStarted->takeReady());
+    ASSERT_TRUE(newOutput);
+    ASSERT_FALSE(newStarted->localCleanupComplete());
+    const auto replacementObject = newOutput->manifest.object.incarnation;
+    const auto replacementElapsed = newOutput->quorumElapsed;
+    EXPECT_EQ(newReader.snapshot().reservedPayloadBytes, 12 * 128);
+
+    EcStripeSelection replacement(std::move(*newOutput));
+    *oldOutput = std::move(replacement);
+    EXPECT_EQ(oldReader.snapshot().reservedPayloadBytes, 0);
+    EXPECT_EQ(newReader.snapshot().reservedPayloadBytes, 12 * 128);
+    EXPECT_EQ(oldOutput->manifest.object.incarnation, replacementObject);
+    EXPECT_EQ(oldOutput->attempted, 11);
+    EXPECT_EQ(oldOutput->rejected, 0);
+    EXPECT_EQ(oldOutput->quorumElapsed, replacementElapsed);
+    auto &sameOutput = *oldOutput;
+    *oldOutput = std::move(sameOutput);
+    EXPECT_EQ(oldOutput->manifest.object.incarnation, replacementObject);
+    EXPECT_EQ(newReader.snapshot().reservedPayloadBytes, 12 * 128);
+    for (const auto &shard : oldOutput->shards)
+      EXPECT_EQ(shard.result.payload.data, GatedTransport::bytes(shard.index));
+
+    newTransport->blocked = 0;
+    folly::coro::blockingWait(newStarted->waitLocalCleanup());
+    folly::coro::blockingWait(oldReader.close());
+    folly::coro::blockingWait(newReader.close());
+    EXPECT_EQ(oldReader.snapshot().activeRequests, 0);
+    EXPECT_EQ(newReader.snapshot().activeRequests, 0);
+    EXPECT_EQ(newReader.snapshot().reservedPayloadBytes, 12 * 128);
+  }
+  EXPECT_EQ(oldReader.snapshot().reservedPayloadBytes, 0);
+  EXPECT_EQ(newReader.snapshot().reservedPayloadBytes, 0);
+}
+
 TEST(TestEcStripeRead, DeadlineRetainsAttemptsUntilTheirFiniteCompletion) {
   folly::CPUThreadPoolExecutor executor(2);
   auto transport = std::make_shared<GatedTransport>();
