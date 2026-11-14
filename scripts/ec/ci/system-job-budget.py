@@ -75,9 +75,19 @@ def main():
     if args.profile == "system" and args.stage in ("regression", "service-contracts", "target-meta", "core", "matrix"):
         parser.error("this stage requires --profile target-meta")
     base = budget_module(args.profile, ref=os.environ.get("GITHUB_REF"))
-    parent, identity = base.context()
-    identity["system_driver_sha256"] = base.digest(Path(__file__).read_bytes())
-    return base.record(parent, identity) if args.command == "record" else check(base, parent, identity, args.stage)
+    try:
+        parent, identity = base.context()
+        identity["system_driver_sha256"] = base.digest(Path(__file__).read_bytes())
+        return base.record(parent, identity) if args.command == "record" else check(base, parent, identity, args.stage)
+    except base.GateError as error:
+        # Only the loaded base's fixed gate messages are safe to publish.
+        print(json.dumps({"status": "system-budget-gate-failed", "error_type": type(error).__name__,
+                          "detail": str(error)}, sort_keys=True))
+        return 1
+    except Exception as error:
+        # Never print arbitrary exception text, environment or HTTP response data.
+        print(json.dumps({"status": "system-budget-gate-failed", "error_type": type(error).__name__}, sort_keys=True))
+        return 1
 
 
 if __name__ == "__main__":

@@ -307,6 +307,42 @@ class SystemEntrypoints(unittest.TestCase):
         with self.assertRaises(ValueError):
             budget.budget_module("arbitrary")
 
+        # Exercise the actual wrapper with the loaded base's exception class.
+        # A same-named foreign exception is not a trusted base gate message.
+        foreign_gate = type("GateError", (ValueError,), {})
+        reasons = {"context": "unexpected hosted job context",
+                   "record": "anonymous API unavailable after bounded retries",
+                   "check": "budget receipt context or constants differ"}
+        for phase, reason in reasons.items():
+            for kind in ("gate", "unknown", "foreign"):
+                actual = budget.budget_module("target-meta")
+                secret = "untrusted exception: environment=private HTTP-body=private"
+                error = (actual.GateError(reason) if kind == "gate" else
+                         RuntimeError(secret) if kind == "unknown" else foreign_gate(secret))
+                calls = {"context": mock.Mock(return_value=(Path("/private"), {})),
+                         "record": mock.Mock(return_value=0), "check": mock.Mock(return_value=0)}
+                calls[phase].side_effect = error
+                argv = ["budget", "check" if phase == "check" else "record", "--profile", "target-meta"]
+                if phase == "check":
+                    argv += ["--stage", "core"]
+                with self.subTest(phase=phase, kind=kind), \
+                     mock.patch.object(budget.sys, "argv", argv), \
+                     mock.patch.object(budget, "budget_module", return_value=actual), \
+                     mock.patch.object(actual, "context", calls["context"]), \
+                     mock.patch.object(actual, "record", calls["record"]), \
+                     mock.patch.object(budget, "check", calls["check"]), \
+                     contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(budget.main(), 1)
+                printed = json.loads(output.getvalue())
+                expected = {"status": "system-budget-gate-failed", "error_type": type(error).__name__}
+                if kind == "gate":
+                    expected["detail"] = reason
+                self.assertEqual(printed, expected)
+                self.assertNotIn(secret, output.getvalue())
+                self.assertEqual(calls["context"].call_count, 1)
+                self.assertEqual(calls["record"].call_count, int(phase == "record"))
+                self.assertEqual(calls["check"].call_count, int(phase == "check"))
+
     def test_file_and_spare_gates_keep_the_verified_anchor_and_exact_boundaries(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "base.py"
