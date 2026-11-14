@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -198,6 +199,18 @@ class PortableExperiments(unittest.TestCase):
                 prepare(root, ROOT, 19000, "v2", file_api=True)
             self.assertFalse(root.exists())
             prepare(root, ROOT, 19000, "gc", file_api=True, user_uid=2345, user_gid=3456)
+            for name in ("kv-replay.py", "kv-replay-native.py"):
+                self.assertEqual((root / "scripts" / name).read_bytes(), (SCRIPTS / name).read_bytes())
+            traces = SCRIPTS.parent / "traces"
+            for name in ("kv_trace.py", "replay_input.py", "replay_model.py"):
+                self.assertEqual((root / "scripts" / name).read_bytes(), (traces / name).read_bytes())
+            for original in (traces / "inputs").glob("*.source.json"):
+                self.assertEqual((root / "scripts/trace-inputs" / original.name).read_bytes(), original.read_bytes())
+            self.assertEqual((root / "scripts/trace-inputs/Qwen-Bailian-LICENSE").read_bytes(),
+                             (traces / "licenses/Qwen-Bailian-LICENSE").read_bytes())
+            help_result = subprocess.run([sys.executable, '-B', str(root / 'scripts/kv-replay.py'), '--help'],
+                                         cwd=root, capture_output=True, text=True, check=True)
+            self.assertIn('start,resume,status', help_result.stdout)
             manifest = json.loads((root / "cluster.json").read_text())
             self.assertEqual(manifest["authenticated_user"], {"uid": 2345, "gid": 3456})
             self.assertTrue(file_api_enabled(manifest))

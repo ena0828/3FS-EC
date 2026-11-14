@@ -153,11 +153,19 @@ def sync_parent(path):
 
 def command(runner,w,argv,*,pass_fds=()):
     require(not runner.stop_requested,'Stop requested; no new command')
+    local_export=False
     if pass_fds:
-        require(runner.transport_role=='control' and len(argv)==5 and
-                list(map(str,argv[:4]))==[str(runner.root/'bin/admin_cli'),'--cfg',str(runner.config),'--'],
-                'An inherited collector lease requires the original control CLI and configuration')
+        if runner.transport_role=='file':
+            local_export=validate_leased_file_command(runner,argv)
+        else:
+            require(runner.transport_role=='control' and len(argv)==5 and
+                    list(map(str,argv[:4]))==[str(runner.root/'bin/admin_cli'),'--cfg',str(runner.config),'--'],
+                    'An inherited collector lease requires the original control CLI and configuration')
     binding=runner.check_transport()
+    if local_export:
+        # Read-only journal export still verifies the prepared profile. It does
+        # not send data RPCs or create a transport sidecar for the journal.
+        return _owned_command(runner,w,argv,None,kind='local_read_export',pass_fds=pass_fds)
     if binding is not None:
         # This shared child owner also runs the formal file acceptance driver.
         # Control-only admin calls have no data-transport claim.
@@ -170,6 +178,73 @@ def command(runner,w,argv,*,pass_fds=()):
                 'File command transport/config/run differs from prepared selection')
         w.bind_transport_run(runner.root,Path(runs[0]),binding,[str(argv[0])])
     return _owned_command(runner,w,argv,binding,pass_fds=pass_fds)
+
+
+def validate_leased_file_command(runner,argv):
+    """Narrow trace-lease handoff; never an arbitrary executable permission."""
+    require(type(argv) is list and all(type(x) is str for x in argv) and len(argv)>=4,
+            'Leased file command must be an explicit argument list')
+    require(argv[:2]==[str(runner.root/'bin/ec_file_cli'),'--cfg='+str(runner.config)] and
+            runner.config==runner.root/'client/file-client.toml', 'Leased file executable/config differs')
+    common={'run_dir'}
+    fields={
+        'create':{'file_path','shard_bytes','permission','session_rights'},
+        'resume-open':set(), 'close':set(),
+        'pwrite':{'session_run_dir','offset_decimal','input_file'}, 'resume':set(), 'query':set(),
+        'read':{'session_run_dir','offset_decimal','length_decimal','output_file'},
+        'resume-read':{'output_file'}, 'release-read':set(),
+        'export-read-allocations':{'output_file'},
+        'repair':{'session_run_dir','repair_stripe_decimal','repair_mask_decimal','repair_source_order',
+                  'repair_mode','repair_window_decimal','repair_delivery'},
+        'resume-repair':set(), 'query-repair':set(), 'close-repair-debt':set(),
+        'truncate':{'session_run_dir','length_decimal'}, 'resume-truncate':set(),
+        'query-truncate':set(), 'close-truncate-debt':set()}
+    require(argv[-1].startswith('mode4-') and argv[-1][6:] in fields, 'Leased file operation is not supported')
+    action=argv[-1][6:]; values={}
+    for arg in argv[2:-1]:
+        require(arg.startswith('--config.') and '=' in arg,'Unexpected leased file argument')
+        key,value=arg[9:].split('=',1)
+        require(key not in values and value!='','Duplicate/empty leased file argument')
+        values[key]=value
+    optional={'storage_transport','deadline_seconds','max_application_bytes'}
+    if action=='repair':optional.add('repair_delivery')
+    required=common|fields[action]
+    if action=='repair':required=required-{'repair_delivery'}
+    require(required<=values.keys() and values.keys()<=required|optional,'Leased file argument set differs')
+    require(values.get('storage_transport','tcp') in ('tcp','rdma'),'Invalid leased transport')
+    for key in ('run_dir','session_run_dir','input_file','output_file'):
+        if key in values:
+            path=Path(values[key])
+            require(path.is_absolute() and path==path.resolve(),'Leased file paths must be canonical absolute paths')
+    return action=='export-read-allocations'
+
+
+def validate_collector_command(root,argv,*,expected_executable=None):
+    """Read-only validation; an evidence reader can pin the original interpreter."""
+    root=Path(root)
+    executable=sys.executable if expected_executable is None else expected_executable
+    require(type(executable) is str and bool(executable) and root.is_absolute() and root==root.resolve(),
+            'Invalid fixed collector interpreter/root')
+    require(type(argv) is list and all(type(x) is str for x in argv) and len(argv) in (8,10),
+            'Invalid collector command shape')
+    require(argv[:3]==[executable,'-B',str(root/'scripts/tree-gc-runner.py')] and
+            argv[3] in ('start','resume') and argv[4:6]==['--root',str(root)] and argv[6]=='--run-dir',
+            'Collector executable/root/operation differs')
+    require((argv[3]=='start' and len(argv)==10 and argv[8]=='--expected') or
+            (argv[3]=='resume' and len(argv)==8),'Collector start/resume arguments differ')
+    for raw in (argv[7],*([argv[9]] if len(argv)==10 else [])):
+        path=Path(raw)
+        require(path.is_absolute() and path==path.resolve(),'Collector paths must be canonical absolute paths')
+    return {'action':argv[3],'run_dir':argv[7], 'expected':argv[9] if len(argv)==10 else None}
+
+
+def collector_command(runner,w,argv,*,pass_fds):
+    """Only the existing object collector may inherit a trace-level lease."""
+    require(not runner.stop_requested and runner.transport_role=='control','Stopped or non-control collector owner')
+    validate_collector_command(runner.root,argv)
+    require(len(checked_pass_fds(pass_fds))==1,'Collector child requires the inherited trace lease')
+    require(runner.check_transport() is None,'Collector unexpectedly claims data transport')
+    return _owned_command(runner,w,argv,None,kind='tree_gc_collector',pass_fds=pass_fds)
 
 
 def validate_supervisor_command(root,argv,*,expected_executable=None):

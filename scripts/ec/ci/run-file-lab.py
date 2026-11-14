@@ -30,7 +30,8 @@ SERVICE_NAMES = {'fdb', 'mgmtd', 'storage', 'meta'}
 PHASE = 'arguments'
 PHASES = {'arguments', 'source', 'core', 'lab-build', 'prepare', 'package', 'copy-fdb',
           'inventory', 'handoff', 'uid-handoff', 'exec-uid1000', 'exec-same-user', 'runtime-preflight',
-          'doctor', 'packaged-loader', 'bootstrap', 'cli-basic', 'cli-repair', 'cli-tree-gc', 'flat-inputs', 'flat-direct',
+          'doctor', 'packaged-loader', 'bootstrap', 'cli-basic', 'cli-repair', 'cli-tree-gc',
+          'cli-kv-replay', 'cli-kv-replay-resume', 'flat-inputs', 'flat-direct',
           'dump-fuse-default.toml',
           'dump-launcher-default.toml', 'prepare-fuse', 'mode4-lifecycle', 'cleanup',
           'cleanup-unknown', 'receipt'}
@@ -1140,6 +1141,155 @@ def stop_signals(owner):
     return {sig: signal.signal(sig, owner.interrupted) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
 
 
+def kv_replay_command_gate(lab, run, step, commands, selection):
+    """Recheck direct child evidence; local commands never acquire a data claim."""
+    require(type(commands) is list and commands, 'replay action has no actual commands')
+    ack = module(lab / 'scripts/ack-service-acceptance.py', 'kv_lab_command_validator')
+    shape = type('FileCommandShape', (), {'root': lab, 'config': lab / 'client/file-client.toml'})()
+    allowed = {
+        'put': {'create', 'resume-open', 'pwrite', 'resume', 'read', 'resume-read', 'release-read'},
+        'get': {'read', 'resume-read', 'release-read'},
+        'repair': {'repair', 'resume-repair', 'close-repair-debt', 'read', 'resume-read', 'release-read'},
+        'evict': {'truncate', 'resume-truncate', 'close-truncate-debt', 'read', 'resume-read', 'release-read', 'close'}}
+    data, local, actions = [], [], set()
+    for row in commands:
+        require(type(row) is dict and row.get('process_started') is True and row.get('process_exited') is True
+                and type(row.get('returncode')) is int and row['returncode'] in (0, 1)
+                and row.get('inherited_collector_lease') is True, 'replay child is not an actual joined lease holder')
+        argv = row['argv']; kind = row.get('kind')
+        if kind == 'tree_gc_collector':
+            require(step['spec']['kind'] == 'evict' and row['returncode'] == 0 and 'transport' not in row,
+                    'collector is not an eviction local command')
+            fixed = ack.validate_collector_command(lab, argv, expected_executable='/usr/bin/python3')
+            folder = run / 'native/actions' / step['name']
+            require(fixed['run_dir'] == str(folder / 'collector-run') and
+                    (fixed['expected'] is None or fixed['expected'] == str(folder / 'expected.json')),
+                    'replay collector changed its original run or expected set')
+            local.append(row); actions.add('collector'); continue
+        exported = ack.validate_leased_file_command(shape, argv)
+        raw_run = next(arg.split('=', 1)[1] for arg in argv if arg.startswith('--config.run_dir='))
+        require(canonical(Path(raw_run)).is_relative_to(run / 'native/actions'), 'replay native run escaped original trace')
+        action = argv[-1][6:]
+        folder = run / 'native/actions' / step['name']
+        if action in ('create', 'resume-open'): expected_run = folder / 'session-run'
+        elif action in ('pwrite', 'resume'): expected_run = folder / 'write-run'
+        elif action in ('repair', 'resume-repair', 'close-repair-debt'): expected_run = folder / 'repair-run'
+        elif action in ('truncate', 'resume-truncate', 'close-truncate-debt'): expected_run = folder / 'truncate-run'
+        elif action == 'close': expected_run = run / 'native/actions' / step['spec']['instance'] / 'session-run'
+        else: expected_run = folder / ('empty/read-run' if step['spec']['kind'] == 'evict' else 'read-run')
+        require(raw_run == str(expected_run), 'replay command changed the original phase journal')
+        if exported:
+            require(kind == 'local_read_export' and step['spec']['kind'] in ('put', 'repair')
+                    and row['returncode'] == 0 and 'transport' not in row, 'read export acquired data or GC authority')
+            output = Path(next(arg.split('=', 1)[1] for arg in argv if arg.startswith('--config.output_file=')))
+            require(canonical(output).is_relative_to(run / 'native/actions' / step['name'] / 'export'),
+                    'read export output escaped its action')
+            local.append(row); actions.add('export'); continue
+        require(kind is None and action in allowed[step['spec']['kind']], 'unexpected replay data command')
+        require(row['returncode'] == 0 or action in ('truncate', 'resume-truncate'), 'failed replay data command')
+        data.append(row); actions.add(action)
+    required = {'put': ({'create', 'resume-open'}, {'pwrite', 'resume'}, {'read', 'resume-read'}, {'release-read'}, {'export'}),
+                'get': ({'read', 'resume-read'}, {'release-read'}),
+                'repair': ({'repair', 'resume-repair'}, {'close-repair-debt'}, {'read', 'resume-read'}, {'release-read'}, {'export'}),
+                'evict': ({'truncate', 'resume-truncate'}, {'close-truncate-debt'}, {'read', 'resume-read'},
+                          {'release-read'}, {'close'}, {'collector'})}[step['spec']['kind']]
+    require(all(actions & alternatives for alternatives in required), 'replay action omitted a mandatory native phase')
+    validate_command_transports(lab, selection, data)
+    return len(data), len(local)
+
+
+def require_kv_replay_result(lab, selection):
+    """The fixed six-observation functional recipe, not a public-trace benchmark."""
+    run = canonical(lab / 'client/kv-replay-hosted')
+    scripts = lab / 'scripts'
+    # The entry imports its three fixed providers by normal Python name.
+    # Keep this read-only verifier from accidentally reusing another bundle.
+    saved_path = list(sys.path)
+    names = ('kv_trace', 'replay_input', 'replay_model')
+    saved = {name: sys.modules.get(name) for name in names}
+    try:
+        sys.path.insert(0, str(scripts))
+        for name in names: sys.modules.pop(name, None)
+        entry = module(scripts / 'kv-replay.py', 'kv_lab_entry_validator')
+        request = read_json(run / 'request.json')
+        require(request['root'] == str(lab) and request['input'] == {'kind': 'synthetic'}, 'replay is not the fixed synthetic lab input')
+        plan = read_json(run / 'plan.json')
+        require(same_transport_value(plan, entry.derive(request)), 'replay plan/provider/input differs')
+        require(plan['bounds']['observations'] == 6 and len(plan['steps']) == 12 and
+                plan['summary']['model_misses'] == 4 and plan['summary']['model_hits'] == 2 and
+                plan['summary']['scheduled_repairs'] == 2, 'replay recipe inventory differs')
+        for value in plan['claims'].values(): require(value is False, 'replay claimed nonfunctional evidence')
+        result = read_json(run / 'completion.json')
+        require(type(result.get('schema')) is int and result['schema'] == 1 and result.get('state') == 'confirmed'
+                and result.get('kind') == 'bounded_native_kv_replay_result' and result.get('actions_confirmed') == 12
+                and result.get('plan_sha256') == entry.digest(plan)
+                and same_transport_value(result.get('summary'), plan['summary'])
+                and same_transport_value(result.get('claims'), plan['claims'])
+                and same_transport_value(result.get('source_binding'), plan['source_binding']), 'replay completion differs')
+        binding = read_json(run / 'native/binding.json')
+        require(type(binding.get('schema')) is int and binding['schema'] == 1
+                and binding['root'] == str(lab) and binding['run_dir'] == str(run)
+                and binding['plan_sha256'] == entry.digest(plan), 'native backend binding differs')
+        required_inputs = {str(lab / name) for name in ('cluster.json', 'state/initialized.json',
+                           'client/file-client.toml', 'config/admin_cli.toml', 'bin/ec_file_cli', 'bin/admin_cli')}
+        required_inputs |= {str(scripts / name) for name in ('kv-replay-native.py', 'kv_trace.py', 'file-command.py',
+                             'ack-service-acceptance.py', 'experiment-runner.py', 'tree-gc-runner.py', 'native_v2_config.py')}
+        require(set(binding['files']) == required_inputs, 'native backend input inventory differs')
+        for raw, expected in binding['files'].items():
+            path = canonical(Path(raw))
+            require(path.is_relative_to(lab) and sha(path) == expected, 'native backend input/provider changed')
+        require(binding['files'].get(str(scripts / 'kv-replay-native.py')) == sha(scripts / 'kv-replay-native.py'),
+                'native backend source was not bound')
+        rows, hashes, data_count, local_count = [], {}, 0, 0
+        require({p.name for p in (run / 'native/actions').iterdir()} == {s['name'] for s in plan['steps']}
+                and {p.name for p in (run / 'confirmed').iterdir()} == {s['name'] + '.json' for s in plan['steps']},
+                'replay action ledger is incomplete or has extras')
+        for step in plan['steps']:
+            folder = run / 'native/actions' / step['name']; path = folder / 'completion.json'
+            value = read_json(path); entry.validate_receipt(step, plan, value)
+            require(value['historical_unconfirmed_attempts'] == 0 and value['historical_join_proven'] is True,
+                    'fresh functional acceptance has an unconfirmed historical child')
+            require(entry.digest(read_json(folder / 'spec.json')) == value['spec_sha256'], 'action spec bytes changed')
+            for raw, expected in value['files'].items():
+                item = canonical(Path(raw))
+                require(item.is_relative_to(run) and sha(item) == expected, 'native action evidence changed')
+            observed_commands = []
+            # Match backend's sorted(Path.rglob(...)) component ordering; plain
+            # strings order repair-debt before repair/ and change the ledger.
+            for observed_path in sorted(map(Path, value['files'])):
+                if observed_path.name != 'observed.json': continue
+                observed = read_json(observed_path)
+                require(len(observed['commands']) == 1, 'unconfirmed native attempt')
+                row = observed['commands'][0]
+                require(row['argv'] == read_json(observed_path.parent / 'intent.json')['argv'], 'actual argv differs from durable intent')
+                if row.get('returncode') == 1:
+                    log = observed_path.parent / 'owner/command-000.log'
+                    values = [json.loads(line, object_pairs_hook=unique) for line in log.read_text(encoding='utf8').splitlines()
+                              if line.lstrip().startswith('{')]
+                    require(len(values) == 1 and values[0].get('observed') is True and values[0].get('published') is False
+                            and values[0].get('all_cleanup_complete') is False and type(values[0].get('error_code')) is int
+                            and values[0]['error_code'] == 0, 'exit 1 is not validated Planned truncate progress')
+                observed_commands.extend(observed['commands'])
+            require(same_transport_value(observed_commands, value['owned_commands']), 'owned command receipt differs from original attempts')
+            data, local = kv_replay_command_gate(lab, run, step, value['owned_commands'], selection)
+            data_count += data; local_count += local
+            row = read_json(run / 'confirmed' / (step['name'] + '.json'))
+            require(row['name'] == step['name'] and row['receipt_path'] == str(path)
+                    and row['receipt_sha256'] == entry.digest(value) and row['plan_sha256'] == entry.digest(plan)
+                    and same_transport_value(row['model_after'], step['model']['after']), 'model commit is not bound to actual native completion')
+            rows.append(row); hashes[str(path)] = sha(path)
+        require(result['confirmed_actions_sha256'] == entry.digest(rows), 'replay final action digest differs')
+        return {'plan_sha256': sha(run / 'plan.json'), 'completion_sha256': sha(run / 'completion.json'),
+                'action_receipt_sha256': hashes, 'data_commands': data_count, 'local_commands': local_count,
+                'actions': 12, 'misses': 4, 'hits': 2, 'repairs': 2, 'performance_validated': False,
+                'physical_capacity_returned': False}
+    finally:
+        sys.path[:] = saved_path
+        for name, value in saved.items():
+            if value is None: sys.modules.pop(name, None)
+            else: sys.modules[name] = value
+
+
 def runtime(parent):
     phase('runtime-preflight')
     private(parent, os.geteuid())
@@ -1278,6 +1428,18 @@ def runtime(parent):
             validate_command_transports(lab, selection, gc_result['commands'])
             report['receipts'].append({'phase': 'tree-gc', 'path': str(receipt), 'sha256': sha(receipt)})
             healthy()
+            replay_run = lab / 'client/kv-replay-hosted'
+            command('cli-kv-replay', [sys.executable, '-B', lab / 'scripts/kv-replay.py', 'start',
+                                      '--root', lab, '--run-dir', replay_run, '--synthetic'])
+            replay_proof = require_kv_replay_result(lab, selection)
+            command('cli-kv-replay-resume', [sys.executable, '-B', lab / 'scripts/kv-replay.py', 'resume',
+                                             '--run-dir', replay_run])
+            require(same_transport_value(require_kv_replay_result(lab, selection), replay_proof),
+                    'terminal replay changed its original native action evidence')
+            receipt = replay_run / 'completion.json'
+            report['receipts'].append({'phase': 'kv-replay', 'path': str(receipt), 'sha256': sha(receipt),
+                                      'proof': replay_proof})
+            healthy()
             command('flat-inputs', [sys.executable, '-B', lab / 'scripts/experiment-runner.py',
                                     '--root', lab, 'inputs'])
             flat_report = lab / 'client/reports/hosted-flat-direct'
@@ -1394,6 +1556,9 @@ def runtime(parent):
                     validate_command_transports(lab, selection, value['commands'])
                     if item['phase'] == 'tree-gc':
                         gc_acceptance.validate_result(value, lab, 'hosted')
+                elif item['phase'] == 'kv-replay':
+                    require(same_transport_value(require_kv_replay_result(lab, selection), item['proof']),
+                            'original replay transport/action evidence changed')
                 elif item['phase'] == 'mode4-lifecycle':
                     validate_fuse_transport(lab, selection, read_json(parent / 'fuse-config/preparation.json'), value)
         require(not helper.mounts_at(parent / 'mount'), 'mount still present after lifecycle')

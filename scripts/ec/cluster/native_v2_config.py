@@ -709,6 +709,16 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False, user_uid=1
                  "ack-expected-scripts.json", "gc-acceptance.py", "tree-gc-runner.py",
                  "native_fault_control.py", "native_managed_domain.py"):
         shutil.copy2(Path(__file__).parent / name, root / "scripts" / name)
+    if file_api:
+        for name in ("kv-replay.py", "kv-replay-native.py"):
+            shutil.copy2(Path(__file__).parent / name, root / "scripts" / name)
+        traces = Path(__file__).parent.parent / "traces"
+        for name in ("kv_trace.py", "replay_input.py", "replay_model.py"):
+            shutil.copy2(traces / name, root / "scripts" / name)
+        (root / "scripts/trace-inputs").mkdir(mode=0o700)
+        for descriptor in sorted((traces / "inputs").glob("*.source.json")):
+            shutil.copy2(descriptor, root / "scripts/trace-inputs" / descriptor.name)
+        shutil.copy2(traces / "licenses/Qwen-Bailian-LICENSE", root / "scripts/trace-inputs/Qwen-Bailian-LICENSE")
     print(f"Prepared {root}: private keys and configuration only; no services, targets or database opened.")
 
 

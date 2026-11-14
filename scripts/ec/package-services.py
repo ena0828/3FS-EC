@@ -146,11 +146,17 @@ def main():
                 include(source_path, f"lib/{soname}", "shared-library")
 
     if bundle_manifest.get("file_api") is True:
-        for name in ("file-cli-acceptance.py", "tree-gc-acceptance.py"):
+        for name in ("file-cli-acceptance.py", "tree-gc-acceptance.py", "kv-replay.py", "kv-replay-native.py"):
             script = Path(__file__).with_name("cluster") / name
             if not script.is_file():
                 raise RuntimeError(f"Missing file API acceptance source: {script}")
             include(script, "scripts/" + name, "script")
+        traces = Path(__file__).with_name("traces")
+        for name in ("kv_trace.py", "replay_input.py", "replay_model.py"):
+            include(traces / name, "scripts/" + name, "script")
+        for descriptor in sorted((traces / "inputs").glob("*.source.json")):
+            include(descriptor, "scripts/trace-inputs/" + descriptor.name, "source-descriptor")
+        include(traces / "licenses/Qwen-Bailian-LICENSE", "scripts/trace-inputs/Qwen-Bailian-LICENSE", "license")
 
     if bundle_manifest.get("profile") == "native-gc-local-14-storage-14-targets" and bundle_manifest.get("file_api") is True:
         script = Path(__file__).with_name("cluster") / "spare-fault-acceptance.py"

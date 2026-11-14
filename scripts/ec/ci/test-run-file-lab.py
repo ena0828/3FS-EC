@@ -36,6 +36,164 @@ def passed_mount():
 
 
 class FileLabGates(unittest.TestCase):
+    def replay_fixture(self, root):
+        """Synthetic receipts only; actual native work remains in the hosted phase."""
+        scripts = root / 'scripts'; scripts.mkdir()
+        source = Path(__file__).resolve().parents[1]
+        for name in ('kv-replay.py', 'kv-replay-native.py', 'ack-service-acceptance.py', 'experiment-runner.py',
+                     'native_v2_config.py', 'generate.py', 'file-command.py', 'tree-gc-runner.py'):
+            shutil.copyfile(source / 'cluster' / name, scripts / name)
+        for name in ('kv_trace.py', 'replay_input.py', 'replay_model.py'):
+            shutil.copyfile(source / 'traces' / name, scripts / name)
+        run = root / 'client/kv-replay-hosted'; run.mkdir(parents=True)
+        saved_path = list(sys.path)
+        names = ('kv_trace', 'replay_input', 'replay_model')
+        saved = {name: sys.modules.pop(name, None) for name in names}
+        try:
+            sys.path.insert(0, str(scripts))
+            entry = lab.module(scripts / 'kv-replay.py', 'test_lab_kv_entry')
+            request = {'schema': 1, 'root': str(root), 'trace_id': '11111111-1111-4111-8111-111111111111',
+                       'input': {'kind': 'synthetic'}, 'policy': {'shard_bytes': 11469, 'slots': 2,
+                       'logical_budget': 229376, 'allocation_budget': 16777216, 'ttl_ns': 5 * 10**9,
+                       'repair_every': 3, 'repair': entry.replay_model.repair_options()}}
+            plan = entry.derive(request)
+            def save(path, value):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(entry.encoded(value))
+            save(run / 'request.json', request); save(run / 'plan.json', plan)
+            inputs = [root / name for name in ('cluster.json', 'state/initialized.json', 'client/file-client.toml',
+                      'config/admin_cli.toml', 'bin/ec_file_cli', 'bin/admin_cli')]
+            for path in inputs:
+                path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'pure fixture input only')
+            inputs += [scripts / name for name in ('kv-replay-native.py', 'kv_trace.py', 'file-command.py',
+                       'ack-service-acceptance.py', 'experiment-runner.py', 'tree-gc-runner.py', 'native_v2_config.py')]
+            save(run / 'native/binding.json', {'schema': 1, 'root': str(root), 'run_dir': str(run), 'plan_sha256': entry.digest(plan),
+                                              'files': {str(path): lab.sha(path) for path in inputs}})
+            rows, values = [], []
+            for step in plan['steps']:
+                name, spec = step['name'], step['spec']; folder = run / 'native/actions' / name
+                session = run / 'native/actions' / spec['instance'] / 'session-run'
+                choices = {'put': ['create', 'pwrite', 'read', 'release-read', 'export-read-allocations'],
+                           'get': ['read', 'release-read'],
+                           'repair': ['repair', 'close-repair-debt', 'read', 'release-read', 'export-read-allocations'],
+                           'evict': ['truncate', 'close-truncate-debt', 'read', 'release-read', 'close', 'collector']}[spec['kind']]
+                files, command_paths = {}, []
+                for index, action in enumerate(choices):
+                    phase_name = {'create': 'session', 'pwrite': 'write', 'read': 'read', 'release-read': 'release',
+                                  'export-read-allocations': 'export', 'repair': 'repair',
+                                  'close-repair-debt': 'repair-debt', 'truncate': 'truncate',
+                                  'close-truncate-debt': 'truncate-debt', 'close': 'close', 'collector': 'collector'}[action]
+                    if spec['kind'] == 'evict' and action in ('read', 'release-read'):
+                        phase_name = 'empty/' + phase_name
+                    attempt = folder / phase_name / 'attempts/0000'
+                    if action == 'collector':
+                        argv = ['/usr/bin/python3', '-B', str(scripts / 'tree-gc-runner.py'), 'start', '--root', str(root),
+                                '--run-dir', str(folder / 'collector-run'), '--expected', str(folder / 'expected.json')]
+                        kind = 'tree_gc_collector'
+                    else:
+                        if action == 'create': native_run = folder / 'session-run'
+                        elif action == 'pwrite': native_run = folder / 'write-run'
+                        elif action in ('repair', 'close-repair-debt'): native_run = folder / 'repair-run'
+                        elif action in ('truncate', 'close-truncate-debt'): native_run = folder / 'truncate-run'
+                        elif action == 'close': native_run = session
+                        else: native_run = folder / ('empty/read-run' if spec['kind'] == 'evict' else 'read-run')
+                        native_run.mkdir(parents=True, exist_ok=True)
+                        options = {'run_dir': str(native_run)}
+                        if action == 'create': options.update(file_path='/ec-lab/test', shard_bytes='11469', permission='384', session_rights='3')
+                        if action == 'pwrite': options.update(session_run_dir=str(session), offset_decimal='0', input_file=str(folder / 'payload.bin'))
+                        if action == 'read': options.update(session_run_dir=str(session), offset_decimal='0', length_decimal='114689',
+                                                           output_file=str(folder / 'read/output-0000.bin'))
+                        if action == 'repair': options.update(session_run_dir=str(session), repair_stripe_decimal='0', repair_mask_decimal='3',
+                            repair_source_order=','.join(map(str, range(2,12))), repair_mode='helper', repair_window_decimal='1', repair_delivery='direct')
+                        if action == 'truncate': options.update(session_run_dir=str(session), length_decimal='0')
+                        if action == 'export-read-allocations':
+                            output = folder / 'export/allocations-0000.json'; save(output, {'synthetic': True})
+                            options['output_file'] = str(output)
+                        argv = [str(root / 'bin/ec_file_cli'), '--cfg=' + str(root / 'client/file-client.toml'),
+                                *['--config.' + key + '=' + value for key, value in options.items()], 'mode4-' + action]
+                        kind = 'local_read_export' if action == 'export-read-allocations' else None
+                    command = {'argv': argv, 'process_started': True, 'process_exited': True, 'returncode': 0,
+                               'inherited_collector_lease': True}
+                    if kind: command['kind'] = kind
+                    save(attempt / 'intent.json', {'argv': argv})
+                    save(attempt / 'observed.json', {'commands': [command]})
+                    files[str(attempt / 'intent.json')] = lab.sha(attempt / 'intent.json')
+                    files[str(attempt / 'observed.json')] = lab.sha(attempt / 'observed.json')
+                    command_paths.append((attempt / 'observed.json', command))
+                commands = [command for _, command in sorted(command_paths, key=lambda pair: pair[0])]
+                value = {'schema': 1, 'state': 'confirmed', 'name': name, 'kind': spec['kind'], 'instance': spec['instance'],
+                         'key_sha256': spec['key_sha256'], 'logical_bytes_decimal': spec['logical_bytes_decimal'],
+                         'plan_sha256': entry.digest(plan), 'spec_sha256': entry.digest(spec), 'current_owner_children_joined': True,
+                         'namespace_deleted': False, 'physical_capacity_returned': False, 'performance_validated': False,
+                         'historical_unconfirmed_attempts': 0, 'historical_join_proven': True,
+                         'snapshot_exports': [{'synthetic': True}] if spec['kind'] in ('put', 'repair') else [],
+                         'gc': None, 'files': files, 'owned_commands': commands}
+                if spec['kind'] == 'evict':
+                    cost = step['model']['required_confirmed_gc_allocation_bytes_decimal']
+                    value['gc'] = {'confirmed_allocation_model_bytes_decimal': cost, 'completion': {'state': 'confirmed',
+                        'completion_scope': 'exact_expected_published_revisions_and_allocations', 'capacity_returned': False,
+                        'namespace_deleted': False, 'unpublished_outputs_covered': False, 'allocations_confirmed': int(cost)//11469}}
+                save(folder / 'spec.json', spec); save(folder / 'completion.json', value)
+                row = {'schema': 1, 'plan_sha256': entry.digest(plan), 'name': name, 'receipt_sha256': entry.digest(value),
+                       'receipt_path': str(folder / 'completion.json'), 'model_after': step['model']['after']}
+                save(run / 'confirmed' / (name + '.json'), row); rows.append(row); values.append(value)
+            result = {'schema': 1, 'kind': 'bounded_native_kv_replay_result', 'state': 'confirmed',
+                      'plan_sha256': entry.digest(plan), 'actions_confirmed': 12, 'summary': plan['summary'],
+                      'claims': plan['claims'], 'source_binding': plan['source_binding'], 'confirmed_actions_sha256': entry.digest(rows)}
+            save(run / 'completion.json', result)
+            return run, plan, values, save
+        finally:
+            sys.path[:] = saved_path
+            for name, value in saved.items():
+                if value is None: sys.modules.pop(name, None)
+                else: sys.modules[name] = value
+
+    def test_native_kv_recipe_revalidates_exact_counts_files_and_original_action_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(); run, plan, values, save = self.replay_fixture(root)
+            proof = lab.require_kv_replay_result(root, None)
+            self.assertEqual((proof['actions'], proof['misses'], proof['hits'], proof['repairs']), (12, 4, 2, 2))
+            self.assertFalse(proof['performance_validated']); self.assertFalse(proof['physical_capacity_returned'])
+            self.assertEqual(lab.require_kv_replay_result(root, None), proof)
+            result = lab.read_json(run / 'completion.json')
+            for changes in ({'actions_confirmed': 11}, {'state': 'partial'}, {'plan_sha256': '0' * 64},
+                            {'claims': dict(result['claims'], performance_result=True)}):
+                save(run / 'completion.json', dict(result, **changes))
+                with self.assertRaises((lab.GateError, ValueError)): lab.require_kv_replay_result(root, None)
+            save(run / 'completion.json', result)
+            first = run / 'native/actions' / plan['steps'][0]['name'] / 'completion.json'
+            changed = copy.deepcopy(values[0]); changed['historical_unconfirmed_attempts'] = 1; changed['historical_join_proven'] = False
+            save(first, changed)
+            with self.assertRaisesRegex(lab.GateError, 'unconfirmed historical'): lab.require_kv_replay_result(root, None)
+            save(first, values[0])
+            file = Path(next(iter(values[0]['files']))); file.write_bytes(b'changed')
+            with self.assertRaisesRegex(lab.GateError, 'evidence changed'): lab.require_kv_replay_result(root, None)
+
+    def test_native_kv_local_commands_never_claim_rdma_or_change_exact_collector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(); run, plan, values, _ = self.replay_fixture(root)
+            step = next(row for row in plan['steps'] if row['spec']['kind'] == 'put')
+            value = next(row for row in values if row['name'] == step['name'])
+            commands = copy.deepcopy(value['owned_commands'])
+            for row in commands:
+                row['argv'].insert(-1, '--config.storage_transport=rdma')
+                if 'kind' not in row: row['transport'] = {'configuration_only': True}
+            with mock.patch.object(lab, 'validate_command_transports') as data_gate:
+                data, local = lab.kv_replay_command_gate(root, run, step, commands, {'mode': 'rdma'})
+                self.assertEqual(local, 1)
+                self.assertEqual(len(data_gate.call_args.args[2]), data)
+                self.assertTrue(all('kind' not in row for row in data_gate.call_args.args[2]))
+            exported = next(row for row in commands if row.get('kind') == 'local_read_export')
+            exported['transport'] = {'mode': 'rdma'}
+            with self.assertRaisesRegex(lab.GateError, 'data or GC authority'):
+                lab.kv_replay_command_gate(root, run, step, commands, {'mode': 'rdma'})
+            step = next(row for row in plan['steps'] if row['spec']['kind'] == 'evict')
+            commands = copy.deepcopy(next(row for row in values if row['name'] == step['name'])['owned_commands'])
+            collector = next(row for row in commands if row.get('kind') == 'tree_gc_collector')
+            collector['argv'][7] = str(run / 'other-collector')
+            with self.assertRaisesRegex(lab.GateError, 'original run'):
+                lab.kv_replay_command_gate(root, run, step, commands, None)
+
     def test_flat_direct_gate_rejects_other_delivery_missing_commands_and_unjoined_children(self):
         # Synthetic receipt checks only; the runtime also parses native journals
         # and rereads the real output after this gate.

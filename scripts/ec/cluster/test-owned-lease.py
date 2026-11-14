@@ -94,11 +94,103 @@ class OwnedLeaseTests(unittest.TestCase):
             with patch.object(ACK.sys, 'platform', 'win32'), self.assertRaises(RuntimeError):
                 ACK.command(runner, WRAPPER, self.argv(), pass_fds=(9876,))
             runner.transport_role = 'file'
-            with self.assertRaisesRegex(RuntimeError, 'control CLI'):
+            with self.assertRaisesRegex(RuntimeError, 'executable/config'):
                 ACK.command(runner, WRAPPER, self.argv(), pass_fds=(9876,))
             popen.assert_not_called()
         self.assertEqual(runner.commands, [])
         self.assertIsNone(runner.child)
+
+    def file_argv(self, action='create'):
+        values = [str(self.root / 'bin/ec_file_cli'), '--cfg=' + str(self.root / 'client/file-client.toml'),
+                  '--config.run_dir=' + str(self.root / 'client/runs/original')]
+        if action == 'create':
+            values += ['--config.file_path=/ec-lab/trace-instance', '--config.shard_bytes=11469',
+                       '--config.permission=384', '--config.session_rights=3']
+        if action == 'export-read-allocations':
+            values += ['--config.output_file=' + str(self.root / 'client/snapshot.json')]
+        return values + ['--config.storage_transport=rdma', 'mode4-' + action]
+
+    def test_file_lease_keeps_transport_gate_join_and_local_export_scope(self):
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=123, st_nlink=1)
+        for action in ('create', 'export-read-allocations'):
+            with self.subTest(action=action):
+                runner = self.runner(); runner.transport_role = 'file'
+                runner.config = self.root / 'client/file-client.toml'
+                runner.check_transport = Mock(return_value={'mode': 'rdma'})
+                child = Mock(pid=456, returncode=0); child.poll.return_value = 0
+                original_fstat = os.fstat
+                with patch.object(ACK.sys, 'platform', 'linux'), \
+                     patch.object(ACK.os, 'geteuid', return_value=123, create=True), \
+                     patch.object(ACK.os, 'fstat', side_effect=lambda fd: info if fd == 9876 else original_fstat(fd)), \
+                     patch.object(WRAPPER, 'bind_transport_run') as bind, \
+                     patch.object(ACK.subprocess, 'Popen', return_value=child) as popen:
+                    ACK.command(runner, WRAPPER, self.file_argv(action), pass_fds=(9876,))
+                    self.assertEqual(popen.call_args.kwargs['pass_fds'], (9876,))
+                    runner.check_transport.assert_called_once()
+                    if action == 'create':
+                        bind.assert_called_once()
+                        self.assertEqual(runner.commands[0]['transport'], {'mode': 'rdma'})
+                    else:
+                        bind.assert_not_called()
+                        self.assertNotIn('transport', runner.commands[0])
+                        self.assertEqual(runner.commands[0]['kind'], 'local_read_export')
+                child.wait.assert_called_once()
+                self.assertIsNone(runner.child)
+                self.assertTrue(runner.commands[0]['process_exited'])
+
+    def test_file_lease_rejects_program_config_operation_and_path_drift(self):
+        runner = self.runner(); runner.transport_role = 'file'
+        runner.config = self.root / 'client/file-client.toml'
+        original = self.file_argv()
+        variants = [
+            ['other-program', *original[1:]],
+            [original[0], '--cfg=' + str(self.root / 'config/admin_cli.toml'), *original[2:]],
+            [*original[:-1], 'mode4-seal'],
+            [*original[:2], '--config.run_dir=relative', *original[3:]],
+            [*original[:-1], '--config.run_dir=' + str(self.root / 'another'), original[-1]],
+            [*original[:-1], '--config.user_info.uid=0', original[-1]],
+            [*original[:-1], '--cfg=' + str(runner.config), original[-1]],
+        ]
+        with patch.object(ACK.subprocess, 'Popen') as popen:
+            for argv in variants:
+                with self.subTest(argv=argv), self.assertRaises(RuntimeError):
+                    ACK.command(runner, WRAPPER, argv, pass_fds=(9876,))
+            runner.stop_requested = True
+            with self.assertRaisesRegex(RuntimeError, 'Stop requested'):
+                ACK.command(runner, WRAPPER, original, pass_fds=(9876,))
+            popen.assert_not_called()
+
+    def test_collector_trace_lease_only_allows_fixed_start_and_resume(self):
+        base = [sys.executable, '-B', str(self.root / 'scripts/tree-gc-runner.py'), 'start',
+                '--root', str(self.root), '--run-dir', str(self.root / 'client/collector'),
+                '--expected', str(self.root / 'client/expected.json')]
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=123, st_nlink=1)
+        recorded = ['/usr/bin/python3', *base[1:]]
+        self.assertEqual(ACK.validate_collector_command(self.root, recorded,
+                         expected_executable='/usr/bin/python3')['action'], 'start')
+        with patch.object(ACK.sys, 'executable', '/different/reader/python3'), \
+             patch.object(ACK.subprocess, 'Popen') as forbidden:
+            with self.assertRaisesRegex(RuntimeError, 'executable/root'):
+                ACK.collector_command(self.runner(), WRAPPER, recorded, pass_fds=(9876,))
+            forbidden.assert_not_called()
+        original_fstat = os.fstat
+        for argv in (base, base[:3] + ['resume'] + base[4:8]):
+            runner = self.runner(); child = Mock(pid=456, returncode=0); child.poll.return_value = 0
+            with patch.object(ACK.sys, 'platform', 'linux'), \
+                 patch.object(ACK.os, 'geteuid', return_value=123, create=True), \
+                 patch.object(ACK.os, 'fstat', side_effect=lambda fd: info if fd == 9876 else original_fstat(fd)), \
+                 patch.object(ACK.subprocess, 'Popen', return_value=child) as popen:
+                ACK.collector_command(runner, WRAPPER, argv, pass_fds=(9876,))
+                self.assertEqual(popen.call_args.kwargs['pass_fds'], (9876,))
+            child.wait.assert_called_once()
+            self.assertEqual(runner.commands[0]['kind'], 'tree_gc_collector')
+            self.assertNotIn('transport', runner.commands[0])
+        for index, replacement in ((0, 'python-other'), (2, str(self.root / 'scripts/arbitrary.py')),
+                                   (3, 'delete'), (5, str(self.root / 'other-root')), (7, 'relative')):
+            argv = list(base); argv[index] = replacement
+            with patch.object(ACK.subprocess, 'Popen') as popen, self.assertRaises(RuntimeError):
+                ACK.collector_command(self.runner(), WRAPPER, argv, pass_fds=(9876,))
+            popen.assert_not_called()
 
     @unittest.skipUnless(sys.platform == 'linux', 'Requires Linux flock and private Python processes')
     def test_child_keeps_kernel_lock_after_parent_descriptor_is_closed(self):

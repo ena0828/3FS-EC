@@ -52,6 +52,7 @@ jobs:
           source = Path.cwd().resolve()
           scripts = source / "scripts/ec/cluster"
           sys.path.insert(0, str(scripts))
+          sys.path.insert(0, str(source / "scripts/ec/traces"))
           suites = {
               "cluster/test-native-v2-config.py": 24,
               "cluster/test-native-multiprocess-config.py": 7,
@@ -60,13 +61,18 @@ jobs:
               "cluster/test-supervisor-command.py": 9,
               "cluster/test-native-managed-domain.py": 14,
               "cluster/test-portable-experiments.py": 7,
-              "cluster/test-owned-lease.py": 4,
-              "cluster/test-tree-gc-runner.py": 13,
+              "cluster/test-owned-lease.py": 7,
+              "cluster/test-tree-gc-runner.py": 16,
               "cluster/test-tree-gc-acceptance.py": 4,
+              "cluster/test-kv-replay-native.py": 11,
+              "cluster/test-kv-replay.py": 7,
+              "traces/test_kv_trace.py": 18,
+              "traces/test_replay_input.py": 5,
+              "traces/test_replay_model.py": 6,
               "cluster/test-experiment-runner.py": 25,
               "cluster/test-experiment-menu.py": 13,
               "cluster/test-prepare-fuse-file.py": 8,
-              "ci/test-run-file-lab.py": 39,
+              "ci/test-run-file-lab.py": 41,
               "ci/test-run-core-tests.py": 16,
               "ci/test-run-spare-lab.py": 14,
               "ci/test-run-fault-matrix.py": 10,
