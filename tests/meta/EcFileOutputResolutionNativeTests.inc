@@ -28,7 +28,14 @@ class TestEcFileOutputResolution : public TestEcFileNativeWrite {
     cleanup.action = EcFileAdvanceAction::CleanupChild;
     cleanup.outputRevocation = Uuid::random();
     cleanup.sourceRevocation = Uuid::random();
-    ASSERT_OK(blockingWait(metaClient_->advanceEcFilePwrite(cleanup)));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto cleaned = blockingWait(metaClient_->advanceEcFilePwrite(cleanup));
+    while (!cleaned && cleaned.error().code() == StorageClientCode::kResourceBusy) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      ASSERT_TRUE(std::chrono::steady_clock::now() < deadline);
+      cleaned = blockingWait(metaClient_->advanceEcFilePwrite(cleanup));
+    }
+    ASSERT_OK(cleaned);
   }
   void closeOutputBeforeSource(const AdvanceEcFilePwriteReq &req) {
     EcV2Coordinator coordinator(metaConfig_, mgmtd_, storageClient_);
@@ -44,7 +51,9 @@ class TestEcFileOutputResolution : public TestEcFileNativeWrite {
       frozen = *started;
       ASSERT_OK(blockingWait(tx.commit()));
     }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     for (size_t n = 0; n < frozen.identity.endpoints.count; ++n) {
+      ASSERT_TRUE(std::chrono::steady_clock::now() < deadline);
       const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
           std::chrono::system_clock::now().time_since_epoch()).count();
       auto request = EcV2DrainCatalog::makeRequest(frozen, n, storage::EcScopeControlAction::Revoke,
@@ -52,7 +61,24 @@ class TestEcFileOutputResolution : public TestEcFileNativeWrite {
       ASSERT_OK(request);
       auto ack = blockingWait(storageClient_->revokeEcScope(*request));
       ASSERT_OK(ack);
+      ASSERT_OK(storage::verifyEcScopeControlAck(coordinator.controlKey(), *ack, *request));
+      while (ack->claims.state == storage::EcScopeControlState::Pending) {
+        ASSERT_TRUE(ack->claims.durable);
+        ASSERT_GT(ack->claims.inflight, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        ASSERT_TRUE(std::chrono::steady_clock::now() < deadline);
+        const auto querySeconds = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        request = EcV2DrainCatalog::makeRequest(frozen, n, storage::EcScopeControlAction::Query,
+                                               coordinator.controlKey(), querySeconds);
+        ASSERT_OK(request);
+        ack = blockingWait(storageClient_->queryEcScopeDrain(*request));
+        ASSERT_OK(ack);
+        ASSERT_OK(storage::verifyEcScopeControlAck(coordinator.controlKey(), *ack, *request));
+      }
       ASSERT_EQ(ack->claims.state, storage::EcScopeControlState::Drained);
+      ASSERT_TRUE(ack->claims.durable);
+      ASSERT_EQ(ack->claims.inflight, 0);
       auto raw = kv_->createReadWriteTransaction();
       EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Repair);
       ASSERT_OK(blockingWait(EcFileExecutionCatalog::recordAck(

@@ -106,7 +106,15 @@ TEST_F(TestEcFileNativeWrite, OutputObservationAuthenticatesExactOwnerAndRetains
       cleanup.action = EcFileAdvanceAction::CleanupChild;
       cleanup.outputRevocation = Uuid::random();
       cleanup.sourceRevocation = Uuid::random();
-      ASSERT_OK(blockingWait(metaClient_->advanceEcFilePwrite(cleanup)));
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      auto cleaned = blockingWait(metaClient_->advanceEcFilePwrite(cleanup));
+      while (!cleaned && cleaned.error().code() == StorageClientCode::kResourceBusy) {
+        // A durable deny may precede the idle RMW worker releasing its ticket.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        ASSERT_TRUE(std::chrono::steady_clock::now() < deadline);
+        cleaned = blockingWait(metaClient_->advanceEcFilePwrite(cleanup));
+      }
+      ASSERT_OK(cleaned);
     }
     auto terminal = blockingWait(metaClient_->queryEcFileOutput(*req));
     ASSERT_OK(terminal);
