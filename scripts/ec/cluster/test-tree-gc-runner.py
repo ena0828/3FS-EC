@@ -326,6 +326,121 @@ class TreeCollectorTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     gc.parser().parse_args(["resume", "--root", str(self.root), "--run-dir", str(self.folder), *extra])
 
+    def test_history_index_reads_intents_and_logs_once_and_rejects_invalid_tail(self):
+        original_load, original_sha = gc.load, gc.file_sha
+        intents, logs = {}, {}
+
+        def counted_load(path):
+            path = Path(path)
+            if path.name == "intent.json":
+                intents[path] = intents.get(path, 0) + 1
+            return original_load(path)
+
+        def counted_sha(path):
+            path = Path(path)
+            if path.name == "command.log":
+                logs[path] = logs.get(path, 0) + 1
+            return original_sha(path)
+
+        with mock.patch.object(gc, "load", side_effect=counted_load):
+            result = self.run_collector()
+        paths = sorted((self.folder / "attempts").iterdir())
+        # New dispatch reads its persisted intent in the adapter assertion and
+        # once in Collector's post-join validation, never through prefix scans.
+        self.assertEqual(intents, {path / "intent.json": 2 for path in paths})
+        intents.clear()
+        before = len(self.adapter.calls)
+        with mock.patch.object(gc, "load", side_effect=counted_load), \
+             mock.patch.object(gc, "file_sha", side_effect=counted_sha):
+            collector = gc.Collector(self.folder, self.plan, self.adapter)
+            self.assertEqual(collector.run(), result)
+            self.assertEqual(collector.run(), result)
+        self.assertEqual(len(self.adapter.calls), before)
+        self.assertEqual(intents, {path / "intent.json": 1 for path in paths})
+        self.assertEqual(logs, {path / "command.log": 1 for path in paths})
+
+        log = paths[-1] / "command.log"
+        prior = log.read_bytes()
+        log.write_bytes(prior + b"changed")
+        with self.assertRaisesRegex(gc.CheckError, "Command log changed"):
+            self.run_collector()
+        log.write_bytes(prior)
+        joined = paths[-1] / "joined.json"
+        prior = joined.read_bytes()
+        value = gc.load(joined)
+        value["process_exited"] = False
+        joined.write_bytes(gc.encoded(value))
+        with self.assertRaisesRegex(gc.CheckError, "actual joined exit"):
+            self.run_collector()
+        joined.write_bytes(prior)
+        gc.private(self.folder / "attempts" / f"{len(paths):06d}", create=True)
+        with self.assertRaises(FileNotFoundError):
+            self.run_collector()
+        self.assertEqual(len(self.adapter.calls), before)
+
+    def test_unknown_recovery_query_must_join_before_later_same_id_mutation(self):
+        self.adapter.failure = ("retire_revision", "before")
+        with self.assertRaises(LostOwner):
+            self.run_collector()
+        original = self.adapter.calls[-1]
+        self.adapter.failure = ("query_revision_retirement", "before")
+        with self.assertRaises(LostOwner):
+            self.run_collector()
+        before = len(self.adapter.calls)
+        with self.assertRaisesRegex(gc.CheckError, "Actual CLI failed"):
+            self.run_collector()
+        self.assertEqual([op["expected"]["action"] for op in self.adapter.calls[before:]],
+                         ["tree_reclaim_inspect", "query_revision_retirement"])
+        self.assertFalse(self.adapter.retired)
+        self.assertEqual([op for op in self.adapter.calls if op["expected"]["action"] == "retire_revision"],
+                         [original])
+
+        # A joined negative query permits only the next explicit invocation to
+        # replay. Losing that new mutation requires another query; an older
+        # negative observation cannot authorize bypassing the newer unknown.
+        self.adapter.failure = ("retire_revision", "before")
+        with self.assertRaises(LostOwner):
+            self.run_collector()
+        before = len(self.adapter.calls)
+        with self.assertRaisesRegex(gc.CheckError, "Actual CLI failed"):
+            self.run_collector()
+        self.assertEqual([op["expected"]["action"] for op in self.adapter.calls[before:]],
+                         ["tree_reclaim_inspect", "query_revision_retirement"])
+        self.assertFalse(self.adapter.retired)
+        result = self.run_collector()
+        mutations = [op for op in self.adapter.calls if op["expected"]["action"] == "retire_revision"]
+        self.assertEqual(mutations, [original, original, original])
+        self.assertEqual(result["historical_unjoined_attempts"], 3)
+        self.assertFalse(result["all_started_commands_joined"])
+        self.assertTrue(result["current_owner_commands_joined"])
+
+    def test_completed_resume_rechecks_unknown_inspection_after_last_business_success(self):
+        original_save = gc.save
+
+        def lose_completion(path, value):
+            if Path(path).name == "completion.json":
+                raise LostOwner("before completion publication, after every business command joined")
+            return original_save(path, value)
+
+        with mock.patch.object(gc, "save", side_effect=lose_completion), self.assertRaises(LostOwner):
+            self.run_collector()
+        self.assertFalse((self.folder / "completion.json").exists())
+        tail = len(self.adapter.calls)
+        self.adapter.failure = ("tree_reclaim_inspect", "before")
+        with self.assertRaises(LostOwner):
+            self.run_collector()
+        unknown = self.folder / "attempts" / f"{tail:06d}"
+        self.assertFalse((unknown / "joined.json").exists())
+        result = self.run_collector()
+        self.assertEqual(result["historical_unjoined_attempts"], 1)
+        self.assertFalse(result["all_started_commands_joined"])
+        self.assertTrue(result["current_owner_commands_joined"])
+        calls = len(self.adapter.calls)
+        self.assertEqual(self.run_collector(), result)
+        self.assertEqual(len(self.adapter.calls), calls)
+        self.assertFalse((unknown / "joined.json").exists())
+        self.assertFalse(gc.load(unknown / "lease-recovered.json")["historical_join_proven"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -293,6 +293,8 @@ class Collector:
                        "object_incarnation": plan["expected"]["object"]["incarnation"]}
         self.checked_joins = {}
         self.recovered = set()
+        self._attempt_paths = None
+        self._attempts_by_operation = {}
 
     def operation(self, name, kind, fixed, generation=None):
         path = self.operations / (name + ".json")
@@ -314,12 +316,21 @@ class Collector:
                               "action": "tree_reclaim_inspect" if node == ZERO else "tree_reclaim"})
 
     def attempt_paths(self):
+        if self._attempt_paths is not None:
+            return self._attempt_paths
         paths = sorted(self.attempts.iterdir())
         require(len(paths) <= self.plan["limits"]["commands"] and
                 [p.name for p in paths] == [f"{i:06d}" for i in range(len(paths))], "Invalid attempt ledger")
         for path in paths:
             private(path)
-        return paths
+            intent = load(path / "intent.json")
+            # Every historical attempt is checked before an operation may return
+            # an earlier success. In particular, trailing unknown observations
+            # must remain in the completion's historical-unjoined count.
+            self.verify_join(path, intent)
+            self._attempts_by_operation.setdefault(intent["operation"]["name"], []).append((path, intent))
+        self._attempt_paths = paths
+        return self._attempt_paths
 
     def verify_join(self, path, intent):
         if path.name in self.checked_joins:
@@ -351,14 +362,12 @@ class Collector:
     def perform(self, operation):
         self.adapter.check()
         paths = self.attempt_paths()
-        unknown = False
-        for path in paths:
-            intent = load(path / "intent.json")
+        unknown_after = None
+        for path, intent in self._attempts_by_operation.get(operation["name"], []):
+            require(intent["operation"] == operation, "Indexed operation identity changed")
             joined = self.verify_join(path, intent)
-            if intent["operation"] != operation:
-                continue
             if joined is None:
-                unknown = True
+                unknown_after = path.name
                 continue
             if joined["returncode"] == 0:
                 result = archive(path / "archive.jsonl", operation)
@@ -370,29 +379,39 @@ class Collector:
                 else:
                     save(path / "accepted.json", accepted)
                 return result
-        if unknown and operation["kind"] in ("retire", "gc") and not operation["name"].startswith("recovery-"):
+        if unknown_after is not None and operation["kind"] in ("retire", "gc") and not operation["name"].startswith("recovery-"):
             # First explicit recovery queries the same permanent identity. If
             # that query failed with a joined nonzero exit, a later explicit
             # resume may replay the original idempotent mutation. No error code
             # is interpreted as evidence that the original mutation did not run.
             recovery_name = "recovery-" + operation["name"]
-            queried = any(load(p / "intent.json")["operation"]["name"] == recovery_name for p in paths)
             query_action = "query_revision_retirement" if operation["kind"] == "retire" else "query"
             query = self.operation(recovery_name, operation["kind"],
                                    {**operation["expected"], "action": query_action}, operation.get("generation"))
-            if not queried:
-                return self.perform(query)
             # A successful recovery query is itself the required confirmation.
-            for path in paths:
-                intent = load(path / "intent.json")
-                if intent["operation"] == query:
-                    joined = self.verify_join(path, intent)
-                    if joined is not None and joined["returncode"] == 0:
-                        return self.perform(query)
+            latest_query = None
+            for path, intent in self._attempts_by_operation.get(recovery_name, []):
+                require(intent["operation"] == query, "Indexed query identity changed")
+                joined = self.verify_join(path, intent)
+                if joined is not None and joined["returncode"] == 0:
+                    return self.perform(query)
+                if path.name > unknown_after:
+                    latest_query = joined
+            # An intent alone is not a failed query. The latest query after the
+            # latest unknown mutation must have a real joined nonzero exit.
+            # Re-querying an unknown attempt may fail this invocation; only a
+            # subsequent explicit resume can then replay the original mutation.
+            if latest_query is None:
+                return self.perform(query)
         require(len(paths) < self.plan["limits"]["commands"], "Command bound exhausted; preserve original plan")
         path = private(self.attempts / f"{len(paths):06d}", create=True)
         argv = self.adapter.argv(operation, path / "archive.jsonl")
-        save(path / "intent.json", {"operation": operation, "argv": argv})
+        intent = {"operation": operation, "argv": argv}
+        save(path / "intent.json", intent)
+        # This index is invocation-local, under the original object lease. Disk
+        # remains authoritative: every new invocation rebuilds and validates it.
+        paths.append(path)
+        self._attempts_by_operation.setdefault(operation["name"], []).append((path, intent))
         # Adapter never returns before the existing Owner's wait. If that owner
         # is lost, recovery requires the inherited object lease to be reacquired.
         joined = self.adapter.execute(argv, path)
