@@ -8,7 +8,7 @@ TEST_F(TestEcFileNativeRepair, HelperDirectCommittedIssuanceLostReplyAndFreshTwe
   auto helperKey = storage::EcHelperKey::loadFile(std::filesystem::path(helperKeyPath_.string()));
   ASSERT_OK(helperKey);
   const std::array<std::pair<uint16_t, uint16_t>, 3> cases{{{1, 1}, {3, 2}, {3, 4}}};
-  for (const auto [mask, window] : cases) {
+  for (const auto &[mask, window] : cases) {
     auto open = request<OpenEcFileSessionReq>();
     open.createNew = true;
     open.path = PathAt(parent_, fmt::format("native-direct-{}-{}", mask, window));
