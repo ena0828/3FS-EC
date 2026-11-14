@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 
 
@@ -249,6 +250,66 @@ def verify_read(path, info):
             "revision": latest["revision"], "remote_released": latest["state"] == "ReadReleased"}
 
 
+def prepared_transport(root, config, *, file_api=False, require_initialized=True):
+    """Bind an explicit RDMA profile; this does not attest to a verbs transfer."""
+    from native_v2_config import (client_transport_problems, file_api_enabled, profile_config_problems,
+                                  transport_settings, validate_initialized_profile)
+    root, config = canonical(root), canonical(config)
+    raw = regular_bytes(config, 2 << 20)
+    client = tomllib.loads(raw.decode("utf-8"))
+    manifest_path = root / "cluster.json"
+    manifest = load_json(manifest_path) if manifest_path.exists() else {}
+    settings = transport_settings(manifest)
+    problems = client_transport_problems(manifest, client, file_api=file_api)
+    require(not problems, "; ".join(problems))
+    if settings is None:
+        return None
+    require(manifest.get("root") == str(root) and type(manifest.get("schema")) is int and manifest["schema"] == 1,
+            "RDMA execution requires the matching prepared native root")
+    name = "file-client.toml" if file_api else "stripe-client.toml"
+    require(config == root / "client" / name, "RDMA profile requires its prepared client config; no external override")
+    require(client.get("cluster_id") == manifest.get("cluster_id"), "RDMA client cluster differs from prepared root")
+    if require_initialized:
+        validate_initialized_profile(manifest, load_json(root / "state/initialized.json"))
+    configs = {p.name: tomllib.loads(regular_bytes(p, 2 << 20).decode("utf-8"))
+               for p in (root / "config").glob("*.toml")}
+    for item in ("stripe-client.toml", "file-client.toml") if file_api_enabled(manifest) else ("stripe-client.toml",):
+        configs[item] = tomllib.loads(regular_bytes(root / "client" / item, 2 << 20).decode("utf-8"))
+    try:
+        problems = profile_config_problems(manifest, configs)
+    except (KeyError, TypeError, AttributeError) as error:
+        raise CheckError("Incomplete prepared RDMA configuration") from error
+    require(not problems, "; ".join(problems))
+    return {"data_transport_requested": settings, "transport_validation": "configuration_only",
+            "root": str(root), "cluster_id": manifest["cluster_id"], "authority": manifest["authority"],
+            "profile": manifest["profile"], "client_config": {"path": str(config), "sha256": hashlib.sha256(raw).hexdigest()}}
+
+
+def bind_transport_run(root, run, binding, cli):
+    """Keep the experiment condition outside the native journal and run path.
+
+    A planned binding is not an operation authorization or a remote-state proof.
+    It can survive a failed launch or interruption before the native record exists.
+    """
+    root, run = canonical(root), canonical(run)
+    folder = root / "client/transport-bindings"
+    name = hashlib.sha256(str(run).encode("utf-8")).hexdigest() + ".json"
+    target = folder / name
+    if binding is None:
+        require(not target.exists(), "A previously bound RDMA run cannot be continued as an unbound TCP experiment")
+        return
+    value = {"schema": 1, "run_dir": str(run), "cli_prefix": list(cli), "profile": binding}
+    if target.exists():
+        private_directory(folder)
+        saved = json.dumps(load_json(target), sort_keys=True, separators=(",", ":"))
+        require(saved == json.dumps(value, sort_keys=True, separators=(",", ":")),
+                "Run transport/config binding differs; preserve the original experiment condition")
+        return
+    require(not run.exists(), "Existing RDMA run has no wrapper transport binding; it cannot be labeled as a bound recovery")
+    private_directory(folder, create=True)
+    write_exclusive(target, json_data(value))
+
+
 class Runner:
     def __init__(self, root, cli_prefix=None, config=None, deadline=300, report=None, extra_env=None):
         self.root = private_directory(root)
@@ -261,6 +322,10 @@ class Runner:
         self.cli = list(cli_prefix or [str(self.root / "bin/ec_stripe_cli")])
         self.config = canonical(config or self.root / "client/stripe-client.toml")
         require(self.config.is_file(), "Missing CLI config; no cluster is initialized by this wrapper")
+        self.transport_role = ("control" if self.config == self.root / "config/admin_cli.toml" else
+                               "file" if self.config == self.root / "client/file-client.toml" else "stripe")
+        self.transport = (None if self.transport_role == "control" else
+                          prepared_transport(self.root, self.config, file_api=self.transport_role == "file"))
         require(1 <= deadline <= 3600, "CLI deadline must be1..3600 seconds")
         self.deadline = deadline
         self.env = os.environ.copy()
@@ -277,6 +342,12 @@ class Runner:
     def request_stop(self, *_):
         self.stop_requested = True
         self.interrupt_count += 1
+
+    def check_transport(self):
+        if self.transport_role != "control":
+            require(prepared_transport(self.root, self.config, file_api=self.transport_role == "file") == self.transport,
+                    "Prepared transport/config changed during the experiment")
+        return self.transport
 
     @contextmanager
     def signal_scope(self):
@@ -303,6 +374,10 @@ class Runner:
         if self.stop_requested:
             raise StopRequested("Stopped before starting another CLI command")
         run = canonical(run)
+        require(self.transport_role == "stripe", "Stripe journal operations require the stripe client profile")
+        require("storage_transport" not in options, "Transport belongs to the prepared profile, not a per-command override")
+        self.check_transport()
+        bind_transport_run(self.root, run, self.transport, self.cli)
         prior = None
         if run.exists():
             require(command in ("release", "resume"), "New operations require a new run directory")
@@ -313,6 +388,8 @@ class Runner:
                            "--config.max_application_bytes=67108864", f"--config.deadline_seconds={self.deadline}",
                            f"--config.log=INFO:normal; normal=file:path={self.root}/logs/ec-stripe-cli.log,async=true,sync_level=ERR"]
         argv += [f"--config.{key}={value}" for key, value in options.items()]
+        if self.transport is not None:
+            argv.append("--config.storage_transport=rdma")
         argv.append(command)
         index = len(self.commands)
         entry = {"index": index, "command": command, "run_dir": str(run), "argv": argv,
@@ -320,6 +397,8 @@ class Runner:
                                     + " " + shlex.join(argv),
                  "process_started": False, "process_exited": False, "remote_release_proven_by_exit": False}
         self.commands.append(entry)
+        if self.transport is not None:
+            entry["transport"] = self.transport
         self.event({"event": "command_planned", **entry})
         print(entry["equivalent_bash"], flush=True)
         log_path = self.report / f"cli-{index:03d}.log"
@@ -445,6 +524,8 @@ class Runner:
                   "performance_validated": False,
                   "timing": "Wrapper wall time is not a benchmark. Keep CLI core/data-phase journal metrics separate.",
                   "remote_state": "Only explicitly validated ReadReleased observations support pin release; process exit alone does not."}
+        if self.transport is not None:
+            result["transport"] = self.transport
         write_exclusive(self.report / "result.json", json_data(result))
         return result
 

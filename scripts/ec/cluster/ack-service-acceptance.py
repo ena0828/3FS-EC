@@ -152,9 +152,22 @@ def sync_parent(path):
 
 def command(runner,w,argv):
     require(not runner.stop_requested,'Stop requested; no new command')
+    binding=runner.check_transport()
+    if binding is not None:
+        # This shared child owner also runs the formal file acceptance driver.
+        # Control-only admin calls have no data-transport claim.
+        require(runner.transport_role=='file' and str(argv[0])==str(runner.root/'bin/ec_file_cli'),
+                'Prepared file transport requires the original native executable path')
+        configs=[str(arg) for arg in argv if str(arg).startswith('--cfg=')]
+        modes=[str(arg) for arg in argv if str(arg).startswith('--config.storage_transport=')]
+        runs=[str(arg).split('=',1)[1] for arg in argv if str(arg).startswith('--config.run_dir=')]
+        require(configs==['--cfg='+str(runner.config)] and modes==['--config.storage_transport=rdma'] and len(runs)==1,
+                'File command transport/config/run differs from prepared selection')
+        w.bind_transport_run(runner.root,Path(runs[0]),binding,[str(argv[0])])
     index=len(runner.commands)
     entry={'index':index,'argv':list(map(str,argv)),'process_started':False,'process_exited':False,
            'remote_release_proven_by_exit':False,'equivalent_bash':shlex.join(list(map(str,argv)))}
+    if binding is not None:entry['transport']=binding
     runner.commands.append(entry);runner.event({'event':'command_planned',**entry})
     path=runner.report/f'command-{index:03d}.log'
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)

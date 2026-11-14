@@ -53,20 +53,21 @@ jobs:
           scripts = source / "scripts/ec/cluster"
           sys.path.insert(0, str(scripts))
           suites = {
-              "cluster/test-native-v2-config.py": 18,
-              "cluster/test-native-multiprocess-config.py": 6,
-              "cluster/test-native-spare-storage.py": 7,
+              "cluster/test-native-v2-config.py": 24,
+              "cluster/test-native-multiprocess-config.py": 7,
+              "cluster/test-native-spare-storage.py": 8,
+              "cluster/test-native-rdma-preflight.py": 11,
               "cluster/test-native-managed-domain.py": 14,
               "cluster/test-portable-experiments.py": 5,
-              "cluster/test-experiment-runner.py": 17,
+              "cluster/test-experiment-runner.py": 21,
               "cluster/test-experiment-menu.py": 13,
-              "cluster/test-prepare-fuse-file.py": 4,
+              "cluster/test-prepare-fuse-file.py": 8,
               "ci/test-run-file-lab.py": 31,
               "ci/test-run-core-tests.py": 16,
               "ci/test-run-spare-lab.py": 10,
               "ci/test-run-fault-matrix.py": 6,
               "ci/test-system-entrypoints.py": 17,
-              "test-mode4-lifecycle-acceptance.py": 15,
+              "test-mode4-lifecycle-acceptance.py": 16,
               "test-mode4-mount-evidence.py": 9,
           }
           rows = []

@@ -7,6 +7,7 @@ import copy
 import io
 from pathlib import Path, PurePosixPath
 import re
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -16,6 +17,7 @@ from native_v2_config import (GC_PROFILE, PROFILE, PROFILES, authenticated_user,
                               gc_inventory_from_observations, gc_settings,
                               generate_configs, key_roles, pool_from_observations,
                               profile_config_problems, to_toml)
+import native_v2_config as configuration
 
 
 class AuthenticatedLabUser(unittest.TestCase):
@@ -37,7 +39,7 @@ class AuthenticatedLabUser(unittest.TestCase):
         gc = dict(authority=gc_authority, key_id=key, client_namespace=namespace,
                   data_protocol=2, disk_format=3, gc_protocol=2)
         root = "/tmp/3fs-ec-native-user-test"
-        manifest = dict(profile=GC_PROFILE, root=root, authority=authority, gc=gc, file_api=True,
+        manifest = dict(profile=GC_PROFILE, root=root, port_base=13500, authority=authority, gc=gc, file_api=True,
                         authenticated_user={"uid": 2345, "gid": 3456})
         default, default_hashes = generate_configs(source, root, 13500, authority, "user-test",
                                                   profile="gc", gc=gc, file_api=True)
@@ -86,7 +88,8 @@ class AuthenticatedLabUser(unittest.TestCase):
         system = SimpleNamespace(platform="linux", argv=[])
         namespace = dict(argparse=argparse, Path=Path, sys=system, os=SimpleNamespace(umask=mock.Mock()),
                          __file__=str(path), __doc__="parser test", PROFILES=PROFILES,
-                         authenticated_user=authenticated_user, prepare=create, load_manifest=load)
+                         authenticated_user=authenticated_user, requested_transport=configuration.requested_transport,
+                         prepare=create, load_manifest=load)
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
         for flags, expected in (([], {"uid": 1000, "gid": 1000}),
                                 (["--user-uid", "2345", "--user-gid", "3456"], {"uid": 2345, "gid": 3456})):
@@ -94,7 +97,8 @@ class AuthenticatedLabUser(unittest.TestCase):
             with mock.patch("sys.argv", system.argv):
                 self.assertEqual(namespace["main"](), 0)
             self.assertEqual(create.call_args.kwargs,
-                             dict(file_api=True, user_uid=expected["uid"], user_gid=expected["gid"]))
+                             dict(file_api=True, user_uid=expected["uid"], user_gid=expected["gid"],
+                                  transport="tcp", rdma_interface=None, rdma_address=None, rdma_device=None))
         for command, flags in [("prepare", ["--user-uid", "2345"]), ("prepare", ["--user-gid", "3456"])] + [
                 (command, ["--user-uid", "2345", "--user-gid", "3456"])
                 for command in ("start", "doctor", "status", "stop", "fault-storage")]:
@@ -221,6 +225,10 @@ class NativeV2Configuration(unittest.TestCase):
 
 
 class NativeGcConfiguration(unittest.TestCase):
+    def setUp(self):
+        # Validate Linux configuration paths even on a Windows authoring host.
+        self.enterContext(mock.patch("native_v2_config.Path", PurePosixPath))
+
     @classmethod
     def setUpClass(cls):
         NativeV2Configuration.setUpClass.__func__(cls)
@@ -228,7 +236,7 @@ class NativeGcConfiguration(unittest.TestCase):
     observation_fixture = NativeV2Configuration.observation_fixture
     def gc_fixture(self):
         manifest, c_observations = self.observation_fixture()
-        manifest.update(profile=GC_PROFILE, root="/tmp/3fs-ec-native-gc-config-test", gc={
+        manifest.update(profile=GC_PROFILE, root="/tmp/3fs-ec-native-gc-config-test", port_base=13500, gc={
             "authority": str(uuid.UUID(int=80)), "key_id": str(uuid.UUID(int=81)),
             "client_namespace": str(uuid.UUID(int=82)),
             "data_protocol": 2, "disk_format": 3, "gc_protocol": 1})
@@ -268,7 +276,7 @@ class NativeGcConfiguration(unittest.TestCase):
         self.assertNotIn("enable_ec_gc", self.configs["storage_main.toml"]["server"]["storage"])
         self.assertNotIn("enable_ec_exact_gc", self.configs["meta_main.toml"]["server"]["meta"])
         self.assertNotIn("client_uuid", self.configs["admin_cli.toml"])
-        manifest = {"profile": PROFILE}
+        manifest = {"profile": PROFILE, "root": "/tmp/3fs-ec-native-config-test", "port_base": 13500}
         self.assertIsNone(gc_settings(manifest))
         self.assertEqual(key_roles(manifest), ("data", "control", "helper"))
         self.assertEqual(profile_config_problems(manifest, self.configs), [])
@@ -303,7 +311,8 @@ class NativeGcConfiguration(unittest.TestCase):
         self.assertTrue(profile_config_problems(manifest, wrong))
         wrong = copy.deepcopy(self.configs)
         wrong["storage_main.toml"]["server"]["targets"]["ec_exact_gc"] = True
-        self.assertTrue(profile_config_problems({"profile": PROFILE}, wrong))
+        self.assertTrue(profile_config_problems(
+            {"profile": PROFILE, "root": "/tmp/3fs-ec-native-config-test", "port_base": 13500}, wrong))
         for section, fields in (("targets", ("ec_only", "ec_staging_v2", "ec_exact_gc")),
                                 ("storage", ("enable_ec_fragments", "enable_ec_gc"))):
             for field in fields:
@@ -368,6 +377,151 @@ class NativeGcConfiguration(unittest.TestCase):
         observed[0]["boot_nonce"] = str(uuid.UUID(int=84))
         with self.assertRaises(ValueError):
             gc_inventory_from_observations(manifest, pool, observed, 1000)
+
+
+class ExplicitDataTransport(unittest.TestCase):
+    OPTIONS = dict(transport="rdma", rdma_interface="enp1s0", rdma_address="192.0.2.17", rdma_device="mlx5_0")
+
+    def setUp(self):
+        self.enterContext(mock.patch("native_v2_config.Path", PurePosixPath))
+
+    def fixture(self, file_api=False):
+        manifest = dict(profile=GC_PROFILE if file_api else PROFILE, root="/tmp/3fs-ec-native-rdma-test",
+                        port_base=15000, authority=str(uuid.UUID(int=90)), file_api=file_api)
+        if file_api:
+            manifest["gc"] = dict(authority=str(uuid.UUID(int=91)), key_id=str(uuid.UUID(int=92)),
+                                  client_namespace=str(uuid.UUID(int=93)), data_protocol=2, disk_format=3, gc_protocol=2)
+        manifest["data_transport"] = configuration.requested_transport(**self.OPTIONS)
+        configs, _ = generate_configs(Path(__file__).resolve().parents[3], manifest["root"], 15000,
+            manifest["authority"], "rdma-test", profile="gc" if file_api else "v2",
+            gc=manifest.get("gc"), file_api=file_api, **self.OPTIONS)
+        return manifest, configs
+
+    def test_transport_input_and_manifest_reject_ambiguous_or_noncanonical_values(self):
+        self.assertIsNone(configuration.requested_transport())
+        self.assertIsNone(configuration.requested_transport(transport="tcp"))
+        self.assertIsNone(configuration.transport_settings({}))
+        expected = {"schema": 1, "mode": "rdma", "interface": "enp1s0", "ipv4": "192.0.2.17", "ib_device": "mlx5_0"}
+        self.assertEqual(configuration.requested_transport(**self.OPTIONS), expected)
+        self.assertEqual(configuration.transport_settings({"data_transport": expected}), expected)
+        for field, value in (("transport", "auto"), ("transport", None), ("transport", "TCP"),
+                             ("rdma_interface", None), ("rdma_interface", "lo"), ("rdma_interface", "eth0:1"),
+                             ("rdma_interface", "x" * 16), ("rdma_interface", "../eth0"),
+                             ("rdma_device", "mlx5 0"), ("rdma_device", "mlx5_0\n"),
+                             ("rdma_address", "127.0.0.1"), ("rdma_address", "0.0.0.0"),
+                             ("rdma_address", "224.0.0.1"), ("rdma_address", "255.255.255.255"),
+                             ("rdma_address", "192.0.2.017"), ("rdma_address", "::1")):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                configuration.requested_transport(**dict(self.OPTIONS, **{field: value}))
+        with self.assertRaises(ValueError):
+            configuration.requested_transport(transport="tcp", rdma_device="mlx5_0")
+        for changed in (None, {}, [], dict(expected, schema=True), dict(expected, schema=2),
+                        dict(expected, mode="tcp"), dict(expected, extra=True)):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                configuration.transport_settings({"data_transport": changed})
+
+    def test_initialized_transport_is_fixed_in_both_directions(self):
+        legacy = {"schema": 1, "cluster_id": "fixed"}
+        current = dict(legacy, data_transport=configuration.requested_transport(**self.OPTIONS))
+        configuration.validate_initialized_profile(legacy, dict(legacy))
+        configuration.validate_initialized_profile(current, copy.deepcopy(current))
+        for left, right in ((legacy, current), (current, legacy),
+                            (current, dict(current, data_transport=dict(current["data_transport"], ipv4="192.0.2.18"))),
+                            (current, dict(current, authenticated_user={"uid": 1100, "gid": 1100}))):
+            with self.subTest(left=left, right=right), self.assertRaises(ValueError):
+                configuration.validate_initialized_profile(left, right)
+        # The old user-only API remains available; it does not migrate transport.
+        configuration.validate_initialized_user(legacy, current)
+
+    def test_single_storage_exact_data_roles_and_groups_reject_drift(self):
+        for file_api in (False, True):
+            manifest, configs = self.fixture(file_api)
+            self.assertEqual(profile_config_problems(manifest, configs), [])
+            groups = configs["storage_main.toml"]["server"]["base"]["groups"]
+            self.assertEqual([group["services"] for group in groups], [["StorageSerde", "Core"], ["StorageSerde"]])
+            self.assertEqual([group["network_type"] for group in groups], ["TCP", "RDMA"])
+            self.assertEqual([group["listener"]["listen_port"] for group in groups], [15003, 15004])
+            self.assertTrue(configs["storage_main.toml"]["server"]["client"]["force_use_tcp"])
+            mutations = [
+                lambda c: c["storage_main.toml"]["server"]["base"]["groups"].pop(),
+                lambda c: c["storage_main.toml"]["server"]["base"]["groups"].__setitem__(0, None),
+                lambda c: c["storage_main.toml"]["server"]["base"]["groups"].append(copy.deepcopy(groups[1])),
+                lambda c: c["storage_main.toml"]["server"]["base"]["groups"][1].update(services=["StorageSerde", "Core"]),
+                lambda c: c["storage_main.toml"]["server"]["base"]["groups"][1]["listener"].update(filter_list=["lo"]),
+                lambda c: c["storage_main.toml"]["server"]["base"]["groups"][1]["listener"].update(reuse_port=0),
+                lambda c: c["storage_main.toml"]["server"]["base"]["groups"][1].update(use_independent_thread_pool=0),
+                lambda c: c["storage_main.toml"]["server"]["base"]["groups"][0].update(network_type="RDMA"),
+                lambda c: c["storage_main.toml"]["server"]["forward_client"].update(force_use_tcp=True),
+                lambda c: c["storage_main_launcher.toml"]["ib_devices"].update(allow_no_usable_devices=True),
+                lambda c: c["meta_main.toml"]["server"]["meta"].update(ec_storage_transport="tcp"),
+                lambda c: c["meta_main.toml"]["server"]["storage_client"]["net_client_for_updates"].update(force_use_tcp=True),
+            ]
+            if file_api:
+                mutations += [
+                    lambda c: c["meta_main.toml"]["server"]["meta"]["ec_rmw_transport"].update(force_use_tcp=True),
+                    lambda c: c["storage_main.toml"]["server"]["storage"]["ec_rmw_client"]["net_client"].update(force_use_tcp=True),
+                    lambda c: c["storage_main.toml"]["server"]["storage"]["ec_rmw_transport"].update(force_use_tcp=False),
+                ]
+            for index, mutate in enumerate(mutations):
+                changed = copy.deepcopy(configs)
+                mutate(changed)
+                with self.subTest(file_api=file_api, mutation=index):
+                    self.assertTrue(profile_config_problems(manifest, changed))
+            if file_api:
+                for key in ("enable_ec_v2", "enable_ec_exact_gc", "enable_ec_revision_retirement",
+                            "enable_ec_rmw", "enable_ec_file_ranges"):
+                    configs["meta_main.toml"]["server"]["meta"][key] = True
+                self.assertEqual(profile_config_problems(manifest, configs), [])
+
+    def test_shared_client_gate_is_strict_for_rdma_and_preserves_legacy_tcp(self):
+        self.assertEqual(configuration.client_transport_problems({}, {}), [])
+        self.assertEqual(configuration.client_transport_problems({}, {"custom": "legacy", "storage_transport": "tcp"}), [])
+        self.assertTrue(configuration.client_transport_problems({}, {"storage_transport": "rdma"}))
+        manifest, configs = self.fixture(True)
+        client = configs["file-client.toml"]
+        self.assertEqual(configuration.client_transport_problems(manifest, client, file_api=True), [])
+        for path, wrong in (("storage_transport", "tcp"), ("client.force_use_tcp", True),
+                            ("storage_client.net_client.force_use_tcp", 0),
+                            ("storage_client.net_client_for_updates.force_use_tcp", True),
+                            ("ib_devices.device_filter", []), ("ib_devices.allow_no_usable_devices", True)):
+            changed = copy.deepcopy(client)
+            configuration.put(changed, path, wrong)
+            with self.subTest(path=path):
+                self.assertTrue(configuration.client_transport_problems(manifest, changed, file_api=True))
+
+    def test_complete_listener_interval_and_exact_storage_selection(self):
+        for profile, count in (("v2", 1), ("v2-12", 12), ("gc-14", 14)):
+            manifest = dict(profile=PROFILES[profile], root="/tmp/3fs-ec-native-ports", port_base=65535 - (2 * count + 2),
+                            data_transport=configuration.requested_transport(**self.OPTIONS))
+            result = configuration.transport_listeners(manifest)
+            self.assertEqual(result, [("127.0.0.1", manifest["port_base"] + i) for i in range(count + 3)] +
+                             [("192.0.2.17", manifest["port_base"] + count + 3 + i) for i in range(count)])
+            self.assertEqual(result[-1][1], 65535)
+            self.assertEqual(configuration.transport_listeners(manifest, node=10000 + count),
+                             [("127.0.0.1", manifest["port_base"] + count + 2), ("192.0.2.17", 65535)])
+            for node in (True, 10000, 10001 + count, "10001"):
+                with self.subTest(node=node), self.assertRaises(ValueError):
+                    configuration.transport_listeners(manifest, node=node)
+            manifest["port_base"] += 1
+            with self.assertRaises(ValueError):
+                configuration.transport_listeners(manifest)
+            manifest.pop("data_transport")
+            manifest["port_base"] = 65535 - (count + 2)
+            self.assertEqual(configuration.transport_listeners(manifest)[-1], ("127.0.0.1", 65535))
+
+    def test_prepare_rejects_bad_inputs_before_creating_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "3fs-ec-native-untouched"
+            source = Path(__file__).resolve().parents[3]
+            with mock.patch.object(configuration.os, "name", "posix"), \
+                 mock.patch.object(type(root), "mkdir") as mkdir:
+                for kwargs, port, reason in ((dict(self.OPTIONS, rdma_device=None), 15000, "device name"),
+                                            (self.OPTIONS, 65532, "additional port interval"),
+                                            ({"transport": "tcp", "rdma_address": "192.0.2.17"}, 15000, "explicit RDMA")):
+                    with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                        configuration.prepare(root, source, port, **kwargs)
+                mkdir.assert_not_called()
+            self.assertFalse(root.exists())
 
 
 if __name__ == "__main__":

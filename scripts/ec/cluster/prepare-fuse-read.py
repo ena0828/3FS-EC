@@ -47,6 +47,8 @@ def main():
     inputs = {name: canonical(getattr(args, name)) for name in ("fuse_default", "launcher_default", "client_cfg")}
     raw = {name: path.read_bytes() for name, path in inputs.items()}
     fuse, launcher, client = [tomllib.loads(raw[name].decode()) for name in ("fuse_default", "launcher_default", "client_cfg")]
+    require(client.get("storage_transport", "tcp") == "tcp",
+            "This legacy read-spool preparer supports TCP only; use the RDMA file profile for mode4 FUSE")
     require("ec_read" in fuse and "common" in fuse, "matching ENABLE_FUSE_APPLICATION binary defaults required")
     uid = client["user_info"]["uid"]
     require(type(uid) is int and uid == os.geteuid(), "run preparation and mount as the configured effective UID")

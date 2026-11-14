@@ -504,6 +504,22 @@ class Lifecycle:
                 "fuse_exitcodes": [row["exitcode"] for row in mounts], "unknown_owned_processes": unknown}
 
 
+def validate_prepared_profile(manifest, initialized, preparation):
+    """Bind first mount and remount to the already initialized user/transport."""
+    from native_v2_config import transport_settings, validate_initialized_profile
+    validate_initialized_profile(manifest, initialized)
+    expected = transport_settings(manifest)
+    if expected is None:
+        require("data_transport_requested" not in preparation and "transport_validation" not in preparation,
+                "preparation transport differs from the initialized profile")
+    else:
+        require("data_transport_requested" in preparation and
+                preparation.get("transport_validation") == "configuration_only",
+                "preparation transport differs from the initialized profile")
+        actual = transport_settings({"data_transport": preparation["data_transport_requested"]})
+        require(actual == expected, "preparation transport differs from the initialized profile")
+
+
 def preflight(args):
     import tomllib
     require(sys.platform == "linux" and os.getuid() == os.geteuid() and os.geteuid() > 0
@@ -549,13 +565,13 @@ def preflight(args):
     try:
         sys.path.insert(0, str(scripts))
         preparation = module(scripts / "prepare-fuse-file.py", "mode4_lifecycle_preparation")
-        from native_v2_config import authenticated_user, validate_initialized_user
+        from native_v2_config import authenticated_user
         user = authenticated_user(cluster)
         client = tomllib.loads(helper.read_file(inputs["client_cfg"], 1 << 20).decode())
         same_user(user, client, prep, os.getuid(), os.geteuid(), os.getgid(), os.getegid())
         initialized_path = helper.absolute(str(root / "state/initialized.json"))
         helper.private(initialized_path)
-        validate_initialized_user(cluster, usr.load_json(helper, initialized_path))
+        validate_prepared_profile(cluster, usr.load_json(helper, initialized_path), prep)
         ec = first["ec_file"]
         rendered = preparation.render(
             cluster, tomllib.loads(helper.read_file(inputs["fuse_default"], 1 << 20).decode()),

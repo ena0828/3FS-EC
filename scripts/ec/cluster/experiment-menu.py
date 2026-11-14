@@ -313,6 +313,12 @@ def main():
     root = args.root.expanduser()
     if not root.is_absolute() or not root.is_dir() or root != root.resolve(strict=True):
         parser.error("--root 必须是已有、无符号链接重定向的绝对目录。")
+    if (root / "cluster.json").exists():
+        from native_v2_config import transport_settings
+        transport = transport_settings(json.loads((root / "cluster.json").read_text(encoding="utf-8")))
+        if transport is not None:
+            print(f"既定数据传输：RDMA；网卡 {transport['interface']}；IPv4 {transport['ipv4']}；设备 {transport['ib_device']}。")
+            print("本菜单沿用准备时的传输配置；配置声明不等于设备或数据路径已通过验收。")
     scripts = Path(__file__).resolve().parent
     command = selection(root, scripts)
     if command is None:

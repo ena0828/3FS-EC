@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prepare and supervise a private native EC lab with an explicit process topology."""
 import argparse
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -24,8 +25,9 @@ from native_fault_control import FaultController, initial_placement, validate_pl
 from native_managed_domain import (KEY as MANAGED_KEY, ManagedDomain, artifact_identity,
                                    identifier as managed_id, make_binding, observe_owned_executable)
 from native_v2_config import (PROFILES, SERVICES, SPARE_GC_PROFILE, target_count, file_api_enabled, required_services,
-                              authenticated_user, validate_initialized_user, gc_inventory_from_observations, gc_settings, json_text,
+                              authenticated_user, validate_initialized_profile, gc_inventory_from_observations, gc_settings, json_text,
                               key_roles, pool_from_observations, prepare, profile_config_problems,
+                              requested_transport, transport_settings, transport_listeners,
                               replace_private, storage_process_count, storage_specs, topology_problems, to_toml, write_new)
 
 
@@ -49,6 +51,8 @@ def load_manifest(root):
     gc_settings(data)
     file_api_enabled(data)
     authenticated_user(data)
+    transport_settings(data)
+    transport_listeners(data)
     for directory in ("config", "secrets", "client", "state", "logs", "scripts", "data", "bin", "lib"):
         path = root / directory
         if path.is_symlink() or not path.is_dir():
@@ -74,6 +78,170 @@ def active_build_processes(proc_root=Path("/proc")):
     return found
 
 
+def transport_record(manifest, record):
+    """Describe the prepared profile, without claiming a successful RDMA operation."""
+    settings = transport_settings(manifest)
+    if settings is not None:
+        record["data_transport"] = settings
+    return record
+
+
+def _sysfs_text(path):
+    with path.open("r", encoding="utf-8") as stream:
+        value = stream.read(4097)
+    if len(value) > 4096:
+        raise ValueError("Oversized sysfs field")
+    return value.strip()
+
+
+def _sysfs_children(path, limit):
+    rows = []
+    for row in path.iterdir():
+        rows.append(row)
+        if len(rows) > limit:
+            raise ValueError("Oversized sysfs directory")
+    return sorted(rows)
+
+
+def _uverbs_access(path, device_number):
+    info = path.stat()
+    if not stat.S_ISCHR(info.st_mode):
+        return False
+    if (os.major(info.st_rdev), os.minor(info.st_rdev)) != device_number:
+        return False
+    return os.access(path, os.R_OK | os.W_OK, effective_ids=True)
+
+
+def rdma_admission(settings, *, sysfs_root=Path("/sys"), dev_root=Path("/dev")):
+    """Read-only Linux admission. It neither opens verbs nor configures a device.
+
+    File permissions cannot prove cgroup/driver permission to allocate RDMA
+    resources. Native startup and a real data operation remain separate gates.
+    The alternate roots are only an in-process test seam, never CLI inputs.
+    """
+    settings = requested_transport(transport="rdma", rdma_interface=settings["interface"],
+                                   rdma_address=settings["ipv4"], rdma_device=settings["ib_device"])
+    problems = []
+    observed = {"requested": settings, "scope": "read-only device/resource admission; no verbs or data operation"}
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    observed["memlock"] = {"soft": soft, "hard": hard, "required_bytes": 3 * 1024**3}
+    if any(value != resource.RLIM_INFINITY and value < 3 * 1024**3 for value in (soft, hard)):
+        problems.append("RDMA requires memlock soft and hard limits of at least 3 GiB; no limits are changed")
+    nic = settings["interface"]
+    argv = ["ip", "-j", "-4", "address", "show", "dev", nic]
+    observed["interface_query"] = {"argv": argv, "timeout_seconds": 10}
+    try:
+        if not (sysfs_root / "class/net" / nic).is_dir():
+            raise ValueError("Missing declared network interface")
+        if _sysfs_text(sysfs_root / "class/net" / nic / "operstate") != "up":
+            raise ValueError("Declared network interface is not up")
+        result = subprocess.run(argv, text=True, capture_output=True, timeout=10)
+        observed["interface_query"]["exit_code"] = result.returncode
+        if len(result.stdout) + len(result.stderr) > 65536:
+            raise ValueError("Oversized interface observation")
+        if result.returncode:
+            raise ValueError("Interface query failed")
+        rows = json.loads(result.stdout)
+        if type(rows) is not list or len(rows) != 1 or type(rows[0]) is not dict:
+            raise ValueError("Ambiguous interface observation")
+        row = rows[0]
+        addresses = row.get("addr_info")
+        if row.get("ifname") != nic or row.get("operstate") != "UP" or \
+                type(row.get("flags")) is not list or "UP" not in row["flags"] or "LOOPBACK" in row["flags"] or \
+                type(addresses) is not list or any(type(value) is not dict for value in addresses):
+            raise ValueError("Invalid or inactive interface observation")
+        ipv4 = [value.get("local") for value in addresses if value.get("family") == "inet"]
+        observed["interface"] = {"name": nic, "operstate": row["operstate"], "ipv4": ipv4}
+        # Native IBDevice selects an interface, not one address on that interface.
+        if ipv4 != [settings["ipv4"]]:
+            raise ValueError("Interface must have exactly the declared IPv4 address")
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired) as error:
+        problems.append(f"RDMA interface admission failed ({type(error).__name__}); require one up NIC with exactly the declared IPv4")
+    observed["ports"] = []
+    try:
+        device = sysfs_root / "class/infiniband" / settings["ib_device"]
+        for port in _sysfs_children(device / "ports", 256):
+            if not port.name.isdigit():
+                continue
+            state = _sysfs_text(port / "state")
+            netdevs = set()
+            empty_gid_indices = []
+            if state != "4: ACTIVE":
+                observed["ports"].append({"port": int(port.name), "state": state, "netdevs": [],
+                                          "empty_gid_indices": []})
+                continue
+            if (port / "net").is_dir():
+                netdevs.update(path.name for path in _sysfs_children(port / "net", 256))
+            if (port / "gid_attrs/ndevs").is_dir():
+                for path in _sysfs_children(port / "gid_attrs/ndevs", 4096):
+                    try:
+                        netdevs.add(_sysfs_text(path))
+                    except OSError as error:
+                        # Kernel gid_attrs returns EINVAL for an empty/reserved
+                        # GID slot. It is not a mapping or an admission success.
+                        if error.errno != errno.EINVAL:
+                            raise
+                        empty_gid_indices.append(path.name)
+            observed["ports"].append({"port": int(port.name), "state": state, "netdevs": sorted(netdevs),
+                                      "empty_gid_indices": empty_gid_indices})
+        if not any(row["state"] == "4: ACTIVE" and nic in row["netdevs"] for row in observed["ports"]):
+            raise ValueError("No active verbs port maps to the declared NIC")
+    except (OSError, ValueError) as error:
+        problems.append(f"RDMA verbs port admission failed ({type(error).__name__}); require an active port mapped to the declared NIC")
+    observed["uverbs"] = []
+    try:
+        for entry in _sysfs_children(sysfs_root / "class/infiniband_verbs", 256):
+            if not re.fullmatch(r"uverbs[0-9]+", entry.name):
+                continue
+            if _sysfs_text(entry / "ibdev") != settings["ib_device"]:
+                continue
+            value = _sysfs_text(entry / "dev")
+            if not re.fullmatch(r"[0-9]+:[0-9]+", value):
+                raise ValueError("Invalid uverbs device number")
+            number = tuple(map(int, value.split(":")))
+            path = dev_root / "infiniband" / entry.name
+            usable = _uverbs_access(path, number)
+            observed["uverbs"].append({"path": str(path), "device_number": value,
+                                      "effective_uid_read_write": usable})
+        if not any(row["effective_uid_read_write"] for row in observed["uverbs"]):
+            raise ValueError("No accessible uverbs node for declared verbs device")
+    except (OSError, ValueError, NotImplementedError) as error:
+        problems.append(f"RDMA uverbs admission failed ({type(error).__name__}); require matching character device and effective-UID read/write access")
+    return problems, observed
+
+
+def probe_listeners(listeners, problems):
+    for address, port in listeners:
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((address, port))
+            except OSError:
+                if address == "127.0.0.1":
+                    problems.append(f"TCP port {port} is occupied; existing listeners are not stopped")
+                else:
+                    problems.append(f"RDMA bootstrap listener {address}:{port} is unavailable; existing listeners are not stopped")
+
+
+def read_profile_configs(root):
+    configs = {}
+    for path in list((root / "config").glob("*.toml")) + list((root / "client").glob("*.toml")):
+        configs[path.name] = tomllib.loads(path.read_text(encoding="utf-8"))
+    return configs
+
+
+def validate_launch_profile(root, frozen):
+    """Recheck mutable on-disk inputs before each child, without probing devices."""
+    current = load_manifest(root)
+    settings = transport_settings(frozen)
+    if transport_settings(current) != settings:
+        raise RuntimeError("Prepared transport changed after supervisor creation")
+    if settings is not None:
+        problems = profile_config_problems(frozen, read_profile_configs(root))
+        if problems:
+            raise RuntimeError("Prepared RDMA configuration changed: " + json_text(problems))
+
+
 def doctor(root, check_ports=True):
     manifest = load_manifest(root)
     problems, observations = [], {}
@@ -93,15 +261,13 @@ def doctor(root, check_ports=True):
                 problems.append(f"{name} version must be {manifest['fdb_version']}")
     if not (root / "lib/libfdb_c.so").is_file():
         problems.append("missing lib/libfdb_c.so")
-    configs = {}
-    for path in list((root / "config").glob("*.toml")) + list((root / "client").glob("*.toml")):
-        configs[path.name] = tomllib.loads(path.read_text(encoding="utf-8"))
+    configs = read_profile_configs(root)
     problems.extend(profile_config_problems(manifest, configs))
     initialized = root / "state/initialized.json"
     if initialized.exists():
         if initialized.is_symlink():
             raise RuntimeError("Refusing redirected initialization record")
-        validate_initialized_user(manifest, json.loads(initialized.read_text(encoding="utf-8")))
+        validate_initialized_profile(manifest, json.loads(initialized.read_text(encoding="utf-8")))
     # This flag exits before IB, FDB or server initialization. The three
     # launchers have fixed top-level objects. Do not treat the full default
     # dump as a schema: unset optional nested fields (e.g. network_type) are
@@ -185,14 +351,12 @@ def doctor(root, check_ports=True):
     observations["nofile_hard"] = hard
     if hard != resource.RLIM_INFINITY and hard < 16384:
         problems.append("nofile hard limit must be at least 16384 for the shared Rust Engine")
+    settings = transport_settings(manifest)
+    if settings is not None:
+        rdma_problems, observations["rdma"] = rdma_admission(settings)
+        problems.extend(rdma_problems)
     if check_ports:
-        for port in range(manifest["port_base"], manifest["port_base"] + 3 + storage_process_count(manifest)):
-            with socket.socket() as probe:
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                try:
-                    probe.bind(("127.0.0.1", port))
-                except OSError:
-                    problems.append(f"TCP port {port} is occupied; existing listeners are not stopped")
+        probe_listeners(transport_listeners(manifest), problems)
     return {"profile": manifest["profile"], "status": "ready" if not problems else "needs_attention",
             "problems": problems, "observations": observations, "services_started": False,
             "validation": "configuration/resources only; native service behavior remains to be tested"}
@@ -223,14 +387,14 @@ class NativeCluster(inherited_runner()):
 
     def status(self):
         with self.status_lock:
-            return {"schema": 1, "run": self.run_id, "stage": self.stage, "root": str(self.root),
+            return transport_record(self.manifest, {"schema": 1, "run": self.run_id, "stage": self.stage, "root": str(self.root),
                     "profile": self.manifest["profile"],
                     "processes": [{"name": name, "pid": proc.pid, "exit_code": proc.poll()}
                                   for name, proc in self.processes],
                     "logical_targets": target_count(self.manifest), "storage_processes": storage_process_count(self.manifest),
                     "storage_process_failure_domains": storage_process_count(self.manifest),
                     "independent_storage_failure_domains": 1, "performance_validated": False,
-                    "failure": self.failure, "maintenance": self.fault_control.snapshot()}
+                    "failure": self.failure, "maintenance": self.fault_control.snapshot()})
 
     def control(self):
         if self.control_path.exists():
@@ -304,6 +468,8 @@ class NativeCluster(inherited_runner()):
         return super().admin(*args, **kwargs)
 
     def preflight(self):
+        if transport_settings(load_manifest(self.root)) != transport_settings(self.manifest):
+            raise RuntimeError("Prepared transport changed after supervisor creation")
         # A registered domain is mandatory; no start flag can omit this gate.
         # Check before FDB/other services as well as immediately at Storage Popen.
         if self.managed is not None:
@@ -320,7 +486,7 @@ class NativeCluster(inherited_runner()):
         elif not initialized.is_file():
             raise RuntimeError("resume requires successful initialization; partial bootstrap needs administrator diagnosis")
         else:
-            validate_initialized_user(self.manifest, json.loads(initialized.read_text(encoding="utf-8")))
+            validate_initialized_profile(self.manifest, json.loads(initialized.read_text(encoding="utf-8")))
         for path in data_paths:
             if path.is_symlink():
                 raise RuntimeError("Refusing redirected database directory")
@@ -342,6 +508,7 @@ class NativeCluster(inherited_runner()):
         return self._start_owned(name, command)
 
     def _start_owned(self, name, command):
+        validate_launch_profile(self.root, self.manifest)
         spec = next((row for row in storage_specs(self.manifest) if row['name'] == name), None)
         launch_inputs = None
         if spec is not None and self.manifest['profile'] == SPARE_GC_PROFILE:
@@ -360,10 +527,12 @@ class NativeCluster(inherited_runner()):
             spec = next((v for v in storage_specs(self.manifest) if v["name"] == name), None)
             if name != "meta" and spec is None:
                 raise RuntimeError("Only explicitly prepared Storage/Meta children support restart")
-            port = spec["port"] if spec else self.manifest["port_base"] + 2
-            with socket.socket() as probe:
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                probe.bind(("127.0.0.1", port))  # Refuse a borrowed listener; never signal it.
+            listeners = transport_listeners(self.manifest, node=spec["node"]) if spec else \
+                [("127.0.0.1", self.manifest["port_base"] + 2)]
+            for address, port in listeners:
+                with socket.socket() as probe:
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    probe.bind((address, port))  # Refuse a borrowed listener; never signal it.
         suffix = f".restart-{generation}" if generation else ""
         log = (self.run_dir / f"{name}{suffix}.stdout.log").open("xb")
         self.logs.append(log)
@@ -706,8 +875,9 @@ class NativeCluster(inherited_runner()):
             user = authenticated_user(self.manifest)
             self.admin(["set-perm", "/ec-lab", "-u", str(user["uid"]), "-g", str(user["gid"]), "-p", "0700"],
                        "chown-user-workspace.log")
-            write_new(self.root / "state/initialized.json", json_text({"schema": 1, "run": self.run_id,
-                "cluster_id": self.manifest["cluster_id"], "physical_pool": pool, "authenticated_user": user}))
+            write_new(self.root / "state/initialized.json", json_text(transport_record(self.manifest,
+                {"schema": 1, "run": self.run_id, "cluster_id": self.manifest["cluster_id"],
+                 "physical_pool": pool, "authenticated_user": user})))
         self.stage = "ready"
         self.healthy()
         # Startup resource sampling is outside the experiment's timed region.
@@ -772,6 +942,11 @@ def main():
                         help="prepare only: enable EC file sessions and RMW on a fresh gc/gc-12/gc-14 profile")
     parser.add_argument("--user-uid", type=int, help="prepare only: authenticated ordinary UID; supply with --user-gid")
     parser.add_argument("--user-gid", type=int, help="prepare only: authenticated GID; both default to 1000")
+    parser.add_argument("--transport", choices=["tcp", "rdma"],
+                        help="prepare only: fixed Storage data transport; default tcp, Meta/control remain TCP")
+    parser.add_argument("--rdma-interface", help="prepare only: RDMA NIC with exactly one declared IPv4")
+    parser.add_argument("--rdma-address", help="prepare only: that NIC's canonical IPv4 address")
+    parser.add_argument("--rdma-device", help="prepare only: exact verbs device")
     parser.add_argument("--run", help="fault action: exact live supervisor run from status")
     parser.add_argument("--action-id", help="fault action: caller-saved nonzero UUID; never regenerated on retry")
     parser.add_argument("--wait-seconds", type=int, default=600,
@@ -797,11 +972,16 @@ def main():
             parser.error("--user-uid and --user-gid must be supplied together")
         user = authenticated_user({"authenticated_user": {"uid": 1000 if args.user_uid is None else args.user_uid,
                                                          "gid": 1000 if args.user_gid is None else args.user_gid}})
+        requested_transport(transport=args.transport or "tcp", rdma_interface=args.rdma_interface,
+                            rdma_address=args.rdma_address, rdma_device=args.rdma_device)
         prepare(root, args.source, args.port_base, args.profile or "v2", file_api=args.file_api,
-                user_uid=user["uid"], user_gid=user["gid"])
+                user_uid=user["uid"], user_gid=user["gid"], transport=args.transport or "tcp",
+                rdma_interface=args.rdma_interface, rdma_address=args.rdma_address, rdma_device=args.rdma_device)
         return 0
     if args.profile is not None or args.file_api or args.user_uid is not None or args.user_gid is not None:
         parser.error("--profile/--file-api/--user-uid/--user-gid are prepare-only; start/resume uses the immutable prepared profile")
+    if any(value is not None for value in (args.transport, args.rdma_interface, args.rdma_address, args.rdma_device)):
+        parser.error("--transport/--rdma-* are prepare-only; start/resume uses the immutable prepared profile")
     load_manifest(root)
     if args.command.startswith('managed-'):
         if args.nodes or args.replace or not args.domain_id:

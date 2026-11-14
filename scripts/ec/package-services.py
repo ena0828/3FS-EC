@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -48,12 +49,31 @@ def selected_services(manifest, native_v2=False, native_gc=False, ec_file_mount=
     return services
 
 
+def transport_provenance(manifest):
+    """Add explicit RDMA intent without expanding the ELF/provider closure."""
+    if "data_transport" not in manifest:
+        return {}
+    scripts = Path(__file__).with_name("cluster")
+    old_path = list(sys.path)
+    try:
+        sys.path.insert(0, str(scripts))
+        spec = importlib.util.spec_from_file_location("package_native_v2_config", scripts / "native_v2_config.py")
+        config = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(config)
+        transport = config.transport_settings(manifest)
+        if manifest.get("profile") not in config.PROFILES.values():
+            raise ValueError("RDMA packaging requires an explicitly prepared native profile")
+    finally:
+        sys.path[:] = old_path
+    return {"data_transport_requested": transport, "transport_validation": "configuration_only"}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     native_profile = parser.add_mutually_exclusive_group()
-    native_profile.add_argument("--native-v2", action="store_true", help="Package the native V2 TCP profile including ec_stripe_cli, without FUSE")
+    native_profile.add_argument("--native-v2", action="store_true", help="Package the prepared native V2 profile including ec_stripe_cli, without FUSE")
     native_profile.add_argument("--native-gc", action="store_true", help="Package the explicitly prepared native GC profile using the same five services")
     parser.add_argument("--ec-file-mount", action="store_true", help="Explicitly package mode4 FUSE and its probe for a native GC --file-api bundle; never mounts")
     parser.add_argument("--ec-example", type=Path, help="Optional compiled POSIX EC example and its runtime libraries")
@@ -66,6 +86,7 @@ def main():
     bundle_manifest = json.loads((output / "cluster.json").read_text())
     try:
         services = selected_services(bundle_manifest, args.native_v2, args.native_gc, args.ec_file_mount)
+        transport = transport_provenance(bundle_manifest)
     except ValueError as error:
         parser.error(str(error))
     for directory in (output / "bin", output / "lib", output / "provenance", output / "scripts"):
@@ -166,6 +187,7 @@ def main():
                 "ld_library_path_during_inspection": environment["LD_LIBRARY_PATH"],
                 "scope": "ELF DT_NEEDED closure; runtime dlopen providers remain guest dependencies",
                 "ec_file_mount": args.ec_file_mount, "mount_started": False}
+    manifest.update(transport)
     (record / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({"services": len(services), "ec_example": bool(args.ec_example),
                       "payload_files": len(copies), "manifest": str(record / "manifest.json")}))

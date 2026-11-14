@@ -16,7 +16,7 @@ import sys
 import tomllib
 
 from generate import to_toml
-from native_v2_config import file_api_enabled
+from native_v2_config import client_transport_problems, file_api_enabled, transport_settings
 
 
 def read_helpers():
@@ -38,6 +38,13 @@ def integer(value, minimum, maximum, label):
     return value
 
 
+def transport_evidence(manifest):
+    """Record configuration intent, never device discovery or a verbs result."""
+    transport = transport_settings(manifest)
+    return {} if transport is None else {
+        "data_transport_requested": transport, "transport_validation": "configuration_only"}
+
+
 def render(manifest, fuse_default, launcher_default, client, *, effective_uid,
            root, output, mountpoint, token, create_new=False, shard_bytes=1 << 20,
            maximum_operation_seconds=300, retained_sessions=128, maximum_input_bytes=256 << 20):
@@ -53,10 +60,13 @@ def render(manifest, fuse_default, launcher_default, client, *, effective_uid,
     integer(client["user_info"].get("gid"), 0, (1 << 32) - 1, "authenticated GID")
     require(type(client.get("cluster_id")) is str and client["cluster_id"] == manifest.get("cluster_id"),
             "client cluster differs from prepared bundle")
-    require(client.get("client", {}).get("force_use_tcp") is True and
+    transport = transport_settings(manifest)
+    require(not client_transport_problems(manifest, client, file_api=True),
+            "file-client transport differs from the prepared profile")
+    require((transport is not None or client.get("client", {}).get("force_use_tcp") is True) and
             client.get("mgmtd_client", {}).get("network_type") == "TCP" and
             client.get("meta_client", {}).get("network_type") == "TCP",
-            "explicit real TCP file-client settings required")
+            "explicit real TCP control-client settings required")
     addresses = client["mgmtd_client"].get("mgmtd_server_addresses")
     require(type(addresses) is list and addresses and all(type(a) is str and a.startswith("TCP://") for a in addresses),
             "real TCP management addresses required")
@@ -67,6 +77,8 @@ def render(manifest, fuse_default, launcher_default, client, *, effective_uid,
             "matching mode4 ENABLE_FUSE_APPLICATION defaults required")
     require(fuse_default["ec_read"].get("enable") is False and fuse_default["ec_file"].get("enable") is False,
             "use untouched defaults; do not mix an active ec_read/mode4 profile")
+    require(transport is not None or fuse_default.get("ec_storage_transport", "tcp") == "tcp",
+            "TCP preparation requires matching default Storage transport")
     require(type(launcher_default.get("ib_devices")) is dict, "matching FUSE launcher defaults required")
     integer(shard_bytes, 1, 1 << 20, "shard bytes")
     integer(maximum_operation_seconds, 1, 3600, "operation seconds")
@@ -94,7 +106,11 @@ def render(manifest, fuse_default, launcher_default, client, *, effective_uid,
     launcher.update(cluster_id=client["cluster_id"], mountpoint=str(mountpoint), allow_other=False, token_file=str(token))
     launcher["client"] = copy.deepcopy(client["client"])
     launcher["mgmtd_client"] = copy.deepcopy(client["mgmtd_client"])
-    launcher["ib_devices"].update(allow_no_usable_devices=True, device_filter=[])
+    if transport is None:
+        launcher["ib_devices"].update(allow_no_usable_devices=True, device_filter=[])
+    else:
+        fuse["ec_storage_transport"] = "rdma"
+        launcher["ib_devices"] = copy.deepcopy(client["ib_devices"])
     resume = copy.deepcopy(fuse)
     resume["ec_file"]["create_state"] = False
     return {"fuse-first.toml": fuse, "fuse-resume.toml": resume, "launcher.toml": launcher}
@@ -167,6 +183,9 @@ def main():
               "first_mount_argv": argv("fuse-first.toml"), "remount_argv": argv("fuse-resume.toml"),
               "unmount_argv": ["fusermount3", "-u", str(mountpoint)],
               "live_file_api_verified": False, "rdma_note": "Empty device_filter permits found devices; it does not disable RDMA registration."}
+    if transport_settings(manifest) is not None:
+        record.update(transport_evidence(manifest))
+        record["rdma_note"] = "Explicit device configuration only; no device, mount or verbs data path was validated."
     helper.new_file(output / "preparation.json", (json.dumps(record, indent=2) + "\n").encode("utf-8"))
     for directory in (output / "logs", output, output.parent):
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

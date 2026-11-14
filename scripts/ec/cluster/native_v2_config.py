@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Generate the local TCP V2 profile; never open a database or invent an instance."""
+"""Generate explicit local transport profiles; never open a database or invent an instance."""
 import copy
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import tomllib
@@ -41,6 +43,76 @@ def validate_initialized_user(manifest, initialized):
         raise ValueError("Initialized cluster/user differs; prepare a fresh lab instead of migrating old state")
 
 
+def requested_transport(*, transport="tcp", rdma_interface=None, rdma_address=None, rdma_device=None):
+    """Configuration intent only: no NIC, verbs device or data path is observed."""
+    if transport == "tcp":
+        if any(value is not None for value in (rdma_interface, rdma_address, rdma_device)):
+            raise ValueError("RDMA inputs require an explicit RDMA transport")
+        return None
+    if type(transport) is not str or transport != "rdma":
+        raise ValueError("Transport must be explicitly tcp or rdma")
+    for label, value, limit in (("interface", rdma_interface, 15), ("device", rdma_device, 64)):
+        if type(value) is not str or not 1 <= len(value) <= limit or \
+                re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value) is None or value in (".", ".."):
+            raise ValueError(f"Require one supported Linux RDMA {label} name")
+    if rdma_interface == "lo" or type(rdma_address) is not str:
+        raise ValueError("RDMA requires an explicit non-loopback IPv4 interface/address")
+    try:
+        address = ipaddress.IPv4Address(rdma_address)
+    except ipaddress.AddressValueError as error:
+        raise ValueError("Require a canonical RDMA IPv4 address") from error
+    if str(address) != rdma_address or address.is_loopback or address.is_unspecified or \
+            address.is_multicast or address.is_reserved:
+        raise ValueError("Require a canonical unicast, non-loopback RDMA IPv4 address")
+    return {"schema": 1, "mode": "rdma", "interface": rdma_interface,
+            "ipv4": rdma_address, "ib_device": rdma_device}
+
+
+def transport_settings(manifest):
+    """Only absence means legacy TCP; malformed or explicit null never does."""
+    if "data_transport" not in manifest:
+        return None
+    value = manifest["data_transport"]
+    if type(value) is not dict or set(value) != {"schema", "mode", "interface", "ipv4", "ib_device"} or \
+            type(value["schema"]) is not int or value["schema"] != 1 or value["mode"] != "rdma":
+        raise ValueError("Invalid prepared data transport")
+    return requested_transport(transport=value["mode"], rdma_interface=value["interface"],
+                               rdma_address=value["ipv4"], rdma_device=value["ib_device"])
+
+
+def validate_initialized_profile(manifest, initialized):
+    validate_initialized_user(manifest, initialized)
+    if transport_settings(manifest) != transport_settings(initialized):
+        raise ValueError("Initialized transport differs; prepare a fresh lab instead of migrating old state")
+
+
+def _value_at(data, path):
+    for key in path.split("."):
+        if type(data) is not dict or key not in data:
+            return None
+        data = data[key]
+    return data
+
+
+def client_transport_problems(manifest, client, *, file_api=False):
+    settings = transport_settings(manifest)
+    problems = []
+    if settings is None:
+        if type(client) is not dict or client.get("storage_transport", "tcp") != "tcp":
+            problems.append("TCP client has a different explicit Storage transport")
+        return problems
+    if _value_at(client, "storage_transport") != "rdma":
+        problems.append("RDMA client requires explicit Storage transport")
+    for path in ("storage_client.net_client.force_use_tcp", "storage_client.net_client_for_updates.force_use_tcp") + \
+            (("client.force_use_tcp",) if file_api else ()):
+        if _value_at(client, path) is not False:
+            problems.append(f"RDMA client {path} must be explicitly false")
+    if _value_at(client, "ib_devices.device_filter") != [settings["ib_device"]] or \
+            _value_at(client, "ib_devices.allow_no_usable_devices") is not False:
+        problems.append("RDMA client device selection differs from the prepared transport")
+    return problems
+
+
 def storage_process_count(manifest):
     profile = manifest.get("profile")
     if profile in (PROFILE, GC_PROFILE):
@@ -64,6 +136,27 @@ def storage_specs(manifest):
     return [dict(node=10001 + i, name="storage" if count == 1 else f"storage-{10001+i}",
                  stem="storage_main" if count == 1 else f"storage-{10001+i}", port=port + 3 + i,
                  data_path=str(root / f"data/storage-{10001+i}")) for i in range(count)]
+
+
+def transport_listeners(manifest, *, node=None):
+    """Return all expected listeners, or just one Storage's TCP/RDMA pair."""
+    specs = storage_specs(manifest)
+    settings = transport_settings(manifest)
+    port, count = manifest["port_base"], len(specs)
+    if settings is not None and port > 65535 - (2 * count + 2):
+        raise ValueError("RDMA topology requires its complete additional port interval")
+    if node is not None:
+        if type(node) is not int or node not in {spec["node"] for spec in specs}:
+            raise ValueError("Listener selection requires an exact prepared Storage node")
+        index = node - 10001
+        result = [("127.0.0.1", specs[index]["port"])]
+        if settings is not None:
+            result.append((settings["ipv4"], port + count + 3 + index))
+        return result
+    result = [("127.0.0.1", port + offset) for offset in range(count + 3)]
+    if settings is not None:
+        result.extend((settings["ipv4"], port + count + 3 + i) for i in range(count))
+    return result
 
 
 def topology_problems(manifest):
@@ -192,16 +285,99 @@ def profile_config_problems(manifest, configs):
     if count > 1:
         if meta.get("ec_allow_colocated_test_targets") is not False:
             problems.append("Twelve-process placement requires twelve distinct Storage node IDs")
-        for spec in storage_specs(manifest):
-            config = configs[spec["stem"] + ".toml"]
-            groups = config["server"]["base"]["groups"]
-            app = configs[spec["stem"] + "_app.toml"]
-            if len(groups) != 1 or type(groups[0]["listener"].get("listen_port")) is not int or \
-                    groups[0]["listener"]["listen_port"] != spec["port"] or \
-                    config["server"]["targets"].get("target_paths") != [spec["data_path"]] or \
-                    type(app.get("node_id")) is not int or app["node_id"] != spec["node"] or \
-                    config["common"]["log"]["handlers"][0].get("file_path") != str(Path(manifest["root"])/"logs"/(spec["name"]+".log")):
-                problems.append(f"{spec['name']} port/path/node/log differs from its prepared topology")
+    problems.extend(_profile_transport_problems(manifest, configs, file_api=file_api))
+    return problems
+
+
+def _profile_transport_problems(manifest, configs, *, file_api):
+    settings = transport_settings(manifest)
+    transport_listeners(manifest)  # Validate the complete port range even for a single Storage.
+    specs = storage_specs(manifest)
+    rdma = settings is not None
+    problems = []
+
+    def flag(label, data, path, expected):
+        if _value_at(data, path) is not expected:
+            problems.append(f"{label} {path} differs from prepared transport")
+
+    def devices(label, data, enabled):
+        flag(label, data, "ib_devices.allow_no_usable_devices", not enabled)
+        expected = [settings["ib_device"]] if enabled else []
+        if _value_at(data, "ib_devices.device_filter") != expected:
+            problems.append(f"{label} device filter differs from prepared transport")
+
+    def groups(label, data, service, port, index=None):
+        values = _value_at(data, "server.base.groups")
+        expected_count = 2 if rdma and index is not None else 1
+        if type(values) is not list or len(values) != expected_count:
+            problems.append(f"{label} must have exactly its prepared service groups")
+            return
+        tcp = values[0]
+        if type(tcp) is not dict:
+            problems.append(f"{label} has no prepared TCP group")
+            return
+        expected_listener = {"listen_port": port, "filter_list": ["lo"], "custom_tcp_nic_prefix": "lo",
+                             "reuse_port": False, "listen_queue_depth": 128}
+        if type(tcp) is not dict or tcp.get("network_type") != "TCP" or \
+                tcp.get("services") != [service, "Core"] or tcp.get("use_independent_thread_pool") is not False or \
+                any(type(_value_at(tcp, "listener." + key)) is not type(value) or
+                    _value_at(tcp, "listener." + key) != value for key, value in expected_listener.items()):
+            problems.append(f"{label} TCP control group differs from prepared listener/services")
+        if expected_count == 2:
+            expected = copy.deepcopy(tcp)
+            expected.update(network_type="RDMA", services=["StorageSerde"])
+            if type(expected.get("listener")) is not dict:
+                problems.append(f"{label} has no prepared listener")
+                return
+            expected["listener"].update(listen_port=manifest["port_base"] + len(specs) + 3 + index,
+                                        filter_list=[settings["interface"]], custom_tcp_nic_prefix=settings["interface"])
+            if json.dumps(values[1], sort_keys=True, separators=(",", ":")) != \
+                    json.dumps(expected, sort_keys=True, separators=(",", ":")) or \
+                    type(_value_at(values[1], "listener.listen_port")) is not int:
+                problems.append(f"{label} RDMA group must contain only StorageSerde on its exact listener")
+
+    for kind, service, offset in (("mgmtd", "Mgmtd", 1), ("meta", "MetaSerde", 2)):
+        groups(kind, configs[kind + "_main.toml"], service, manifest["port_base"] + offset)
+        devices(kind + " launcher", configs[kind + "_main_launcher.toml"], rdma and kind == "meta")
+    meta = configs["meta_main.toml"]
+    policy = _value_at(meta, "server.meta.ec_storage_transport")
+    if (policy != "rdma" if rdma else policy not in (None, "tcp")):
+        problems.append("Meta Storage transport differs from prepared transport")
+    for path in ("server.storage_client.net_client.force_use_tcp", "server.storage_client.net_client_for_updates.force_use_tcp"):
+        flag("Meta", meta, path, not rdma)
+    flag("Meta", meta, "server.background_client.force_use_tcp", True)
+    if _value_at(meta, "server.mgmtd_client.network_type") != "TCP":
+        problems.append("Meta Mgmtd control transport must remain TCP")
+    if file_api:
+        flag("Meta", meta, "server.meta.ec_rmw_transport.force_use_tcp", not rdma)
+    for index, spec in enumerate(specs):
+        label = spec["stem"]
+        data = configs[label + ".toml"]
+        groups(label, data, "StorageSerde", spec["port"], index)
+        app = configs[label + "_app.toml"]
+        logs = _value_at(data, "common.log.handlers")
+        log_name = "storage-10001" if len(specs) == 1 else spec["name"]
+        if _value_at(data, "server.targets.target_paths") != [spec["data_path"]] or \
+                type(app.get("node_id")) is not int or app["node_id"] != spec["node"] or \
+                type(logs) is not list or not logs or type(logs[0]) is not dict or \
+                logs[0].get("file_path") != str(Path(manifest["root"]) / "logs" / (log_name + ".log")):
+            problems.append(f"{label} path/node/log differs from its prepared topology")
+        devices(label + " launcher", configs[label + "_launcher.toml"], rdma)
+        flag(label, data, "server.forward_client.force_use_tcp", not rdma)
+        flag(label, data, "server.client.force_use_tcp", True)
+        if _value_at(data, "server.mgmtd.network_type") != "TCP":
+            problems.append(f"{label} Mgmtd control transport must remain TCP")
+        if file_api:
+            for path in ("server.storage.ec_rmw_client.net_client.force_use_tcp",
+                         "server.storage.ec_rmw_client.net_client_for_updates.force_use_tcp"):
+                flag(label, data, path, not rdma)
+            flag(label, data, "server.storage.ec_rmw_transport.force_use_tcp", True)  # Meta52 binder.
+    for name in ("stripe-client.toml", "file-client.toml") if file_api else ("stripe-client.toml",):
+        data = configs[name]
+        problems.extend(f"{name}: {problem}" for problem in
+                        client_transport_problems(manifest, data, file_api=name == "file-client.toml"))
+        if any(_value_at(data, path) != "TCP" for path in ("mgmtd_client.network_type", "meta_client.network_type")):
+            problems.append(f"{name} Meta/Mgmtd control transports must remain TCP")
     return problems
 
 
@@ -250,11 +426,18 @@ def tcp_only(value):
 
 
 def generate_configs(source, root, port_base, authority, cluster_id, *, profile="v2", gc=None, file_api=False,
-                     user_uid=1000, user_gid=1000):
+                     user_uid=1000, user_gid=1000, transport="tcp", rdma_interface=None,
+                     rdma_address=None, rdma_device=None):
     """Pure configuration generation, shared by prepare and configuration tests."""
     user = authenticated_user({"authenticated_user": {"uid": user_uid, "gid": user_gid}})
     if profile not in PROFILES:
         raise ValueError("Unknown native profile")
+    data_transport = requested_transport(transport=transport, rdma_interface=rdma_interface,
+                                         rdma_address=rdma_address, rdma_device=rdma_device)
+    layout = dict(profile=PROFILES[profile], root=root, port_base=port_base)
+    if data_transport is not None:
+        layout["data_transport"] = data_transport
+    transport_listeners(layout)
     requested = {"profile": PROFILES[profile], "authority": authority}
     if gc is not None:
         requested["gc"] = gc
@@ -420,10 +603,48 @@ def generate_configs(source, root, port_base, authority, cluster_id, *, profile=
             configs[spec["stem"] + ".toml"] = node
             configs[spec["stem"] + "_launcher.toml"] = copy.deepcopy(launcher)
             configs[spec["stem"] + "_app.toml"] = {"allow_empty_node_id": False, "node_id": spec["node"]}
+    if data_transport is not None:
+        def enable_device(data):
+            put(data, "ib_devices.device_filter", [data_transport["ib_device"]])
+            put(data, "ib_devices.allow_no_usable_devices", False)
+
+        meta = configs["meta_main.toml"]
+        put(meta, "server.meta.ec_storage_transport", "rdma")
+        for path in ("server.storage_client.net_client.force_use_tcp", "server.storage_client.net_client_for_updates.force_use_tcp"):
+            put(meta, path, False)
+        if file_api:
+            put(meta, "server.meta.ec_rmw_transport.force_use_tcp", False)
+        enable_device(configs["meta_main_launcher.toml"])
+        specs = storage_specs(layout)
+        for index, spec in enumerate(specs):
+            data = configs[spec["stem"] + ".toml"]
+            group = copy.deepcopy(data["server"]["base"]["groups"][0])
+            group.update(network_type="RDMA", services=["StorageSerde"])
+            group["listener"].update(listen_port=port_base + len(specs) + 3 + index,
+                                     filter_list=[data_transport["interface"]],
+                                     custom_tcp_nic_prefix=data_transport["interface"])
+            data["server"]["base"]["groups"].append(group)
+            put(data, "server.forward_client.force_use_tcp", False)
+            if file_api:
+                for path in ("server.storage.ec_rmw_client.net_client.force_use_tcp",
+                             "server.storage.ec_rmw_client.net_client_for_updates.force_use_tcp"):
+                    put(data, path, False)
+            enable_device(configs[spec["stem"] + "_launcher.toml"])
+        for name in ("stripe-client.toml", "file-client.toml") if file_api else ("stripe-client.toml",):
+            data = configs[name]
+            data["storage_transport"] = "rdma"
+            for path in ("storage_client.net_client.force_use_tcp", "storage_client.net_client_for_updates.force_use_tcp"):
+                put(data, path, False)
+            if name == "file-client.toml":
+                put(data, "client.force_use_tcp", False)
+            enable_device(data)
     return configs, hashes
 
 
-def prepare(root, source, port_base, profile="v2", *, file_api=False, user_uid=1000, user_gid=1000):
+def prepare(root, source, port_base, profile="v2", *, file_api=False, user_uid=1000, user_gid=1000,
+            transport="tcp", rdma_interface=None, rdma_address=None, rdma_device=None):
+    data_transport = requested_transport(transport=transport, rdma_interface=rdma_interface,
+                                         rdma_address=rdma_address, rdma_device=rdma_device)
     if os.name != "posix":
         raise RuntimeError("prepare requires the target Linux filesystem and permission semantics")
     original = root.absolute()
@@ -436,6 +657,10 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False, user_uid=1
     count = storage_process_count({"profile": PROFILES.get(profile)})
     if type(port_base) is not int or not 1024 <= port_base <= 65535 - (count + 2):
         raise RuntimeError("port-base leaves insufficient consecutive ports for this profile")
+    layout = dict(profile=PROFILES[profile], root=root, port_base=port_base)
+    if data_transport is not None:
+        layout["data_transport"] = data_transport
+    transport_listeners(layout)
     authority, cluster_id = str(uuid.uuid4()), "ec_native_" + secrets.token_hex(6)
     gc = None
     if profile in ("gc", "gc-12", "gc-14"):
@@ -443,7 +668,8 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False, user_uid=1
               "data_protocol": 2, "disk_format": 3, "gc_protocol": 2 if file_api else 1}
     configs, hashes = generate_configs(source.resolve(strict=True), root, port_base, authority, cluster_id,
                                        profile=profile, gc=gc, file_api=file_api,
-                                       user_uid=user["uid"], user_gid=user["gid"])
+                                       user_uid=user["uid"], user_gid=user["gid"], transport=transport,
+                                       rdma_interface=rdma_interface, rdma_address=rdma_address, rdma_device=rdma_device)
     root.mkdir(mode=0o700)
     for name in ("config", "secrets", "client", "state", "logs", "scripts", "data", "bin", "lib", "provenance"):
         (root / name).mkdir(mode=0o700)
@@ -467,6 +693,8 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False, user_uid=1
         "fdb_version": "7.3.63", "state": "prepared_not_started", "performance_validated": False}
     if gc:
         manifest["gc"] = gc
+    if data_transport is not None:
+        manifest["data_transport"] = data_transport
     if file_api:
         manifest["file_api"] = True
     if count > 1:

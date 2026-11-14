@@ -65,6 +65,7 @@ jobs:
           python3 -B scripts/ec/ci/test-run-file-lab.py -v
           python3 -B scripts/ec/ci/test-run-spare-lab.py -v
           python3 -B scripts/ec/cluster/test-native-spare-storage.py -v
+          python3 -B scripts/ec/cluster/test-native-rdma-preflight.py -v
           python3 -B scripts/ec/cluster/test-portable-experiments.py -v
 
       - name: Build one ISA-L configuration for core regressions and both labs

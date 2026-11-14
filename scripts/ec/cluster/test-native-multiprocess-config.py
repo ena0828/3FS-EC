@@ -2,9 +2,10 @@
 """Pure local-12 topology checks; no process, key, target or database startup."""
 import copy
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 import unittest
+from unittest import mock
 import uuid
 
 SOURCE = Path(os.environ.get("EC_SOURCE", Path(__file__).resolve().parents[3]))
@@ -12,9 +13,13 @@ sys.path.append(str(SOURCE / "scripts/ec/cluster"))
 from native_v2_config import (GC_PROFILE, MULTI_GC_PROFILE, MULTI_PROFILE, PROFILE, gc_inventory_from_observations,
                               generate_configs, pool_from_observations, profile_config_problems,
                               storage_process_count, storage_specs, topology_problems)
+import native_v2_config as configuration
 
 
 class NativeMultiProcessConfiguration(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch("native_v2_config.Path", PurePosixPath))
+
     def fixture(self, gc=False):
         manifest = dict(profile=MULTI_GC_PROFILE if gc else MULTI_PROFILE,
                         root="/tmp/3fs-ec-native-local12", port_base=14000, storage_count=12, logical_target_count=12,
@@ -135,6 +140,29 @@ class NativeMultiProcessConfiguration(unittest.TestCase):
             manifest = self.fixture()
             manifest["port_base"] = value
             with self.subTest(port=value), self.assertRaises(ValueError): storage_specs(manifest)
+
+    def test_rdma_twelve_processes_keep_tcp_control_and_unique_data_endpoints(self):
+        options = dict(transport="rdma", rdma_interface="enp1s0", rdma_address="192.0.2.17", rdma_device="mlx5_0")
+        for use_gc in (False, True):
+            manifest = self.fixture(use_gc)
+            manifest["data_transport"] = configuration.requested_transport(**options)
+            configs, _ = generate_configs(SOURCE, manifest["root"], 14000, manifest["authority"], "rdma12",
+                profile="gc-12" if use_gc else "v2-12", gc=manifest.get("gc"), **options)
+            self.assertEqual(profile_config_problems(manifest, configs), [])
+            self.assertEqual(configuration.transport_listeners(manifest),
+                [("127.0.0.1", port) for port in range(14000, 14015)] +
+                [("192.0.2.17", port) for port in range(14015, 14027)])
+            for i in range(12):
+                stem = f"storage-{10001+i}"
+                groups = configs[stem + ".toml"]["server"]["base"]["groups"]
+                self.assertEqual([(g["network_type"], g["services"], g["listener"]["listen_port"]) for g in groups],
+                    [("TCP", ["StorageSerde", "Core"], 14003+i), ("RDMA", ["StorageSerde"], 14015+i)])
+                self.assertEqual(configs[stem + "_launcher.toml"]["ib_devices"]["device_filter"], ["mlx5_0"])
+                changed = copy.deepcopy(configs)
+                changed[stem + ".toml"]["server"]["base"]["groups"][1]["listener"]["listen_port"] = 14015
+                if i == 0:
+                    changed[stem + ".toml"]["server"]["base"]["groups"][1]["listener"]["listen_port"] = 14015.0
+                self.assertTrue(profile_config_problems(manifest, changed))
 
 
 if __name__ == "__main__":

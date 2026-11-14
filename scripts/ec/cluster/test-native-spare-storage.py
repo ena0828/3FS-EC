@@ -4,7 +4,7 @@ import copy
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 import stat
 import sys
@@ -16,6 +16,7 @@ from types import MethodType, SimpleNamespace
 import native_fault_control as fault
 from native_v2_config import (SPARE_GC_PROFILE, generate_configs, storage_process_count,
                               storage_specs, topology_problems, profile_config_problems)
+import native_v2_config as configuration
 SOURCE = Path(os.environ.get('EC_SOURCE', Path(__file__).resolve().parents[3]))
 
 
@@ -80,6 +81,33 @@ def controller(cluster):
 
 
 class SpareStorageTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch("native_v2_config.Path", PurePosixPath))
+
+    def test_rdma_spares_keep_fixed_data_ports_and_control_binding_across_replay(self):
+        m = manifest()
+        options = dict(transport='rdma', rdma_interface='enp1s0', rdma_address='192.0.2.17', rdma_device='mlx5_0')
+        m['data_transport'] = configuration.requested_transport(**options)
+        configs, _ = generate_configs(SOURCE, m['root'], m['port_base'], m['authority'], 'spare-rdma',
+                                       profile='gc-14', gc=m['gc'], file_api=True, **options)
+        self.assertEqual(profile_config_problems(m, configs), [])
+        self.assertEqual(configuration.transport_listeners(m, node=10014),
+                         [('127.0.0.1', 14516), ('192.0.2.17', 14530)])
+        self.assertEqual(len(set(configuration.transport_listeners(m))), 31)
+        for node in (10001, 10013, 10014):
+            stem = f'storage-{node}'
+            self.assertEqual(configs[stem + '.toml']['server']['base']['groups'][1]['services'], ['StorageSerde'])
+            for path, value in (('server.storage.ec_rmw_transport.force_use_tcp', False),
+                                ('server.storage.ec_rmw_client.net_client.force_use_tcp', True),
+                                ('server.forward_client.force_use_tcp', True)):
+                changed = copy.deepcopy(configs)
+                configuration.put(changed[stem + '.toml'], path, value)
+                self.assertTrue(profile_config_problems(m, changed))
+        initialized = dict(schema=1, cluster_id='fixed', data_transport=copy.deepcopy(m['data_transport']))
+        configuration.validate_initialized_profile(dict(m, cluster_id='fixed'), initialized)
+        wrong = dict(initialized, data_transport=dict(m['data_transport'], ib_device='mlx5_1'))
+        with self.assertRaises(ValueError):
+            configuration.validate_initialized_profile(dict(m, cluster_id='fixed'), wrong)
 
     def test_fourteen_inventory_twelve_placement_and_legacy_unchanged(self):
         m = manifest()

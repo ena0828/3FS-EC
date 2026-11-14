@@ -35,6 +35,7 @@ def adapter():
             self.processes.append((name, self.fake))
     namespace = dict(Base=Base, SPARE_GC_PROFILE=SPARE_GC_PROFILE, storage_specs=storage_specs,
                      managed_id=domain.identifier, Path=Path, uuid=uuid, json=json,
+                     validate_launch_profile=mock.Mock(),  # Profile I/O is covered by the RDMA preflight suite.
                      artifact_identity=mock.Mock(side_effect=AssertionError('unexpected binary observation')),
                      observe_owned_executable=mock.Mock(side_effect=AssertionError('unexpected proc observation')))
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), '<actual-native-methods>', 'exec'), namespace)
@@ -55,6 +56,7 @@ class PortableContracts(unittest.TestCase):
         cls, namespace = adapter()
         value = cls()
         value.manifest = {'profile': 'v2', 'root': '/unused', 'port_base': 14000}
+        value.root = Path('/unused')
         value.managed_uncertain = False
         value.managed = None
         value.fake = object()
@@ -63,6 +65,7 @@ class PortableContracts(unittest.TestCase):
         # the actual legacy branch; the new Linux owned-child cases test observation.
         namespace['storage_specs'] = lambda m: [{'name': 'storage', 'stem': 'storage'}]
         self.assertIs(value.start('storage', ['unchanged-legacy-command']), value.fake)
+        namespace['validate_launch_profile'].assert_called_once_with(value.root, value.manifest)
         namespace['artifact_identity'].assert_not_called()
         namespace['observe_owned_executable'].assert_not_called()
 

@@ -6,13 +6,13 @@ import io
 import os
 import signal
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 HERE = Path(__file__).resolve().parent
@@ -39,6 +39,150 @@ class RunnerTest(unittest.TestCase):
 
     def calls(self):
         return [json.loads(line) for line in (self.root / "fake-invocations.jsonl").read_text().splitlines()]
+
+    def rdma_profile(self):
+        import native_v2_config as profile
+        # The generated server settings are Linux paths; the fake CLI journals
+        # themselves remain real host-native files under the test's private root.
+        self.enterContext(patch.object(profile, "Path", PurePosixPath))
+        authority = "11111111-1111-1111-1111-111111111111"
+        gc = {"authority": "22222222-2222-2222-2222-222222222222",
+              "key_id": "33333333-3333-3333-3333-333333333333",
+              "client_namespace": "44444444-4444-4444-4444-444444444444",
+              "data_protocol": 2, "disk_format": 3, "gc_protocol": 2}
+        choice = dict(transport="rdma", rdma_interface="eth0", rdma_address="192.0.2.10", rdma_device="mlx5_0")
+        configs, _ = profile.generate_configs(HERE.parents[2], self.root, 20000, authority, "FAKE_ONLY",
+                                               profile="gc", gc=gc, file_api=True, **choice)
+        (self.root / "config").mkdir(mode=0o700)
+        (self.root / "state").mkdir(mode=0o700)
+        for name, value in configs.items():
+            folder = "client" if name in ("stripe-client.toml", "file-client.toml") else "config"
+            (self.root / folder / name).write_text(profile.to_toml(value), encoding="utf-8")
+        manifest = {"schema": 1, "profile": profile.GC_PROFILE, "file_api": True, "gc": gc,
+                    "root": str(self.root), "port_base": 20000, "authority": authority, "cluster_id": "FAKE_ONLY",
+                    "data_transport": profile.requested_transport(**choice)}
+        (self.root / "cluster.json").write_bytes(mod.json_data(manifest))
+        (self.root / "state/initialized.json").write_bytes(mod.json_data({
+            "schema": 1, "cluster_id": "FAKE_ONLY", "data_transport": manifest["data_transport"]}))
+        return manifest
+
+    def test_rdma_case_binds_actual_commands_outside_native_journals(self):
+        manifest = self.rdma_profile()
+        r = self.runner()
+        r.case("bound", "kv112", "helper", 2, "direct")
+        self.assertEqual(len(self.calls()), 5)
+        for call in self.calls():
+            self.assertEqual(call["options"]["config.storage_transport"], "rdma")
+            self.assertNotIn("transport", mod.load_json(Path(call["run"]) / "record.json"))
+        bindings = list((self.root / "client/transport-bindings").glob("*.json"))
+        self.assertEqual(len(bindings), 3)
+        for path in bindings:
+            value = mod.load_json(path)
+            self.assertEqual(value["profile"]["data_transport_requested"], manifest["data_transport"])
+            self.assertEqual(value["profile"]["transport_validation"], "configuration_only")
+            self.assertEqual(Path(value["run_dir"]).parent, r.runs)
+        result = r.summary("passed")
+        self.assertEqual(result["transport"], r.transport)
+        self.assertFalse(result["performance_validated"])
+        self.assertTrue(result["checks"][0]["readback"]["remote_released"])
+
+    def test_rdma_drift_and_unbound_recovery_are_rejected_before_child(self):
+        self.rdma_profile()
+        r = self.runner()
+        run = r.runs / "unstarted"
+        with patch.object(mod.subprocess, "Popen") as popen:
+            manifest_path = self.root / "cluster.json"
+            manifest_bytes = manifest_path.read_bytes()
+            changed_manifest = json.loads(manifest_bytes)
+            changed_manifest["schema"] = True
+            manifest_path.write_bytes(mod.json_data(changed_manifest))
+            with self.assertRaisesRegex(mod.CheckError, "matching prepared native root"):
+                r.invoke(run, "new-write")
+            manifest_path.write_bytes(manifest_bytes)
+            with self.assertRaisesRegex(mod.CheckError, "per-command override"):
+                r.invoke(run, "new-write", storage_transport="tcp")
+            original = r.config.read_bytes()
+            r.config.write_bytes(original + b"\n# changed experiment condition\n")
+            with self.assertRaisesRegex(mod.CheckError, "changed during"):
+                r.invoke(run, "new-write")
+            r.config.write_bytes(original)
+            run.mkdir(mode=0o700)
+            with self.assertRaisesRegex(mod.CheckError, "no wrapper transport binding"):
+                r.invoke(run, "resume")
+            popen.assert_not_called()
+        self.assertFalse((self.root / "client/transport-bindings").exists())
+        self.assertEqual(list(run.iterdir()), [])
+        other = self.root / "client/other.toml"
+        other.write_bytes(original)
+        with self.assertRaisesRegex(mod.CheckError, "external override"):
+            mod.Runner(self.root, config=other)
+
+    def test_rdma_record_only_failure_keeps_original_binding_for_resume(self):
+        self.rdma_profile()
+        r = self.runner("record-only")
+        run = r.runs / "record-only"
+        info = mod.sample_info(self.root, "kv112")
+        with self.assertRaisesRegex(mod.CheckError, "CLI failed with exit2"):
+            r.invoke(run, "new-write", input_file=info[0], remote_path="/ec-lab/record-only", shard_bytes=info[2])
+        before = (run / "record.json").read_bytes()
+        original = {p.name: p.read_bytes() for p in (self.root / "client/transport-bindings").iterdir()}
+        resumed = self.runner()
+        resumed.invoke(run, "resume")
+        mod.published(run, info)
+        self.assertEqual((run / "record.json").read_bytes(), before)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.root / "client/transport-bindings").iterdir()}, original)
+        self.assertEqual([item["command"] for item in self.calls()], ["new-write", "resume"])
+        binding_path = next((self.root / "client/transport-bindings").iterdir())
+        binding_bytes = binding_path.read_bytes()
+        for nested in (False, True):
+            changed = json.loads(binding_bytes)
+            if nested:
+                changed["profile"]["data_transport_requested"]["schema"] = True
+            else:
+                changed["schema"] = True
+            binding_path.write_bytes(mod.json_data(changed))
+            with patch.object(mod.subprocess, "Popen") as popen, \
+                 self.assertRaisesRegex(mod.CheckError, "binding differs"):
+                resumed.invoke(run, "resume")
+            popen.assert_not_called()
+        binding_path.write_bytes(binding_bytes)
+        with self.assertRaisesRegex(mod.CheckError, "continued as an unbound TCP"):
+            mod.bind_transport_run(self.root, run, None, resumed.cli)
+
+    def test_rdma_file_wrapper_and_formal_child_owner_use_same_bound_config(self):
+        self.rdma_profile()
+        def load(name, filename):
+            spec = importlib.util.spec_from_file_location(name, HERE / filename)
+            value = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(value)
+            return value
+        wrapper = load("rdma_file_wrapper", "file-command.py")
+        transport = load("rdma_formal_child", "ack-service-acceptance.py")
+        run = self.root / "client/new-file-operation"
+        args = wrapper.parser().parse_args(["--root", str(self.root), "--show-command", "create",
+                                            "--run-dir", str(run), "--path", "/ec-lab/rdma-file"])
+        argv = wrapper.command(args)
+        self.assertIn("--config.storage_transport=rdma", argv)
+        self.assertFalse(run.exists())
+        self.assertFalse((self.root / "client/transport-bindings").exists())
+        r = mod.Runner(self.root, config=self.root / "client/file-client.toml")
+        proc = Mock(pid=123, returncode=0)
+        proc.poll.return_value = 0
+        with patch.object(transport.os, "O_NOFOLLOW", getattr(os, "O_NOFOLLOW", 0), create=True), \
+             patch.object(transport.subprocess, "Popen", return_value=proc) as popen:
+            changed = [arg.replace("--config.storage_transport=rdma", "--config.storage_transport=tcp") for arg in argv]
+            with self.assertRaisesRegex(RuntimeError, "differs from prepared"):
+                transport.command(r, mod, changed)
+            popen.assert_not_called()
+            self.assertEqual(transport.command(r, mod, argv), "")
+            self.assertEqual(popen.call_args.args[0], argv)
+        proc.wait.assert_called_once()
+        self.assertIsNone(r.child)
+        self.assertFalse(run.exists())  # Only the native process may create this path.
+        self.assertEqual(len(list((self.root / "client/transport-bindings").glob("*.json"))), 1)
+        self.assertEqual(r.commands[0]["transport"]["transport_validation"], "configuration_only")
+        control = mod.Runner(self.root, config=self.root / "config/admin_cli.toml")
+        self.assertIsNone(control.check_transport())
 
     def test_root_is_mandatory_and_preserves_explicit_paths(self):
         with contextlib.redirect_stderr(io.StringIO()):

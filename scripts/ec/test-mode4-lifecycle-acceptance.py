@@ -2,7 +2,9 @@
 """Pure ordering and evidence tests; no native process, mount or signal."""
 import importlib.util
 import errno
+import copy
 from pathlib import Path
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -44,6 +46,34 @@ class FakeLifecycle:
 
 
 class TestMode4Lifecycle(unittest.TestCase):
+    def test_prepared_transport_matches_initialized_user_and_same_mount_profile(self):
+        scripts = Path(__file__).parent / "cluster"
+        with mock.patch.object(sys, "path", [str(scripts), *sys.path]):
+            from native_v2_config import requested_transport
+            tcp = {"schema": 1, "cluster_id": "fixed", "authenticated_user": {"uid": 2345, "gid": 3456}}
+            DRIVER.validate_prepared_profile(tcp, copy.deepcopy(tcp), {})
+            transport = requested_transport(transport="rdma", rdma_interface="enp2s0",
+                                            rdma_address="192.0.2.10", rdma_device="mlx5_0")
+            manifest = dict(tcp, data_transport=transport)
+            initialized = copy.deepcopy(manifest)
+            receipt = {"data_transport_requested": copy.deepcopy(transport),
+                       "transport_validation": "configuration_only"}
+            DRIVER.validate_prepared_profile(manifest, initialized, receipt)
+            changed_device = dict(transport, ib_device="mlx5_1")
+            cases = (
+                (manifest, tcp, receipt), (tcp, initialized, {}),
+                (manifest, dict(initialized, data_transport=changed_device), receipt),
+                (manifest, dict(initialized, authenticated_user={"uid": 2345, "gid": 3457}), receipt),
+                (manifest, initialized, {}), (tcp, tcp, receipt),
+                (manifest, initialized, dict(receipt, transport_validation="validated")),
+                (manifest, initialized, dict(receipt, data_transport_requested=changed_device)),
+                (manifest, initialized, dict(receipt, data_transport_requested=dict(transport, schema=True))),
+                (manifest, initialized, dict(receipt, data_transport_requested=None)),
+            )
+            for index, (current, prior, prepared) in enumerate(cases):
+                with self.subTest(index=index), self.assertRaises(ValueError):
+                    DRIVER.validate_prepared_profile(current, prior, prepared)
+
     def test_diagnostic_entries_require_completion_and_exact_expected_refusals(self):
         path = Path('/mount/file')
         def receipt(events):

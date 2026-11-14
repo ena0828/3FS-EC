@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """易读的 EC 文件命令入口；打印等价命令后以 exec 交给原生客户端。"""
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,13 @@ import sys
 
 
 RIGHTS = {"read": 1, "write": 2, "read-write": 3}
+
+
+def transport_module():
+    spec = importlib.util.spec_from_file_location("file_experiment_transport", Path(__file__).with_name("experiment-runner.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def decimal(value):
@@ -86,6 +94,13 @@ def command(args):
     manifest = json.loads((root / "cluster.json").read_text(encoding="utf-8"))
     if manifest.get("file_api") is not True or manifest.get("root") != str(root):
         raise ValueError("此目录未明确配置文件 API；请使用新目录 prepare --profile gc --file-api")
+    # Keep the historical TCP command-only wrapper usable before packaging.
+    # An explicit RDMA profile must already have coherent prepared configs.
+    from native_v2_config import transport_settings
+    transport = transport_settings(manifest)
+    if transport is not None:
+        transport_module().prepared_transport(root, root / "client/file-client.toml", file_api=True,
+                                               require_initialized=False)
     options = {"run_dir": absolute(args.run_dir)}
     mapping = {"session": "session_run_dir", "offset": "offset_decimal", "input": "input_file",
                "output": "output_file", "length": "length_decimal", "path": "file_path",
@@ -110,6 +125,8 @@ def command(args):
         options["session_rights"] = RIGHTS[args.rights]
     if getattr(args, "metrics", None) is not None:
         options["repair_metrics"] = "true" if args.metrics else "false"
+    if transport is not None:
+        options["storage_transport"] = "rdma"
     if args.action == "create" and not args.path.startswith("/"):
         raise ValueError("--path 必须为 3FS 绝对路径")
     return [str(root / "bin/ec_file_cli"), f"--cfg={root / 'client/file-client.toml'}",
@@ -129,6 +146,9 @@ def main():
         return 0
     if sys.platform != "linux":
         raise ValueError("实际运行须在 Linux/WSL 中进行")
+    module = transport_module()
+    binding = module.prepared_transport(args.root, args.root / "client/file-client.toml", file_api=True)
+    module.bind_transport_run(args.root, args.run_dir, binding, [argv[0]])
     # No timer, sampling thread, retry or identity generation survives exec.
     # The native journal owns operation and recovery semantics.
     os.execve(argv[0], argv, environment)
@@ -137,6 +157,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         print(f"未启动原生操作：{error}", file=sys.stderr)
         sys.exit(2)
