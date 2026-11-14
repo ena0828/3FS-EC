@@ -26,10 +26,11 @@ def case_name(strategy, failures):
     return strategy + '-' + str(failures)
 
 
-def command(source, build, fdb, core, parent, strategy, failures):
+def command(source, build, fdb, core, parent, strategy, failures, transport=None):
     return [sys.executable, '-B', source / 'scripts/ec/ci/run-spare-lab.py',
             '--source', source, '--build', build, '--fdb-bin-dir', fdb, '--core-record', core,
-            '--local-work', parent, '--strategy', strategy, '--failures', str(failures)]
+            '--local-work', parent, '--strategy', strategy, '--failures', str(failures),
+            *shared.transport_cli_args(transport)]
 
 
 def fixed_prefix(rows):
@@ -40,10 +41,11 @@ def fixed_prefix(rows):
                 'matrix cases must be a unique fixed-order prefix')
 
 
-def complete_gate(rows):
+def complete_gate(rows, transport=None):
     fixed_prefix(rows)
     require(len(rows) == len(CASES), 'six actual cases required')
     for row in rows:
+        require(shared.request_transport(row) == transport, 'case transport differs from the fixed matrix selection')
         require(row.get('status') == 'passed' and type(row.get('returncode')) is int and row['returncode'] == 0
                 and row.get('complete_receipts_verified') is True
                 and row.get('all_owned_processes_exited') is True,
@@ -66,7 +68,7 @@ def identity_gate(rows):
     require(len(actions) == 3 * len(rows) and len(set(actions)) == len(actions), 'matrix reused an action ID')
 
 
-def input_snapshot(source, build, fdb, core_path):
+def input_snapshot(source, build, fdb, core_path, transport=None):
     revision = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
     subprocess.run(['git', '-C', str(source), 'diff', '--exit-code', 'HEAD', '--ignore-submodules=all'],
                    stdout=subprocess.DEVNULL, check=True)
@@ -86,7 +88,33 @@ def input_snapshot(source, build, fdb, core_path):
             'backend': built['backend'], 'core': core, 'binaries': built['binaries'],
             'lab_build_sha256': sha(provenance / 'lab-build.json'),
             'native_build_sha256': sha(provenance / 'native-build.json'),
-            'drivers': {path: sha(source / path) for path in drivers}}
+            'drivers': {path: sha(source / path) for path in drivers}, **shared.transport_fields(transport)}
+
+
+def verify_transport_doctor(parent, lab, report, transport):
+    """Bind admission to the actual owned command output; not a data-transfer claim."""
+    if transport is None:
+        require('transport_doctor' not in report, 'TCP matrix has an unexpected RDMA doctor receipt')
+        return
+    value = report.get('transport_doctor')
+    require(type(value) is dict and set(value) == {'sequence', 'path', 'sha256', 'observation'}
+            and type(value['sequence']) is int and value['sequence'] == 1,
+            'missing first owned RDMA doctor observation')
+    path = parent / 'runtime/001-doctor.stdout'
+    require(value['path'] == str(path) and shared.canonical(path) == path and sha(path) == value['sha256'],
+            'RDMA doctor output differs from original command')
+    actual = read_json(path)
+    require(json.dumps(actual, sort_keys=True, separators=(',', ':')) ==
+            json.dumps(value['observation'], sort_keys=True, separators=(',', ':')),
+            'RDMA doctor observation differs from original output')
+    start_path = parent / 'runtime/001-doctor.started.json'
+    started = read_json(start_path)
+    require(started.get('argv') == ['/usr/bin/python3', '-B', str(lab / 'scripts/native-v2.py'),
+                                    'doctor', '--root', str(lab)], 'RDMA doctor executable or root changed')
+    commands = report.get('commands')
+    require(type(commands) is list and commands and commands[0].get('started') == str(start_path)
+            and commands[0].get('started_sha256') == sha(start_path), 'doctor is not bound to the command ledger')
+    spare.resource_gate(actual, transport=transport)
 
 
 def verify_case(parent, expected, strategy, failures, uid):
@@ -95,6 +123,8 @@ def verify_case(parent, expected, strategy, failures, uid):
     lab = parent / '3fs-ec-native-spare'
     request_path = parent / 'handoff-request.json'
     request = read_json(request_path)
+    transport = shared.request_transport(expected)
+    require(shared.request_transport(request) == transport, 'prepared case transport differs from matrix input')
     spare.local_shape(parent, request)
     marker = read_json(parent / 'handoff-complete.json')
     require(marker.get('request_sha256') == sha(request_path) and marker.get('ownership_changed') is False,
@@ -108,6 +138,7 @@ def verify_case(parent, expected, strategy, failures, uid):
             'case driver or selection differs')
     report_path = parent / 'runtime/result.json'
     report = read_json(report_path)
+    require(shared.request_transport(report) == transport, 'runtime transport differs from matrix input')
     require(report.get('status') == 'passed' and type(report.get('exitcode')) is int and report['exitcode'] == 0
             and report.get('business_passed') is True and report.get('cleanup_unknown', False) is False
             and not report.get('cleanup_error') and report.get('stop_method') == 'private_control'
@@ -120,16 +151,17 @@ def verify_case(parent, expected, strategy, failures, uid):
     require(report['case_result']['path'] == str(case_path) and report['case_result']['sha256'] == sha(case_path),
             'business receipt changed')
     ready, completed = report['ready'], report['completed']
-    spare.case_gate(case, ready, completed, lab, strategy, failures, uid)
+    spare.case_gate(case, ready, completed, lab, strategy, failures, uid, transport=transport)
     final = read_json(lab / 'state/last-supervisor.json')
     cleanup = read_json(lab / 'logs' / final['run'] / 'cleanup.json')
     require(final == report['final_supervisor_observation'] and cleanup == report['cleanup_observation'],
             'final supervisor receipt changed')
-    joined = spare.shutdown_gate(final, cleanup, completed, lab, report['supervisor_exitcode'])
+    joined = spare.shutdown_gate(final, cleanup, completed, lab, report['supervisor_exitcode'], transport=transport)
     require(joined == report['cleanup'], 'shutdown projection changed')
     commands = spare.command_records(parent / 'runtime', len(report['commands']))
     require(commands == report['commands'] and all(row['returncode'] == 0 for row in commands),
             'single-case commands did not all join successfully')
+    verify_transport_doctor(parent, lab, report, transport)
     for control in case['controls']:
         if control.get('operation') in {'fault-storage', 'replace-placement', 'restart-storage'}:
             action = control['fixed_action']
@@ -148,6 +180,9 @@ def verify_case(parent, expected, strategy, failures, uid):
             require(value['sha256'] == expected['binaries'][Path(path).name], 'packaged binary differs from matrix build')
     cluster = read_json(lab / 'cluster.json')
     initialized = read_json(lab / 'state/initialized.json')
+    shared.validate_lab_transport(lab, request, package=package, initialized=True,
+                                  observations=(ready, completed, final))
+    shared.validate_command_transports(lab, transport, case['commands'], allow_control=True)
     pool = json.loads((lab / 'state/physical-pool.json').read_text(), object_pairs_hook=shared.unique)
     require(pool == initialized.get('physical_pool') and type(pool) is list and len(pool) == 14,
             'original persistent instance inventory changed')
@@ -159,15 +194,16 @@ def verify_case(parent, expected, strategy, failures, uid):
             'action_ids': [case['actions'][name]['action_id'] for name in ('fault', 'placement', 'restore')],
             'runtime_receipt': str(report_path), 'runtime_receipt_sha256': sha(report_path),
             'business_receipt': str(case_path), 'business_receipt_sha256': sha(case_path),
-            'complete_receipts_verified': True, **joined}
+            'complete_receipts_verified': True, **shared.transport_fields(transport), **joined}
 
 
-def execute_cases(rows, run_case):
+def execute_cases(rows, run_case, transport=None):
     """Stop at the first error; an unrun suffix is never represented as passing."""
     require(rows == [], 'matrix cannot resume or adopt previous cases')
     for strategy, failures in CASES:
         rows.append({'strategy': strategy, 'failures': failures, 'status': 'attempting', 'returncode': None})
         value = run_case(strategy, failures)
+        require(shared.request_transport(value) == transport, 'case transport changed within the serial matrix')
         require(value.get('strategy') == strategy and type(value.get('failures')) is int
                 and value['failures'] == failures and value.get('status') == 'passed'
                 and type(value.get('returncode')) is int and value['returncode'] == 0
@@ -175,13 +211,14 @@ def execute_cases(rows, run_case):
                 'case completion evidence insufficient')
         identity_gate([*rows[:-1], value])
         rows[-1] = value
-    complete_gate(rows)
+    complete_gate(rows, transport)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('source', 'build', 'fdb-bin-dir', 'core-record', 'work'):
         parser.add_argument('--' + name, type=Path, required=True)
+    shared.add_transport_arguments(parser)
     args = parser.parse_args()
     require(sys.version_info >= (3, 11), 'Python 3.11 or newer required')
     require(sys.platform == 'linux' and os.getuid() == os.geteuid() > 0 and os.getgid() == os.getegid(),
@@ -200,6 +237,9 @@ def main():
     require(all(len(os.fsencode(args.work / 'cases' / case_name(s, n) / '3fs-ec-native-spare/state/control.sock')) < 104
                 for s, n in CASES), 'matrix path exceeds Unix control socket limit; use a shorter private parent')
     inputs = input_snapshot(source, build, fdb, core)
+    # Validate the source revision and clean tree before importing its transport helpers.
+    transport = shared.lab_transport_selection(args, source)
+    inputs.update(shared.transport_fields(transport))
     args.work.mkdir(mode=0o700)
     for name in ('cases', 'commands'):
         (args.work / name).mkdir(mode=0o700)
@@ -210,18 +250,19 @@ def main():
     report = {'schema': 1, 'status': 'running', 'exitcode': 1, 'inputs': inputs, 'cases': [],
               'expected_cases': [{'strategy': s, 'failures': n} for s, n in CASES],
               'uid': os.geteuid(), 'gid': os.getegid(), 'performance_validated': False,
-              'physical_machine_failure_domains': 1, 'physical_disk_or_power_failure_tested': False}
+              'physical_machine_failure_domains': 1, 'physical_disk_or_power_failure_tested': False,
+              **shared.transport_fields(transport)}
     try:
         def run_case(strategy, failures):
             owner.checkpoint()
-            require(input_snapshot(source, build, fdb, core) == inputs, 'matrix inputs changed before case')
+            require(input_snapshot(source, build, fdb, core, transport) == inputs, 'matrix inputs changed before case')
             parent = args.work / 'cases' / case_name(strategy, failures)
-            owner.command(case_name(strategy, failures), command(source, build, fdb, core, parent, strategy, failures))
+            owner.command(case_name(strategy, failures), command(source, build, fdb, core, parent, strategy, failures, transport))
             value = verify_case(parent, inputs, strategy, failures, os.geteuid())
-            require(input_snapshot(source, build, fdb, core) == inputs, 'matrix inputs changed after case')
+            require(input_snapshot(source, build, fdb, core, transport) == inputs, 'matrix inputs changed after case')
             shared.write_new(args.work / (case_name(strategy, failures) + '.json'), value)
             return value
-        execute_cases(report['cases'], run_case)
+        execute_cases(report['cases'], run_case, transport)
         owner.checkpoint()
         report.update(status='passed', exitcode=0)
     except BaseException as error:

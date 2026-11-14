@@ -46,7 +46,8 @@ def ledger(rows):
     return result
 
 
-def status_gate(value, root, run=None):
+def status_gate(value, root, run=None, transport=None):
+    shared.require_transport_observation(value, transport)
     require(type(value.get('schema')) is int and value['schema'] == 1
             and value.get('profile') == PROFILE and value.get('root') == str(root)
             and value.get('stage') == 'ready' and value.get('failure') is None
@@ -65,8 +66,8 @@ def status_gate(value, root, run=None):
     return ledger(value.get('processes'))
 
 
-def ready_gate(value, root):
-    rows = status_gate(value, root)
+def ready_gate(value, root, transport=None):
+    rows = status_gate(value, root, transport=transport)
     require(len(rows) == 17 and {name for name, _ in rows} == NAMES
             and all(code is None for code in rows.values())
             and value['maintenance'].get('expected_exits') == []
@@ -90,9 +91,9 @@ def case_cleanup_known(value, ready, strategy, failures, expected_uid=1000):
             and value.get('supervisor_run') == ready['run'] and command_joins(value))
 
 
-def case_gate(value, ready, completed, root, strategy, failures, expected_uid=1000):
+def case_gate(value, ready, completed, root, strategy, failures, expected_uid=1000, transport=None):
     """Bind the formal driver's proof, not a second implementation of repair/T2."""
-    initial = ready_gate(ready, root)
+    initial = ready_gate(ready, root, transport)
     require(type(value.get('schema')) is int and value['schema'] == 1
             and value.get('state') == 'completed' and value.get('success') is True
             and value.get('failure') is None and value.get('strategy') == strategy
@@ -132,7 +133,7 @@ def case_gate(value, ready, completed, root, strategy, failures, expected_uid=10
         require(observations and observations[-1].get('request') == action
                 and observations[-1].get('state') == 'completed'
                 and observations[-1].get('cleanup_or_T2_claimed') is False, 'controller action not confirmed')
-    actual = status_gate(completed, root, ready['run'])
+    actual = status_gate(completed, root, ready['run'], transport)
     require(set(initial) <= set(actual) and len(actual) == 18 + failures, 'complete process history missing')
     killed = {(name, pid): -9 for name, pid in initial if name in {f'storage-{n}' for n in nodes}}
     old_meta = next(key for key in initial if key[0] == 'meta')
@@ -157,7 +158,9 @@ def case_gate(value, ready, completed, root, strategy, failures, expected_uid=10
     return actual
 
 
-def shutdown_gate(final, cleanup, completed, root, supervisor_code):
+def shutdown_gate(final, cleanup, completed, root, supervisor_code, transport=None):
+    shared.require_transport_observation(completed, transport)
+    shared.require_transport_observation(final, transport)
     before = ledger(completed.get('processes'))
     after = ledger(final.get('processes'))
     require(supervisor_code == 0 and type(final.get('schema')) is int and final['schema'] == 1
@@ -176,7 +179,7 @@ def shutdown_gate(final, cleanup, completed, root, supervisor_code):
             'fdb_exitcode': next(code for (name, _), code in after.items() if name == 'fdb')}
 
 
-def resource_gate(doctor):
+def resource_gate(doctor, transport=None):
     observations = doctor.get('observations', {})
     require(doctor.get('profile') == PROFILE and doctor.get('status') == 'ready' and doctor.get('problems') == []
             and doctor.get('services_started') is False
@@ -185,6 +188,7 @@ def resource_gate(doctor):
             and observations.get('free_bytes', 0) >= 10 * 1024**3
             and observations.get('free_inodes', 0) >= 60000
             and observations.get('active_build_processes') == [], 'gc14 startup resource gate failed')
+    shared.validate_transport_doctor(doctor, transport)
 
 
 def resolution_gate(backend, text, lab):
@@ -287,6 +291,7 @@ def runtime(parent):
     sys.path.insert(0, str(lab / 'scripts'))
     owner_module = shared.module(parent / 'tools/fuse-read-acceptance.py', 'spare_command_owner')
     native = shared.module(lab / 'scripts/native-v2.py', 'spare_native_supervisor')
+    transport = shared.request_transport(request)  # The inventory-checked bundle has now loaded its config helper.
     output = parent / 'runtime'
     output.mkdir(mode=0o700)
     owner = owner_module.Owner(output)
@@ -299,7 +304,7 @@ def runtime(parent):
               'native_build_sha256': request['native_build_sha256'],
               'execution_mode': request.get('execution_mode', 'hosted-handoff'),
               'backend_validation': request['backend_validation'],
-              'physical_machine_failure_domains': 1}
+              'physical_machine_failure_domains': 1, **shared.transport_fields(transport)}
     supervisor, log, ready, completed = None, None, None, None
     case_started, safe_stop = False, True
     result_path = lab / 'client/spare-fault-acceptance/report/result.json'
@@ -310,10 +315,21 @@ def runtime(parent):
                     or resource.getrlimit(which)[0] >= minimum, 'runtime resource limit insufficient')
         os.environ.pop('LD_PRELOAD', None)
         os.environ['LD_LIBRARY_PATH'] = str(lab / 'lib')
+        packages = list((lab / 'provenance').glob('services-*/manifest.json'))
+        require(len(packages) == 1 and sha(packages[0]) == request['package_manifest_sha256'],
+                'prepared package receipt changed')
+        package = read_json(packages[0])
+        shared.validate_lab_transport(lab, request, package=package)
         STAGE = 'doctor'
         owner.checkpoint()
-        resource_gate(json.loads(owner.command('doctor', [sys.executable, '-B', lab / 'scripts/native-v2.py',
-                                                         'doctor', '--root', lab]), object_pairs_hook=shared.unique))
+        doctor = json.loads(owner.command('doctor', [sys.executable, '-B', lab / 'scripts/native-v2.py',
+                                                   'doctor', '--root', lab]), object_pairs_hook=shared.unique)
+        resource_gate(doctor, transport)
+        if transport is not None:
+            doctor_path = output / f'{owner.sequence:03}-doctor.stdout'
+            require(read_json(doctor_path) == doctor, 'doctor stdout differs from parsed observation')
+            report['transport_doctor'] = {'sequence': owner.sequence, 'path': str(doctor_path),
+                                          'sha256': sha(doctor_path), 'observation': doctor}
         owner.checkpoint()
         STAGE = 'packaged-loader'
         resolution_gate(request['backend'], owner.command('packaged-ldd', ['ldd', lab / 'bin/storage_main']).decode('utf-8'), lab)
@@ -336,11 +352,12 @@ def runtime(parent):
                 time.sleep(0.25)
                 continue
             if value.get('stage') == 'ready':
-                ready_gate(value, lab)
+                ready_gate(value, lab, transport)
                 ready = value
                 break
             time.sleep(0.25)
         require(ready is not None, 'native readiness timed out')
+        shared.validate_lab_transport(lab, request, package=package, initialized=True, observations=(ready,))
         report['ready'] = ready
         report['ready_process_identities'] = [dict(name=row['name'], **shared.process_identity(row['pid']))
                                              for row in ready['processes']]
@@ -353,7 +370,9 @@ def runtime(parent):
         value = read_json(result_path)
         safe_stop = case_cleanup_known(value, ready, request['strategy'], request['failures'], os.geteuid())
         completed = native.request_control(lab, 'status')
-        case_gate(value, ready, completed, lab, request['strategy'], request['failures'], os.geteuid())
+        case_gate(value, ready, completed, lab, request['strategy'], request['failures'], os.geteuid(), transport)
+        shared.validate_lab_transport(lab, request, package=package, initialized=True, observations=(ready, completed))
+        shared.validate_command_transports(lab, transport, value['commands'], allow_control=True)
         require(value.get('file_driver_sha256') == sha(lab / 'scripts/file-cli-acceptance.py'), 'file driver receipt differs')
         for row in value['controls']:
             if row.get('operation') in {'fault-storage', 'restart-storage', 'replace-placement'}:
@@ -396,6 +415,7 @@ def runtime(parent):
                         reply = native.request_control(lab, 'stop')
                         require(reply.get('root') == str(lab) and (ready is None or reply.get('run') == ready['run']),
                                 'stop response belongs to another supervisor')
+                        shared.require_transport_observation(reply, transport)
                         report['stop_method'] = 'private_control'
                     except Exception as error:
                         report['stop_control_error'] = type(error).__name__
@@ -411,8 +431,14 @@ def runtime(parent):
                 cleanup = read_json(lab / 'logs' / final['run'] / 'cleanup.json')
                 report['cleanup_observation'] = cleanup
                 if completed is not None:
-                    report['cleanup'] = shutdown_gate(final, cleanup, completed, lab, supervisor.returncode)
+                    report['cleanup'] = shutdown_gate(final, cleanup, completed, lab, supervisor.returncode, transport)
                 if report.get('business_passed') and not report.get('cleanup_unknown'):
+                    shared.validate_lab_transport(lab, request, package=package, initialized=True, observations=(final,))
+                    shared.validate_command_transports(lab, transport, value['commands'], allow_control=True)
+                    if transport is not None:
+                        proof = report['transport_doctor']
+                        require(sha(output / f"{proof['sequence']:03}-doctor.stdout") == proof['sha256'],
+                                'doctor stdout changed after admission')
                     require(report.get('stop_method') == 'private_control', 'normal control stop was not confirmed')
                     report['commands'] = command_records(output, owner.sequence)
                     require(all(row['returncode'] == 0 for row in report['commands']), 'owned command failed')
@@ -443,6 +469,12 @@ def runtime(parent):
     return report['exitcode']
 
 
+def native_prepare_command(source, lab, transport=None):
+    return [sys.executable, '-B', source / 'scripts/ec/cluster/native-v2.py', 'prepare', '--root', lab,
+            '--source', source, '--profile', 'gc-14', '--file-api', '--port-base', '14500',
+            *shared.transport_cli_args(transport)]
+
+
 def prepare(args):
     global STAGE
     STAGE = 'source'
@@ -471,6 +503,7 @@ def prepare(args):
     require(local or revision == os.environ['GITHUB_SHA'], 'source is not triggering revision')
     subprocess.run(['git', '-C', str(source), 'diff', '--exit-code', 'HEAD', '--ignore-submodules=all'],
                    stdout=subprocess.DEVNULL, check=True)
+    transport = shared.lab_transport_selection(args, source)
     STAGE = 'core'
     core = shared.core_gate(source, build, fdb, core_path)
     built_path = work / 'provenance/lab-build.json'
@@ -503,8 +536,7 @@ def prepare(args):
             owner.checkpoint()
             return value
         # Keep this case's listeners separate from the preceding file lab.
-        command('prepare', [sys.executable, '-B', source / 'scripts/ec/cluster/native-v2.py', 'prepare', '--root', lab,
-                            '--source', source, '--profile', 'gc-14', '--file-api', '--port-base', '14500'])
+        command('prepare', native_prepare_command(source, lab, transport))
         command('package', [sys.executable, '-B', source / 'scripts/ec/package-services.py', '--build', build,
                             '--output', lab, '--native-gc'])
         manifests = list((lab / 'provenance').glob('services-*/manifest.json'))
@@ -540,7 +572,8 @@ def prepare(args):
                    'package_manifest_sha256': sha(manifests[0]), 'lab_build_sha256': sha(built_path),
                    'native_build_sha256': sha(work / 'provenance/native-build.json'),
                    'preparation_commands': command_records(output, owner.sequence),
-                   'inventory': shared.tree_rows(parent, os.geteuid())}
+                   'inventory': shared.tree_rows(parent, os.geteuid()), **shared.transport_fields(transport)}
+        shared.validate_lab_transport(lab, request, package=package)
         shared.write_new(parent / 'handoff-request.json', request)
         request_sha = sha(parent / 'handoff-request.json')
         if local:
@@ -584,6 +617,7 @@ def main():
     parser.add_argument('--local-work', type=Path, help='fresh private same-user work; no hosted environment or chown')
     parser.add_argument('--strategy', choices=('central', 'pipeline', 'helper'))
     parser.add_argument('--failures', type=int, choices=(1, 2))
+    shared.add_transport_arguments(parser)
     internal = parser.add_mutually_exclusive_group()
     internal.add_argument('--handoff', type=Path, help=argparse.SUPPRESS)
     internal.add_argument('--run-owned', type=Path, help=argparse.SUPPRESS)
@@ -594,6 +628,8 @@ def main():
     os.umask(0o077)
     sys.dont_write_bytecode = True
     os.environ.pop('LD_PRELOAD', None)
+    if args.handoff or args.run_owned:
+        shared.lab_transport_selection(args, None)  # Internal ownership transitions cannot override the sealed profile.
     if args.handoff:
         request = read_json(args.handoff / 'handoff-request.json')
         shared.privileged_handoff(args.handoff, args.request_sha256,

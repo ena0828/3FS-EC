@@ -20,7 +20,7 @@ PROFILE = "native-gc-local-14-storage-14-targets"
 BUNDLE_SCRIPTS = {
     "native_managed_domain.py": "5e8a91992d6bf8f2f54f30089d2145a100465885b8d356f70f89d69911527128",
     "experiment-runner.py": "0713bca4bba671a7323d3f0f7d554b8a2f29ff3783fb0daa5fa4b0b166c5a3a3",
-    "ack-service-acceptance.py": "3e07ea27761d15f1cbd1a6510d399cf3ce47700bf7366f185627a64006405e92",
+    "ack-service-acceptance.py": "917e014e41fe1a212dde83bb9badf81df715044997e82af6d146ff568a1cb630",
     "file-command.py": "fe112dc60a159b834c275372bf5b03ff48a540e9bb2e0ecda3dd42d80e9c765c",
     "native-v2.py": "facd989833b438ecd1daf1bc7a5a50eeef80091831d35a89ef40f960bad8cd4c",
     "native_v2_config.py": "b5010996619d84bded995a784d45d8b83d0262bb5e2b1ab095292f6774cef89c",
@@ -75,6 +75,11 @@ class FaultCase:
     def control(self, operation, action=None):
         a = self.a
         a.guard()
+        if action is not None:
+            fixed = a.w.load_json(a.folder / "actions.json")
+            require(type(fixed) is dict and action.get("run") == self.run and
+                    any(a.transport.typed(action) == a.transport.typed(value) for value in fixed.values()),
+                    "Control action differs from the original persisted intent")
         argv = [sys.executable, str(a.runner.root / "scripts/native-v2.py"), operation,
                 "--root", str(a.runner.root)]
         if action:
@@ -88,7 +93,8 @@ class FaultCase:
         item = {"index": index, "operation": operation, "fixed_action": action, "argv": argv}
         self.controls.append(item)
         try:
-            text = a.transport.command(a.runner, a.w, argv)
+            text = a.transport.supervisor_command(a.runner, a.w, argv, operation=operation,
+                                                 run=self.run if action is not None else None, action=action)
             item["observations"] = control_json(a.w, text)
             return item["observations"][-1]
         except BaseException as error:

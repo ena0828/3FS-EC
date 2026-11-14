@@ -10,6 +10,7 @@ Owner.command and final wait retain ownership without a local wall-clock cap;
 the enclosing workflow cap may interrupt them and is not a clean-stop proof.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -564,6 +565,221 @@ def module(path, name):
     return result
 
 
+@contextmanager
+def transport_config(scripts=None):
+    """Use the checked source/bundle helpers, without leaking an imported lab."""
+    if scripts is None:
+        scripts = Path(__file__).resolve().parents[1] / 'cluster'
+        if not (scripts / 'native_v2_config.py').is_file():
+            # Owned runtimes add their inventory-checked bundle/scripts first.
+            existing = sys.modules.get('native_v2_config')
+            require(existing is not None, 'runtime transport helper has not been loaded')
+            scripts = Path(existing.__file__).resolve().parent
+    saved_path = list(sys.path)
+    saved = {name: sys.modules.get(name) for name in ('generate', 'native_v2_config')}
+    try:
+        sys.path.insert(0, str(scripts))
+        sys.modules['generate'] = module(scripts / 'generate.py', 'generate')
+        config = module(scripts / 'native_v2_config.py', 'native_v2_config')
+        sys.modules['native_v2_config'] = config
+        yield config
+    finally:
+        sys.path[:] = saved_path
+        for name, value in saved.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+
+
+def same_transport_value(left, right):
+    # Python equality alone equates true and 1 in nested receipt objects.
+    return json.dumps(left, sort_keys=True, separators=(',', ':'), allow_nan=False) == \
+        json.dumps(right, sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+
+def checked_transport(config, manifest):
+    try:
+        return config.transport_settings(manifest)
+    except (ValueError, TypeError, KeyError):
+        raise GateError('invalid explicit lab transport') from None
+
+
+def add_transport_arguments(parser):
+    parser.add_argument('--transport', choices=('tcp', 'rdma'), default=None,
+                        help='new lab only: default TCP, or explicit strict RDMA')
+    parser.add_argument('--rdma-interface')
+    parser.add_argument('--rdma-address')
+    parser.add_argument('--rdma-device')
+
+
+def lab_transport_selection(args, source):
+    values = [getattr(args, name, None) for name in
+              ('transport', 'rdma_interface', 'rdma_address', 'rdma_device')]
+    if getattr(args, 'handoff', None) is not None or getattr(args, 'run_owned', None) is not None:
+        require(all(value is None for value in values), 'owned runtime cannot override prepared transport')
+        return None
+    with transport_config(Path(source) / 'scripts/ec/cluster') as config:
+        try:
+            return config.requested_transport(transport=values[0] if values[0] is not None else 'tcp',
+                                              rdma_interface=values[1], rdma_address=values[2], rdma_device=values[3])
+        except (ValueError, TypeError):
+            raise GateError('invalid new-lab transport arguments') from None
+
+
+def transport_fields(selection):
+    if selection is None:
+        return {}
+    with transport_config() as config:
+        actual = checked_transport(config, {'data_transport': selection})
+    require(same_transport_value(actual, selection), 'noncanonical requested lab transport')
+    return {'data_transport_requested': actual, 'transport_validation': 'configuration_only'}
+
+
+def transport_cli_args(selection):
+    if selection is None:
+        return []
+    value = transport_fields(selection)['data_transport_requested']
+    return ['--transport', 'rdma', '--rdma-interface', value['interface'],
+            '--rdma-address', value['ipv4'], '--rdma-device', value['ib_device']]
+
+
+def request_transport(request):
+    require(type(request) is dict, 'transport receipt must be an object')
+    fields = {'data_transport_requested', 'transport_validation'} & request.keys()
+    if not fields:
+        return None
+    require(fields == {'data_transport_requested', 'transport_validation'}
+            and request['transport_validation'] == 'configuration_only', 'incomplete lab transport receipt')
+    value = request['data_transport_requested']
+    require(value is not None, 'explicit null is not a TCP transport receipt')
+    actual = transport_fields(value)['data_transport_requested']
+    return actual
+
+
+def require_transport_observation(value, selection):
+    require(type(value) is dict, 'missing supervisor transport observation')
+    if selection is None:
+        require('data_transport' not in value, 'TCP supervisor acquired a transport override')
+    else:
+        require('data_transport' in value and same_transport_value(value['data_transport'], selection),
+                'supervisor transport differs from the prepared request')
+
+
+def validate_lab_transport(lab, request, package=None, initialized=False, observations=()):
+    """Read-only binding; neither a new sidecar nor a verbs-success claim."""
+    scripts = lab / 'scripts'
+    with transport_config(scripts) as config:
+        selection = request_transport(request)
+        cluster = read_json(lab / 'cluster.json')
+        require(same_transport_value(checked_transport(config, cluster), selection),
+                'cluster transport differs from the sealed request')
+        records = list((lab / 'provenance').glob('services-*/manifest.json'))
+        require(len(records) == 1, 'one transport-bound package required')
+        recorded = read_json(records[0])
+        require(sha(records[0]) == request['package_manifest_sha256'], 'transport package receipt changed')
+        require(package is None or same_transport_value(recorded, package), 'provided package receipt differs')
+        require(same_transport_value(request_transport(recorded), selection),
+                'package transport differs from the sealed request')
+        wrapper = module(scripts / 'experiment-runner.py', 'lab_transport_wrapper')
+        # Even TCP clients must not acquire RDMA by editing their TOML.
+        for name, file_api in (('stripe-client.toml', False), ('file-client.toml', True)):
+            if file_api and not config.file_api_enabled(cluster):
+                continue
+            binding = wrapper.prepared_transport(lab, lab / 'client' / name,
+                                                 file_api=file_api, require_initialized=initialized)
+            require(same_transport_value(None if binding is None else request_transport(binding), selection),
+                    'client transport differs from the sealed request')
+        if initialized:
+            config.validate_initialized_profile(cluster, read_json(lab / 'state/initialized.json'))
+        for observation in observations:
+            require_transport_observation(observation, selection)
+    return selection
+
+
+def validate_command_transports(lab, selection, commands, allow_control=False):
+    require(type(commands) is list and commands, 'missing actual transport command ledger')
+    scripts = lab / 'scripts'
+    with transport_config(scripts):
+        wrapper = module(scripts / 'experiment-runner.py', 'lab_command_transport_wrapper')
+        bindings = {}
+        for row in commands:
+            require(type(row) is dict and type(row.get('argv')) is list and row['argv']
+                    and all(type(arg) is str for arg in row['argv']), 'invalid actual transport command')
+            argv = row['argv']
+            if selection is None:
+                require('transport' not in row and row.get('kind') != 'supervisor_control',
+                        'TCP command acquired RDMA evidence')
+                modes = [arg for arg in argv if arg == '--config.storage_transport'
+                         or arg.startswith('--config.storage_transport=')]
+                require(modes in ([], ['--config.storage_transport=tcp']), 'TCP command requested another transport')
+                continue
+            if row.get('kind') == 'supervisor_control':
+                require(allow_control and 'transport' not in row, 'control command claimed a data transport')
+                ack = module(scripts / 'ack-service-acceptance.py', 'lab_control_transport_validator')
+                # These ledgers come from the fixed owned-runtime interpreter,
+                # which need not be the interpreter rereading them on the parent.
+                ack.validate_supervisor_command(lab, argv, expected_executable='/usr/bin/python3')
+                continue
+            require('kind' not in row and argv[0] in (str(lab / 'bin/ec_file_cli'), str(lab / 'bin/ec_stripe_cli')),
+                    'RDMA data command is not an original packaged CLI')
+            file_api = argv[0] == str(lab / 'bin/ec_file_cli')
+            cfg = lab / 'client' / ('file-client.toml' if file_api else 'stripe-client.toml')
+            flags = lambda name: [arg for arg in argv if arg == name or arg.startswith(name + '=')]
+            require(flags('--cfg') == ['--cfg=' + str(cfg)]
+                    and flags('--config.storage_transport') == ['--config.storage_transport=rdma']
+                    and len(flags('--config.run_dir')) == 1
+                    and flags('--config.run_dir')[0].startswith('--config.run_dir='),
+                    'actual data command transport/config/run differs')
+            run = canonical(Path(flags('--config.run_dir')[0].split('=', 1)[1]))
+            require(run.is_relative_to(lab / 'client') and run != lab / 'client', 'data run is outside the private client tree')
+            if file_api not in bindings:
+                bindings[file_api] = wrapper.prepared_transport(lab, cfg, file_api=file_api)
+            binding = bindings[file_api]
+            require(binding is not None and same_transport_value(request_transport(binding), selection)
+                    and same_transport_value(row.get('transport'), binding), 'actual command transport binding differs')
+            if 'run_dir' in row:
+                require(row['run_dir'] == str(run), 'command run fields disagree')
+            sidecar = lab / 'client/transport-bindings' / (hashlib.sha256(str(run).encode()).hexdigest() + '.json')
+            expected = {'schema': 1, 'run_dir': str(run), 'cli_prefix': [argv[0]], 'profile': binding}
+            require(same_transport_value(read_json(canonical(sidecar)), expected), 'original run transport sidecar missing or changed')
+
+
+def validate_transport_doctor(value, selection):
+    require(type(value) is dict and value.get('status') == 'ready' and value.get('problems') == []
+            and value.get('services_started') is False, 'transport doctor did not admit the prepared lab')
+    observations = value.get('observations', {})
+    if selection is None:
+        require('rdma' not in observations, 'TCP doctor acquired RDMA evidence')
+    else:
+        rdma = observations.get('rdma')
+        require(type(rdma) is dict and same_transport_value(rdma.get('requested'), selection)
+                and rdma.get('scope') == 'read-only device/resource admission; no verbs or data operation',
+                'doctor observation differs from the requested RDMA profile')
+
+
+def validate_fuse_transport(lab, selection, preparation, lifecycle=None):
+    require(same_transport_value(request_transport(preparation), selection), 'FUSE preparation transport differs')
+    if lifecycle is None:
+        return
+    path = lab.parent / 'fuse-config/preparation.json'
+    require(lifecycle.get('preparation') == str(path)
+            and lifecycle.get('source_sha256', {}).get(str(path)) == sha(path), 'FUSE receipt lost the fixed preparation')
+    mounts = lifecycle.get('mounts')
+    require(type(mounts) is list and len(mounts) == 2, 'missing two actual FUSE transport observations')
+    for row, key in zip(mounts, ('first_mount_argv', 'remount_argv')):
+        require(row.get('argv') == preparation[key], 'actual FUSE argv differs from prepared transport')
+    services = lifecycle.get('services')
+    require(type(services) is list and services, 'missing FUSE supervisor observations')
+    for row in services:
+        require_transport_observation(row.get('snapshot'), selection)
+    for name, digest in preparation['outputs'].items():
+        require(name in ('fuse-first.toml', 'fuse-resume.toml', 'launcher.toml')
+                and sha(path.parent / name) == digest
+                and lifecycle['source_sha256'].get(str(path.parent / name)) == digest,
+                'FUSE transport configuration changed across mounts')
+
+
 def copy_new(source, target, mode=0o600):
     canonical(source)
     before = sha(source)
@@ -948,6 +1164,7 @@ def runtime(parent):
     sys.path.insert(0, str(lab / 'scripts'))
     helper = module(lab / 'scripts/fuse-read-acceptance.py', 'lab_owner')
     native = module(lab / 'scripts/native-v2.py', 'lab_native')
+    selection = validate_lab_transport(lab, request)
     output = parent / 'runtime'
     output.mkdir(mode=0o700)
     owner = helper.Owner(output)
@@ -958,6 +1175,7 @@ def runtime(parent):
               'native_build_sha256': request['native_build_sha256'], 'lab_build_sha256': request['lab_build_sha256'],
               'backend_validation': request['backend_validation'],
               'core': request['core'], 'receipts': [], 'services_started': False, 'exitcode': 1}
+    report.update(transport_fields(selection))
     supervisor = None
     failure = None
     lifecycle_started = False
@@ -984,13 +1202,20 @@ def runtime(parent):
                 raise
             owner.checkpoint()
             return result
-        command('doctor', [sys.executable, '-B', lab / 'scripts/native-v2.py', 'doctor', '--root', lab])
+        doctor_raw = command('doctor', [sys.executable, '-B', lab / 'scripts/native-v2.py', 'doctor', '--root', lab])
+        doctor = json.loads(doctor_raw, object_pairs_hook=unique)
+        validate_transport_doctor(doctor, selection)
+        if selection is not None:
+            report['transport_doctor'] = {'sequence': owner.sequence,
+                'path': str(output / f'{owner.sequence:03}-doctor.stdout'),
+                'sha256': hashlib.sha256(doctor_raw).hexdigest(), 'observation': doctor}
         report['packaged_loader'] = {}
         for name in ('storage_main', 'hf3fs_fuse_main'):
             listing = command('packaged-loader', ['ldd', lab / 'bin' / name]).decode('utf-8')
             report['packaged_loader'][name] = resolution_gate(
                 request['backend_validation']['backend'], listing, lab, fuse=name == 'hf3fs_fuse_main')
         phase('bootstrap')
+        validate_lab_transport(lab, request)
         log = (output / 'supervisor.log').open('xb')
         try:
             supervisor = subprocess.Popen([sys.executable, '-B', str(lab / 'scripts/native-v2.py'),
@@ -1014,11 +1239,13 @@ def runtime(parent):
                     break
                 time.sleep(0.25)
             require(ready is not None, 'native readiness timed out')
+            validate_lab_transport(lab, request, initialized=True, observations=(ready,))
             ready_identities = {row['name']: process_identity(row['pid']) for row in ready['processes']}
             def healthy():
                 owner.checkpoint()
                 require(supervisor.poll() is None, 'owned supervisor exited')
                 now = native.request_control(lab, 'status')
+                require_transport_observation(now, selection)
                 require(now['stage'] == 'ready' and now['failure'] is None and now['run'] == ready['run']
                         and now['processes'] == ready['processes'] and now['root'] == str(lab)
                         and {row['name'] for row in now['processes']} == SERVICE_NAMES
@@ -1036,7 +1263,9 @@ def runtime(parent):
                 command('cli-' + cli_phase, [sys.executable, '-B', lab / 'scripts/file-cli-acceptance.py',
                                             '--root', lab, '--label', 'hosted-' + cli_phase, cli_phase])
                 receipt = lab / 'client/file-cli-acceptance' / ('hosted-' + cli_phase) / cli_phase / 'report/result.json'
-                require_cli_result(read_json(receipt))
+                cli_result = read_json(receipt)
+                require_cli_result(cli_result)
+                validate_command_transports(lab, selection, cli_result['commands'])
                 report['receipts'].append({'phase': cli_phase, 'path': str(receipt), 'sha256': sha(receipt)})
             healthy()
             command('flat-inputs', [sys.executable, '-B', lab / 'scripts/experiment-runner.py',
@@ -1047,7 +1276,9 @@ def runtime(parent):
                                    '--strategy', 'helper', '--delivery', 'direct', '--replacements', '2',
                                    '--sample', 'kv112'])
             receipt = flat_report / 'result.json'
-            stem = require_flat_direct_result(read_json(receipt), lab)
+            flat_result = read_json(receipt)
+            stem = require_flat_direct_result(flat_result, lab)
+            validate_command_transports(lab, selection, flat_result['commands'])
             # Re-read the actual native journals and bytes; a passed wrapper label
             # cannot replace fixed delivery, complete ACKs or a content check.
             flat = module(lab / 'scripts/experiment-runner.py', 'file_lab_flat_direct')
@@ -1077,6 +1308,8 @@ def runtime(parent):
             command('prepare-fuse', [sys.executable, '-B', lab / 'scripts/prepare-fuse-file.py', '--root', lab,
                     '--fuse-default', parent / 'fuse-default.toml', '--launcher-default', parent / 'launcher-default.toml',
                     '--output-dir', parent / 'fuse-config', '--mountpoint', mountpoint, '--create-new', '--shard-bytes', '65536'])
+            preparation = read_json(parent / 'fuse-config/preparation.json')
+            validate_fuse_transport(lab, selection, preparation)
             healthy()
             lifecycle_started = True
             command('mode4-lifecycle', [sys.executable, '-B', lab / 'scripts/mode4-lifecycle-acceptance.py',
@@ -1084,6 +1317,7 @@ def runtime(parent):
             receipt = parent / 'mode4/result.json'
             lifecycle = read_json(receipt)
             require_mount_result(lifecycle)
+            validate_fuse_transport(lab, selection, preparation, lifecycle)
             for probe in lifecycle['probes']:
                 proof = canonical(Path(probe['receipt']))
                 require(proof.is_relative_to(parent / 'mode4') and sha(proof) == probe['receipt_sha256'],
@@ -1134,6 +1368,22 @@ def runtime(parent):
         final = read_json(lab / 'state/last-supervisor.json')
         cleanup = read_json(lab / 'logs' / report['ready']['run'] / 'cleanup.json')
         require_shutdown(final, cleanup, report['ready']['run'], supervisor.returncode)
+        validate_lab_transport(lab, request, initialized=True, observations=(report['ready'], final))
+        if selection is not None:
+            proof = report['transport_doctor']
+            doctor_path = output / f"{proof['sequence']:03}-doctor.stdout"
+            require(proof['path'] == str(doctor_path) and sha(doctor_path) == proof['sha256']
+                    and same_transport_value(read_json(doctor_path), proof['observation']),
+                    'original RDMA doctor observation changed')
+            validate_transport_doctor(proof['observation'], selection)
+            for item in report['receipts']:
+                receipt_path = canonical(Path(item['path']))
+                require(sha(receipt_path) == item['sha256'], 'original transport receipt changed')
+                value = read_json(receipt_path)
+                if item['phase'] in ('basic', 'repair', 'flat-direct'):
+                    validate_command_transports(lab, selection, value['commands'])
+                elif item['phase'] == 'mode4-lifecycle':
+                    validate_fuse_transport(lab, selection, read_json(parent / 'fuse-config/preparation.json'), value)
         require(not helper.mounts_at(parent / 'mount'), 'mount still present after lifecycle')
         report.update(status='passed', exitcode=0, cleanup=cleanup)
     except BaseException as error:
@@ -1186,6 +1436,7 @@ def prepare(args):
     require(local or revision == os.environ['GITHUB_SHA'], 'source is not the triggering revision')
     subprocess.run(['git', '-C', str(source), 'diff', '--exit-code', 'HEAD', '--ignore-submodules=all'], check=True,
                    stdout=subprocess.DEVNULL)
+    selection = lab_transport_selection(args, source)
     phase('core')
     core = core_gate(source, build, fdb, core_path)
     phase('lab-build')
@@ -1220,6 +1471,7 @@ def prepare(args):
                         '--root', lab, '--source', source, '--profile', 'gc', '--file-api', '--port-base', '13500']
         if local:
             prepare_argv.extend(['--user-uid', str(os.geteuid()), '--user-gid', str(os.getegid())])
+        prepare_argv.extend(transport_cli_args(selection))
         command('prepare', prepare_argv)
         command('package', [sys.executable, '-B', source / 'scripts/ec/package-services.py', '--build', build,
                            '--output', lab, '--native-gc', '--ec-file-mount'])
@@ -1255,6 +1507,8 @@ def prepare(args):
                    'package_manifest_sha256': sha(manifests[0]), 'lab_build_sha256': sha(work / 'provenance/lab-build.json'),
                    'native_build_sha256': sha(native_path),
                    'inventory': tree_rows(parent, os.geteuid())}
+        request.update(transport_fields(selection))
+        validate_lab_transport(lab, request, package)
         write_new(parent / 'handoff-request.json', request)
         request_sha = sha(parent / 'handoff-request.json')
         if local:
@@ -1269,7 +1523,8 @@ def prepare(args):
         require(marker['request_sha256'] == request_sha and marker['uid'] == (os.geteuid() if local else 1000),
                 'handoff response differs')
         write_new(output / 'prepared.json', {'schema': 1, 'parent': str(parent), 'revision': revision,
-                  'request_sha256': request_sha, 'handoff': marker, 'services_started': False})
+                  'request_sha256': request_sha, 'handoff': marker, 'services_started': False,
+                  **transport_fields(selection)})
         owner.checkpoint()
         phase('exec-same-user' if local else 'exec-uid1000')
         argv = ['/usr/bin/sudo', '-n', 'prlimit', '--memlock=3221225472:3221225472', '--nofile=65536:65536', '--',
@@ -1303,12 +1558,15 @@ def main():
     internal.add_argument('--handoff', type=Path, help=argparse.SUPPRESS)
     internal.add_argument('--run-owned', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--request-sha256', help=argparse.SUPPRESS)
+    add_transport_arguments(parser)
     args = parser.parse_args()
     require(sys.version_info >= (3, 11), 'Python 3.11 or newer required')
     require(sys.platform == 'linux', 'Linux only; no WSL/VM launcher is implemented')
     os.umask(0o077)
     sys.dont_write_bytecode = True
     os.environ.pop('LD_PRELOAD', None)
+    if args.handoff is not None or args.run_owned is not None:
+        lab_transport_selection(args, None)
     if args.handoff:
         privileged_handoff(args.handoff, args.request_sha256)
         return 0

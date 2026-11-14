@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 
 import tomllib
 
@@ -164,10 +165,83 @@ def command(runner,w,argv):
         require(configs==['--cfg='+str(runner.config)] and modes==['--config.storage_transport=rdma'] and len(runs)==1,
                 'File command transport/config/run differs from prepared selection')
         w.bind_transport_run(runner.root,Path(runs[0]),binding,[str(argv[0])])
+    return _owned_command(runner,w,argv,binding)
+
+
+def validate_supervisor_command(root,argv,*,expected_executable=None):
+    """Read-only grammar; a receipt reader may pin the original owned interpreter."""
+    executable=sys.executable if expected_executable is None else expected_executable
+    require(type(executable) is str and bool(executable),'Missing expected supervisor interpreter')
+    root=Path(root)
+    script=root/'scripts/native-v2.py'
+    require(root.is_absolute() and root==root.resolve() and script==script.resolve(),
+            'Supervisor command requires the original canonical bundle paths')
+    require(type(argv) is list and all(type(value) is str for value in argv) and len(argv)>=5,
+            'Supervisor command requires an exact string argument list')
+    operation=argv[2]
+    require(operation in ('status','fault-storage','restart-storage','replace-placement','action-status') and
+            argv[:2]==[executable,str(script)] and argv[3:5]==['--root',str(root)],
+            'Supervisor executable/path/operation/root differs')
+    if operation=='status':
+        require(len(argv)==5,'Status does not accept action or launch arguments')
+        return {'operation':operation}
+    require(len(argv)==(9 if operation=='action-status' else 13) and
+            argv[5]=='--run' and argv[7]=='--action-id', 'Supervisor action argument shape differs')
+    run,action_id=argv[6],argv[8]
+    require(bool(run) and len(run)<=128 and all(32<=ord(char)<127 for char in run),
+            'Supervisor run identity is invalid')
+    require(str(uuid.UUID(action_id))==action_id and uuid.UUID(action_id).int!=0,
+            'Supervisor action requires the original nonzero canonical UUID')
+    request={'operation':operation,'run':run,'action_id':action_id}
+    if operation=='action-status':
+        return request
+    require(argv[11:]==['--wait-seconds','600'],'Supervisor action wait bound differs')
+    key='replacements' if operation=='replace-placement' else 'nodes'
+    require(argv[9]==('--replace' if key=='replacements' else '--nodes'), 'Supervisor selection flag differs')
+    parts=argv[10].split(',')
+    require(1<=len(parts)<=2,'Supervisor action needs one or two selections')
+    if key=='nodes':
+        require(all(re.fullmatch(r'[1-9][0-9]*',part) for part in parts),'Invalid exact Storage node')
+        nodes=list(map(int,parts))
+        require(len(set(nodes))==len(nodes) and all(10001<=node<=10014 for node in nodes),
+                'Supervisor action node is outside the prepared spare topology')
+        request[key]=nodes
+    else:
+        require(all(re.fullmatch(r'[1-9][0-9]*:[1-9][0-9]*',part) for part in parts),'Invalid exact replacement pair')
+        pairs=[list(map(int,part.split(':'))) for part in parts]
+        require(len({pair[0] for pair in pairs})==len(pairs) and len({pair[1] for pair in pairs})==len(pairs) and
+                all(10001<=old<=10014 and new in (10013,10014) and old!=new for old,new in pairs),
+                'Supervisor replacement is outside the prepared spare topology')
+        request[key]=pairs
+    return request
+
+
+def supervisor_command(runner,w,argv,*,operation,run=None,action=None):
+    require(not runner.stop_requested,'Stop requested; no new command')
+    binding=runner.check_transport()
+    actual=validate_supervisor_command(runner.root,argv)
+    if operation=='status':
+        require(run is None and action is None and actual=={'operation':'status'},'Status cannot change an action')
+    else:
+        require(type(action) is dict and type(run) is str and action.get('run')==run,
+                'Supervisor action differs from the fixed live run')
+        original=action.get('operation')
+        require(original in ('fault-storage','restart-storage','replace-placement'), 'Unknown fixed action')
+        key='replacements' if original=='replace-placement' else 'nodes'
+        require(set(action)=={'operation','run','action_id',key},'Fixed action fields differ')
+        expected=({'operation':'action-status','run':run,'action_id':action['action_id']}
+                  if operation=='action-status' else action)
+        require((operation=='action-status' or operation==original) and typed(actual)==typed(expected),
+                'Supervisor command differs from the original action')
+    return _owned_command(runner,w,argv,None,kind='supervisor_control' if binding is not None else None)
+
+
+def _owned_command(runner,w,argv,binding,*,kind=None):
     index=len(runner.commands)
     entry={'index':index,'argv':list(map(str,argv)),'process_started':False,'process_exited':False,
            'remote_release_proven_by_exit':False,'equivalent_bash':shlex.join(list(map(str,argv)))}
     if binding is not None:entry['transport']=binding
+    if kind is not None:entry['kind']=kind
     runner.commands.append(entry);runner.event({'event':'command_planned',**entry})
     path=runner.report/f'command-{index:03d}.log'
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)

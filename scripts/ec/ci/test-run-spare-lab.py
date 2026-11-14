@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Pure receipt/resource/identity gates; no processes, sockets, chown or services."""
 import copy
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 import uuid
 
 spec = importlib.util.spec_from_file_location('spare_lab_under_test', Path(__file__).with_name('run-spare-lab.py'))
 lab = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lab)
 ROOT = Path('/tmp/example-spare')
+RDMA = {'schema': 1, 'mode': 'rdma', 'interface': 'eth7', 'ipv4': '192.0.2.17', 'ib_device': 'mlx5_7'}
 
 
 def example(failures=2, strategy='helper'):
@@ -70,6 +75,100 @@ def stopped(completed, fdb=-15):
 
 
 class SpareLabGates(unittest.TestCase):
+    def test_prepare_command_preserves_tcp_and_forwards_only_normalized_rdma_selection(self):
+        source = Path(__file__).resolve().parents[3]
+        args = SimpleNamespace(transport=None, rdma_interface=None, rdma_address=None, rdma_device=None,
+                               handoff=None, run_owned=None)
+        self.assertIsNone(lab.shared.lab_transport_selection(args, source))
+        expected = [lab.sys.executable, '-B', source / 'scripts/ec/cluster/native-v2.py', 'prepare', '--root', ROOT,
+                    '--source', source, '--profile', 'gc-14', '--file-api', '--port-base', '14500']
+        self.assertEqual(lab.native_prepare_command(source, ROOT), expected)
+        self.assertEqual(lab.shared.transport_fields(None), {})
+        args.transport, args.rdma_interface, args.rdma_address, args.rdma_device = 'rdma', 'eth7', '192.0.2.17', 'mlx5_7'
+        selected = lab.shared.lab_transport_selection(args, source)
+        self.assertEqual(selected, RDMA)
+        self.assertEqual(lab.native_prepare_command(source, ROOT, selected), expected + [
+            '--transport', 'rdma', '--rdma-interface', 'eth7', '--rdma-address', '192.0.2.17', '--rdma-device', 'mlx5_7'])
+        fields = lab.shared.transport_fields(selected)
+        self.assertEqual(lab.shared.request_transport(fields), selected)
+        self.assertEqual(fields['transport_validation'], 'configuration_only')
+        for change in ({'transport': 'tcp'}, {'rdma_device': None}, {'rdma_address': '127.0.0.1'}):
+            invalid = SimpleNamespace(**(vars(args) | change))
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                lab.shared.lab_transport_selection(invalid, source)
+
+    def test_internal_runtime_and_handoff_cannot_override_sealed_transport(self):
+        overrides = [['--transport', 'tcp'], ['--transport', 'rdma'], ['--rdma-device', 'mlx5_7']]
+        with mock.patch.object(lab.sys, 'platform', 'linux'), mock.patch.object(lab.os, 'umask'), \
+                mock.patch.object(lab.os.environ, 'pop'), mock.patch.object(lab, 'runtime', return_value=7) as runtime, \
+                mock.patch.object(lab, 'read_json') as read, \
+                mock.patch.object(lab.shared, 'privileged_handoff') as handoff, \
+                mock.patch.object(lab, 'prepare') as prepare:
+            for internal in ('--handoff', '--run-owned'):
+                for flags in overrides:
+                    with self.subTest(internal=internal, flags=flags), \
+                            mock.patch.object(lab.sys, 'argv', ['run-spare-lab.py', internal, str(ROOT), *flags]), \
+                            contextlib.redirect_stderr(io.StringIO()), self.assertRaises(ValueError):
+                        lab.main()
+            runtime.assert_not_called()
+            handoff.assert_not_called()
+            read.assert_not_called()
+            prepare.assert_not_called()
+            with mock.patch.object(lab.sys, 'argv', ['run-spare-lab.py', '--run-owned', str(ROOT)]):
+                self.assertEqual(lab.main(), 7)
+            runtime.assert_called_once_with(ROOT)
+
+    def test_rdma_ready_completion_and_final_receipts_cannot_change_or_omit_transport(self):
+        result, ready, completed = example()
+        ready['data_transport'] = copy.deepcopy(RDMA)
+        completed['data_transport'] = copy.deepcopy(RDMA)
+        self.assertEqual(len(lab.case_gate(result, ready, completed, ROOT, 'helper', 2, transport=RDMA)), 20)
+        final, cleanup = stopped(completed)
+        self.assertTrue(lab.shutdown_gate(final, cleanup, completed, ROOT, 0, RDMA)['all_owned_processes_exited'])
+        for index in range(3):
+            for value in (None, dict(RDMA, ipv4='192.0.2.18'), dict(RDMA, schema=True)):
+                before, after, stopped_state = copy.deepcopy((ready, completed, final))
+                target = (before, after, stopped_state)[index]
+                if value is None:
+                    target.pop('data_transport')
+                else:
+                    target['data_transport'] = value
+                with self.subTest(index=index, value=value), self.assertRaises(ValueError):
+                    if index == 2:
+                        lab.shutdown_gate(stopped_state, cleanup, after, ROOT, 0, RDMA)
+                    else:
+                        lab.case_gate(result, before, after, ROOT, 'helper', 2, transport=RDMA)
+        with self.assertRaises(ValueError):
+            lab.ready_gate(ready, ROOT)  # Legacy TCP cannot acquire an RDMA label.
+        failed = copy.deepcopy(result)
+        failed['commands'][0]['returncode'] = 1
+        with self.assertRaises(ValueError):
+            lab.case_gate(failed, ready, completed, ROOT, 'helper', 2, transport=RDMA)
+
+    def test_rdma_doctor_requires_matching_canonical_request_and_original_resource_gates(self):
+        doctor = dict(profile=lab.PROFILE, status='ready', problems=[], services_started=False,
+                      observations=dict(required_available_memory_gib=7, memory_kib={'MemAvailable': 7 * 1024**2},
+                          free_bytes=10 * 1024**3, free_inodes=60000, active_build_processes=[],
+                          rdma={'requested': copy.deepcopy(RDMA),
+                                'scope': 'read-only device/resource admission; no verbs or data operation'}))
+        lab.resource_gate(doctor, RDMA)
+        admitted = doctor['observations']['rdma']
+        for rdma in (None, {}, dict(admitted, requested=dict(RDMA, interface='eth8')),
+                     dict(admitted, requested=dict(RDMA, schema=True)), dict(admitted, scope='data validated')):
+            changed = copy.deepcopy(doctor)
+            if rdma is None:
+                changed['observations'].pop('rdma')
+            else:
+                changed['observations']['rdma'] = rdma
+            with self.subTest(rdma=rdma), self.assertRaises(ValueError):
+                lab.resource_gate(changed, RDMA)
+        with self.assertRaises(ValueError):
+            lab.resource_gate(doctor)
+        changed = copy.deepcopy(doctor)
+        changed['observations']['free_bytes'] -= 1
+        with self.assertRaises(ValueError):
+            lab.resource_gate(changed, RDMA)
+
     def test_one_and_two_fault_ledgers_include_old_and_restarted_instances(self):
         for failures in (1, 2):
             for strategy in ('central', 'pipeline', 'helper'):

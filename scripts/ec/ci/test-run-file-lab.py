@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """Pure gates and Linux private-file FD checks; no chown, subprocess or service."""
 import copy
+import argparse
 import errno
 import hashlib
 import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import shutil
 import stat
 import sys
 import tempfile
 import unittest
 from unittest import mock
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import xml.etree.ElementTree as ET
 
 spec = importlib.util.spec_from_file_location('file_lab_under_test', Path(__file__).with_name('run-file-lab.py'))
@@ -654,6 +656,284 @@ class FileLabGates(unittest.TestCase):
                     lab.read_json(path)
             path.write_text(json.dumps({'ok': True}), encoding='utf-8')
             self.assertEqual(lab.read_json(path), {'ok': True})
+
+
+class LabTransportGates(unittest.TestCase):
+    OPTIONS = ['--transport', 'rdma', '--rdma-interface', 'eth0',
+               '--rdma-address', '192.0.2.10', '--rdma-device', 'mlx5_0']
+
+    def setUp(self):
+        self.source = Path(__file__).resolve().parents[3]
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve() / '3fs-ec-native-test'
+        self.root.mkdir(mode=0o700)
+        for name in ('config', 'client', 'state', 'scripts', 'provenance', 'logs', 'lib', 'bin'):
+            (self.root / name).mkdir(mode=0o700)
+        for name in ('generate.py', 'native_v2_config.py', 'experiment-runner.py', 'ack-service-acceptance.py'):
+            shutil.copyfile(self.source / 'scripts/ec/cluster' / name, self.root / 'scripts' / name)
+        original = lab.transport_config
+
+        @contextmanager
+        def linux_config(scripts=None):
+            with original(scripts) as config:
+                # Linux server path generation only; receipt IO stays host-native.
+                with mock.patch.object(config, 'Path', PurePosixPath):
+                    yield config
+        self.enterContext(mock.patch.object(lab, 'transport_config', linux_config))
+        self.parser = argparse.ArgumentParser()
+        lab.add_transport_arguments(self.parser)
+        self.selection = lab.lab_transport_selection(self.parser.parse_args(self.OPTIONS), self.source)
+
+    def write(self, path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, sort_keys=True), encoding='utf-8')
+
+    def profile(self, selection=True):
+        with lab.transport_config(self.root / 'scripts') as config:
+            gc = {'authority': '22222222-2222-2222-2222-222222222222',
+                  'key_id': '33333333-3333-3333-3333-333333333333',
+                  'client_namespace': '44444444-4444-4444-4444-444444444444',
+                  'data_protocol': 2, 'disk_format': 3, 'gc_protocol': 2}
+            options = dict(transport='rdma', rdma_interface='eth0', rdma_address='192.0.2.10', rdma_device='mlx5_0') \
+                if selection else {}
+            configs, _ = config.generate_configs(self.source, self.root, 20000,
+                '11111111-1111-1111-1111-111111111111', 'TRANSPORT_FIXTURE',
+                profile='gc', gc=gc, file_api=True, **options)
+            for name, value in configs.items():
+                folder = 'client' if name in ('file-client.toml', 'stripe-client.toml') else 'config'
+                (self.root / folder / name).write_text(config.to_toml(value), encoding='utf-8')
+            self.cluster = {'schema': 1, 'root': str(self.root), 'profile': config.GC_PROFILE,
+                            'file_api': True, 'gc': gc, 'port_base': 20000, 'cluster_id': 'TRANSPORT_FIXTURE',
+                            'authority': '11111111-1111-1111-1111-111111111111'}
+        self.initialized = {'schema': 1, 'cluster_id': self.cluster['cluster_id']}
+        value = self.selection if selection else None
+        if value is not None:
+            self.cluster['data_transport'] = copy.deepcopy(value)
+            self.initialized['data_transport'] = copy.deepcopy(value)
+        self.write(self.root / 'cluster.json', self.cluster)
+        self.write(self.root / 'state/initialized.json', self.initialized)
+        self.package = {'files': {}, **lab.transport_fields(value)}
+        self.package_path = self.root / 'provenance/services-test/manifest.json'
+        self.write(self.package_path, self.package)
+        self.request = {'package_manifest_sha256': lab.sha(self.package_path), **lab.transport_fields(value)}
+        return value
+
+    def command(self, file_api=True):
+        with lab.transport_config(self.root / 'scripts'):
+            wrapper = lab.module(self.root / 'scripts/experiment-runner.py', 'transport_real_binding')
+            config = self.root / 'client' / ('file-client.toml' if file_api else 'stripe-client.toml')
+            binding = wrapper.prepared_transport(self.root, config, file_api=file_api)
+            run = self.root / 'client/runs' / ('file-case' if file_api else 'stripe-case')
+            binary = self.root / 'bin' / ('ec_file_cli' if file_api else 'ec_stripe_cli')
+            # Use the real writer once; validators must never repair a missing sidecar.
+            wrapper.bind_transport_run(self.root, run, binding, [str(binary)])
+            run.mkdir(parents=True)
+        row = {'index': 0, 'argv': [str(binary), '--cfg=' + str(config),
+                                  '--config.run_dir=' + str(run), '--config.storage_transport=rdma',
+                                  'mode4-create' if file_api else 'new-write'],
+               'process_started': True, 'process_exited': True, 'returncode': 0, 'transport': binding}
+        sidecar = self.root / 'client/transport-bindings' / (hashlib.sha256(str(run).encode()).hexdigest() + '.json')
+        return row, sidecar
+
+    def test_prepare_arguments_preserve_tcp_and_reject_owned_overrides_before_source_access(self):
+        for argv in ([], ['--transport', 'tcp']):
+            args = self.parser.parse_args(argv)
+            value = lab.lab_transport_selection(args, self.source)
+            self.assertIsNone(value)
+            self.assertEqual(lab.transport_cli_args(value), [])
+            self.assertEqual(lab.transport_fields(value), {})
+        self.assertEqual(lab.transport_cli_args(self.selection), self.OPTIONS)
+        for argv in (['--rdma-device', 'mlx5_0'], ['--transport', 'rdma'],
+                     ['--transport', 'tcp', '--rdma-address', '192.0.2.10'],
+                     self.OPTIONS[:-1] + ['../device']):
+            with self.subTest(argv=argv), self.assertRaises(lab.GateError):
+                lab.lab_transport_selection(self.parser.parse_args(argv), self.source)
+        for internal in ('handoff', 'run_owned'):
+            for argv in (['--transport', 'tcp'], self.OPTIONS, ['--rdma-device', 'mlx5_0']):
+                args = self.parser.parse_args(argv)
+                setattr(args, internal, self.root)
+                with self.subTest(internal=internal, argv=argv), mock.patch.object(lab, 'transport_config') as load:
+                    with self.assertRaises(lab.GateError):
+                        lab.lab_transport_selection(args, None)
+                    load.assert_not_called()
+            args = self.parser.parse_args([])
+            setattr(args, internal, self.root)
+            self.assertIsNone(lab.lab_transport_selection(args, None))
+        # A caller-supplied source is not imported before the formal-driver gate.
+        source, work = self.root / 'untrusted-source', self.root / 'build-work'
+        build, fdb = work / 'build', work / 'fdb/bin'
+        core = self.root / 'core/result.json'
+        for directory in (source, build, fdb, core.parent):
+            directory.mkdir(parents=True, exist_ok=True)
+        self.write(core, {})
+        args = argparse.Namespace(source=source, build=build, fdb_bin_dir=fdb, core_record=core,
+                                  local_work=Path(self.temp.name) / 'x')
+        with mock.patch.object(lab.os, 'getuid', return_value=1000, create=True), \
+             mock.patch.object(lab.os, 'geteuid', return_value=1000, create=True), \
+             mock.patch.object(lab.os, 'getgid', return_value=1000, create=True), \
+             mock.patch.object(lab.os, 'getegid', return_value=1000, create=True), \
+             mock.patch.object(lab, 'private'), mock.patch.object(lab, 'mount_host_gate'), \
+             mock.patch.object(lab, 'lab_transport_selection') as load, \
+             mock.patch.object(lab.subprocess, 'Popen') as child:
+            with self.assertRaisesRegex(lab.GateError, 'checked-out formal driver'):
+                lab.prepare(args)
+            load.assert_not_called()
+            child.assert_not_called()
+
+    def test_request_and_supervisor_receipts_reject_partial_null_and_boolean_substitution(self):
+        fields = lab.transport_fields(self.selection)
+        self.assertEqual(lab.request_transport(fields), self.selection)
+        self.assertIsNone(lab.request_transport({}))
+        bad = copy.deepcopy(fields)
+        bad['data_transport_requested']['schema'] = True
+        for value in (bad, {'data_transport_requested': self.selection},
+                      {'transport_validation': 'configuration_only'},
+                      dict(fields, data_transport_requested=None), dict(fields, transport_validation='hardware_validated')):
+            with self.subTest(value=value), self.assertRaises(lab.GateError):
+                lab.request_transport(value)
+        lab.require_transport_observation({}, None)
+        lab.require_transport_observation({'data_transport': self.selection}, self.selection)
+        for value, expected in (({}, self.selection), ({'data_transport': None}, None),
+                                ({'data_transport': self.selection}, None),
+                                ({'data_transport': dict(self.selection, schema=True)}, self.selection)):
+            with self.subTest(value=value), self.assertRaises(lab.GateError):
+                lab.require_transport_observation(value, expected)
+
+    def test_actual_generated_profile_is_bound_to_request_package_initialized_and_all_roles(self):
+        self.profile()
+        observed = {'data_transport': self.selection}
+        self.assertEqual(lab.validate_lab_transport(self.root, self.request, self.package,
+                         initialized=True, observations=(observed, observed)), self.selection)
+        mutations = [(self.root / 'cluster.json', dict(self.cluster, data_transport=dict(self.selection, schema=True))),
+                     (self.root / 'state/initialized.json', dict(self.initialized, data_transport=dict(self.selection, ib_device='mlx5_1'))),
+                     (self.package_path, dict(self.package, transport_validation='hardware_validated'))]
+        for path, value in mutations:
+            old = path.read_bytes()
+            try:
+                self.write(path, value)
+                with self.subTest(path=path), self.assertRaises((ValueError, lab.GateError)):
+                    lab.validate_lab_transport(self.root, self.request, initialized=True)
+            finally:
+                path.write_bytes(old)
+        with lab.transport_config(self.root / 'scripts') as config:
+            path = self.root / 'config/storage_main.toml'
+            old = path.read_bytes()
+            import tomllib
+            data = tomllib.loads(old.decode())
+            # A non-client role drift must also fail before any child can start.
+            data['server']['forward_client']['force_use_tcp'] = True
+            path.write_text(config.to_toml(data), encoding='utf-8')
+            try:
+                with self.assertRaises(RuntimeError), mock.patch.object(lab.subprocess, 'Popen') as child:
+                    lab.validate_lab_transport(self.root, self.request)
+                child.assert_not_called()
+            finally:
+                path.write_bytes(old)
+
+    def test_tcp_receipts_stay_empty_but_mixed_rdma_cluster_or_client_is_rejected(self):
+        self.profile(selection=False)
+        before = copy.deepcopy(self.request)
+        self.assertIsNone(lab.validate_lab_transport(self.root, self.request, initialized=True, observations=({},)))
+        self.assertEqual(self.request, before)
+        self.assertEqual(lab.transport_fields(None), {})
+        self.write(self.root / 'cluster.json', dict(self.cluster, data_transport=self.selection))
+        with self.assertRaises(lab.GateError):
+            lab.validate_lab_transport(self.root, self.request)
+        self.write(self.root / 'cluster.json', self.cluster)
+        path = self.root / 'client/file-client.toml'
+        path.write_text('storage_transport="rdma"\n' + path.read_text(encoding='utf-8'), encoding='utf-8')
+        with self.assertRaises(RuntimeError):
+            lab.validate_lab_transport(self.root, self.request)
+
+    def test_real_run_sidecars_bind_both_cli_argv_and_config_hash_without_repairing_missing_evidence(self):
+        self.profile()
+        for file_api in (True, False):
+            row, sidecar = self.command(file_api)
+            lab.validate_command_transports(self.root, self.selection, [row])
+            for index, replacement in ((0, str(self.root / 'bin/admin_cli')),
+                                       (1, '--cfg=' + str(self.root / 'client/other.toml')),
+                                       (3, '--config.storage_transport=tcp')):
+                bad = copy.deepcopy(row)
+                bad['argv'][index] = replacement
+                with self.subTest(file_api=file_api, index=index), self.assertRaises(ValueError):
+                    lab.validate_command_transports(self.root, self.selection, [bad])
+            original = sidecar.read_bytes()
+            changed = json.loads(original)
+            changed['schema'] = True
+            self.write(sidecar, changed)
+            with self.assertRaises(lab.GateError):
+                lab.validate_command_transports(self.root, self.selection, [row])
+            sidecar.unlink()
+            with self.assertRaises(FileNotFoundError):
+                lab.validate_command_transports(self.root, self.selection, [row])
+            self.assertFalse(sidecar.exists())
+            sidecar.write_bytes(original)
+            config = Path(row['transport']['client_config']['path'])
+            config_original = config.read_bytes()
+            config.write_bytes(config_original + b'\n# changed bytes\n')
+            with self.assertRaises(lab.GateError):
+                lab.validate_command_transports(self.root, self.selection, [row])
+            config.write_bytes(config_original)
+
+    def test_control_is_only_fixed_supervisor_grammar_and_cannot_claim_data_transport(self):
+        self.profile()
+        row = {'kind': 'supervisor_control', 'argv': ['/usr/bin/python3', str(self.root / 'scripts/native-v2.py'),
+                                                    'status', '--root', str(self.root)]}
+        # A legitimate inspecting parent may have another Python executable.
+        with mock.patch.object(sys, 'executable', '/private/parent/python3'):
+            lab.validate_command_transports(self.root, self.selection, [row], allow_control=True)
+        for changed in (dict(row, transport=lab.transport_fields(self.selection)),
+                        dict(row, argv=row['argv'] + ['--transport', 'tcp']),
+                        dict(row, argv=['/private/parent/python3', *row['argv'][1:]]),
+                        dict(row, argv=['/usr/bin/python3', row['argv'][1], 'start', *row['argv'][3:]]),
+                        dict(row, argv=['/usr/bin/python3', str(self.root / 'other.py'), *row['argv'][2:]])):
+            with self.subTest(row=changed), self.assertRaises((ValueError, RuntimeError)):
+                lab.validate_command_transports(self.root, self.selection, [changed], allow_control=True)
+        with self.assertRaises(lab.GateError):
+            lab.validate_command_transports(self.root, self.selection, [row])
+        with self.assertRaises(lab.GateError):
+            lab.validate_command_transports(self.root, None, [row], allow_control=True)
+
+    def test_doctor_binds_read_only_admission_not_hardware_success(self):
+        value = {'status': 'ready', 'problems': [], 'services_started': False, 'observations': {}}
+        lab.validate_transport_doctor(value, None)
+        value['observations']['rdma'] = {'requested': self.selection,
+            'scope': 'read-only device/resource admission; no verbs or data operation'}
+        lab.validate_transport_doctor(value, self.selection)
+        for bad in (dict(value, problems=['device missing']), dict(value, services_started=True),
+                    dict(value, observations={'rdma': {'requested': dict(self.selection, ipv4='192.0.2.11'),
+                                                       'scope': value['observations']['rdma']['scope']}})):
+            with self.subTest(value=bad), self.assertRaises(lab.GateError):
+                lab.validate_transport_doctor(bad, self.selection)
+        with self.assertRaises(lab.GateError):
+            lab.validate_transport_doctor(value, None)
+
+    def test_fuse_first_remount_and_supervisor_evidence_bind_original_preparation(self):
+        self.profile()
+        folder = self.root.parent / 'fuse-config'
+        folder.mkdir()
+        outputs = {}
+        for name in ('fuse-first.toml', 'fuse-resume.toml', 'launcher.toml'):
+            (folder / name).write_text('# synthetic locked config; no mount\n', encoding='utf-8')
+            outputs[name] = lab.sha(folder / name)
+        prep = {**lab.transport_fields(self.selection), 'outputs': outputs,
+                'first_mount_argv': ['fuse', '--cfg', str(folder / 'fuse-first.toml')],
+                'remount_argv': ['fuse', '--cfg', str(folder / 'fuse-resume.toml')]}
+        path = folder / 'preparation.json'
+        self.write(path, prep)
+        value = {'preparation': str(path), 'source_sha256': {str(path): lab.sha(path),
+                 **{str(folder / name): digest for name, digest in outputs.items()}},
+                 'mounts': [{'argv': prep['first_mount_argv']}, {'argv': prep['remount_argv']}],
+                 'services': [{'snapshot': {'data_transport': self.selection}}]}
+        lab.validate_fuse_transport(self.root, self.selection, prep, value)
+        for bad in (dict(value, mounts=[value['mounts'][0]] * 2),
+                    dict(value, services=[{'snapshot': {}}]), dict(value, source_sha256={})):
+            with self.subTest(value=bad), self.assertRaises(lab.GateError):
+                lab.validate_fuse_transport(self.root, self.selection, prep, bad)
+        (folder / 'launcher.toml').write_text('# drift\n', encoding='utf-8')
+        with self.assertRaises(lab.GateError):
+            lab.validate_fuse_transport(self.root, self.selection, prep, value)
 
 
 @unittest.skipUnless(sys.platform == 'linux', 'requires Linux directory-FD and O_NOFOLLOW semantics')
