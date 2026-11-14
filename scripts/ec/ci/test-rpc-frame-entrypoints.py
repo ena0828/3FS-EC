@@ -251,5 +251,147 @@ class NativeFailureDiagnostics(unittest.TestCase):
             regression.check_rpc_frames(original)
 
 
+    def test_summary_attribute_uses_only_complete_bounded_cdata_first_line_for_location(self):
+        summary = "Expected equality of these values:\nWhich is: 2\nWhich is: 1"
+        body = "/PRIVATE_BUILD/" + self.relative + ":1750\nPRIVATE_TOKEN\nStack trace: PRIVATE_STACK"
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "result.xml"
+            path.write_text('<testsuites tests="1" failures="1"><testcase classname="TestFixture" '
+                            'name="Case" status="run"><failure message="Expected equality of these values:">'
+                            '<![CDATA[' + body + ']]></failure></testcase></testsuites>', encoding="utf-8")
+            row = driver.xml_tests(path)["cases"][0]
+        self.assertTrue(row["failed"])
+        detail = row["failure_diagnostics"]["assertions"][0]
+        self.assertEqual(detail["source"], {"file": self.relative, "line": 1750})
+        self.assertEqual(detail["classification"], "equality")
+        self.assertNotIn("PRIVATE", json.dumps(row))
+        for text in ("../private/" + self.relative + ":1750\nPRIVATE_TOKEN",
+                     "PRIVATE_FIRST_LINE\n" + self.relative + ":1750",
+                     "x" * 8192 + "/" + self.relative + ":1750\n",
+                     "\u754c" * 2800 + "/" + self.relative + ":1750\n"):
+            node = ET.Element("failure", message=summary)
+            node.text = text
+            with self.subTest(text_length=len(text)):
+                value = driver.assertion_diagnostic(node)
+                self.assertNotIn("source", value)
+                self.assertNotIn("PRIVATE", json.dumps(value))
+        node = ET.Element("failure", message=self.relative + ":2\n" + summary)
+        node.text = body
+        self.assertEqual(driver.assertion_diagnostic(node)["source"]["line"], 2)
+
+
+class NativeRunProgress(unittest.TestCase):
+    selected = [{"name": "TestFixture.First", "disabled": False},
+                {"name": "TestFixture.Second", "disabled": False},
+                {"name": "TestFixture.DISABLED_Private", "disabled": True}]
+
+    def test_only_complete_listed_markers_leave_no_payload_or_failure_summary(self):
+        data = (b"PRIVATE_TOKEN at /private/build\n"
+                b"[ RUN      ] TestFixture.First\r\n"
+                b"[       OK ] TestFixture.First (123 ms)\r\n"
+                b"[ RUN      ] TestFixture.Second\n"
+                b"[  FAILED  ] TestFixture.Second (1 ms)\n"
+                b"[  FAILED  ] TestFixture.Second\n"  # End-of-suite summary is not completion.
+                b"[ RUN      ] TestFixture.FORGED_PRIVATE\n"
+                b"[ RUN      ] TestFixture.DISABLED_Private\n"
+                b"prefix [ RUN      ] TestFixture.First\n"
+                b"[ RUN      ] TestFixture.First PRIVATE_PAYLOAD\n"
+                b"[       OK ] TestFixture.Second (0 ms) PRIVATE_PAYLOAD\n"
+                b"[ RUN      ] TestFixture.First")  # Incomplete EOF is not a full marker.
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "client.run.log"
+            path.write_bytes(data)
+            value = driver.run_progress(path, self.selected, ended=True)
+        self.assertEqual(value["scope"], "bounded_progress_not_acceptance")
+        self.assertEqual((value["started_markers"], value["ok_markers"], value["failed_markers"]), (2, 1, 1))
+        self.assertEqual((value["last_started"], value["last_completed"]),
+                         ("TestFixture.Second", "TestFixture.Second"))
+        self.assertFalse(value["truncated"])
+        self.assertTrue(value["last_partial_line_discarded"])
+        self.assertNotIn("executed_count", value)
+        self.assertNotIn("PRIVATE", json.dumps(value))
+
+    def test_tail_bound_missing_file_and_read_exception_are_safe(self):
+        tail = (b"[ RUN      ] TestFixture.First\n" + b"x" * (driver.PROGRESS_LOG_BYTES - 100) +
+                b"\n[ RUN      ] TestFixture.Second\n")
+        data = b"PRIVATE_PREFIX" * 100 + tail
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "client.run.log"
+            path.write_bytes(data)
+            value = driver.run_progress(path, self.selected, ended=True)
+            self.assertTrue(value["truncated"])
+            self.assertEqual(value["bytes_read"], driver.PROGRESS_LOG_BYTES)
+            self.assertTrue(value["first_partial_line_discarded"])
+            self.assertEqual(value["last_started"], "TestFixture.Second")
+            self.assertEqual(value["started_markers"], 1)
+            self.assertIsNone(value["last_completed"])
+            self.assertNotIn("PRIVATE", json.dumps(value))
+            missing = driver.run_progress(Path(folder) / "missing.run.log", self.selected, ended=True)
+            with mock.patch.object(driver.os, "fstat", side_effect=OSError("PRIVATE_DISK_TOKEN")):
+                failed = driver.run_progress(path, self.selected, ended=True)
+            with mock.patch.object(Path, "open", side_effect=AssertionError("must not read live log")):
+                self.assertEqual(driver.run_progress(path, self.selected), missing)
+        self.assertEqual(missing, failed)
+        self.assertEqual(failed, {"status": "unavailable", "scope": "bounded_progress_not_acceptance",
+                                  "details_redacted": True})
+
+    def test_actual_main_keeps_nonzero_missing_xml_and_failed_xml_failures(self):
+        for mode in ("signal", "missing_xml", "failed_xml", "diagnostic_error", "unjoined", "passed"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                binary = root / "test_client"
+                binary.write_bytes(b"NOT_AN_EXECUTED_NATIVE_BINARY")
+                output = root / "result"
+                def command(argv, cwd, env, log, *rest):
+                    listing = "--gtest_list_tests" in argv
+                    log.write_text("TestFixture.\n  First\n" if listing else
+                                   "[ RUN      ] TestFixture.First\n[       OK ] TestFixture.First (1 ms)\n"
+                                   "PRIVATE_BEARER_TOKEN\n", encoding="utf-8")
+                    if not listing and mode in ("failed_xml", "passed"):
+                        (output / "client.xml").write_text(
+                            '<testsuites tests="1" failures="' + ("1" if mode == "failed_xml" else "0") +
+                            '"><testcase classname="TestFixture" name="First" status="run">' +
+                            ('<failure message="PRIVATE_FAILURE" />' if mode == "failed_xml" else '') +
+                            '</testcase></testsuites>', encoding="utf-8")
+                    return {"log": str(log), "exitcode": 0 if listing or mode in ("missing_xml", "passed") else
+                            None if mode == "unjoined" else
+                            1 if mode == "failed_xml" else -11, "timed_out": False, "interrupted": False}
+                captured = io.StringIO()
+                with mock.patch.object(driver.sys, "platform", "linux"), \
+                     mock.patch.object(driver.signal, "signal"), \
+                     mock.patch.object(driver, "resource_snapshot", return_value={}), \
+                     mock.patch.object(driver, "mount_for", return_value={"filesystem": "ext4"}), \
+                     mock.patch.object(driver.os, "access", return_value=True), \
+                     mock.patch.object(driver, "plans", return_value=[("client", "test_client", "TestFixture.*")]), \
+                     mock.patch.object(driver, "prepare_nofile", return_value={}), \
+                     mock.patch.object(driver, "prepare_memlock", side_effect=lambda r, _: r.update(memlock={})), \
+                     mock.patch.object(driver, "run_command", side_effect=command) as invoked, \
+                     mock.patch.object(driver.os, "fstat", side_effect=OSError("PRIVATE_DIAGNOSTIC")
+                                       if mode == "diagnostic_error" else None,
+                                       wraps=driver.os.fstat), redirect_stdout(captured):
+                    result = driver.main(["--bin-dir", str(root), "--tmp-root", str(root),
+                                          "--output", str(output), "--suite", "client"])
+                receipt = json.loads((output / "results.json").read_text(encoding="utf-8"))
+                suite = receipt["suites"][0]
+                self.assertEqual(invoked.call_count, 2)
+                if mode == "passed":
+                    self.assertEqual((result, receipt["status"], suite["status"]), (0, "passed", "passed"))
+                    self.assertNotIn("run_progress", suite)
+                    self.assertNotIn("NATIVE_SUITE_PROGRESS ", captured.getvalue())
+                    continue
+                self.assertEqual(result, 1)
+                self.assertEqual((receipt["status"], suite["status"]), ("failed", "failed"))
+                self.assertEqual(suite["executed_count"], 1 if mode == "failed_xml" else 0)
+                self.assertEqual(suite["execution"]["exitcode"], 0 if mode == "missing_xml" else
+                                 None if mode == "unjoined" else
+                                 1 if mode == "failed_xml" else -11)
+                self.assertTrue(any(("test XML contains failed" if mode == "failed_xml" else
+                                     "missing or invalid test XML") in reason for reason in suite["failures"]))
+                self.assertEqual(suite["run_progress"]["status"],
+                                 "unavailable" if mode in ("diagnostic_error", "unjoined") else "available")
+                self.assertIn("NATIVE_SUITE_PROGRESS ", captured.getvalue())
+                self.assertNotIn("PRIVATE", captured.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

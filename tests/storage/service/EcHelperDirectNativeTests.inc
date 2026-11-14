@@ -185,6 +185,12 @@ TEST_F(TestEcNativeRepairService, HelperDirectGlobalBudgetSaturationKeepsControl
       ctl.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
       return blockingWait(client_->executeEcHelperDirect(std::move(request), ctl));
     }));
+    // The fixture has two independent data permits. Reach the real pre-hop4
+    // barrier before starting the next chain: this chain's four earlier local
+    // reads have completed, while its four helper permits remain held. Launching
+    // all sixteen together could hit data admission before the intended 64-slot
+    // helper-budget saturation. No permit or successful response is fabricated.
+    ASSERT_TRUE(hold->waitFor([expected = i + 1](const auto &state) { return state.held == expected; }));
   }
   ASSERT_TRUE(hold->waitFor([](const auto &state) { return state.held == heldPlans; }));
   const auto expectHeld = [&] {
@@ -285,6 +291,14 @@ TEST_F(TestEcNativeRepairService, HelperDirectGlobalBudgetSaturationKeepsControl
 }
 
 TEST_F(TestEcNativeRepairService, HelperDirectW1W2W4WriteOriginalTargetsWithSmallReplies) {
+  // Each live direct chain awaits one local Read, target Query or Append at a
+  // time. Four chains need four data permits on this colocated host; upstream
+  // helper frames retain their separate permits, not a data permit. Reconstruct
+  // the real Operator because its semaphore captures the setting at creation.
+  // Other cases keep the fixture's original two-permit admission boundary.
+  config_.storage().set_max_concurrent_ec_requests(4);
+  ASSERT_NO_FATAL_FAILURE(reopenStorage());
+  ASSERT_EQ(config_.storage().max_concurrent_ec_requests(), 4);
   for (uint8_t window : {1, 2, 4}) {
     auto value = prepare(window == 1 ? std::vector<uint16_t>{0} : std::vector<uint16_t>{0, 11},
                          window == 4 ? 16 * kEcIntegrityBlockBytes : kEcIntegrityBlockBytes + 7, window);
@@ -331,6 +345,14 @@ TEST_F(TestEcNativeRepairService, HelperDirectW1W2W4WriteOriginalTargetsWithSmal
 }
 
 TEST_F(TestEcNativeRepairService, HelperDirectReverseArrivalWaitsForDurablePrefixAcrossWindows) {
+  // Each live direct chain awaits one local Read, target Query or Append at a
+  // time. Four chains need four data permits on this colocated host; upstream
+  // helper frames retain their separate permits, not a data permit. Reconstruct
+  // the real Operator because its semaphore captures the setting at creation.
+  // Other cases keep the fixture's original two-permit admission boundary.
+  config_.storage().set_max_concurrent_ec_requests(4);
+  ASSERT_NO_FATAL_FAILURE(reopenStorage());
+  ASSERT_EQ(config_.storage().max_concurrent_ec_requests(), 4);
   for (uint8_t window : {2, 4}) {
     auto value = prepare({0, 11}, window * kEcIntegrityBlockBytes + 7, window);
     ASSERT_OK(value);

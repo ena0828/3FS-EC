@@ -40,6 +40,7 @@ GTEST_ENV = {
     "GTEST_BREAK_ON_FAILURE", "GTEST_THROW_ON_FAILURE", "GTEST_FAIL_FAST",
 }
 DIAGNOSTIC_CASE_LIMIT = 16
+PROGRESS_LOG_BYTES = 1024 * 1024
 
 
 def utc():
@@ -168,6 +169,10 @@ def print_summary(report):
         print(f"{suite['suite']}: {suite['status'].upper()} — "
               f"{suite['executed_count']}/{suite['selected_count']} executed/selected", flush=True)
         if suite["status"] != "passed":
+            if "run_progress" in suite:
+                print("NATIVE_SUITE_PROGRESS " + json.dumps(
+                    {"suite": suite["suite"], "diagnostics": suite["run_progress"]},
+                    sort_keys=True, ensure_ascii=True), flush=True)
             diagnostic_count = 0
             for case in suite.get("xml_results", {}).get("cases", []):
                 if case.get("failed") and "failure_diagnostics" in case:
@@ -312,6 +317,13 @@ def assertion_diagnostic(node):
               "input_truncated": len(raw) > 8192 or len(message.splitlines()) > 64,
               "details_redacted": True}
     location = failure_location(message)
+    if location is None:
+        # Some GoogleTest versions put only the summary in the attribute and
+        # the compiler location in CDATA. Never treat a cut first line as a path.
+        text = node.text or ""
+        prefix = text[:8192].encode("utf-8")[:8192].decode("utf-8", errors="ignore")
+        if "\n" in prefix or prefix == text:
+            location = failure_location(prefix)
     if location is not None:
         result["source"] = location
     for line in lines:
@@ -376,6 +388,51 @@ def xml_tests(path):
         cases.append(row)
     return {"cases": cases, "declared_tests": root.get("tests"),
             "declared_failures": root.get("failures"), "declared_errors": root.get("errors")}
+
+
+def run_progress(path, selected, *, ended=False):
+    """Read ended private output for bounded progress, never acceptance evidence."""
+    unavailable = {"status": "unavailable", "scope": "bounded_progress_not_acceptance",
+                   "details_redacted": True}
+    if ended is not True:
+        return unavailable
+    try:
+        allowed = {row["name"] for row in selected if row["disabled"] is False}
+        with path.open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            start = max(0, size - PROGRESS_LOG_BYTES)
+            stream.seek(start)
+            data = stream.read(PROGRESS_LOG_BYTES)
+        result = {"status": "available", "scope": "bounded_progress_not_acceptance",
+                  "details_redacted": True, "bytes_read": len(data), "truncated": start > 0,
+                  "first_partial_line_discarded": start > 0,
+                  "last_partial_line_discarded": bool(data and not data.endswith(b"\n")),
+                  "started_markers": 0, "ok_markers": 0, "failed_markers": 0,
+                  "last_started": None, "last_completed": None}
+        # At a tail boundary the first line may be partial; discard even if its
+        # bytes happen to look like a full marker. EOF without newline is partial.
+        lines = data.split(b"\n")
+        if start:
+            lines = lines[1:]
+        lines = lines[:-1]
+        for line in lines:
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            started = re.fullmatch(rb"\[ RUN      \] ([A-Za-z0-9_/]+\.[A-Za-z0-9_/]+)", line)
+            completed = re.fullmatch(
+                rb"\[ (      OK| FAILED ) \] ([A-Za-z0-9_/]+\.[A-Za-z0-9_/]+) \([0-9]{1,12} ms\)", line)
+            name = (started[1] if started else completed[2] if completed else b"").decode("ascii")
+            if name not in allowed:
+                continue
+            if started:
+                result["started_markers"] += 1
+                result["last_started"] = name
+            else:
+                result["ok_markers" if completed[1] == b"      OK" else "failed_markers"] += 1
+                result["last_completed"] = name
+        return result
+    except Exception:
+        return unavailable
 
 
 def plans(args):
@@ -480,6 +537,9 @@ def main(argv=None):
                         suite["failures"].append("test XML declares failures or errors")
                 except (OSError, ET.ParseError, ValueError) as error:
                     suite["failures"].append("missing or invalid test XML: " + str(error))
+                if suite["failures"]:
+                    suite["run_progress"] = run_progress(
+                        output / (name + ".run.log"), selected, ended=type(execution["exitcode"]) is int)
             suite["binary_sha256_after"] = sha256(Path(suite["binary"]))
             if suite["binary_sha256_after"] != suite["binary_sha256"]:
                 suite["failures"].append("test binary changed during this run")
