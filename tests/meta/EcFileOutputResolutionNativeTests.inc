@@ -115,7 +115,14 @@ TEST_F(TestEcFileOutputResolution, UnissuedZeroAndIssuedDataCloseBeforePermanent
       ASSERT_OK(installed);
       ASSERT_TRUE(installed->progress.worker);
       ASSERT_TRUE(installed->progress.child);
-      ASSERT_EQ(installed->progress.child->source.kind, EcTreeSlotKind::Data);
+      // WRITE-only public progress omits the source; inspect the exact committed child.
+      auto raw = kv_->createReadWriteTransaction();
+      EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Repair);
+      auto child = blockingWait(EcFileMutationCatalog::queryChild(
+          tx, accepted.object, accepted.child, EcOwner{user_.uid, metaClientId_.uuid}));
+      ASSERT_OK(child);
+      ASSERT_TRUE(*child);
+      ASSERT_EQ((**child).source.kind, EcTreeSlotKind::Data);
     } else ASSERT_NO_FATAL_FAILURE(reserveWithoutIssuance(accepted));
     auto confirm = confirmation(accepted);
     ASSERT_OK(confirm);
