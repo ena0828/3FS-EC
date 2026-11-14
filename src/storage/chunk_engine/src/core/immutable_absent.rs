@@ -86,7 +86,7 @@ impl ImmutableStagingEngine {
             engine.meta_store.get_chunk_meta(key)?.is_some() {return Err(ImmutableStageError::Conflict);}
         if prior.is_none() && slot.unknown {return Err(ImmutableStageError::OutcomeUnknown("absence write unconfirmed".into()));}
         if prior.is_none() && query {return Err(ImmutableStageError::Missing);}
-        let entry=engine.meta_cache.entry_by_ref(key);
+        let mut entry=engine.meta_cache.entry_by_ref(key);
         if entry.get().is_some() {return Err(ImmutableStageError::Conflict);}
         Self::absent_indexes(engine,key)?;
         // An unknown write remains non-evictable. Query may confirm an exact

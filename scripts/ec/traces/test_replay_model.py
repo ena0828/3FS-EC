@@ -90,6 +90,17 @@ class ReplayModelTests(unittest.TestCase):
         plan = self.plan(repair_every=0)
         self.assertFalse(any(s['spec']['kind'] == 'repair' for s in plan['steps']))
 
+    def test_recovery_attempt_policy_is_bounded_without_adding_logical_actions_or_credit(self):
+        first = self.plan(max_mutation_attempts=1)
+        last = self.plan(max_mutation_attempts=4)
+        self.assertEqual(first['steps'], last['steps'])
+        self.assertEqual(first['summary'], last['summary'])
+        self.assertFalse(last['model']['unpublished_unknown_outputs_credit'])
+        self.assertEqual(last['recovery'], {'schema': 1, 'max_mutation_attempts': 4,
+                                           'policy': 'explicit_settle_original_candidates'})
+        for value in (0, 5, True):
+            with self.assertRaises(ValueError): self.plan(max_mutation_attempts=value)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

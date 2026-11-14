@@ -250,6 +250,15 @@ def local_build_root(build, uid, gid, euid, egid):
             "local build parent must be a private same-user directory")
 
 
+def regression_work_root(work, build):
+    # Keep every generation beside this exact build. Never adopt/overwrite an
+    # old result tree; its XML and absolute-path receipts remain where created.
+    name_allowed = work.name == "regressions" or re.fullmatch(r"regressions-[a-z0-9][a-z0-9-]{0,63}", work.name)
+    require(work.is_absolute() and work.parent == build.parent and work == work.resolve()
+            and name_allowed and not os.path.lexists(work),
+            "fresh canonical regressions or regressions-<safe-generation> directory beside build required")
+
+
 def backend_property(xml, expected):
     require(expected in ("scalar", "isal"), "unknown expected backend")
     cases = [case for case in ET.parse(xml).getroot().iter("testcase")
@@ -332,7 +341,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--build", required=True, type=Path)
-    parser.add_argument("--work", required=True, type=Path)
+    parser.add_argument("--work", required=True, type=Path,
+                        help="fresh build-parent/regressions or regressions-<generation>; generation is 1-64 lowercase letters/digits/hyphens")
     parser.add_argument("--backend", required=True, choices=("scalar", "isal"))
     parser.add_argument("--require-target-retirement", action="store_true")
     parser.add_argument("--local-revision", help="explicit full source commit for an ordinary Linux acceptance host; "
@@ -363,8 +373,7 @@ def main():
         require(target in built["targets"] and digest(core.existing_path(build / "tests" / target)) == built["binaries"][target],
                 "regression executable differs from build receipt")
     work = args.work
-    require(work.is_absolute() and work == build.parent / "regressions" and not os.path.lexists(work),
-            "fresh fixed regression directory required")
+    regression_work_root(work, build)
     work.mkdir(mode=0o700)
     (work / "tmp").mkdir(mode=0o700)
     inputs = {str(path): digest(path) for path in (

@@ -112,7 +112,8 @@ def lease(run, new):
 
 def providers():
     paths = [Path(__file__).resolve(), Path(kv.__file__).resolve(), Path(replay_input.__file__).resolve(),
-             Path(replay_model.__file__).resolve(), HERE / 'kv-replay-native.py']
+             Path(replay_model.__file__).resolve(), HERE / 'kv-replay-native.py',
+             HERE / 'replay-reservations.py', HERE / 'output-reservation-runner.py']
     return {str(path): kv.sha(path.read_bytes()) for path in paths}
 
 
@@ -141,6 +142,19 @@ def validate_receipt(step, plan, receipt):
     kv.require(receipt['historical_join_proven'] is (unknown == 0), 'Historical join overclaim')
     kv.require(type(receipt['snapshot_exports']) is list and len(receipt['snapshot_exports']) ==
                (1 if spec['kind'] in ('put', 'repair') else 0), 'Published snapshot inventory differs')
+    if spec['kind'] in ('put', 'repair'):
+        reservation = receipt.get('mutation_reservations')
+        kv.require(type(reservation) is dict, 'Missing mutation reservation ledger')
+        attempts = kv.integer(reservation['attempts'], 'mutation attempts', 1, plan['recovery']['max_mutation_attempts'])
+        for key, expected in {'schema': 1, 'max_attempts': plan['recovery']['max_mutation_attempts'],
+             'released_model_bytes_decimal': str((attempts - 1) * 12 * plan['shard_bytes']),
+             'retained_model_bytes_decimal': str(12 * plan['shard_bytes']),
+             'physical_capacity_returned': False, 'scope': 'exact_original_candidate_reservations_only'}.items():
+            kv.require(type(reservation.get(key)) is type(expected) and reservation[key] == expected,
+                       'Reservation completion differs: ' + key)
+        kv.require(type(reservation['settlement_sha256']) is list and len(reservation['settlement_sha256']) == attempts - 1 and
+                   len(set(reservation['settlement_sha256'])) == attempts - 1, 'Repeated or incomplete settlement credit')
+        for sha in reservation['settlement_sha256']: kv.digest(sha, 'settlement SHA')
     if spec['kind'] == 'evict':
         unlink = receipt['namespace_unlink']
         for key, expected in {'schema': 1, 'kind': 'ec_file_namespace_unlink',
@@ -225,9 +239,15 @@ def parser():
     start.add_argument('--delivery', choices=('return', 'direct'), help='Default helper=direct, other=return')
     start.add_argument('--window', type=int, default=1)
     start.add_argument('--targets', default='0,1', help='One or two distinct shard indices')
+    start.add_argument('--max-mutation-attempts', type=int, default=2,
+                       help='Fixed 1..4 attempts; each replacement requires explicit complete settlement')
     for command in ('resume', 'status'):
         child = sub.add_parser(command)
         child.add_argument('--run-dir', required=True, type=Path)
+    settle = sub.add_parser('settle', help='Explicit original close/classification; never completes a workload action')
+    settle.add_argument('--run-dir', required=True, type=Path)
+    settle.add_argument('--action', required=True)
+    settle.add_argument('--authorize-absence-confirmation', action='store_true')
     return result
 
 
@@ -259,13 +279,14 @@ def main(argv=None):
                    'policy': {'shard_bytes': options.shard_bytes, 'slots': options.slots,
                     'logical_budget': options.logical_budget, 'allocation_budget': options.allocation_budget,
                     'ttl_ns': ttl * 10**9, 'repair_every': options.repair_every,
+                    'max_mutation_attempts': options.max_mutation_attempts,
                     'repair': replay_model.repair_options(options.strategy,
                          options.delivery or ('direct' if options.strategy == 'helper' else 'return'),
                          options.window, [int(x) for x in options.targets.split(',')])}}
         plan = derive(request)  # Validate entire source and policy before creating any remote identity.
         run.mkdir(mode=0o700); sync_parent(run)
     with lease(run, options.command == 'start') as fd:
-        if options.command == 'resume':
+        if options.command in ('resume', 'settle'):
             request = read(run / 'request.json')
             plan = derive(request)
             kv.require(encoded(read(run / 'plan.json')) == encoded(plan), 'Original replay plan or provenance changed')
@@ -278,7 +299,11 @@ def main(argv=None):
             for sig in old: signal.signal(sig, backend.request_stop)
             def verify_input():
                 kv.require(encoded(derive(request)) == encoded(plan), 'Replay inputs changed during execution')
-            result = execute(plan, run, backend, verify_input)
+            if options.command == 'settle':
+                result = backend.settle(options.action, authorize_absence=options.authorize_absence_confirmation)
+                verify_input()
+            else:
+                result = execute(plan, run, backend, verify_input)
             print(json.dumps(result, sort_keys=True))
         finally:
             for sig, handler in old.items(): signal.signal(sig, handler)

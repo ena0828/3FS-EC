@@ -228,6 +228,11 @@ class SupervisorCommandTests(unittest.TestCase):
         self.assertIsNone(runner.child)
 
     def test_fault_case_uses_same_saved_action_and_never_replaces_or_retries_it(self):
+        # The fresh fault driver rejects a stale bundle before starting this
+        # control path. Keep this check tied to the shipped dependency bytes.
+        for name, expected in FAULT.BUNDLE_SCRIPTS.items():
+            self.assertEqual(FAULT.digest(HERE / name), expected, name)
+        self.assertEqual(FAULT.digest(HERE / 'file-cli-acceptance.py'), FAULT.FILE_DRIVER_SHA)
         runner = self.runner()
         action_path = runner.report / 'actions.json'
         action_path.write_bytes(RUNNER.json_data({'fault': self.action}))

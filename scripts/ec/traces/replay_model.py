@@ -42,7 +42,7 @@ def synthetic():
 
 
 def build(binding, events, *, trace_id, shard_bytes=11469, slots=2, logical_budget=229376,
-          allocation_budget=16777216, ttl_ns=259200000000000, repair_every=3, repair=None):
+          allocation_budget=16777216, ttl_ns=259200000000000, repair_every=3, repair=None, max_mutation_attempts=2):
     kv.require(str(uuid.UUID(trace_id)) == trace_id, 'Require canonical fixed trace UUID')
     kv.require(type(binding) is dict and type(binding.get('schema')) is int and binding.get('schema') == 1 and binding.get('kind') in (
         'verified_public_input_observations', 'synthetic_functional_observations'), 'Unknown observation provenance')
@@ -56,6 +56,7 @@ def build(binding, events, *, trace_id, shard_bytes=11469, slots=2, logical_budg
     kv.integer(allocation_budget, 'allocation reservation byte budget', 1, 1 << 40)
     kv.integer(ttl_ns, 'inactivity TTL ns', 1, kv.MAX_NS)
     kv.integer(repair_every, 'repair period (zero disables)', 0, 4096)
+    kv.integer(max_mutation_attempts, 'explicit bounded mutation attempts', 1, 4)
     if repair is None:
         repair = repair_options()
     kv.require(kv.canonical(repair) == kv.canonical(repair_options(
@@ -149,6 +150,8 @@ def build(binding, events, *, trace_id, shard_bytes=11469, slots=2, logical_budg
     return {'schema': 1, 'kind': 'bounded_serial_native_kv_replay', 'trace_id': trace_id, 'namespace': '/ec-lab',
             'source_binding': binding, 'selected_observations_sha256': kv.sha(kv.canonical(events)),
             'shard_bytes': shard_bytes, 'repair': repair, 'collector_limits': dict(COLLECTOR_LIMITS),
+            'recovery': {'schema': 1, 'max_mutation_attempts': max_mutation_attempts,
+                         'policy': 'explicit_settle_original_candidates'},
             'model': {'slots': slots, 'logical_budget_decimal': str(logical_budget),
                       'allocation_budget_decimal': str(allocation_budget), 'ttl_ns_decimal': str(ttl_ns),
                       'repair_every': repair_every, 'eviction_policy': 'source-time-inactivity-ttl-then-lru',

@@ -41,7 +41,8 @@ class FileLabGates(unittest.TestCase):
         scripts = root / 'scripts'; scripts.mkdir()
         source = Path(__file__).resolve().parents[1]
         for name in ('kv-replay.py', 'kv-replay-native.py', 'ack-service-acceptance.py', 'experiment-runner.py',
-                     'native_v2_config.py', 'generate.py', 'file-command.py', 'tree-gc-runner.py'):
+                     'native_v2_config.py', 'generate.py', 'file-command.py', 'tree-gc-runner.py',
+                     'replay-reservations.py', 'output-reservation-runner.py'):
             shutil.copyfile(source / 'cluster' / name, scripts / name)
         for name in ('kv_trace.py', 'replay_input.py', 'replay_model.py'):
             shutil.copyfile(source / 'traces' / name, scripts / name)
@@ -66,7 +67,8 @@ class FileLabGates(unittest.TestCase):
             for path in inputs:
                 path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'pure fixture input only')
             inputs += [scripts / name for name in ('kv-replay-native.py', 'kv_trace.py', 'file-command.py',
-                       'ack-service-acceptance.py', 'experiment-runner.py', 'tree-gc-runner.py', 'native_v2_config.py')]
+                       'ack-service-acceptance.py', 'experiment-runner.py', 'tree-gc-runner.py', 'native_v2_config.py',
+                       'replay-reservations.py', 'output-reservation-runner.py')]
             save(run / 'native/binding.json', {'schema': 1, 'root': str(root), 'run_dir': str(run), 'plan_sha256': entry.digest(plan),
                                               'files': {str(path): lab.sha(path) for path in inputs}})
             rows, values = [], []
@@ -133,6 +135,12 @@ class FileLabGates(unittest.TestCase):
                          'historical_unconfirmed_attempts': 0, 'historical_join_proven': True,
                          'snapshot_exports': [{'synthetic': True}] if spec['kind'] in ('put', 'repair') else [],
                          'gc': None, 'files': files, 'owned_commands': commands, 'namespace_unlink': None}
+                if spec['kind'] in ('put', 'repair'):
+                    value['mutation_reservations'] = {'schema': 1, 'attempts': 1,
+                        'max_attempts': plan['recovery']['max_mutation_attempts'],
+                        'released_model_bytes_decimal': '0', 'retained_model_bytes_decimal': str(12 * plan['shard_bytes']),
+                        'settlement_sha256': [], 'physical_capacity_returned': False,
+                        'scope': 'exact_original_candidate_reservations_only'}
                 if spec['kind'] == 'evict':
                     obj = {'client_namespace': '00000000-0000-0000-0000-000000000001', 'inode_decimal': '42',
                            'incarnation': '00000000-0000-0000-0000-000000000002', 'birth': '00000000-0000-0000-0000-000000000003'}
@@ -178,6 +186,11 @@ class FileLabGates(unittest.TestCase):
             changed = copy.deepcopy(values[0]); changed['historical_unconfirmed_attempts'] = 1; changed['historical_join_proven'] = False
             save(first, changed)
             with self.assertRaisesRegex(lab.GateError, 'unconfirmed historical'): lab.require_kv_replay_result(root, None)
+            changed = copy.deepcopy(values[0])
+            changed['mutation_reservations'].update(attempts=2,
+                released_model_bytes_decimal=str(12 * plan['shard_bytes']), settlement_sha256=['1' * 64])
+            save(first, changed)
+            with self.assertRaisesRegex(lab.GateError, 'replaced mutation'): lab.require_kv_replay_result(root, None)
             save(first, values[0])
             file = Path(next(iter(values[0]['files']))); file.write_bytes(b'changed')
             with self.assertRaisesRegex(lab.GateError, 'evidence changed'): lab.require_kv_replay_result(root, None)

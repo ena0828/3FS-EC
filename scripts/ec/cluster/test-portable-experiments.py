@@ -258,7 +258,7 @@ class PortableExperiments(unittest.TestCase):
                 prepare(root, ROOT, 19000, "v2", file_api=True)
             self.assertFalse(root.exists())
             prepare(root, ROOT, 19000, "gc", file_api=True, user_uid=2345, user_gid=3456)
-            for name in ("kv-replay.py", "kv-replay-native.py"):
+            for name in ("kv-replay.py", "kv-replay-native.py", "replay-reservations.py", "output-reservation-runner.py"):
                 self.assertEqual((root / "scripts" / name).read_bytes(), (SCRIPTS / name).read_bytes())
             traces = SCRIPTS.parent / "traces"
             for name in ("kv_trace.py", "replay_input.py", "replay_model.py"):
@@ -269,7 +269,11 @@ class PortableExperiments(unittest.TestCase):
                              (traces / "licenses/Qwen-Bailian-LICENSE").read_bytes())
             help_result = subprocess.run([sys.executable, '-B', str(root / 'scripts/kv-replay.py'), '--help'],
                                          cwd=root, capture_output=True, text=True, check=True)
-            self.assertIn('start,resume,status', help_result.stdout)
+            self.assertIn('start,resume,status,settle', help_result.stdout)
+            classifier_help = subprocess.run(
+                [sys.executable, '-B', str(root / 'scripts/output-reservation-runner.py'), '--help'],
+                cwd=root, capture_output=True, text=True, check=True)
+            self.assertIn('start,resume', classifier_help.stdout)
             manifest = json.loads((root / "cluster.json").read_text())
             self.assertEqual(manifest["authenticated_user"], {"uid": 2345, "gid": 3456})
             self.assertTrue(file_api_enabled(manifest))

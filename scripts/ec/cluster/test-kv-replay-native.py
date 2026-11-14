@@ -29,6 +29,8 @@ w = load('experiment-runner.py')
 gc = load('tree-gc-runner.py')
 cli = load('file-command.py')
 trace = n.module(HERE.parent / 'traces/kv_trace.py', 'test_kv_native_payload')
+reservations = load('replay-reservations.py')
+classification_fixture = load('test-output-reservation-runner.py')
 
 
 def uid(number): return str(uuid.UUID(int=number))
@@ -89,6 +91,70 @@ class NativeAdapterTests(unittest.TestCase):
         if kind == 'repair': result.update(self.backend.plan['repair'])
         return result
 
+    def enable_settlement(self, *, limit=2, mode='released'):
+        """Actual reservation/Classifier algorithms, explicitly simulated services."""
+        b = self.backend
+        b.plan['recovery'] = {'schema': 1, 'max_mutation_attempts': limit, 'policy': reservations.POLICY}
+        b.plan['model'] = {'allocation_budget_decimal': str(8 * 12 * 11469)}
+        for step in b.plan['steps']:
+            step['model']['before'] = {'allocation_reservation_bytes_decimal':
+                                      '0' if step['spec']['kind'] == 'put' else str(12 * 11469)}
+        b.plan_sha = n.digest(b.plan)
+        b.reservations_module = reservations
+        b.resolution_runner = m = classification_fixture.m
+        self.classifiers = {}; self.classification_mode = mode; self.classification_calls = []
+        fixture = self
+
+        class Adapter(classification_fixture.Adapter):
+            def execute(self, argv, attempt):
+                op = json.loads(argv[1])
+                if op['kind'] != 'close' or self.plan['output_kind'] != 'pwrite':
+                    return super().execute(argv, attempt)
+                self.calls.append(copy.deepcopy(op))
+                show = fixture.session | {'operation': self.exported[0]['parent'], 'error_code': 0,
+                                          'offset_decimal': '0', 'length_decimal': '896'}
+                published = fixture.classification_mode == 'published'
+                prefix = '896' if published else '0'
+                value = {'observed': True, 'logical_closed': True, 'logical_complete': published,
+                         'all_cleanup_complete': True, 'error_code': 0,
+                         'confirmed_prefix_decimal': prefix, 'revalidated_prefix_decimal': prefix}
+                (attempt / 'command.log').write_bytes(n.encoded(show) + n.encoded(value))
+                return {'argv': argv, 'process_started': True, 'process_exited': True, 'returncode': 0,
+                        'log_sha256': sha(attempt / 'command.log'), 'owner_error_type': None}
+
+        def classify(args):
+            b.guard()
+            self.classification_calls.append((args.action, args.authorize_absence_confirmation))
+            folder = args.run_dir
+            if args.action == 'start':
+                folder.mkdir(mode=0o700)
+                for part in ('operations', 'attempts'): (folder / part).mkdir(mode=0o700)
+                record = args.source_run / ('record.json' if args.kind == 'pwrite' else 'record.data')
+                plan = {'schema': 1, 'kind': 'ec_output_reservation_plan', 'root': str(b.root),
+                        'source_run': str(args.source_run), 'source_record': str(record),
+                        'source_record_sha256': sha(record), 'output_kind': args.kind, 'id_namespace': uid(600),
+                        'max_commands': args.max_commands,
+                        'policy': 'collect_first_absence_requires_explicit_resume_authorization',
+                        'binding': {'cluster': 'test-cluster', 'client_namespace': Adapter.namespace,
+                                    'files': {str(record): sha(record)}}}
+                self.save(folder / 'plan.json', plan)
+                i = {'inode_decimal': '42', 'object_incarnation': uid(2), 'owner_uid': 1000,
+                     'owner_client': uid(4), 'parent': uid(6 if args.kind == 'pwrite' else 30),
+                     'child': uid(7 if args.kind == 'pwrite' else 31), 'owner_kind': args.kind}
+                observation = classification_fixture.observation(i, 5 if self.classification_mode == 'published' else 6,
+                                                                 bound=self.classification_mode != 'released')
+                adapter = Adapter(plan, {} if self.classification_mode == 'missing' else {i['child']: observation})
+                adapter.exported = [i]
+                adapter.cleanup.update(self.session | {'operation': i['parent'], 'child': i['child'],
+                    'plan': uid(32), 'source_pin': uid(33)})
+                if self.classification_mode == 'published':
+                    adapter.cleanup.update(state='Published', published=True)
+                if self.classification_mode == 'mixed': adapter.present = {0, 3, 7, 11}
+                self.classifiers[str(folder)] = adapter
+            adapter = self.classifiers[str(folder)]
+            return m.Classifier(folder, adapter.plan, adapter, args.authorize_absence_confirmation).run()
+        b.run_classifier = classify
+
     def snapshot(self, run):
         size = 896; generation = str(self.generation)
         row = {'stripe_decimal': '0', 'revision_decimal': str(self.generation + 4), 'generation_decimal': generation,
@@ -130,7 +196,8 @@ class NativeAdapterTests(unittest.TestCase):
         if failing: self.fail_action = None
         if not (failing and self.fail_without_record):
             run.mkdir(parents=True, exist_ok=True, mode=0o700)
-            record = run / ('record.data' if 'read' in action or 'allocations' in action else 'record.json')
+            record = run / ('record.data' if any(word in action for word in ('read', 'allocations', 'repair', 'truncate'))
+                            else 'record.json')
             if not record.exists(): record.write_bytes(b'FIXTURE: stable original journal identity')
         values = []
         if collector:
@@ -398,7 +465,7 @@ class NativeAdapterTests(unittest.TestCase):
         get = self.backend.perform('get-0', self.spec('get'))
         self.fail_action = 'repair'
         with self.assertRaises(RuntimeError): self.backend.perform('repair-0', self.spec('repair'))
-        original = self.backend.actions / 'repair-0/repair-run/record.json'
+        original = self.backend.actions / 'repair-0/repair-run/record.data'
         before = sha(original)
         count = len(self.calls)
         self.assertEqual(self.backend.perform('put-0', self.spec('put')), put)
@@ -411,6 +478,140 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(repaired['state'], 'confirmed')
         self.assertEqual([x[0] for x in self.calls].count('repair'), 1)
         self.assertEqual([x[0] for x in self.calls].count('resume-repair'), 1)
+
+    def test_explicit_full_settlement_releases_once_then_runs_new_bounded_workload(self):
+        self.enable_settlement()
+        self.fail_action = 'pwrite'
+        with self.assertRaises(RuntimeError): self.backend.perform('put-0', self.spec('put'))
+        folder = self.backend.actions / 'put-0'
+        original = sha(folder / 'write-run/record.json')
+        result = self.backend.settle('put-0')
+        self.assertFalse(result['business_action_completed']); self.assertFalse(result['model_advanced'])
+        self.assertFalse((folder / 'completion.json').exists())
+        self.assertEqual(result['settlement']['released_model_bytes_decimal'], str(12 * 11469))
+        calls = len(self.classification_calls)
+        self.assertEqual(self.backend.settle('put-0'), result)
+        self.assertEqual(len(self.classification_calls), calls, 'No second release or command on repeated settlement')
+        directory = self.backend.directory
+        replacement = folder / 'mutation-attempts/0001'
+        def interrupted(path):
+            if path == replacement: raise OSError('synthetic crash after durable reservation plan')
+            return directory(path)
+        with patch.object(self.backend, 'directory', side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, 'durable reservation'):
+                self.backend.perform('put-0', self.spec('put'))
+        self.assertTrue((folder / 'reservations/0001/plan.json').is_file())
+        self.assertFalse(replacement.exists())
+        completed = self.backend.perform('put-0', self.spec('put'))
+        self.assertEqual(sha(folder / 'write-run/record.json'), original)
+        writes = [p for action, p, _ in self.calls if action == 'pwrite']
+        self.assertEqual(writes, [folder / 'write-run', folder / 'mutation-attempts/0001/write-run'])
+        self.assertEqual(completed['mutation_reservations']['attempts'], 2)
+        self.assertEqual(completed['mutation_reservations']['retained_model_bytes_decimal'], str(12 * 11469))
+        self.assertTrue(completed['snapshot_exports'])
+        self.assertNotIn('close', [a for a, _, _ in self.calls])
+        changed = folder / 'reservations/0000/classification/attempts/000000/joined.json'
+        changed.write_bytes(b'changed historical classification')
+        with self.assertRaisesRegex(ValueError, 'evidence changed'):
+            self.backend.perform('put-0', self.spec('put'))
+
+    def test_published_settlement_keeps_charge_and_completes_by_original_result_readback(self):
+        self.enable_settlement(mode='published')
+        self.fail_action = 'pwrite'
+        with self.assertRaises(RuntimeError): self.backend.perform('put-0', self.spec('put'))
+        settled = self.backend.settle('put-0')
+        self.assertEqual(settled['settlement']['released_model_bytes_decimal'], '0')
+        done = self.backend.perform('put-0', self.spec('put'))
+        self.assertEqual(done['mutation_reservations']['attempts'], 1)
+        self.assertEqual([a for a, _, _ in self.calls].count('pwrite'), 1)
+        self.assertNotIn('resume', [a for a, _, _ in self.calls])
+        self.assertEqual(len(done['snapshot_exports']), 1)
+
+    def test_missing_ecfe_and_partial_classifier_block_resume_without_replacing_identity(self):
+        self.enable_settlement(mode='missing')
+        self.fail_action = 'pwrite'
+        with self.assertRaises(RuntimeError): self.backend.perform('put-0', self.spec('put'))
+        with self.assertRaises(Exception): self.backend.settle('put-0')
+        before = len(self.calls)
+        with self.assertRaisesRegex(ValueError, 'settlement is incomplete'):
+            self.backend.perform('put-0', self.spec('put'))
+        self.assertEqual(len(self.calls), before)
+        folder = self.backend.actions / 'put-0'
+        self.assertFalse((folder / 'reservations/0000/settlement.json').exists())
+        self.assertFalse((folder / 'mutation-attempts').exists())
+
+    def test_repair_settlement_uses_original_debt_and_full_mixed_set_before_replacement(self):
+        self.enable_settlement(mode='mixed')
+        self.backend.perform('put-0', self.spec('put')); self.backend.perform('get-0', self.spec('get'))
+        self.fail_action = 'repair'
+        with self.assertRaises(RuntimeError): self.backend.perform('repair-0', self.spec('repair'))
+        with self.assertRaises(Exception): self.backend.settle('repair-0')
+        with self.assertRaises(Exception): self.backend.settle('repair-0')
+        with self.assertRaisesRegex(ValueError, 'settlement is incomplete'):
+            self.backend.perform('repair-0', self.spec('repair'))
+        for _ in range(9):
+            try:
+                settled = self.backend.settle('repair-0', authorize_absence=True); break
+            except classification_fixture.m.gc.CheckError: pass
+        else: self.fail('Bounded synthetic classifications did not finish')
+        self.assertEqual(settled['settlement']['released_model_bytes_decimal'], str(12 * 11469))
+        result = self.backend.perform('repair-0', self.spec('repair'))
+        self.assertEqual(result['mutation_reservations']['attempts'], 2)
+        self.assertFalse(result['physical_capacity_returned'])
+
+    def test_exhausted_attempt_budget_and_missing_original_record_never_generate_replacement(self):
+        self.enable_settlement(limit=1)
+        self.fail_action = 'pwrite'
+        with self.assertRaises(RuntimeError): self.backend.perform('put-0', self.spec('put'))
+        folder = self.backend.actions / 'put-0'
+        self.backend.settle('put-0')
+        count = len(self.calls)
+        with self.assertRaisesRegex(ValueError, 'Replacement requires explicit|attempt limit exhausted'):
+            self.backend.perform('put-0', self.spec('put'))
+        self.assertEqual(len(self.calls), count)
+        (folder / 'write-run/record.json').unlink()
+        with self.assertRaisesRegex(ValueError, 'missing/partial'): self.backend.settle('put-0')
+        self.assertFalse((folder / 'mutation-attempts').exists())
+
+    def test_classification_tampering_cannot_turn_partial_or_foreign_set_into_credit(self):
+        self.enable_settlement()
+        self.fail_action = 'pwrite'
+        with self.assertRaises(RuntimeError): self.backend.perform('put-0', self.spec('put'))
+        self.backend.settle('put-0')
+        folder = self.backend.actions / 'put-0'
+        path = folder / 'reservations/0000/classification/completion.json'
+        good = gc.load(path)
+        for change in (lambda r: r.update(candidate_count=1),
+                       lambda r: r.update(source_cleanup_confirmed=False),
+                       lambda r: r['children'][0]['candidates'].pop(),
+                       lambda r: r['children'][0]['candidates'][0].update(allocation=uid(999)),
+                       lambda r: r['children'][0]['candidates'][0].update(eligible=False),
+                       lambda r: r.update(session_closed_by_runner=True)):
+            bad = copy.deepcopy(good); change(bad); self.save(path, bad)
+            with self.assertRaises((ValueError, classification_fixture.m.gc.CheckError)):
+                self.backend.perform('put-0', self.spec('put'))
+            self.assertFalse((folder / 'mutation-attempts').exists())
+        self.save(path, good)
+        self.backend.perform('put-0', self.spec('put'))
+
+    def test_visible_settlement_lost_sync_requires_reconfirmation_before_replacement(self):
+        self.enable_settlement()
+        self.fail_action = 'pwrite'
+        with self.assertRaises(RuntimeError): self.backend.perform('put-0', self.spec('put'))
+        original = self.backend.seal
+        marker = self.backend.actions / 'put-0/reservations/0000/settlement.json'
+        def uncertain(path, value):
+            result = original(path, value)
+            if path == marker: raise OSError('synthetic lost directory sync confirmation')
+            return result
+        with patch.object(self.backend, 'seal', side_effect=uncertain):
+            with self.assertRaisesRegex(OSError, 'sync'): self.backend.settle('put-0')
+        with self.assertRaisesRegex(ValueError, 'Replacement requires explicit'):
+            self.backend.perform('put-0', self.spec('put'))
+        with patch.object(self.backend, 'seal', wraps=original) as calls:
+            self.backend.settle('put-0')
+            self.assertTrue(any(c.args[0] == marker for c in calls.call_args_list))
+        self.backend.perform('put-0', self.spec('put'))
 
 
 if __name__ == '__main__': unittest.main()

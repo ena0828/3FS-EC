@@ -41,7 +41,13 @@ class FakeBackend:
                 'object': obj, 'namespace_unlink': unlink,
                 'historical_unconfirmed_attempts': 1, 'historical_join_proven': False,
                 'current_owner_children_joined': True, 'namespace_deleted': False,
-                'physical_capacity_returned': False, 'performance_validated': False}
+                'physical_capacity_returned': False, 'performance_validated': False,
+                **({'mutation_reservations': {'schema': 1, 'attempts': 1,
+                    'max_attempts': self.plan['recovery']['max_mutation_attempts'],
+                    'released_model_bytes_decimal': '0',
+                    'retained_model_bytes_decimal': str(12 * self.plan['shard_bytes']), 'settlement_sha256': [],
+                    'physical_capacity_returned': False, 'scope': 'exact_original_candidate_reservations_only'}}
+                   if spec['kind'] in ('put', 'repair') else {})}
 
 
 class ReplayEntryTests(unittest.TestCase):
@@ -131,6 +137,26 @@ class ReplayEntryTests(unittest.TestCase):
             self.assertEqual(args.strategy, strategy)
         args = entry.parser().parse_args(['resume', '--run-dir', '/run'])
         self.assertEqual(vars(args), {'command': 'resume', 'run_dir': Path('/run')})
+
+    def test_settle_is_separate_explicit_authority_and_never_an_implicit_resume_flag(self):
+        args = entry.parser().parse_args(['settle', '--run-dir', '/run', '--action', 'a000002'])
+        self.assertFalse(args.authorize_absence_confirmation)
+        args = entry.parser().parse_args(['settle', '--run-dir', '/run', '--action', 'a000002',
+                                         '--authorize-absence-confirmation'])
+        self.assertTrue(args.authorize_absence_confirmation)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            entry.parser().parse_args(['resume', '--run-dir', '/run', '--authorize-absence-confirmation'])
+
+    def test_settlement_cannot_replace_business_completion_or_partial_credit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, plan = self.fixture(temporary); step = plan['steps'][0]
+            good = FakeBackend(plan).perform(step['name'], step['spec'])
+            for change in (lambda r: r.update(state='released'),
+                           lambda r: r['mutation_reservations'].update(retained_model_bytes_decimal='0'),
+                           lambda r: r['mutation_reservations'].update(attempts=2, released_model_bytes_decimal='1'),
+                           lambda r: r['mutation_reservations'].update(attempts=True)):
+                bad = copy.deepcopy(good); change(bad)
+                with self.assertRaises(ValueError): entry.validate_receipt(step, plan, bad)
 
 
 if __name__ == '__main__':

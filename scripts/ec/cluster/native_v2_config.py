@@ -710,7 +710,7 @@ def prepare(root, source, port_base, profile="v2", *, file_api=False, user_uid=1
                  "native_fault_control.py", "native_managed_domain.py"):
         shutil.copy2(Path(__file__).parent / name, root / "scripts" / name)
     if file_api:
-        for name in ("kv-replay.py", "kv-replay-native.py"):
+        for name in ("kv-replay.py", "kv-replay-native.py", "replay-reservations.py", "output-reservation-runner.py"):
             shutil.copy2(Path(__file__).parent / name, root / "scripts" / name)
         traces = Path(__file__).parent.parent / "traces"
         for name in ("kv_trace.py", "replay_input.py", "replay_model.py"):

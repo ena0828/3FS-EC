@@ -120,6 +120,8 @@ def snapshot_revision(value, session, cluster, shard_bytes, size, range_id, reco
 
 
 class NativeBackend:
+    same = staticmethod(lambda a, b: encoded(a) == encoded(b))
+
     def __init__(self, root, run_dir, plan, lease_fd):
         require(sys.platform == 'linux' and os.getuid() == os.geteuid() != 0 and
                 os.getgid() == os.getegid() != 0, 'Native replay requires ordinary Linux real/effective UID/GID')
@@ -137,6 +139,9 @@ class NativeBackend:
         self.gc = module(scripts / 'tree-gc-runner.py', 'kv_native_gc')
         payload_source = scripts / 'kv_trace.py'
         self.trace = module(payload_source, 'kv_native_payload')
+        self.reservations_module = module(scripts / 'replay-reservations.py', 'kv_native_reservations')
+        self.resolution_runner = module(scripts / 'output-reservation-runner.py', 'kv_native_output_resolution')
+        self.run_classifier = lambda args: self.resolution_runner.execute(args, check_owner=self.guard)
         self.w.private_directory(self.root); self.w.private_directory(self.run_dir)
         self.lease_fd = lease_fd
         self.ack.checked_pass_fds((lease_fd,))
@@ -150,6 +155,7 @@ class NativeBackend:
         names = [name_checked(step['name']) for step in plan['steps']]
         require(len(set(names)) == len(names), 'Repeated fixed action name')
         self.plan = json.loads(encoded(plan)); self.plan_sha = digest(plan)
+        self.reservations_module.policy(plan)
         require(encoded(plan.get('collector_limits')) == encoded({'nodes': 2064, 'commands': 16384}) and
                 plan.get('bounds', {}).get('max_revisions_per_instance') == 128,
                 'Replay collector limits must be fixed before native I/O')
@@ -162,7 +168,8 @@ class NativeBackend:
         paths = [self.root / p for p in ('cluster.json', 'state/initialized.json', 'client/file-client.toml',
                  'config/admin_cli.toml', 'bin/ec_file_cli', 'bin/admin_cli')]
         paths += [scripts / p for p in ('kv-replay-native.py', 'kv_trace.py', 'file-command.py',
-                  'ack-service-acceptance.py', 'experiment-runner.py', 'tree-gc-runner.py', 'native_v2_config.py')]
+                  'ack-service-acceptance.py', 'experiment-runner.py', 'tree-gc-runner.py', 'native_v2_config.py',
+                  'replay-reservations.py', 'output-reservation-runner.py')]
         self.binding = {'schema': 1, 'root': str(self.root), 'run_dir': str(self.run_dir), 'plan_sha256': self.plan_sha,
                         'files': {str(p): self.sha(p) for p in paths}}
         self.seal(self.folder / 'binding.json', self.binding)
@@ -525,6 +532,31 @@ class NativeBackend:
                 'completion_sha256': self.sha(run / 'completion.json'), 'completion': completion,
                 'confirmed_allocation_model_bytes_decimal': str(len(allocations) * self.plan['shard_bytes'])}
 
+    def settle(self, name, *, authorize_absence=False):
+        """Explicitly close/classify one original mutation, never advance the trace."""
+        self.guard()
+        require(type(authorize_absence) is bool, 'Invalid absence authorization')
+        matches = [s for s in self.plan['steps'] if s['name'] == name]
+        require(len(matches) == 1, 'Settlement is outside the original plan')
+        step = matches[0]; spec = spec_checked(name, step['spec'], self.plan)
+        require(spec['kind'] in ('put', 'repair'), 'Only put/repair settlement is supported; retain same-ID recovery')
+        for prior in self.plan['steps'][:self.plan['steps'].index(step)]:
+            self.receipt(self.actions / prior['name'])
+        folder = self.actions / name
+        require(not (folder / 'completion.json').exists(), 'Logical action already completed; no new cancellation')
+        require(self.same(self.load(folder / 'spec.json'), spec), 'Original action spec changed')
+        for existing in self.actions.iterdir():
+            require(existing == folder or (existing / 'completion.json').exists(), 'Another action is unfinished')
+        session = self.actions / spec['instance'] / 'session/done.json'
+        fixed = self.load(session); self.verify_files(fixed)
+        ledger = self.reservations_module.Reservations(self, folder, spec, fixed['value'])
+        result = ledger.settle(authorize_absence)
+        self.guard()
+        return {'schema': 1, 'kind': 'ec_replay_explicit_settlement', 'name': name,
+                'plan_sha256': self.plan_sha, 'settlement': result,
+                'business_action_completed': False, 'model_advanced': False, 'session_closed': False,
+                'instruction': 'resume validates original evidence and executes the pending logical workload'}
+
     def perform(self, name, spec):
         self.guard()
         spec = spec_checked(name, spec, self.plan)
@@ -564,6 +596,11 @@ class NativeBackend:
             session_run = instance_folder / 'session-run'
         payload, data = self.payload(instance_folder, spec)
         exports, collection, namespace_unlink = [], None, None
+        reservation, settled, mutation_folder = None, None, folder
+        if spec['kind'] in ('put', 'repair') and 'recovery' in self.plan:
+            reservation = self.reservations_module.Reservations(self, folder, spec, fixed)
+            active, settled = reservation.active()
+            mutation_folder = Path(active['work'])
         if spec['kind'] == 'put':
             def written(result):
                 require(result['returncode'] == 0 and len(result['business']) == 2, 'Pwrite journal/outcome missing')
@@ -577,23 +614,28 @@ class NativeBackend:
                                   ('confirmed_prefix_decimal', str(len(data))), ('revalidated_prefix_decimal', str(len(data)))):
                     exact(value, key, want)
                 return {'journal': show, 'outcome': value}
-            self.phase(folder, 'write', folder / 'write-run', 'pwrite', 'resume',
-                       ['--session', session_run, '--offset', 0, '--input', payload], written, new_run=True)
+            if settled is not None:
+                written(settled['cleanup_result'])  # Publication is not enough: require the original full workload result.
+            else:
+                self.phase(mutation_folder, 'write', mutation_folder / 'write-run', 'pwrite', 'resume',
+                           ['--session', session_run, '--offset', 0, '--input', payload], written, new_run=True)
         elif spec['kind'] == 'repair':
             require(sum(len(value['snapshot_exports']) for value in history) < min(128, self.gc.MAX_REVISIONS),
                     'Published revision capacity exhausted before starting another mutation')
             options = ['--session', session_run, '--stripe', 0, '--targets', ','.join(map(str, spec['targets'])),
                        '--sources', ','.join(map(str, spec['sources'])), '--strategy', spec['strategy'], '--window', spec['window']]
             if spec['strategy'] == 'helper': options += ['--delivery', spec['delivery']]
-            run = folder / 'repair-run'
-            repaired = self.phase(folder, 'repair', run, 'repair', 'resume-repair', options,
-                                  lambda r: self.repair_check(r, fixed), new_run=True)
+            run = mutation_folder / 'repair-run'
+            repaired = self.repair_check(settled['cleanup_result'], fixed, debt=True) if settled is not None else \
+                self.phase(mutation_folder, 'repair', run, 'repair', 'resume-repair', options,
+                           lambda r: self.repair_check(r, fixed), new_run=True)
             def closed_repair(result):
                 value = self.repair_check(result, fixed, debt=True)
                 for key in ('operation', 'child', 'plan', 'source_pin'):
                     require(value[key] == repaired[key], 'Repair debt changed fixed identity')
                 return value
-            self.phase(folder, 'repair-debt', run, 'close-repair-debt', 'close-repair-debt', (), closed_repair)
+            if settled is None:
+                self.phase(mutation_folder, 'repair-debt', run, 'close-repair-debt', 'close-repair-debt', (), closed_repair)
         if spec['kind'] in ('put', 'get', 'repair'):
             entry = self.readback(folder, session_run, fixed, data, export=spec['kind'] != 'get')
             if entry is not None: exports.append(entry)
@@ -635,13 +677,16 @@ class NativeBackend:
         owned_attempts = {folder / phase / 'attempts' for phase in (
             'session', 'write', 'read', 'release', 'export', 'repair', 'repair-debt',
             'truncate', 'truncate-debt', 'close', 'unlink', 'collector', 'empty/read', 'empty/release')}
+        if reservation is not None:
+            for attempt in reservation.plans():
+                owned_attempts.update(Path(attempt['work']) / phase / 'attempts' for phase in ('write', 'repair', 'repair-debt'))
         for path in sorted(folder.rglob('*')):
             direct_attempt = path.parent.parent in owned_attempts and re.fullmatch('[0-9]{4}', path.parent.name) is not None
             collector_join = (collection is not None and path.name == 'joined.json' and
                               path.is_relative_to(Path(collection['run'])))
             if path.is_file() and (path.name in ('done.json', 'intent.json', 'observed.json', 'record.json', 'record.data',
                                                'expected.json', 'settled-ledger.json') or path.suffix in ('.bin', '.log')
-                                   or collector_join):
+                                   or collector_join or path.is_relative_to(folder / 'reservations')):
                 files[str(path)] = self.sha(path)
                 if path.name == 'done.json': self.verify_files(self.load(path))
                 if path.name == 'observed.json' and direct_attempt: commands.extend(self.load(path)['commands'])
@@ -663,5 +708,7 @@ class NativeBackend:
                  'current_owner_children_joined': True, 'namespace_deleted': False,
                  'physical_capacity_returned': False, 'performance_validated': False,
                  'scope': 'same-journal serial replay instance; confirmed published snapshots only'}
+        if reservation is not None:
+            value['mutation_reservations'] = reservation.summary(exports)
         self.seal(folder / 'completion.json', value)
         return self.receipt(folder)

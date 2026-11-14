@@ -125,15 +125,50 @@ class SystemEntrypoints(unittest.TestCase):
                 receipt.write_text(json.dumps(built))
                 self.assertEqual(regression.main(), 1)
                 private.assert_called_with(build, 1100, 1200, 1100, 1200)
-            common.main.assert_called_once_with([
-                "--bin-dir", str(build / "tests"), "--tmp-root", str(work / "tmp"),
-                "--output", str(work / "tests"), "--suite", "all", "--include-legacy", "--timeout", "300"])
+                original = (work / "result.json").read_bytes()
+                generation = root / "regressions-g000002-abcdef"
+                argv[argv.index("--work") + 1] = str(generation)
+                self.assertEqual(regression.main(), 1)
+                self.assertEqual((work / "result.json").read_bytes(), original)
+                with self.assertRaises(ValueError): regression.main()
+                self.assertEqual(common.main.call_count, 2)
+            self.assertEqual(common.main.call_args_list, [mock.call([
+                "--bin-dir", str(build / "tests"), "--tmp-root", str(directory / "tmp"),
+                "--output", str(directory / "tests"), "--suite", "all", "--include-legacy", "--timeout", "300"])
+                for directory in (work, generation)])
             report = json.loads((work / "result.json").read_text())
             self.assertEqual(report["revision_binding"], {"mode": "local-revision", "expected_revision": revision})
             self.assertEqual(report["driver_exitcode"], 1)
             self.assertEqual(report["status"], "incomplete")
             self.assertNotIn("passed", report)
             self.assertEqual(report["native_build_sha256"], regression.digest(receipt))
+
+    def test_regression_generation_is_fresh_canonical_and_bound_to_build_parent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder).resolve()
+            build = parent / "build"
+            build.mkdir()
+            for name in ("regressions", "regressions-g000001", "regressions-" + "a" * 64):
+                regression.regression_work_root(parent / name, build)
+            for path in (parent / "arbitrary", parent / "regressions-", parent / "regressions-../escape",
+                         parent / "regressions-A", parent / ("regressions-" + "a" * 65),
+                         build / "regressions-g000001", Path("regressions-g000001"),
+                         parent / "missing" / ".." / "regressions-g000001"):
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    regression.regression_work_root(path, build)
+            old = parent / "regressions-g000001"
+            old.mkdir(); (old / "storage.xml").write_bytes(b"original XML evidence")
+            with self.assertRaises(ValueError): regression.regression_work_root(old, build)
+            self.assertEqual((old / "storage.xml").read_bytes(), b"original XML evidence")
+            file = parent / "regressions-file"
+            file.write_bytes(b"not a fresh directory")
+            with self.assertRaises(ValueError): regression.regression_work_root(file, build)
+            # lexists, unlike exists, also rejects a dangling symlink.
+            candidate = parent / "regressions-dangling"
+            with mock.patch.object(regression.os.path, "lexists", return_value=True):
+                with self.assertRaises(ValueError): regression.regression_work_root(candidate, build)
+            with mock.patch.object(type(candidate), "resolve", return_value=parent / "elsewhere"):
+                with self.assertRaises(ValueError): regression.regression_work_root(candidate, build)
 
     def test_required_target_retirement_cases_are_selected_by_real_driver(self):
         driver = regression.module(Path(__file__).parent.parent / "test-native-fragments.py", "retirement_native_driver")

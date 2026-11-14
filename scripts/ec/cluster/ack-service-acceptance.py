@@ -203,7 +203,7 @@ def validate_leased_file_command(runner,argv):
         'create':{'file_path','shard_bytes','permission','session_rights'},
         'resume-open':set(), 'close':set(),
         'unlink':{'session_run_dir','file_path'}, 'resume-unlink':set(), 'inspect-unlink':set(),
-        'pwrite':{'session_run_dir','offset_decimal','input_file'}, 'resume':set(), 'query':set(),
+        'pwrite':{'session_run_dir','offset_decimal','input_file'}, 'resume':set(), 'query':set(), 'seal':set(),
         'read':{'session_run_dir','offset_decimal','length_decimal','output_file'},
         'resume-read':{'output_file'}, 'release-read':set(),
         'export-read-allocations':{'output_file'},

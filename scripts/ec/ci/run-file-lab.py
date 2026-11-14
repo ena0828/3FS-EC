@@ -1246,7 +1246,8 @@ def require_kv_replay_result(lab, selection):
         required_inputs = {str(lab / name) for name in ('cluster.json', 'state/initialized.json',
                            'client/file-client.toml', 'config/admin_cli.toml', 'bin/ec_file_cli', 'bin/admin_cli')}
         required_inputs |= {str(scripts / name) for name in ('kv-replay-native.py', 'kv_trace.py', 'file-command.py',
-                             'ack-service-acceptance.py', 'experiment-runner.py', 'tree-gc-runner.py', 'native_v2_config.py')}
+                             'ack-service-acceptance.py', 'experiment-runner.py', 'tree-gc-runner.py', 'native_v2_config.py',
+                             'replay-reservations.py', 'output-reservation-runner.py')}
         require(set(binding['files']) == required_inputs, 'native backend input inventory differs')
         for raw, expected in binding['files'].items():
             path = canonical(Path(raw))
@@ -1262,6 +1263,9 @@ def require_kv_replay_result(lab, selection):
             value = read_json(path); entry.validate_receipt(step, plan, value)
             require(value['historical_unconfirmed_attempts'] == 0 and value['historical_join_proven'] is True,
                     'fresh functional acceptance has an unconfirmed historical child')
+            if step['spec']['kind'] in ('put', 'repair'):
+                require(value['mutation_reservations']['attempts'] == 1,
+                        'fresh functional acceptance cannot include a replaced mutation')
             require(entry.digest(read_json(folder / 'spec.json')) == value['spec_sha256'], 'action spec bytes changed')
             for raw, expected in value['files'].items():
                 item = canonical(Path(raw))
