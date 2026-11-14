@@ -35,6 +35,10 @@ TEST(TestEcStripeClient, AdmissionIsSynchronousAndAbandonedWaiterDoesNotReleaseI
   folly::CPUThreadPoolExecutor pool(2);
   auto core = manager(pool, 100, 1);
   folly::coro::Baton entered, release;
+  SCOPE_EXIT {
+    release.post();
+    blockingWait(Core::close(core));
+  };
   auto payload = std::make_shared<int>(17);
   std::weak_ptr<int> weak = payload;
   auto call = core->launch<int>(
@@ -74,6 +78,7 @@ CoTask<Output> splitOutput(std::shared_ptr<detail::EcReadReservation> lease) {
 TEST(TestEcStripeClient, ReturnedOutputKeepsChargeAcrossCloseAndAffectsNewAdmissions) {
   folly::CPUThreadPoolExecutor pool(2);
   auto core = manager(pool, 100);
+  SCOPE_EXIT { blockingWait(Core::close(core)); };
   auto call = core->launch<Output>(
       100,
       [](auto lease) { return splitOutput(std::move(lease)); },
