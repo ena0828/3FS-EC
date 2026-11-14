@@ -2,6 +2,8 @@
 """Small portable standard-library tests; fake CLI only, no native services."""
 import importlib.util
 import contextlib
+import copy
+import hashlib
 import io
 import os
 import signal
@@ -263,6 +265,102 @@ class RunnerTest(unittest.TestCase):
         self.assertFalse(result["cluster_stop_or_restart_performed"])
         with self.assertRaises(mod.CheckError):
             r.matrix("six")
+
+    def metrics_case(self, label='metrics'):
+        runner = self.runner()
+        runner.case(label, 'kv112', 'helper', 2, 'direct')
+        entry = runner.commands[1]
+        record, _ = mod.journal(Path(entry['run_dir']))
+        output = Path(entry['repair_metrics_log']).read_bytes()
+        row = next(json.loads(line) for line in output.splitlines() if b'ec_flat_repair_metrics' in line)
+        return runner, entry, record, row
+
+    def test_flat_metrics_use_actual_child_log_and_history_keeps_fixed_ids(self):
+        runner, entry, record, row = self.metrics_case()
+        self.assertIn('--config.repair_metrics=true', entry['argv'])
+        self.assertEqual(entry['repair_metrics_log_sha256'], hashlib.sha256(Path(entry['repair_metrics_log']).read_bytes()).hexdigest())
+        self.assertEqual(entry['repair_metrics']['operation'], record['operation'])
+        self.assertTrue(entry['repair_metrics']['data_phase_entered'])
+        self.assertNotIn('metrics', entry['repair_metrics'])  # Whole sample stays in the private log.
+        self.assertLess(len(json.dumps(entry['repair_metrics'])), 1024)
+        self.assertNotIn('repair_metrics', runner.commands[0])
+        repair = Path(entry['run_dir'])
+        original = (repair / 'record.json').read_bytes()
+        runner.invoke(repair, 'resume', repair_metrics='true')
+        self.assertFalse(runner.commands[-1]['repair_metrics']['data_phase_entered'])
+        self.assertEqual(runner.commands[-1]['repair_metrics']['first_hop_frames_decimal'], '0')
+        self.assertEqual((repair / 'record.json').read_bytes(), original)
+        runner.release(repair)
+        self.assertNotIn('repair_metrics', runner.commands[-1])
+        self.assertTrue(all(item['process_exited'] for item in runner.commands))
+
+    def test_flat_metrics_reject_duplicate_missing_identity_and_inexact_numbers(self):
+        _, _, record, row = self.metrics_case()
+        encoded = json.dumps(row).encode()
+        for output in (b'No measurement\n', encoded + b'\n' + encoded,
+                       encoded.replace(b'"schema": 1', b'"schema": 1, "schema": 1', 1),
+                       b'{"kind":"ec_flat_repair_metrics","padding":"' + b'x' * mod.MAX_JSON + b'"}'):
+            with self.subTest(output_bytes=len(output)), self.assertRaises(mod.CheckError):
+                mod.flat_repair_metrics(output, record, 'new-repair')
+        changes = ((('schema',), True), (('operation',), '00000000-0000-0000-0000-000000000001'),
+                   (('plan',), record['operation']), (('strategy',), 'central'), (('delivery',), 'return'),
+                   (('command',), 'resume'), (('data_phase_entered',), 1), (('telemetry_unavailable',), 0),
+                   (('metrics', 'action'), 0), (('metrics', 'configured_window'), True),
+                   (('metrics', 'elapsed_ns_decimal'), True), (('metrics', 'elapsed_ns_decimal'), '01'),
+                   (('metrics', 'elapsed_ns_decimal'), str(2**64)))
+        for path, value in changes:
+            bad = copy.deepcopy(row)
+            target = bad
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path, value=value), self.assertRaises(mod.CheckError):
+                mod.flat_repair_metrics(json.dumps(bad).encode(), record, 'new-repair')
+
+    def test_flat_metrics_reject_unsettled_or_missing_samples_without_inventing_wire(self):
+        _, _, record, row = self.metrics_case()
+        changes = ((('metrics', 'wire_bytes'), 0), (('metrics', 'storage_rpc', 'helper_downstream_bytes'), '0'),
+                   (('metrics', 'points'), {}), (('metrics', 'points', 'selected_repair', 'active_decimal'), '1'),
+                   (('metrics', 'storage_rpc', 'methods', 'begin_stage', 'frame_active_decimal'), '1'),
+                   (('metrics', 'storage_rpc', 'methods', 'begin_stage', 'request_frame_bytes_decimal'), '7'),
+                   (('metrics', 'storage_rpc', 'methods', 'begin_stage', 'missing_encoded_response_frames_decimal'), '1'),
+                   (('metrics', 'storage_rpc', 'methods', 'helper_direct', 'limiters'), {}),
+                   (('metrics', 'storage_rpc', 'by_phase', 'selected_repair', 'methods'), {}),
+                   (('metrics', 'storage_rpc', 'by_phase', 'selected_repair', 'methods', 'begin_stage',
+                     'request_frame_bytes_decimal'), '17'))
+        for path, value in changes:
+            bad = copy.deepcopy(row)
+            target = bad
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(mod.CheckError):
+                mod.flat_repair_metrics(json.dumps(bad).encode(), record, 'new-repair')
+        # A missing timestamp is valid censored evidence, not a zero-latency success.
+        self.assertEqual(mod.flat_repair_metrics(json.dumps(row).encode(), record, 'new-repair')['first_hop_frames_decimal'], '1')
+        # A cancellation/deadline observed after publication is not a failed business result.
+        row['metrics'].update(cancellation_requested=True, deadline_expired=True)
+        summary = mod.flat_repair_metrics(json.dumps(row).encode(), record, 'new-repair')
+        self.assertTrue(summary['cancellation_requested'])
+        self.assertTrue(summary['deadline_expired'])
+
+    def test_flat_metrics_do_not_mask_business_failure_or_accept_success_without_sample(self):
+        failed = self.runner('metrics-business-failure')
+        with self.assertRaisesRegex(mod.CheckError, 'CLI failed with exit7'):
+            failed.case('business', 'kv112', 'pipeline', 1)
+        entry = failed.commands[-1]
+        self.assertEqual(entry['returncode'], 7)
+        self.assertTrue(entry['process_exited'])
+        self.assertTrue((Path(entry['run_dir']) / 'record.json').is_file())
+        self.assertEqual(entry['repair_metrics_log_sha256'], hashlib.sha256(Path(entry['repair_metrics_log']).read_bytes()).hexdigest())
+        self.assertNotIn('repair_metrics', entry)
+        self.assertEqual(len(failed.commands), 2)
+        missing = self.runner('metrics-missing')
+        with self.assertRaisesRegex(mod.CheckError, 'Exactly one flat repair telemetry'):
+            missing.case('missing', 'kv112', 'pipeline', 1)
+        self.assertEqual(missing.commands[-1]['returncode'], 0)
+        self.assertTrue(missing.commands[-1]['process_exited'])
+        self.assertEqual(len(missing.commands), 2)
 
     def test_exit_zero_without_published_stops_before_repair(self):
         r = self.runner("false-published")

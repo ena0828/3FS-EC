@@ -60,7 +60,7 @@ jobs:
               "cluster/test-supervisor-command.py": 9,
               "cluster/test-native-managed-domain.py": 14,
               "cluster/test-portable-experiments.py": 5,
-              "cluster/test-experiment-runner.py": 21,
+              "cluster/test-experiment-runner.py": 25,
               "cluster/test-experiment-menu.py": 13,
               "cluster/test-prepare-fuse-file.py": 8,
               "ci/test-run-file-lab.py": 39,

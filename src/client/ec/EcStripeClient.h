@@ -1,6 +1,7 @@
 #pragma once
 
 #include "client/ec/EcBlockRead.h"
+#include "client/ec/EcRepairObservation.h"
 #include "client/ec/EcStorageTransport.h"
 #include "client/ec/NativeEcRepairTransport.h"
 #include "client/meta/MetaClient.h"
@@ -50,6 +51,8 @@ struct EcStripeRepair {
   EcRepairMode mode = EcRepairMode::CentralSerial;
   // Persist before any RPC; Direct is HelperChain-only and never falls back.
   EcRepairDelivery delivery = EcRepairDelivery::ClientAppend;
+  // Local observation of this owned call only; never part of durable intent.
+  bool collectMetrics = false;
 };
 
 enum class EcStripePhase { Validate, Observe, Encode, Begin, Bind, Stage, Repair, Publish, Published, Indeterminate };
@@ -65,6 +68,11 @@ struct EcStripeMutationOutcome {
   // Optional data phase only: bounded fragment stages for Write; the complete
   // EcRepairPipeline::run for Repair. Excludes Meta preparation/publication.
   std::optional<std::chrono::steady_clock::duration> dataPhaseElapsed;
+  // Available only when explicitly requested and repairOwned was entered.
+  // Excludes public admission and the caller's journal. No healthy COW copy
+  // belongs to flat repair; a historical Published result can have no data phase.
+  EcRepairSample repairMetrics;
+  bool repairDataPhaseEntered = false;
   bool published() const {
     return !failure && observation && observation->record.state == meta::EcOperationState::Published;
   }

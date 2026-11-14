@@ -34,6 +34,8 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
     "FixedDeadlineStopsConflictRecovery",
     "LostCommittedBeginReplyIsNotRetried",
 )) + ("TestEcStorageTransportConfig.RejectsImplicitModesAndHotTransportChanges",)
+# The two flat manager cases also verify opt-in repair metrics, joined failure
+# scopes and history/default-off isolation against real Meta/FDB + Storage.
 REPAIR_CASES = (
     "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
     "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",

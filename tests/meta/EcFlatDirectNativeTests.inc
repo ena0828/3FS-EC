@@ -38,11 +38,34 @@ TEST_F(TestEcV2NativeHelperPlan, FlatDirectSingleAndDoubleTargetsKeepPermanentDe
       repair.blockWindow = window;
       repair.mode = EcRepairMode::HelperChain;
       repair.delivery = EcRepairDelivery::HelperDirect;
+      // Keep one real data execution at the API's default-off setting. All
+      // remaining windows/target counts exercise the same opt-in observer.
+      EXPECT_FALSE(repair.collectMetrics);
+      repair.collectMetrics = mask != 1 || window != 1;
       size_t source = 0;
       for (uint16_t shard = 0; shard != 12 && source != repair.sources.size(); ++shard)
         if (!(mask & (uint16_t{1} << shard))) repair.sources[source++] = shard;
       auto repaired = blockingWait(manager->repair(repair, control()));
       ASSERT_TRUE(repaired.published()) << (repaired.failure ? repaired.failure->describe() : "not published");
+      EXPECT_TRUE(repaired.repairDataPhaseEntered);
+      if (repair.collectMetrics) {
+        const uint64_t targets = std::popcount(mask);
+        ASSERT_NO_FATAL_FAILURE(expectFlatRepairMetrics(
+            repaired.repairMetrics, {0, targets, 0, targets, targets, targets, 0, 4}));
+        EXPECT_EQ(repaired.repairMetrics.configuredWindow, window);
+        EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::SelectedRepair).succeeded, 1);
+        EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::NativeBegin).apiInvocations, 3 * targets);
+        EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::NativeHelper).succeeded, 4);
+        EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::NativeHelper).validatedReturnedPayloadBytes, 0);
+        EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::NativeAppend).entered, 0);
+        EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::NativeSeal).succeeded, targets);
+        EXPECT_LE(repaired.repairMetrics.at(EcRepairPoint::BlockActor).peakActive, window);
+      } else {
+        EXPECT_FALSE(repaired.repairMetrics.available);
+        EXPECT_EQ(repaired.repairMetrics.elapsedNs, 0);
+        for (const auto &point : repaired.repairMetrics.points) EXPECT_EQ(point.entered, 0);
+        for (const auto &method : repaired.repairMetrics.storageRpc.methods) EXPECT_EQ(method.entered, 0);
+      }
       ASSERT_TRUE(repaired.observation->drain);
       EXPECT_EQ(repaired.observation->drain->state, EcV2DrainState::Published);
       EXPECT_EQ(repaired.observation->drain->expectedEndpoints,
@@ -107,7 +130,14 @@ TEST_F(TestEcV2NativeHelperPlan, FlatDirectSingleAndDoubleTargetsKeepPermanentDe
       };
       auto before = seq();
       ASSERT_OK(before);
+      repair.collectMetrics = true;
       auto replay = blockingWait(manager->repair(repair, control()));
+      EXPECT_FALSE(replay.repairDataPhaseEntered);
+      ASSERT_NO_FATAL_FAILURE(expectFlatRepairMetrics(replay.repairMetrics, {}));
+      EXPECT_EQ(replay.repairMetrics.at(EcRepairPoint::Query).succeeded, 1);
+      EXPECT_EQ(replay.repairMetrics.at(EcRepairPoint::Prepare).succeeded, 1);
+      EXPECT_EQ(replay.repairMetrics.at(EcRepairPoint::SelectedRepair).entered, 0);
+      EXPECT_EQ(replay.repairMetrics.at(EcRepairPoint::Publish).entered, 0);
       ASSERT_TRUE(replay.published()) << (replay.failure ? replay.failure->describe() : "not published");
       EXPECT_EQ(serde::serialize(replay.observation->record), serde::serialize(repaired.observation->record));
       auto after = seq();
@@ -118,6 +148,13 @@ TEST_F(TestEcV2NativeHelperPlan, FlatDirectSingleAndDoubleTargetsKeepPermanentDe
       auto rejected = blockingWait(manager->repair(wrong, control()));
       ASSERT_TRUE(rejected.failure);
       EXPECT_EQ(rejected.failure->code(), StatusCode::kTokenMismatch);
+      EXPECT_FALSE(rejected.repairDataPhaseEntered);
+      ASSERT_NO_FATAL_FAILURE(expectFlatRepairMetrics(rejected.repairMetrics, {}));
+      EXPECT_EQ(rejected.repairMetrics.at(EcRepairPoint::Query).succeeded, 1);
+      EXPECT_EQ(rejected.repairMetrics.at(EcRepairPoint::Prepare).entered, 1);
+      EXPECT_EQ(rejected.repairMetrics.at(EcRepairPoint::Prepare).succeeded, 0);
+      EXPECT_EQ(rejected.repairMetrics.at(EcRepairPoint::SelectedRepair).entered, 0);
+      EXPECT_EQ(rejected.repairMetrics.at(EcRepairPoint::Publish).entered, 0);
       auto observed = request<PrepareEcRepairDirectV2Req>();
       observed.object = object.object;
       observed.operation = repair.ids.operation;
@@ -140,6 +177,7 @@ TEST_F(TestEcV2NativeHelperPlan, FlatDirectSingleAndDoubleTargetsKeepPermanentDe
   EXPECT_EQ(manager->snapshot().activeOperations, 0);
   EXPECT_EQ(manager->snapshot().reservedApplicationBytes, 0);
   RecordProperty("flat_direct_targets_windows", "1,2 targets x 1,2,4 blocks in flight; four blocks per shard");
+  RecordProperty("flat_direct_metrics", "default off plus first-hop-only frames; no client Append or validated output bytes");
   RecordProperty("authority", "Meta71 committed ECRP2/ECVI; independent Append and Query; Storage50 TCP");
 }
 

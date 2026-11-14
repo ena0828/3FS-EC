@@ -215,6 +215,23 @@ class TestCoreAcceptanceContract(unittest.TestCase):
             RUNNER.check_meta_receipt(sample, binary, output)
         with self.assertRaises(ValueError):
             RUNNER.check_meta_receipt(receipt(binary, output), binary, output, cases, test_filter)
+        # Both existing real flat fixtures now carry the metrics contract.
+        # A successful summary cannot hide either missing/failed XML case.
+        for name in (
+                "TestEcV2NativeHelperPlan.StripeManagerRunsAllExplicitRepairStrategiesThroughMetaIssuedPlan",
+                "TestEcV2NativeHelperPlan.FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery"):
+            for broken in ("missing", "failed"):
+                invalid = copy.deepcopy(sample)
+                if broken == "missing":
+                    invalid["selected"].remove(name)
+                    invalid["test_results"]["cases"] = [
+                        case for case in invalid["test_results"]["cases"] if case["name"] != name]
+                    invalid["test_results"]["declared_tests"] = str(len(cases) - 1)
+                    invalid["passed_tests"] -= 1
+                else:
+                    next(case for case in invalid["test_results"]["cases"] if case["name"] == name)["failed"] = True
+                with self.subTest(metrics_case=name, broken=broken), self.assertRaises(ValueError):
+                    RUNNER.check_meta_receipt(invalid, binary, output, cases, test_filter)
         for broken in ("filter", "skip", "unjoined", "pending_case_missing"):
             invalid = copy.deepcopy(sample)
             if broken == "filter":

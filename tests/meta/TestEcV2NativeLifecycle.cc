@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "client/bin/EcRepairMetricsJson.h"
 #include "client/ec/EcFileAppendClient.h"
 #include "client/ec/EcFileRepairClient.h"
 #include "client/ec/EcFileRunFactory.h"
@@ -2137,6 +2138,85 @@ TEST_F(TestEcV2NativeLifecycle, StripeManagerOwnsWriteAndReadsThroughTwoMissingR
   RecordProperty("actual_missing_route_candidates", "0,1,2; all decoded through real Storage TCP");
 }
 
+// Inspect the final sample from real Meta/FDB + Storage TCP work. Flat repair
+// has no healthy-copy phase: all first-hop samples belong to selected repair.
+void expectFlatRepairMetrics(
+    const hf3fs::client::ec::EcRepairSample &metrics,
+    const std::array<uint64_t, size_t(storage::client::EcRpcMethod::Count)> &expectedCalls) {
+  using namespace hf3fs::client::ec;
+  using storage::client::EcRpcMethodSample;
+  ASSERT_TRUE(metrics.available);
+  EXPECT_EQ(metrics.action, 1);
+  EXPECT_FALSE(metrics.overflow);
+  EXPECT_FALSE(metrics.clockAnomaly);
+  EXPECT_FALSE(metrics.journalStateObserved);  // The manager does not own the CLI's journal.
+  for (const auto &point : metrics.points) {
+    EXPECT_EQ(point.active, 0);
+    EXPECT_EQ(point.finished, point.entered);
+  }
+  for (const auto point : {EcRepairPoint::HealthyCopy, EcRepairPoint::CopyRead, EcRepairPoint::CopyBegin,
+                           EcRepairPoint::CopyReconcile, EcRepairPoint::CopyAppend, EcRepairPoint::CopySeal})
+    EXPECT_EQ(metrics.at(point).entered, 0);
+  EXPECT_FALSE(metrics.storageRpc.overflow);
+  EXPECT_FALSE(metrics.selectedRepairRpc.overflow);
+  EXPECT_FALSE(metrics.healthyCopyRpc.overflow);
+  const auto json = folly::parseJson(repairMetricsJson(metrics));
+  EXPECT_EQ(json["schema"].asInt(), 1);
+  EXPECT_EQ(json["scope"].asString(), "this_call");
+  EXPECT_TRUE(json["wire_bytes"].isNull());
+  EXPECT_TRUE(json["transport_retry_attempts"].isNull());
+  EXPECT_TRUE(json["helper_server_compute"].isNull());
+  const auto &rpcJson = json["storage_rpc"];
+  EXPECT_EQ(rpcJson["coverage"].asString(), "controlled_client_to_storage_first_hop");
+  EXPECT_TRUE(rpcJson["helper_downstream_bytes"].isNull());
+  EXPECT_TRUE(rpcJson["complete_server_queue"].isNull());
+  for (size_t i = 0; i != expectedCalls.size(); ++i) {
+    SCOPED_TRACE(storage::client::kEcRpcMethodNames[i]);
+    const auto &total = metrics.storageRpc.methods[i];
+    const auto &selected = metrics.selectedRepairRpc.methods[i];
+    const auto &copy = metrics.healthyCopyRpc.methods[i];
+    EXPECT_EQ(total.entered, expectedCalls[i]);
+    EXPECT_EQ(total.finished, total.entered);
+    EXPECT_EQ(total.active, 0);
+    EXPECT_EQ(total.outerOk, total.entered);
+    EXPECT_EQ(total.outerError, 0);
+    EXPECT_EQ(total.withoutResult, 0);
+    EXPECT_EQ(total.messengerInvocations, total.entered);
+    EXPECT_EQ(total.withoutMessenger, 0);
+    EXPECT_EQ(total.observedEncodedRequestFrames, total.entered);
+    EXPECT_EQ(total.observedEncodedResponseFrames, total.entered);
+    EXPECT_EQ(total.missingEncodedRequestFrames, 0);
+    EXPECT_EQ(total.missingEncodedResponseFrames, 0);
+    EXPECT_GE(total.requestFrameBytes, total.entered * uint64_t{8});
+    EXPECT_GE(total.responseFrameBytes, total.entered * uint64_t{8});
+    // Finished local scopes permit additive comparisons. Peaks are deliberately
+    // not added: these counters are not a globally atomic concurrent snapshot.
+    for (auto field : {&EcRpcMethodSample::entered, &EcRpcMethodSample::finished, &EcRpcMethodSample::active,
+                       &EcRpcMethodSample::outerOk, &EcRpcMethodSample::outerError, &EcRpcMethodSample::withoutResult,
+                       &EcRpcMethodSample::messengerInvocations, &EcRpcMethodSample::withoutMessenger,
+                       &EcRpcMethodSample::observedEncodedRequestFrames, &EcRpcMethodSample::requestFrameBytes,
+                       &EcRpcMethodSample::missingEncodedRequestFrames, &EcRpcMethodSample::compressedRequestFrames,
+                       &EcRpcMethodSample::observedEncodedResponseFrames, &EcRpcMethodSample::responseFrameBytes,
+                       &EcRpcMethodSample::missingEncodedResponseFrames, &EcRpcMethodSample::compressedResponseFrames}) {
+      EXPECT_EQ(total.*field, selected.*field);
+      EXPECT_EQ(copy.*field, 0);
+      if (!expectedCalls[i]) EXPECT_EQ(total.*field, 0);
+    }
+    for (const auto &limiter : total.limiters) {
+      EXPECT_EQ(limiter.active, 0);
+      EXPECT_EQ(limiter.entered, limiter.finished);
+    }
+    const auto *name = storage::client::kEcRpcMethodNames[i];
+    const auto &methodJson = rpcJson["methods"][name];
+    EXPECT_EQ(methodJson["frame_entered_decimal"].asString(), std::to_string(expectedCalls[i]));
+    EXPECT_EQ(methodJson["request_frame_bytes_decimal"].asString(), std::to_string(total.requestFrameBytes));
+    EXPECT_EQ(methodJson["response_frame_bytes_decimal"].asString(), std::to_string(total.responseFrameBytes));
+    EXPECT_EQ(rpcJson["by_phase"]["selected_repair"]["methods"][name]["frame_entered_decimal"].asString(),
+              std::to_string(expectedCalls[i]));
+    EXPECT_EQ(rpcJson["by_phase"]["healthy_copy"]["methods"][name]["frame_entered_decimal"].asString(), "0");
+  }
+}
+
 TEST_F(TestEcV2NativeHelperPlan, StripeManagerRunsAllExplicitRepairStrategiesThroughMetaIssuedPlan) {
   using namespace hf3fs::client::ec;
   folly::CPUThreadPoolExecutor pool(4);
@@ -2182,10 +2262,75 @@ TEST_F(TestEcV2NativeHelperPlan, StripeManagerRunsAllExplicitRepairStrategiesThr
     repair.replacementMask = masks[round];
     repair.blockWindow = 2;
     repair.mode = modes[round];
+    repair.collectMetrics = true;
     size_t source = 0;
     for (uint16_t i = 0; i != 12 && source != 10; ++i)
       if (!(repair.replacementMask & (1u << i))) repair.sources[source++] = i;
+    // The first round gets an injected error after real durable revoke during
+    // Publish. The data path completed; retrying the fixed operation only finishes
+    // its existing Closing drain and must not inherit those data samples.
+    size_t revokeBaseline = 0;
+    if (round == 0) {
+      std::lock_guard lock(controlFault_.mutex);
+      revokeBaseline = controlFault_.actualRevokes;
+      controlFault_.scope = repair.ids.operation;
+      controlFault_.fail = true;
+    }
     auto repaired = blockingWait(manager->repair(repair, control()));
+    const auto dataMetrics = repaired.repairMetrics;
+    ASSERT_TRUE(repaired.repairDataPhaseEntered);
+    const uint64_t targets = std::popcount(repair.replacementMask);
+    const bool helper = repair.mode == EcRepairMode::HelperChain;
+    ASSERT_NO_FATAL_FAILURE(expectFlatRepairMetrics(
+        dataMetrics, {helper ? 0ULL : 20ULL, targets, 2 * targets, 0, 0, targets, helper ? 2ULL : 0ULL, 0}));
+    EXPECT_EQ(dataMetrics.configuredWindow, repair.blockWindow);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::Query).entered, 1);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::Query).succeeded, 0);  // Fresh operation does not exist yet.
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::Begin).succeeded, 1);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::Prepare).succeeded, 3);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::SelectedRepair).succeeded, 1);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::NativeAppend).submittedPayloadBytes, targets * create.shardBytes);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::NativeSeal).succeeded, targets);
+    EXPECT_EQ(dataMetrics.blockActorsApplicable, repair.mode != EcRepairMode::CentralSerial);
+    EXPECT_LE(dataMetrics.at(EcRepairPoint::BlockActor).peakActive, repair.blockWindow);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::CentralCodecRecover).entered,
+              repair.mode == EcRepairMode::CentralSerial ? 1 : 0);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::ClientBlockAdvance).entered,
+              repair.mode == EcRepairMode::ClientPipeline ? 20 : 0);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::NativeRead).validatedReturnedPayloadBytes,
+              helper ? 0 : 10ULL * create.shardBytes);
+    EXPECT_EQ(dataMetrics.at(EcRepairPoint::NativeHelper).validatedReturnedPayloadBytes,
+              helper ? targets * create.shardBytes : 0);
+    if (round == 0) {
+      ASSERT_TRUE(repaired.failure);
+      EXPECT_EQ(repaired.failure->code(), StorageCode::kEcSealOutcomeUnknown);
+      EXPECT_EQ(repaired.phase, EcStripePhase::Publish);
+      EXPECT_EQ(dataMetrics.at(EcRepairPoint::Publish).entered, 1);
+      // publish() resolves its failed RPC attempts through Get and returns the
+      // real Closing record. Result success does not mean business Published.
+      EXPECT_EQ(dataMetrics.at(EcRepairPoint::Publish).succeeded, 1);
+      {
+        std::lock_guard lock(controlFault_.mutex);
+        EXPECT_GT(controlFault_.actualRevokes, revokeBaseline);
+        controlFault_.fail = false;
+      }
+      auto get = request<GetEcOperationV2Req>();
+      get.object = repair.object.object;
+      get.operation = repair.ids.operation;
+      auto closing = blockingWait(metaClient_->getEcOperationV2(get));
+      ASSERT_OK(closing);
+      ASSERT_TRUE(closing->drain);
+      EXPECT_EQ(closing->drain->state, EcV2DrainState::Closing);
+      repaired = blockingWait(manager->repair(repair, control()));
+      EXPECT_FALSE(repaired.repairDataPhaseEntered);
+      ASSERT_NO_FATAL_FAILURE(expectFlatRepairMetrics(repaired.repairMetrics, {}));
+      EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::Query).succeeded, 1);
+      EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::Prepare).succeeded, 1);
+      EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::Publish).succeeded, 1);
+      EXPECT_EQ(repaired.repairMetrics.at(EcRepairPoint::SelectedRepair).entered, 0);
+    } else {
+      EXPECT_EQ(dataMetrics.at(EcRepairPoint::Publish).succeeded, 1);
+    }
     ASSERT_TRUE(repaired.published()) << (repaired.failure ? repaired.failure->describe() : "not published");
     EXPECT_EQ(repaired.observation->record.candidate.generation, written.observation->record.candidate.generation);
     object = repaired.observation->object;
@@ -2209,6 +2354,20 @@ TEST_F(TestEcV2NativeHelperPlan, StripeManagerRunsAllExplicitRepairStrategiesThr
     auto replay = blockingWait(manager->repair(repair, control()));
     ASSERT_TRUE(replay.published()) << (replay.failure ? replay.failure->describe() : "not published");
     EXPECT_EQ(replay.observation->record.candidate.revision, revision);
+    EXPECT_FALSE(replay.repairDataPhaseEntered);
+    ASSERT_NO_FATAL_FAILURE(expectFlatRepairMetrics(replay.repairMetrics, {}));
+    EXPECT_EQ(replay.repairMetrics.at(EcRepairPoint::Query).succeeded, 1);
+    EXPECT_EQ(replay.repairMetrics.at(EcRepairPoint::Prepare).succeeded, 1);
+    EXPECT_EQ(replay.repairMetrics.at(EcRepairPoint::SelectedRepair).entered, 0);
+    EXPECT_EQ(replay.repairMetrics.at(EcRepairPoint::Publish).entered, 0);
+    auto disabled = repair;
+    disabled.collectMetrics = false;
+    auto unobserved = blockingWait(manager->repair(disabled, control()));
+    ASSERT_TRUE(unobserved.published());
+    EXPECT_FALSE(unobserved.repairMetrics.available);
+    EXPECT_EQ(unobserved.repairMetrics.elapsedNs, 0);
+    for (const auto &point : unobserved.repairMetrics.points) EXPECT_EQ(point.entered, 0);
+    for (const auto &method : unobserved.repairMetrics.storageRpc.methods) EXPECT_EQ(method.entered, 0);
     PrepareEcRepairDirectV2Req wrongDelivery;
     static_cast<PrepareEcRepairV2Req &>(wrongDelivery) = request<PrepareEcRepairV2Req>();
     wrongDelivery.object = repair.object.object;
@@ -2222,6 +2381,7 @@ TEST_F(TestEcV2NativeHelperPlan, StripeManagerRunsAllExplicitRepairStrategiesThr
   blockingWait(manager->close());
   EXPECT_EQ(manager->snapshot().activeOperations, 0);
   EXPECT_EQ(manager->snapshot().reservedApplicationBytes, 0);
+  RecordProperty("flat_metrics", "real first-hop encoded frames; selected only; Closing/Published are per-call");
   RecordProperty("trusted_plan_issuance", "real Meta37 with independent helper signing key");
   RecordProperty("physical_failure_domains", "one process/disk; not a multi-node benchmark");
 }

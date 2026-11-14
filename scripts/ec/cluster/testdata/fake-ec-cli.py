@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Test double only: creates local journal-shaped files, never contacts 3FS."""
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,68 @@ def initial_state(record, obj, revision):
             "maxOperations": 1, "applicationByteBudget": 67108864, "writeFragmentWindow": 2,
             "readBlockWindow": 1, "workerThreads": 2, "deadlineSeconds": 300,
             "metaRpcTimeoutMillis": 5000, "metaRetryTotalMillis": 60000}
+
+
+def metrics_fixture(record, command):
+    """Parser fixture only: counters are invented, never native measurements."""
+    def decimals(names, count=0):
+        return {key + '_decimal': str(count) for key in names.split()}
+    points = {}
+    for key in ('query_rpc begin_rpc prepare_rpc selected_repair healthy_copy publish_rpc close_debt_rpc journal_append '
+                'native_begin native_read native_append native_seal native_helper copy_read copy_begin copy_reconcile '
+                'copy_append copy_seal block_actor ordered_append_wait central_codec_recover client_block_advance').split():
+        points[key] = decimals('entered finished succeeded span_ns active peak_active api_invocations '
+                               'submitted_payload_bytes validated_returned_payload_bytes')
+    methods = {}
+    for key in ('read_block begin_stage append_stage query_stage reconcile_stage seal_stage helper helper_direct').split():
+        method = decimals('frame_entered frame_finished frame_active outer_ok outer_error without_outer_result '
+                          'messenger_invocations frames_without_messenger observed_encoded_request_frames request_frame_bytes '
+                          'missing_encoded_request_frames compressed_request_frames observed_encoded_response_frames '
+                          'response_frame_bytes missing_encoded_response_frames compressed_response_frames')
+        for host, spans in (('client', 'called_to_serialized_ns serialized_to_received_ns received_to_waked_ns'),
+                            ('server', 'received_to_waked_ns waked_to_processed_ns processed_to_serialized_ns')):
+            method[host] = decimals('valid_samples missing_or_nonpositive_samples reversed_samples out_of_range_samples ' + spans)
+        method['limiters'] = None if key in ('helper', 'helper_direct') else {
+            name: decimals('entered acquired finished without_permit active_scopes peak_active_scopes '
+                           'entry_to_acquired_ns entry_to_unacquired_exit_ns acquired_to_exit_ns')
+            for name in ('per_server', 'global')}
+        methods[key] = method
+    empty = {'overflow': False, 'clock_anomaly': False, 'methods': copy.deepcopy(methods)}
+    fresh = command == 'new-repair'
+    if fresh:
+        row = methods['begin_stage']
+        for key in ('frame_entered', 'frame_finished', 'outer_ok', 'messenger_invocations',
+                    'observed_encoded_request_frames', 'observed_encoded_response_frames'):
+            row[key + '_decimal'] = '1'
+        row.update(request_frame_bytes_decimal='16', response_frame_bytes_decimal='16')
+        for host in ('client', 'server'):
+            row[host]['missing_or_nonpositive_samples_decimal'] = '1'
+        for limiter in row['limiters'].values():
+            for key in ('entered', 'acquired', 'finished', 'peak_active_scopes'):
+                limiter[key + '_decimal'] = '1'
+    rpc = {'schema': 1, 'coverage': 'controlled_client_to_storage_first_hop', 'encoded_frame_header_bytes': 8,
+           'overflow': False, 'clock_anomaly': False, 'methods': methods,
+           'by_phase': {'schema': 1, 'selected_repair': {'overflow': False, 'clock_anomaly': False,
+                                                      'methods': copy.deepcopy(methods)}, 'healthy_copy': empty}}
+    rpc.update({key: True for key in ('missing_samples_are_censored', 'frame_counts_are_not_dispatch_counts',
+                'outer_ok_is_not_business_success', 'messenger_invocations_are_not_dispatch_or_retry_counts',
+                'spans_overlap_and_are_not_total_wall_time', 'encoded_frames_use_actual_compression',
+                'selected_repair_and_healthy_copy_rpc_slots_merged')})
+    rpc.update({key: None for key in ('helper_downstream_bytes', 'wire_bytes', 'encoded_bytes',
+                                    'transport_retry_attempts', 'complete_server_queue')})
+    sample = {'schema': 1, 'scope': 'this_call', 'action': 1, 'configured_window': record['blockWindow'],
+              'block_actors_applicable': record['strategy'] != 'central', 'points': points, 'storage_rpc': rpc,
+              'prior_journal_sequence_decimal': '0', 'elapsed_ns_decimal': '11'}
+    sample.update({key: False for key in ('journal_state_observed', 'had_journal_state', 'cancellation_requested',
+                  'deadline_expired', 'overflow', 'clock_anomaly', 'persisted_in_business_journal')})
+    sample.update({key: None for key in ('wire_bytes', 'rpc_encoded_bytes', 'transport_retry_attempts',
+                                       'server_queue_depth', 'helper_server_compute')})
+    return {'schema': 1, 'kind': 'ec_flat_repair_metrics', 'command': command, 'operation': record['operation'],
+            'plan': record['planId'], 'strategy': record['strategy'], 'delivery': record.get('delivery', 'return'),
+            'observation_boundary': 'owned_flat_repair; excludes public admission, CLI journal and shutdown',
+            'repair_scope': 'selected_replacement_shards; unchanged shards are not copied', 'repair_invoked': True,
+            'data_phase_entered': fresh, 'owned_repair_published': True, 'local_manager_joined': True,
+            'telemetry_unavailable': False, 'metrics': sample}
 
 
 def main():
@@ -136,6 +199,11 @@ def main():
     dump(run / f"state-{state['sequence']:020d}.json", state)
     print("FAKE CLI ONLY; not storage evidence")
     print("Local manager joined; active_operations=0 reserved_application_bytes=0.")
+    if command == 'new-repair' and mode == 'metrics-business-failure':
+        return 7
+    if (options.get('config.repair_metrics') == 'true' and record['action'] == 'repair'
+            and command in ('new-repair', 'resume') and mode != 'metrics-missing'):
+        print(json.dumps(metrics_fixture(record, command)))
     if mode == "delayed":
         (root / "fake-exited").write_text("exited")
     return 1 if mode == "unknown" and command == "new-write" else 0

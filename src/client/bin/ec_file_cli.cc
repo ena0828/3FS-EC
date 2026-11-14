@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "client/bin/EcRepairMetricsJson.h"
 #include "client/ec/EcFileAppendClient.h"
 #include "client/ec/EcFilePwriteClient.h"
 #include "client/ec/EcFileRepairClient.h"

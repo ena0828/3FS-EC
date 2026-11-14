@@ -29,6 +29,19 @@ STRATEGIES = ("central", "pipeline", "helper")
 DELIVERIES = ("return", "direct")
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 MAX_JSON = 65536
+METRIC_POINTS = tuple(('query_rpc begin_rpc prepare_rpc selected_repair healthy_copy publish_rpc '
+                       'close_debt_rpc journal_append native_begin native_read native_append native_seal '
+                       'native_helper copy_read copy_begin copy_reconcile copy_append copy_seal '
+                       'block_actor ordered_append_wait central_codec_recover client_block_advance').split())
+METRIC_METHODS = ('read_block', 'begin_stage', 'append_stage', 'query_stage',
+                  'reconcile_stage', 'seal_stage', 'helper', 'helper_direct')
+POINT_DECIMALS = tuple(('entered finished succeeded span_ns active peak_active api_invocations '
+                        'submitted_payload_bytes validated_returned_payload_bytes').split())
+RPC_DECIMALS = tuple(('frame_entered frame_finished frame_active outer_ok outer_error without_outer_result '
+                      'messenger_invocations frames_without_messenger observed_encoded_request_frames '
+                      'request_frame_bytes missing_encoded_request_frames compressed_request_frames '
+                      'observed_encoded_response_frames response_frame_bytes missing_encoded_response_frames '
+                      'compressed_response_frames').split())
 
 
 class CheckError(RuntimeError):
@@ -118,6 +131,135 @@ def number(data, key, minimum=0, maximum=2**63 - 1):
     value = data.get(key)
     require(type(value) is int and minimum <= value <= maximum, f"Invalid journal integer: {key}")
     return value
+
+
+def metric_decimal(data, key):
+    value = data.get(key + '_decimal')
+    require(type(value) is str and re.fullmatch(r'0|[1-9][0-9]{0,19}', value) is not None
+            and int(value) <= 2**64 - 1, 'Invalid bounded telemetry decimal: ' + key)
+    return int(value)
+
+
+def metric_counters(data, names):
+    require(type(data) is dict, 'Missing telemetry counter object')
+    return {key: metric_decimal(data, key) for key in names}
+
+
+def flat_repair_metrics(output, record, command):
+    """Validate a completed opt-in CLI observation, never a publication/T2 proof."""
+    rows = []
+    for line in output.splitlines():
+        if b'ec_flat_repair_metrics' not in line:
+            continue
+        require(len(line) <= MAX_JSON, 'Oversized flat repair telemetry line')
+        try:
+            value = json.loads(line, object_pairs_hook=unique_object,
+                               parse_constant=lambda _: (_ for _ in ()).throw(CheckError('Nonfinite telemetry')))
+        except (ValueError, UnicodeError, RecursionError) as error:
+            raise CheckError('Invalid flat repair telemetry JSON') from error
+        require(type(value) is dict and value.get('kind') == 'ec_flat_repair_metrics',
+                'Invalid flat repair telemetry kind')
+        exact_numbers(value)
+        rows.append(value)
+    require(len(rows) == 1, 'Exactly one flat repair telemetry line required')
+    value = rows[0]
+    require(number(value, 'schema') == 1 and value.get('command') == command
+            and value.get('operation') == record['operation'] and value.get('plan') == record['planId']
+            and value.get('strategy') == record['strategy']
+            and value.get('delivery') == record_delivery(record), 'Flat repair telemetry identity differs')
+    require(value.get('repair_invoked') is True and value.get('owned_repair_published') is True
+            and value.get('local_manager_joined') is True and value.get('telemetry_unavailable') is False,
+            'Flat repair telemetry unavailable or incomplete')
+    require(type(value.get('data_phase_entered')) is bool
+            and (command != 'new-repair' or value['data_phase_entered']), 'Missing fresh repair data phase')
+    require(value.get('observation_boundary') == 'owned_flat_repair; excludes public admission, CLI journal and shutdown'
+            and value.get('repair_scope') == 'selected_replacement_shards; unchanged shards are not copied',
+            'Flat repair telemetry scope differs')
+    sample = value.get('metrics')
+    require(type(sample) is dict and number(sample, 'schema') == 1 and sample.get('scope') == 'this_call'
+            and number(sample, 'action') == 1 and number(sample, 'configured_window', 1, 4) == record['blockWindow'],
+            'Invalid flat repair sample identity')
+    for key in ('journal_state_observed', 'had_journal_state', 'overflow', 'clock_anomaly', 'persisted_in_business_journal'):
+        require(sample.get(key) is False, 'Unexpected flat repair sample flag: ' + key)
+    for key in ('cancellation_requested', 'deadline_expired'):
+        # These are observations at snapshot time, not the business outcome.
+        require(type(sample.get(key)) is bool, 'Missing flat repair sample flag: ' + key)
+    require(sample.get('block_actors_applicable') is (record['strategy'] != 'central'),
+            'Flat repair actor applicability differs')
+    require(metric_decimal(sample, 'prior_journal_sequence') == 0, 'Flat sample cannot claim journal history')
+    elapsed = metric_decimal(sample, 'elapsed_ns')
+    for key in ('wire_bytes', 'rpc_encoded_bytes', 'transport_retry_attempts', 'server_queue_depth', 'helper_server_compute'):
+        require(key in sample and sample[key] is None, 'Unmeasured telemetry must remain null: ' + key)
+    points = sample.get('points')
+    require(type(points) is dict and set(points) == set(METRIC_POINTS), 'Incomplete repair point inventory')
+    for point in points.values():
+        counts = metric_counters(point, POINT_DECIMALS)
+        require(counts['active'] == 0 and counts['entered'] == counts['finished']
+                and counts['succeeded'] <= counts['finished'] and counts['peak_active'] <= counts['entered'],
+                'Unsettled repair point counters')
+    rpc = sample.get('storage_rpc')
+    require(type(rpc) is dict and number(rpc, 'schema') == 1
+            and rpc.get('coverage') == 'controlled_client_to_storage_first_hop'
+            and number(rpc, 'encoded_frame_header_bytes') == 8, 'Invalid first-hop telemetry schema')
+    for key in ('missing_samples_are_censored', 'frame_counts_are_not_dispatch_counts', 'outer_ok_is_not_business_success',
+                'messenger_invocations_are_not_dispatch_or_retry_counts', 'spans_overlap_and_are_not_total_wall_time',
+                'encoded_frames_use_actual_compression', 'selected_repair_and_healthy_copy_rpc_slots_merged'):
+        require(rpc.get(key) is True, 'Missing first-hop measurement boundary: ' + key)
+    for key in ('helper_downstream_bytes', 'wire_bytes', 'encoded_bytes', 'transport_retry_attempts', 'complete_server_queue'):
+        require(key in rpc and rpc[key] is None, 'Unmeasured RPC telemetry must remain null: ' + key)
+    phases = rpc.get('by_phase')
+    require(type(phases) is dict and number(phases, 'schema') == 1, 'Missing RPC phase attribution')
+    groups = (rpc, phases.get('selected_repair'), phases.get('healthy_copy'))
+    totals = []
+    for group in groups:
+        require(type(group) is dict and group.get('overflow') is False and group.get('clock_anomaly') is False,
+                'RPC telemetry overflow or missing flags')
+        methods = group.get('methods')
+        require(type(methods) is dict and set(methods) == set(METRIC_METHODS), 'Incomplete RPC method inventory')
+        parsed = {}
+        for name, method in methods.items():
+            counts = metric_counters(method, RPC_DECIMALS)
+            finished = counts['frame_finished']
+            require(counts['frame_active'] == 0 and counts['frame_entered'] == finished
+                    and sum(counts[k] for k in ('outer_ok', 'outer_error', 'without_outer_result')) == finished
+                    and counts['messenger_invocations'] + counts['frames_without_messenger'] == finished,
+                    'Unsettled or inconsistent RPC frames')
+            for direction in ('request', 'response'):
+                observed = counts['observed_encoded_' + direction + '_frames']
+                require(observed + counts['missing_encoded_' + direction + '_frames'] == finished
+                        and counts['compressed_' + direction + '_frames'] <= observed
+                        and counts[direction + '_frame_bytes'] >= 8 * observed
+                        and (observed > 0 or counts[direction + '_frame_bytes'] == 0), 'RPC frame coverage differs')
+            for host, spans in (('client', ('called_to_serialized_ns', 'serialized_to_received_ns', 'received_to_waked_ns')),
+                                ('server', ('received_to_waked_ns', 'waked_to_processed_ns', 'processed_to_serialized_ns'))):
+                names = ('valid_samples', 'missing_or_nonpositive_samples', 'reversed_samples', 'out_of_range_samples')
+                clock = metric_counters(method.get(host), (*names, *spans))
+                require(sum(clock[k] for k in names) == finished, 'RPC timestamp coverage differs')
+            if name in ('helper', 'helper_direct'):
+                require('limiters' in method and method['limiters'] is None, 'Helper limiter is not measured')
+            else:
+                limiters = method.get('limiters')
+                require(type(limiters) is dict and set(limiters) == {'per_server', 'global'}, 'Missing limiter inventory')
+                for limiter in limiters.values():
+                    counts_l = metric_counters(limiter, ('entered', 'acquired', 'finished', 'without_permit', 'active_scopes',
+                        'peak_active_scopes', 'entry_to_acquired_ns', 'entry_to_unacquired_exit_ns', 'acquired_to_exit_ns'))
+                    require(counts_l['active_scopes'] == 0 and counts_l['entered'] == counts_l['finished']
+                            and counts_l['acquired'] + counts_l['without_permit'] == counts_l['finished']
+                            and counts_l['peak_active_scopes'] <= counts_l['entered'], 'Unsettled limiter scopes')
+            parsed[name] = counts
+        totals.append(parsed)
+    for name in METRIC_METHODS:
+        for key in RPC_DECIMALS:
+            require(totals[0][name][key] == totals[1][name][key] + totals[2][name][key], 'RPC phase totals differ')
+        require(totals[2][name]['frame_entered'] == 0, 'Flat repair cannot claim healthy-copy RPCs')
+    frames = sum(row['frame_entered'] for row in totals[0].values())
+    require(not value['data_phase_entered'] or frames > 0, 'Entered repair data phase without measured first hop')
+    return {'schema': 1, 'kind': value['kind'], 'operation': value['operation'], 'plan': value['plan'],
+            'strategy': value['strategy'], 'delivery': value['delivery'], 'data_phase_entered': value['data_phase_entered'],
+            'owned_repair_published': True, 'local_manager_joined': True, 'elapsed_ns_decimal': str(elapsed),
+            'cancellation_requested': sample['cancellation_requested'], 'deadline_expired': sample['deadline_expired'],
+            'first_hop_frames_decimal': str(frames), 'sample_sha256': hashlib.sha256(json_data(sample)).hexdigest(),
+            'scope': 'this_call_selected_shards_first_hop_not_wire_or_remote_drain'}
 
 
 def object_identity(observation):
@@ -376,6 +518,11 @@ class Runner:
         run = canonical(run)
         require(self.transport_role == "stripe", "Stripe journal operations require the stripe client profile")
         require("storage_transport" not in options, "Transport belongs to the prepared profile, not a per-command override")
+        if 'repair_metrics' in options:
+            require(type(options['repair_metrics']) is str and options['repair_metrics'] in ('true', 'false'),
+                    'repair_metrics must be an explicit boolean string')
+        collect_metrics = options.get('repair_metrics') == 'true'
+        require(not collect_metrics or command in ('new-repair', 'resume'), 'Repair metrics require repair or resume')
         self.check_transport()
         bind_transport_run(self.root, run, self.transport, self.cli)
         prior = None
@@ -429,17 +576,35 @@ class Runner:
                 self.child = None
                 entry.update(process_exited=True, returncode=proc.returncode,
                              interrupted=self.stop_requested)
+        output = None
+        if collect_metrics:
+            # Preserve the original exit/log even when the business call failed.
+            # Telemetry parsing must never replace that failure with a missing-sample error.
+            entry['repair_metrics_log'] = str(log_path)
+            try:
+                output = regular_bytes(log_path, 8 * 1024 * 1024)
+                entry['repair_metrics_log_sha256'] = hashlib.sha256(output).hexdigest()
+            except (OSError, CheckError):
+                entry['repair_metrics_log_observation'] = 'unavailable'
         self.event({"event": "command_exited", **entry})
         if self.stop_requested:
             raise StopRequested("Owned CLI exited; no further commands were started. Preserve journals and inspect/resume explicitly.")
         require(proc.returncode == 0, f"CLI failed with exit{proc.returncode}; private log retained at {log_path}")
-        output = regular_bytes(log_path, 8 * 1024 * 1024)
+        require(not collect_metrics or output is not None, 'Successful repair telemetry log could not be observed')
+        if output is None:
+            output = regular_bytes(log_path, 8 * 1024 * 1024)
         require(b"Local manager joined; active_operations=0 reserved_application_bytes=0." in output,
                 "CLI exited0 without the expected joined-manager marker")
-        _, observed = journal(run)
+        fixed, observed = journal(run)
         if prior is not None:
             require(observed["sequence"] > prior[0], "CLI returned success without a new observation")
             require(regular_bytes(run / "record.json", MAX_JSON) == prior[1], "CLI changed the immutable run record")
+        if collect_metrics:
+            entry['repair_metrics_record_sha256'] = hashlib.sha256(regular_bytes(run / 'record.json', MAX_JSON)).hexdigest()
+            summary = flat_repair_metrics(output, fixed, command)
+            entry['repair_metrics'] = summary
+            self.event({'event': 'repair_metrics_checked', 'index': index, 'summary': summary,
+                        'stdout_sha256': entry['repair_metrics_log_sha256']})
 
     def fresh(self, paths):
         for path in paths:
@@ -468,6 +633,7 @@ class Runner:
                 "Write journal does not bind requested paths")
         self.invoke(repair, "new-repair", source_run=write, strategy=strategy, replacement_mask=mask,
                     source_order=json.dumps(order, separators=(",", ":")), block_window=2,
+                    repair_metrics='true',
                     **({"delivery": "direct"} if delivery == "direct" else {}))
         rr, ro = published(repair, info)
         require(record_delivery(rr) == delivery, "Repair journal changed requested delivery")

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <bit>
 #include <cerrno>
+#include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
 #include <fmt/ranges.h>
@@ -11,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "client/bin/EcRepairMetricsJson.h"
 #include "client/ec/EcAllocationExport.h"
 #include "client/ec/EcStripeRecoveryWrite.h"
 #include "client/ec/EcStripeRunRecord.h"
@@ -70,6 +72,7 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(replacement_mask, uint16_t{0});
   CONFIG_ITEM(source_order, std::vector<uint16_t>{});
   CONFIG_ITEM(block_window, uint8_t{0});
+  CONFIG_ITEM(repair_metrics, false);
   CONFIG_ITEM(storage_transport, "tcp");
   CONFIG_OBJ(ib_devices, net::IBDevice::Config);
   CONFIG_ITEM(deadline_seconds, uint32_t{300});
@@ -269,12 +272,46 @@ EcStripeRunObservation observation(const EcStripeRunJournal &journal, const EcSt
   result.dataPhaseElapsedNanoseconds.reset();
   return result;
 }
+struct FlatRepairMetrics {
+  EcRepairSample sample;
+  bool invoked = false, dataPhaseEntered = false, published = false;
+};
+
+// The CLI journal and manager shutdown are outside the owned repair sample.
+// Emit only after close(), separately from business records. Rendering failure
+// must not replace the operation's result or create a journal observation.
+void emitFlatRepairMetrics(const FlatRepairMetrics &metrics,
+                           const EcStripeRunRecord &record,
+                           std::string_view command) noexcept {
+  try {
+    folly::dynamic out = folly::dynamic::object("schema", 1)("kind", "ec_flat_repair_metrics")(
+        "command", std::string(command))("operation", record.operation.toHexString())(
+        "plan", record.planId.toHexString())("strategy", record.strategy)("delivery", record.delivery)(
+        "observation_boundary", "owned_flat_repair; excludes public admission, CLI journal and shutdown")(
+        "repair_scope", "selected_replacement_shards; unchanged shards are not copied")(
+        "meta_invocation_scope", "orchestration method entries; internal retries and recovery queries are not separate samples")(
+        "repair_invoked", metrics.invoked)("data_phase_entered", metrics.dataPhaseEntered)(
+        "owned_repair_published", metrics.published)("local_manager_joined", true)(
+        "telemetry_unavailable", !metrics.sample.available);
+    auto line = folly::toJson(out);
+    line.pop_back();
+    line += ",\"metrics\":";
+    line += metrics.sample.available ? repairMetricsJson(metrics.sample) : "null";
+    line += "}\n";
+    std::fwrite(line.data(), 1, line.size(), stdout);
+  } catch (...) {
+    std::fputs("{\"schema\":1,\"kind\":\"ec_flat_repair_metrics\",\"metrics\":null,"
+               "\"telemetry_unavailable\":true}\n", stdout);
+  }
+}
+
 Result<Void> run(EcStripeRunJournal &journal,
                  EcStripeClient &manager,
                  const Config &config,
                  std::string_view command,
                  std::shared_ptr<meta::client::MetaClient> metadata,
-                 const flat::UserInfo &credentials) {
+                 const flat::UserInfo &credentials,
+                 FlatRepairMetrics *metrics) {
   const auto &record = journal.record();
   if (record.expectedOwnerUid && *record.expectedOwnerUid != manager.owner().uid.toUnderType())
     return makeError(StatusCode::kTokenMismatch, "authenticated user differs from source run owner");
@@ -382,7 +419,14 @@ Result<Void> run(EcStripeRunJournal &journal,
                    : record.strategy == "pipeline" ? EcRepairMode::ClientPipeline
                                                    : EcRepairMode::HelperChain;
     request.delivery = record.delivery == "direct" ? EcRepairDelivery::HelperDirect : EcRepairDelivery::ClientAppend;
+    request.collectMetrics = metrics != nullptr;
     auto result = blockingWait(manager.repair(std::move(request), control()));
+    if (metrics) {
+      metrics->invoked = true;
+      metrics->sample = result.repairMetrics;
+      metrics->dataPhaseEntered = result.repairDataPhaseEntered;
+      metrics->published = result.published();
+    }
     state.coreElapsedNanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(result.elapsed).count();
     if (result.dataPhaseElapsed)
       state.dataPhaseElapsedNanoseconds =
@@ -436,6 +480,8 @@ int execute(int argc, char **argv) {
            "new-repair: source_run plus --config.strategy=central|pipeline|helper, replacement_mask, optional "
            "source_order and block_window; helper accepts --config.delivery=return|direct (default return)\n"
            "resume/release/inspect/export-allocations reject delivery overrides and use the immutable run record.\n"
+           "Optional --config.repair_metrics=true for new-repair/resume emits this-call observations after local "
+           "join; default false, journal and durable IDs unchanged. It excludes CLI journal and admission.\n"
            "Uses actual mgmtd/Meta/Storage clients and a real user token_file (owner-only). No signing keys are "
            "accepted.\n"
            "Single stripe only; no FUSE, multi-stripe mapping or physical GC. Input preparation, output files "
@@ -582,8 +628,14 @@ int execute(int argc, char **argv) {
     return 2;
   }
   SCOPE_EXIT { blockingWait((*manager)->close()); };
-  auto result = run(record, **manager, config, command, metadata, credentials);
+  std::optional<FlatRepairMetrics> repairMetrics;
+  if (config.repair_metrics() && record.record().action == "repair" &&
+      (command == "new-repair" || command == "resume"))
+    repairMetrics.emplace();
+  auto result = run(record, **manager, config, command, metadata, credentials,
+                    repairMetrics ? &*repairMetrics : nullptr);
   blockingWait((*manager)->close());
+  if (repairMetrics) emitFlatRepairMetrics(*repairMetrics, record.record(), command);
   if (record.latest()) fmt::print("{}\n", serde::toJsonString(*record.latest(), true, true));
   fmt::print("Local manager joined; active_operations={} reserved_application_bytes={}.\n",
              (*manager)->snapshot().activeOperations,
