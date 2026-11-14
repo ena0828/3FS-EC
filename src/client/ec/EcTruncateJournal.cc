@@ -171,6 +171,10 @@ Result<Void> EcTruncateJournal::writeNew(std::string_view name, std::string_view
   if (::fsync(directory_)) return io("sync journal directory");
   return Void{};
 }
+uint64_t EcTruncateJournal::remainingStates() const {
+  if (!latest_) return kMaximumStates;
+  return latest_->sequence < kMaximumStates ? kMaximumStates - latest_->sequence - 1 : 0;
+}
 Result<Void> EcTruncateJournal::append(EcTruncateJournalState progress) {
   if (poisoned_)
     return makeError(StatusCode::kIOError, "file run requires close and explicit resume after persistence error");

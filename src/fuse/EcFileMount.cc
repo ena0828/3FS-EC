@@ -494,6 +494,11 @@ Result<uint64_t> EcFileMount::truncateOwned(Session &s, flat::UserInfo u, uint64
     CHECK_RESULT(client, reader(u));
     const auto deadline = control();
     Result<meta::EcFileTruncateProgress> progress = makeError(StatusCode::kIOError);
+    // One client call appends at most seven states. Leave room for one later
+    // Query (three) and one CloseDebt attempt (five), not a promise of remote T2.
+    constexpr uint64_t kCallStates = 7, kRecoveryStates = 8;
+    constexpr uint32_t kMaximumConflicts = 8;
+    uint32_t conflicts = 0;
     do {
       stage = "deadline";
       auto permitted = active(deadline);
@@ -501,10 +506,23 @@ Result<uint64_t> EcFileMount::truncateOwned(Session &s, flat::UserInfo u, uint64
         progress = makeError(std::move(permitted.error()));
         break;
       }
+      stage = "journal_budget";
+      if (journal->remainingStates() < kCallStates + kRecoveryStates) {
+        // Retain a definite conflict if that was the last actual result.
+        if (progress || progress.error().code() != TransactionCode::kConflict)
+          progress = makeError(StorageClientCode::kResourceBusy, "truncate journal recovery capacity reserved");
+        break;
+      }
       stage = "advance";
       progress = blockingWait(client->truncate(journal, deadline));
-      if (!progress || client->localJoinUnconfirmed()) break;
-      if (progress->observed && progress->observed->state != meta::EcFileTruncateState::Planned) break;
+      if (client->localJoinUnconfirmed() || journal->poisoned()) break;
+      if (!progress) {
+        if (progress.error().code() != TransactionCode::kConflict || ++conflicts >= kMaximumConflicts) break;
+        // The next SAME-journal call queries before any mutation. Neither an
+        // unknown result nor a new identity/deadline is admitted here.
+      } else if (progress->observed && progress->observed->state != meta::EcFileTruncateState::Planned) {
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } while (true);
     if (progress && progress->observed && progress->observed->state == meta::EcFileTruncateState::Published &&

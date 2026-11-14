@@ -15,6 +15,7 @@
 #include "fdb/FDBTransaction.h"
 #include "meta/store/EcFileTreeTxnBudget.h"
 #include "tests/GtestHelpers.h"
+#include "tests/meta/EcMountedTruncateFault.h"
 
 namespace hf3fs::meta::server::detail {
 // Test-owned, fixed-capacity observation. No keys, values, credentials, callback
@@ -139,9 +140,13 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
  public:
   using Clock = std::chrono::steady_clock;
   EcObservedNativeTransaction(std::unique_ptr<kv::IReadWriteTransaction> inner,
-                              std::shared_ptr<EcNativeTxnObservation> observation)
+                              std::shared_ptr<EcNativeTxnObservation> observation,
+                              std::shared_ptr<EcMountedTruncateFault> fault = nullptr,
+                              std::shared_ptr<kv::IKVEngine> rawEngine = nullptr)
       : inner_(std::move(inner)),
-        observation_(std::move(observation)) {
+        observation_(std::move(observation)),
+        fault_(std::move(fault)),
+        rawEngine_(std::move(rawEngine)) {
     event_.rawId = observation_->nextId();
     observation_->started();
   }
@@ -172,6 +177,7 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
     event_.rawId = id;
     event_.rawAttempt = nextAttempt;
     started_ = Clock::now();
+    faultToken_ = 0;
   }
   CoTryTask<void> addReadConflict(std::string_view k) override { return inner_->addReadConflict(k); }
   CoTryTask<void> addReadConflictRange(std::string_view a, std::string_view b) override {
@@ -179,6 +185,14 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
   }
   CoTryTask<void> set(std::string_view k, std::string_view v) override {
     recordFamily(k);
+    if (fault_) {
+      try {
+        const auto selected = fault_->selectSet(k, v);
+        if (selected) faultToken_ = *selected;
+      } catch (...) {
+        fault_->setupFailed(StatusCode::kIOError);
+      }
+    }
     return inner_->set(k, v);
   }
   CoTryTask<void> clear(std::string_view k) override {
@@ -193,6 +207,20 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
   }
   CoTryTask<void> commit() override {
     ++event_.rawCommitCalls;
+    bool injected = false;
+    if (fault_ && faultToken_) {
+      try {
+        if (rawEngine_ && dynamic_cast<kv::FDBTransaction *>(inner_.get())) {
+          auto prepared = co_await fault_->beforeCommit(*inner_, *rawEngine_, faultToken_);
+          if (prepared) injected = *prepared;
+          else fault_->setupFailed(prepared.error().code());
+        } else {
+          fault_->setupFailed(StatusCode::kInvalidArg);
+        }
+      } catch (...) {
+        fault_->setupFailed(StatusCode::kIOError);
+      }
+    }
     event_.approximateAttempted = true;
     const auto measuring = Clock::now();
     try {
@@ -222,6 +250,7 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
       event_.rawCommit =
           result ? EcNativeTxnObservation::RawCommit::Succeeded : EcNativeTxnObservation::RawCommit::Failed;
       if (!result) event_.rawError = result.error().code();
+      if (fault_) fault_->originalCommitted(injected, result ? StatusCode::kOK : result.error().code());
       co_return result;
     } catch (...) {
       event_.commitMicros = micros(Clock::now() - committing);
@@ -247,15 +276,21 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
   }
   std::unique_ptr<kv::IReadWriteTransaction> inner_;
   std::shared_ptr<EcNativeTxnObservation> observation_;
+  std::shared_ptr<EcMountedTruncateFault> fault_;
+  std::shared_ptr<kv::IKVEngine> rawEngine_;
+  uint64_t faultToken_ = 0;
   EcNativeTxnObservation::Event event_;
   Clock::time_point started_ = Clock::now();
 };
 
 class EcObservedNativeEngine final : public kv::IKVEngine {
  public:
-  EcObservedNativeEngine(std::shared_ptr<kv::IKVEngine> inner, std::shared_ptr<EcNativeTxnObservation> observation)
+  EcObservedNativeEngine(std::shared_ptr<kv::IKVEngine> inner,
+                         std::shared_ptr<EcNativeTxnObservation> observation,
+                         std::shared_ptr<EcMountedTruncateFault> fault = nullptr)
       : inner_(std::move(inner)),
-        observation_(std::move(observation)) {}
+        observation_(std::move(observation)),
+        fault_(std::move(fault)) {}
   std::unique_ptr<kv::IReadOnlyTransaction> createReadonlyTransaction() override {
     // Preserve the engine's read-only factory semantics. RMW service budgets
     // use createReadWriteTransaction even for their committed observations.
@@ -264,11 +299,12 @@ class EcObservedNativeEngine final : public kv::IKVEngine {
   std::unique_ptr<kv::IReadWriteTransaction> createReadWriteTransaction() override {
     auto inner = inner_->createReadWriteTransaction();
     if (!inner) return nullptr;
-    return std::make_unique<EcObservedNativeTransaction>(std::move(inner), observation_);
+    return std::make_unique<EcObservedNativeTransaction>(std::move(inner), observation_, fault_, inner_);
   }
 
  private:
   std::shared_ptr<kv::IKVEngine> inner_;
   std::shared_ptr<EcNativeTxnObservation> observation_;
+  std::shared_ptr<EcMountedTruncateFault> fault_;
 };
 }  // namespace hf3fs::meta::server::detail

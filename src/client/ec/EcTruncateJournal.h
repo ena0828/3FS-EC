@@ -55,6 +55,8 @@ class EcTruncateJournal {
   const EcTruncateRun &record() const { return record_; }
   const std::optional<EcTruncateJournalState> &latest() const { return latest_; }
   bool poisoned() const { return poisoned_; }
+  // Capacity only, not a durability or cleanup-completion observation.
+  uint64_t remainingStates() const;
   Result<Void> append(EcTruncateJournalState);
 
  private:

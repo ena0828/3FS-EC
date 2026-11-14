@@ -37,6 +37,7 @@ TEST(TestEcTruncateJournal, FixedCasAndTerminalProgressSurviveExclusiveResume) {
   auto created = EcTruncateJournal::create(path, *made);
   ASSERT_OK(created);
   auto j = std::move(*created);
+  EXPECT_EQ(j->remainingStates(), 4096u);
   EXPECT_FALSE(EcTruncateJournal::resume(path));
   EcTruncateJournalState s;
   s.beginIssued = true;
@@ -51,9 +52,11 @@ TEST(TestEcTruncateJournal, FixedCasAndTerminalProgressSurviveExclusiveResume) {
   o.tailRequired = true;
   s.progress = progress;
   ASSERT_OK(j->append(s));
+  EXPECT_EQ(j->remainingStates(), 4095u);
   auto bad = s;
   bad.progress->intent.expectedSequence++;
   EXPECT_FALSE(j->append(bad));
+  EXPECT_EQ(j->remainingStates(), 4095u);
   o.state = meta::EcFileTruncateState::Published;
   o.publishedRoot = o.fencedRoot;
   ++o.publishedRoot->sequence;
@@ -76,6 +79,7 @@ TEST(TestEcTruncateJournal, FixedCasAndTerminalProgressSurviveExclusiveResume) {
   j.reset();
   auto resumed = EcTruncateJournal::resume(path);
   ASSERT_OK(resumed);
+  EXPECT_EQ((*resumed)->remainingStates(), 4093u);
   EXPECT_EQ(serde::serialize((*resumed)->record()), serde::serialize(*made));
   ASSERT_TRUE((*resumed)->latest()->progress->observed);
   EXPECT_TRUE((*resumed)->latest()->progress->observed->outputDrained);

@@ -17,7 +17,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 
-META_FILTER = "TestEcFileNativeWrite.*"
+META_FILTER = "TestEcFileNativeWrite.*:TestEcMountedTruncateRecovery.*"
 FUSE_FILTER = "TestEcFuseRead.*:TestEcFuseShutdown.*:TestEcFileMount.*"
 META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
     "AppendLostAcceptanceUsesSameEofAndFsyncRequiresPublishedData",
@@ -27,6 +27,12 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
     "RenameMovesReplacesAndKeepsOpenObjectsWithPermanentReplay",
     "TruncateTailLostReplyAndExtensionDoNotResurrectBytes",
     "TruncatePublicationSurvivesClosingLastUnlinkedSession",
+)) + tuple("TestEcMountedTruncateRecovery." + name for name in (
+    "BeginConflictReplaysOriginalIntent",
+    "PublishedConflictAfterDataTailReplaysOriginalIntent",
+    "EightConflictsKeepDebtAndRecoveryCapacity",
+    "FixedDeadlineStopsConflictRecovery",
+    "LostCommittedBeginReplyIsNotRetried",
 ))
 REPAIR_CASES = (
     "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
@@ -76,7 +82,7 @@ def parser():
     for name in ("source", "build", "fdb-bin-dir", "work"):
         result.add_argument("--" + name, required=True, type=Path)
     result.add_argument("--profile", choices=("core", "repair", "target-meta", "auth-user", "service-contracts"), default="core",
-                        help="core: 7 Meta + 14 FUSE; repair: three-strategy and pending-copy recovery fixtures; "
+                        help="core: 12 Meta + 14 FUSE; repair: three-strategy and pending-copy recovery fixtures; "
                              "target-meta: 9 retirement catalogue, RPC and evidence cases; "
                              "auth-user: default and explicit primary GID with MemKV and FDB; "
                              "service-contracts: auth-user plus all Meta dispatch IDs")

@@ -42,6 +42,7 @@
 #include "fbs/storage/EcAuthorizedV2.h"
 #include "fbs/storage/EcStageValidationV2.h"
 #include "fdb/FDBKVEngine.h"
+#include "fuse/EcFileMount.h"
 #include "meta/components/NativeEcGcTransport.h"
 #include "meta/service/MetaSerdeService.h"
 #include "meta/store/EcCatalog.h"
@@ -52,6 +53,7 @@
 #include "meta/store/EcRangeCatalog.h"
 #include "meta/store/EcRevisionRetirementCatalog.h"
 #include "meta/store/EcTargetRetirementCatalog.h"
+#include "meta/store/EcTerminalEvidence.h"
 #include "meta/store/EcV2GcCatalog.h"
 #include "meta/store/EcV2PublishedCatalog.h"
 #include "meta/store/Inode.h"
@@ -86,6 +88,12 @@ void smallClient(net::Client::Config &config) {
 }
 
 struct PublishReplyDrop {
+  std::shared_ptr<detail::EcMountedTruncateFault> mountedTruncate;
+  bool mountedDropBegin = false;
+  size_t mountedBeginDrops = 0;
+  int mountedShutdownResult = -1;
+  bool mountedShutdownFinished = false;
+  std::condition_variable mountedChanged;
   struct State {
     size_t calls = 0;
     std::optional<EcOperationRecord> committed;
@@ -135,6 +143,56 @@ class DropPublishMetaService : public MetaSerdeService {
       : MetaSerdeService(meta),
         fault_(fault) {}
 
+  CoTryTask<EcFileTruncateRsp> queryEcFileTruncate(serde::CallContext &ctx, const QueryEcFileTruncateReq &req) {
+    const auto trace = fault_.mountedTruncate;
+    const auto event = trace ? trace->enter(detail::EcMountedTruncateFault::Method::Query, req.intent, req.uuid)
+                             : detail::EcMountedTruncateFault::kIgnored;
+    auto response = co_await MetaSerdeService::queryEcFileTruncate(ctx, req);
+    if (trace) trace->finish(event, response ? StatusCode::kOK : response.error().code());
+    co_return response;
+  }
+  CoTryTask<EcFileTruncateRsp> beginEcFileTruncate(serde::CallContext &ctx, const BeginEcFileTruncateReq &req) {
+    const auto trace = fault_.mountedTruncate;
+    const auto event = trace ? trace->enter(detail::EcMountedTruncateFault::Method::Begin, req.intent, req.uuid)
+                             : detail::EcMountedTruncateFault::kIgnored;
+    auto response = co_await MetaSerdeService::beginEcFileTruncate(ctx, req);
+    if (trace) trace->finish(event, response ? StatusCode::kOK : response.error().code());
+    bool drop = false;
+    if (response && response->progress.observed && event != detail::EcMountedTruncateFault::kIgnored) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.mountedDropBegin) {
+        fault_.mountedDropBegin = false;
+        drop = true;
+        ++fault_.mountedBeginDrops;
+      }
+    }
+    if (drop) {
+      const auto transport = ctx.transport();
+      int result = -1;
+      if (transport->isTCP()) {
+        const auto &handler = static_cast<const net::EventLoop::EventHandler &>(*transport);
+        result = ::shutdown(handler.fd(), SHUT_RDWR);
+      }
+      transport->invalidate(false);
+      {
+        std::lock_guard lock(fault_.mutex);
+        fault_.mountedShutdownResult = result;
+        fault_.mountedShutdownFinished = true;
+      }
+      fault_.mountedChanged.notify_all();
+    }
+    co_return response;
+  }
+  CoTryTask<EcFileTruncateRsp> closeEcFileTruncateDebt(serde::CallContext &ctx,
+                                                     const CloseEcFileTruncateDebtReq &req) {
+    const auto trace = fault_.mountedTruncate;
+    const auto event = trace ? trace->enter(detail::EcMountedTruncateFault::Method::Close, req.intent, req.uuid)
+                             : detail::EcMountedTruncateFault::kIgnored;
+    auto response = co_await MetaSerdeService::closeEcFileTruncateDebt(ctx, req);
+    if (trace) trace->finish(event, response ? StatusCode::kOK : response.error().code());
+    co_return response;
+  }
+
   CoTryTask<EcFileRepairDirectRsp> prepareEcFileRepairDirect(
       serde::CallContext &ctx, const PrepareEcFileRepairDirectReq &req) {
     auto response = co_await MetaSerdeService::prepareEcFileRepairDirect(ctx, req);
@@ -169,7 +227,11 @@ class DropPublishMetaService : public MetaSerdeService {
   }
 
   CoTryTask<EcFileTruncateRsp> advanceEcFileTruncate(serde::CallContext &ctx, const AdvanceEcFileTruncateReq &req) {
+    const auto trace = fault_.mountedTruncate;
+    const auto event = trace ? trace->enter(detail::EcMountedTruncateFault::Method::Advance, req.intent, req.uuid)
+                             : detail::EcMountedTruncateFault::kIgnored;
     auto response = co_await MetaSerdeService::advanceEcFileTruncate(ctx, req);
+    if (trace) trace->finish(event, response ? StatusCode::kOK : response.error().code());
     bool drop = false;
     if (response && response->progress.observed &&
         response->progress.observed->state == EcFileTruncateState::Published) {
@@ -428,6 +490,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   virtual bool enableMetaGcAdmin() const { return false; }
   virtual bool enableTargetRetirement() const { return false; }
   virtual bool enableFileRmw() const { return false; }
+  virtual bool enableMountedTruncateFault() const { return false; }
   struct Mutation {
     std::string logical;
     storage::EcCodec::Shards shards;
@@ -474,7 +537,8 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     RecordProperty("private_fdb_reset", "user keys [empty, 0xff), before Meta initialization");
     if (enableFileRmw()) {
       txnObservation_ = std::make_shared<detail::EcNativeTxnObservation>();
-      kv_ = std::make_shared<detail::EcObservedNativeEngine>(kv_, txnObservation_);
+      if (enableMountedTruncateFault()) replyDrop_.mountedTruncate = std::make_shared<detail::EcMountedTruncateFault>();
+      kv_ = std::make_shared<detail::EcObservedNativeEngine>(kv_, txnObservation_, replyDrop_.mountedTruncate);
     }
     ASSERT_NO_FATAL_FAILURE(writeKey());
     ASSERT_NO_FATAL_FAILURE(startStorage());
@@ -1303,6 +1367,7 @@ class TestEcV2NativeHelperPlan : public TestEcV2NativeLifecycle {
 #include "EcFileRepairPendingNativeTests.inc"
 #include "EcFileAppendNativeTests.inc"
 #include "EcFileTruncateNativeTests.inc"
+#include "EcMountedTruncateNativeTests.inc"
 // clang-format on
 
 TEST_F(TestEcV2NativeLifecycle, PublicCreateTracksNewObjectsAndLegacyCreateReplayDoesNotUpgrade) {
