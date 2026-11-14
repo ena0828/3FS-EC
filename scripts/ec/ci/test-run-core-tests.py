@@ -185,7 +185,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                     else:
                         RUNNER.run_meta(source, build, fdb, work, common, SimpleNamespace(received=[]),
                                         report, cases, test_filter)
-                        self.assertEqual(report["meta"]["passed_tests"], 2)
+                        self.assertEqual(report["meta"]["passed_tests"], len(cases))
                         self.assertEqual(report["meta"]["status"], "passed")
                 self.assertIs(RUNNER.sys.argv, original_argv)
                 self.assertIs(common.listed_tests, listing)
