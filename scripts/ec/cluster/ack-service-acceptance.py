@@ -151,8 +151,12 @@ def sync_parent(path):
     try:os.fsync(fd)
     finally:os.close(fd)
 
-def command(runner,w,argv):
+def command(runner,w,argv,*,pass_fds=()):
     require(not runner.stop_requested,'Stop requested; no new command')
+    if pass_fds:
+        require(runner.transport_role=='control' and len(argv)==5 and
+                list(map(str,argv[:4]))==[str(runner.root/'bin/admin_cli'),'--cfg',str(runner.config),'--'],
+                'An inherited collector lease requires the original control CLI and configuration')
     binding=runner.check_transport()
     if binding is not None:
         # This shared child owner also runs the formal file acceptance driver.
@@ -165,7 +169,7 @@ def command(runner,w,argv):
         require(configs==['--cfg='+str(runner.config)] and modes==['--config.storage_transport=rdma'] and len(runs)==1,
                 'File command transport/config/run differs from prepared selection')
         w.bind_transport_run(runner.root,Path(runs[0]),binding,[str(argv[0])])
-    return _owned_command(runner,w,argv,binding)
+    return _owned_command(runner,w,argv,binding,pass_fds=pass_fds)
 
 
 def validate_supervisor_command(root,argv,*,expected_executable=None):
@@ -236,18 +240,36 @@ def supervisor_command(runner,w,argv,*,operation,run=None,action=None):
     return _owned_command(runner,w,argv,None,kind='supervisor_control' if binding is not None else None)
 
 
-def _owned_command(runner,w,argv,binding,*,kind=None):
+def checked_pass_fds(value):
+    require(type(value) is tuple and len(value)<=1,'At most one explicit collector lease descriptor is supported')
+    if value:
+        require(sys.platform=='linux' and type(value[0]) is int and value[0]>2,
+                'Collector lease inheritance requires a Linux descriptor above standard streams')
+        info=os.fstat(value[0])
+        require(stat.S_ISREG(info.st_mode) and info.st_uid==os.geteuid() and
+                not info.st_mode&0o077 and info.st_nlink==1,
+                'Collector lease must be a private single-link regular file owned by this user')
+    return value
+
+
+def _owned_command(runner,w,argv,binding,*,kind=None,pass_fds=()):
+    inherited=checked_pass_fds(pass_fds)
     index=len(runner.commands)
     entry={'index':index,'argv':list(map(str,argv)),'process_started':False,'process_exited':False,
            'remote_release_proven_by_exit':False,'equivalent_bash':shlex.join(list(map(str,argv)))}
     if binding is not None:entry['transport']=binding
     if kind is not None:entry['kind']=kind
+    if inherited:entry['inherited_collector_lease']=True
     runner.commands.append(entry);runner.event({'event':'command_planned',**entry})
     path=runner.report/f'command-{index:03d}.log'
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
     with os.fdopen(fd,'wb') as log:
+        # The caller owns the flock and only closes its descriptor after this
+        # join. Inheritance also retains that lock if the caller is killed.
+        # Reacquiring it is not a remote-drain or prior-manager-join receipt.
+        inherited_options={'pass_fds':inherited} if inherited else {}
         proc=subprocess.Popen(entry['argv'],cwd=runner.root,env=runner.env,stdin=subprocess.DEVNULL,
-                              stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+                              stdout=log,stderr=subprocess.STDOUT,start_new_session=True,**inherited_options)
         runner.child=proc
         try:
             # Runner signal handlers only mark stop_requested. Logging failures cannot bypass join.

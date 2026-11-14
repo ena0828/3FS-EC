@@ -30,7 +30,7 @@ SERVICE_NAMES = {'fdb', 'mgmtd', 'storage', 'meta'}
 PHASE = 'arguments'
 PHASES = {'arguments', 'source', 'core', 'lab-build', 'prepare', 'package', 'copy-fdb',
           'inventory', 'handoff', 'uid-handoff', 'exec-uid1000', 'exec-same-user', 'runtime-preflight',
-          'doctor', 'packaged-loader', 'bootstrap', 'cli-basic', 'cli-repair', 'flat-inputs', 'flat-direct',
+          'doctor', 'packaged-loader', 'bootstrap', 'cli-basic', 'cli-repair', 'cli-tree-gc', 'flat-inputs', 'flat-direct',
           'dump-fuse-default.toml',
           'dump-launcher-default.toml', 'prepare-fuse', 'mode4-lifecycle', 'cleanup',
           'cleanup-unknown', 'receipt'}
@@ -1268,6 +1268,16 @@ def runtime(parent):
                 validate_command_transports(lab, selection, cli_result['commands'])
                 report['receipts'].append({'phase': cli_phase, 'path': str(receipt), 'sha256': sha(receipt)})
             healthy()
+            command('cli-tree-gc', [sys.executable, '-B', lab / 'scripts/tree-gc-acceptance.py',
+                                    '--root', lab, '--label', 'hosted'])
+            receipt = lab / 'client/tree-gc-acceptance/hosted/report/result.json'
+            gc_result = read_json(receipt)
+            require_cli_result(gc_result)
+            gc_acceptance = module(lab / 'scripts/tree-gc-acceptance.py', 'file_lab_tree_gc')
+            gc_acceptance.validate_result(gc_result, lab, 'hosted')
+            validate_command_transports(lab, selection, gc_result['commands'])
+            report['receipts'].append({'phase': 'tree-gc', 'path': str(receipt), 'sha256': sha(receipt)})
+            healthy()
             command('flat-inputs', [sys.executable, '-B', lab / 'scripts/experiment-runner.py',
                                     '--root', lab, 'inputs'])
             flat_report = lab / 'client/reports/hosted-flat-direct'
@@ -1380,8 +1390,10 @@ def runtime(parent):
                 receipt_path = canonical(Path(item['path']))
                 require(sha(receipt_path) == item['sha256'], 'original transport receipt changed')
                 value = read_json(receipt_path)
-                if item['phase'] in ('basic', 'repair', 'flat-direct'):
+                if item['phase'] in ('basic', 'repair', 'flat-direct', 'tree-gc'):
                     validate_command_transports(lab, selection, value['commands'])
+                    if item['phase'] == 'tree-gc':
+                        gc_acceptance.validate_result(value, lab, 'hosted')
                 elif item['phase'] == 'mode4-lifecycle':
                     validate_fuse_transport(lab, selection, read_json(parent / 'fuse-config/preparation.json'), value)
         require(not helper.mounts_at(parent / 'mount'), 'mount still present after lifecycle')

@@ -121,13 +121,27 @@ TEST(TestEcTransportPolicy, LocalRdmaRequirementPreservesOriginalFiveFieldWireAn
   EXPECT_EQ(std::string_view(before), std::string_view(after));
 }
 
+TEST(TestEcTransportPolicy, UnstartedStorageClientConstructsAndDestroys) {
+  // A separate GTest RUN/OK boundary identifies constructor/destructor failure
+  // without needing XML that a process crash cannot finish writing.
+  StorageClient::Config config;
+  hf3fs::tests::FakeMgmtdClient mgmtd;
+  {
+    // Two messengers embed large Services tables. Match the production
+    // factory's heap allocation; no test body should place those on its stack.
+    auto client = std::make_unique<StorageClientImpl>(ClientId{Uuid::zero(), "transport-policy-test"}, config, mgmtd);
+    // Deliberately do not start the client or contact a service.
+  }
+  SUCCEED();
+}
+
 TEST(TestEcTransportPolicy, RejectsImplicitAndInvalidPoliciesBeforeControlledDataDispatch) {
   EXPECT_EQ(EcRequestControl{}.transport, Policy::TcpOnly);
   EXPECT_TRUE(isExplicitEcTransportPolicy(Policy::TcpOnly));
   EXPECT_TRUE(isExplicitEcTransportPolicy(Policy::RdmaOnly));
   StorageClient::Config config;
   hf3fs::tests::FakeMgmtdClient mgmtd;
-  StorageClientImpl client(ClientId{Uuid::zero(), "transport-policy-test"}, config, mgmtd);
+  auto client = std::make_unique<StorageClientImpl>(ClientId{Uuid::zero(), "transport-policy-test"}, config, mgmtd);
   // No start(), socket or IB device: these public methods must reject the
   // policy before trying routing, grants or a network ClientContext.
   for (const auto policy : {Policy::Automatic, static_cast<Policy>(255)}) {
@@ -137,20 +151,34 @@ TEST(TestEcTransportPolicy, RejectsImplicitAndInvalidPoliciesBeforeControlledDat
       ASSERT_FALSE(outcome);
       EXPECT_EQ(outcome.error().code(), StatusCode::kNotImplemented);
     };
-    rejected(blockingWait(client.authorizedReadEcFragmentControlled({}, control)));
-    rejected(blockingWait(client.readEcBlockV2Controlled({}, control)));
-    rejected(blockingWait(client.beginEcStageV2Controlled({}, control)));
-    rejected(blockingWait(client.appendEcStageV2Controlled({}, control)));
-    rejected(blockingWait(client.queryEcStageV2Controlled({}, control)));
-    rejected(blockingWait(client.reconcileEcStageV2Controlled({}, control)));
-    rejected(blockingWait(client.sealEcStageV2Controlled({}, control)));
+    rejected(blockingWait(client->authorizedReadEcFragmentControlled({}, control)));
+    rejected(blockingWait(client->readEcBlockV2Controlled({}, control)));
+    rejected(blockingWait(client->beginEcStageV2Controlled({}, control)));
+    rejected(blockingWait(client->appendEcStageV2Controlled({}, control)));
+    rejected(blockingWait(client->queryEcStageV2Controlled({}, control)));
+    rejected(blockingWait(client->reconcileEcStageV2Controlled({}, control)));
+    rejected(blockingWait(client->sealEcStageV2Controlled({}, control)));
   }
-  for (const auto policy : {Policy::TcpOnly, Policy::RdmaOnly}) {
-    EcRequestControl control{std::chrono::steady_clock::now() + std::chrono::seconds(30), {}, policy};
-    auto acceptedPolicy = blockingWait(client.readEcBlockV2Controlled({}, control));
-    ASSERT_FALSE(acceptedPolicy);
-    EXPECT_EQ(acceptedPolicy.error().code(), StorageClientCode::kNotInitialized);
-  }
+}
+
+TEST(TestEcTransportPolicy, ExplicitTcpPolicyOnUnstartedClientReturnsNotInitialized) {
+  StorageClient::Config config;
+  hf3fs::tests::FakeMgmtdClient mgmtd;
+  auto client = std::make_unique<StorageClientImpl>(ClientId{Uuid::zero(), "transport-policy-test"}, config, mgmtd);
+  EcRequestControl control{std::chrono::steady_clock::now() + std::chrono::seconds(30), {}, Policy::TcpOnly};
+  auto acceptedPolicy = blockingWait(client->readEcBlockV2Controlled({}, control));
+  ASSERT_FALSE(acceptedPolicy);
+  EXPECT_EQ(acceptedPolicy.error().code(), StorageClientCode::kNotInitialized);
+}
+
+TEST(TestEcTransportPolicy, ExplicitRdmaPolicyOnUnstartedClientReturnsNotInitialized) {
+  StorageClient::Config config;
+  hf3fs::tests::FakeMgmtdClient mgmtd;
+  auto client = std::make_unique<StorageClientImpl>(ClientId{Uuid::zero(), "transport-policy-test"}, config, mgmtd);
+  EcRequestControl control{std::chrono::steady_clock::now() + std::chrono::seconds(30), {}, Policy::RdmaOnly};
+  auto acceptedPolicy = blockingWait(client->readEcBlockV2Controlled({}, control));
+  ASSERT_FALSE(acceptedPolicy);
+  EXPECT_EQ(acceptedPolicy.error().code(), StorageClientCode::kNotInitialized);
 }
 
 TEST(TestEcTransportPolicy, ExplicitRoutesFilterServiceAndNeverFallBack) {

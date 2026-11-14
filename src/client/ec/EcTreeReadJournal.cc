@@ -54,8 +54,12 @@ Result<std::unique_ptr<EcTreeReadJournal>> EcTreeReadJournal::create(const std::
 Result<std::unique_ptr<EcTreeReadJournal>> EcTreeReadJournal::resume(const std::filesystem::path &path) {
   return open(path, std::nullopt);
 }
+Result<std::unique_ptr<EcTreeReadJournal>> EcTreeReadJournal::inspectExisting(const std::filesystem::path &path) {
+  return open(path, std::nullopt, true);
+}
 Result<std::unique_ptr<EcTreeReadJournal>> EcTreeReadJournal::open(const std::filesystem::path &path,
-                                                                   std::optional<EcTreeReadRun> initial) {
+                                                                   std::optional<EcTreeReadRun> initial,
+                                                                   bool readOnly) {
   try {
     if (!path.is_absolute() || path.filename().empty() || path.filename() == "." || path.filename() == "..")
       return makeError(StatusCode::kInvalidArg, "file run requires an explicit absolute directory");
@@ -77,12 +81,13 @@ Result<std::unique_ptr<EcTreeReadJournal>> EcTreeReadJournal::open(const std::fi
       return makeError(StatusCode::kInvalidFormat, "run directory must be owner-only");
     if (initial && (::fchmod(directory.value, 0700) || ::fsync(parent.value)))
       return makeError(io("persist new run directory").error());
-    Fd lock(::openat(directory.value, ".lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600));
+    Fd lock(::openat(directory.value, ".lock", O_RDWR | (readOnly ? 0 : O_CREAT) | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600));
     if (lock.value < 0) return makeError(io("open run lock").error());
     RETURN_ON_ERROR(privateRegular(lock.value));
     if (::flock(lock.value, LOCK_EX | LOCK_NB))
       return makeError(StorageClientCode::kResourceBusy, "file run is already owned");
     auto journal = std::unique_ptr<EcTreeReadJournal>(new EcTreeReadJournal(directory.release(), lock.release(), {}));
+    journal->readOnly_ = readOnly;
     if (initial) {
       journal->record_ = std::move(*initial);
       RETURN_ON_ERROR(journal->writeNew("record.data", *encoded));
@@ -172,6 +177,7 @@ Result<Void> EcTreeReadJournal::writeNew(std::string_view name, std::string_view
   return Void{};
 }
 Result<Void> EcTreeReadJournal::append(EcTreeReadProgress progress) {
+  if (readOnly_) return makeError(StatusCode::kInvalidArg, "inspection cannot append journal state");
   if (poisoned_)
     return makeError(StatusCode::kIOError, "file run requires close and explicit resume after persistence error");
   try {

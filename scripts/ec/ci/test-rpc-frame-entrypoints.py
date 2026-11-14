@@ -55,6 +55,16 @@ class RpcFrameEntrypoints(unittest.TestCase):
                                        selection_source)), 1)
         self.assertIn(selection, regression.CLIENT_MANDATORY)
         self.assertTrue(any(fnmatch.fnmatchcase(selection, part) for part in driver.CLIENT_FILTER.split(":")))
+        for suite, method in (
+            ("TestEcTreeReadJournal", "ReadOnlyExportRejectsMissingLockIncompleteAndConflictingOutput"),
+            ("TestEcTreeReadJournal", "SnapshotExportBoundsZeroEofAndEightDistinctRevisions"),
+            ("TestEcTreeReadClient", "ReleasedReadExportPreservesTwelveIdentitiesAndJournalBytes"),
+        ):
+            source = (SOURCE / "tests/client/TestEcTreeReadClient.cc").read_text(encoding="utf-8")
+            self.assertEqual(len(re.findall(r"TEST(?:_F)?\(" + suite + r",\s*" + method + r"\)", source)), 1)
+            name = suite + "." + method
+            self.assertIn(name, regression.CLIENT_MANDATORY)
+            self.assertTrue(any(fnmatch.fnmatchcase(name, part) for part in driver.CLIENT_FILTER.split(":")))
 
     def test_real_xml_parser_accepts_all_and_rejects_skip_failure_or_missing_execution(self):
         with tempfile.TemporaryDirectory() as temporary:

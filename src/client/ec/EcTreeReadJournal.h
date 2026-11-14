@@ -53,6 +53,8 @@ class EcTreeReadJournal {
  public:
   static Result<std::unique_ptr<EcTreeReadJournal>> create(const std::filesystem::path &, EcTreeReadRun);
   static Result<std::unique_ptr<EcTreeReadJournal>> resume(const std::filesystem::path &);
+  // Existing lock only: never creates a lock or permits append. Retains exclusive ownership.
+  static Result<std::unique_ptr<EcTreeReadJournal>> inspectExisting(const std::filesystem::path &);
   ~EcTreeReadJournal();
   EcTreeReadJournal(const EcTreeReadJournal &) = delete;
   EcTreeReadJournal &operator=(const EcTreeReadJournal &) = delete;
@@ -66,12 +68,15 @@ class EcTreeReadJournal {
       : directory_(directory),
         lock_(lock),
         record_(std::move(record)) {}
-  static Result<std::unique_ptr<EcTreeReadJournal>> open(const std::filesystem::path &, std::optional<EcTreeReadRun>);
+  static Result<std::unique_ptr<EcTreeReadJournal>> open(const std::filesystem::path &,
+                                                                std::optional<EcTreeReadRun>,
+                                                                bool readOnly = false);
   Result<Void> writeNew(std::string_view, std::string_view);
   Result<std::string> read(std::string_view) const;
   int directory_ = -1, lock_ = -1;
   EcTreeReadRun record_;
   std::optional<EcTreeReadProgress> latest_;
   bool poisoned_ = false;
+  bool readOnly_ = false;
 };
 }  // namespace hf3fs::client::ec

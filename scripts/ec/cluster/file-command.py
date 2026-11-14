@@ -40,7 +40,7 @@ def parser():
     p.add_argument("--show-command", action="store_true", help="仅显示命令，不运行实验")
     sub = p.add_subparsers(dest="action", required=True)
     for name in ("create", "open", "resume-open", "pwrite", "resume", "query", "seal", "close",
-                 "read", "resume-read", "release-read", "truncate", "resume-truncate", "query-truncate",
+                 "read", "resume-read", "release-read", "export-read-allocations", "truncate", "resume-truncate", "query-truncate",
                  "close-truncate-debt", "append", "resume-append", "query-append", "seal-append",
                  "fsync", "resume-fsync", "repair", "resume-repair", "query-repair", "close-repair-debt"):
         item = sub.add_parser(name)
@@ -54,7 +54,7 @@ def parser():
             item.add_argument("--offset", type=decimal, required=True, help="字节偏移")
         if name in ("pwrite", "append"):
             item.add_argument("--input", type=Path, required=True)
-        if name in ("read", "resume-read"):
+        if name in ("read", "resume-read", "export-read-allocations"):
             item.add_argument("--output", type=Path, required=True, help="新的独占输出文件")
         if name == "read":
             item.add_argument("--length", type=decimal, required=True, help="最大读取字节数，实际受 EOF 限制")
@@ -146,9 +146,10 @@ def main():
         return 0
     if sys.platform != "linux":
         raise ValueError("实际运行须在 Linux/WSL 中进行")
-    module = transport_module()
-    binding = module.prepared_transport(args.root, args.root / "client/file-client.toml", file_api=True)
-    module.bind_transport_run(args.root, args.run_dir, binding, [argv[0]])
+    if args.action != "export-read-allocations":
+        module = transport_module()
+        binding = module.prepared_transport(args.root, args.root / "client/file-client.toml", file_api=True)
+        module.bind_transport_run(args.root, args.run_dir, binding, [argv[0]])
     # No timer, sampling thread, retry or identity generation survives exec.
     # The native journal owns operation and recovery semantics.
     os.execve(argv[0], argv, environment)

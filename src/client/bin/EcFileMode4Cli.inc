@@ -1,6 +1,16 @@
 // Included inside ec_file_cli's anonymous namespace. Mode 4 is deliberately
 // separate from legacy mode-3 append-at/range run formats and permissions.
 int executeMode4(const Config &cfg, const std::string &command) {
+  // No token, RPC client, worker or IB device is needed for this local archive.
+  if (command == "mode4-export-read-allocations") {
+    auto exported = exportEcTreeReadAllocations(cfg.run_dir(), cfg.output_file());
+    if (!exported) {
+      std::cerr << "unconfirmed local snapshot export: " << exported.error().describe() << '\n';
+      return 1;
+    }
+    std::cout << "{\"kind\":\"ec_tree_read_allocations_exported\",\"network_io_performed\":false}\n";
+    return 0;
+  }
   const bool freshSession = command == "mode4-create" || command == "mode4-open";
   const bool freshWrite = command == "mode4-pwrite";
   const bool freshRead = command == "mode4-read";

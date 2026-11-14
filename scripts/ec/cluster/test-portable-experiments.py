@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from native_v2_config import prepare, file_api_enabled, key_roles, profile_config_problems, required_services
 import tomllib
@@ -28,6 +29,75 @@ spec.loader.exec_module(file_command)
 
 
 class PortableExperiments(unittest.TestCase):
+    def test_read_allocation_export_forwards_only_local_paths_without_creating_output(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent).resolve()
+            (root / "cluster.json").write_text(json.dumps({"root": str(root), "file_api": True}))
+            run, output = root / "released read", root / "new snapshot.json"
+            args = ["--root", str(root), "export-read-allocations", "--run-dir", str(run), "--output", str(output)]
+            before = {path.name: path.read_bytes() for path in root.iterdir()}
+            actual = file_command.command(file_command.parser().parse_args(args))
+            self.assertEqual(actual, [str(root / "bin/ec_file_cli"), "--cfg=" + str(root / "client/file-client.toml"),
+                                     "--config.run_dir=" + str(run), "--config.output_file=" + str(output),
+                                     "mode4-export-read-allocations"])
+            self.assertFalse(run.exists())
+            self.assertFalse(output.exists())
+            self.assertEqual({path.name: path.read_bytes() for path in root.iterdir()}, before)
+            for extra in (["--metrics"], ["--session", str(run)], ["--offset", "0"]):
+                with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    file_command.parser().parse_args(args + extra)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                file_command.parser().parse_args(args[:-2])
+            parsed = file_command.parser().parse_args(args)
+            parsed.output = Path("relative.json")
+            with self.assertRaises(ValueError):
+                file_command.command(parsed)
+
+    def test_read_allocation_export_exec_skips_initialized_gate_and_transport_sidecar(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent).resolve()
+            run, output = root / "released read", root / "export.json"
+            run.mkdir()
+            (run / "record.data").write_bytes(b"fixed journal bytes")
+            for transport in (None, {"schema": 1, "mode": "rdma", "interface": "eth0",
+                                     "ipv4": "192.0.2.1", "ib_device": "mlx5_0"}):
+                with self.subTest(transport=transport):
+                    manifest = {"root": str(root), "file_api": True}
+                    if transport is not None:
+                        manifest["data_transport"] = transport
+                    (root / "cluster.json").write_text(json.dumps(manifest))
+                    module = mock.Mock()
+                    before = {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+                    args = ["file-command.py", "--root", str(root), "export-read-allocations", "--run-dir", str(run),
+                            "--output", str(output)]
+                    with mock.patch.object(file_command.sys, "argv", args), mock.patch.object(file_command.sys, "platform", "linux"), \
+                         mock.patch.object(file_command, "transport_module", return_value=module) as provider, \
+                         mock.patch.object(file_command.os, "execve", side_effect=RuntimeError("captured exec"), create=True) as execute, \
+                         contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "captured exec"):
+                        file_command.main()
+                    execute.assert_called_once()
+                    self.assertEqual(execute.call_args.args[0], str(root / "bin/ec_file_cli"))
+                    self.assertEqual(execute.call_args.args[1][-1], "mode4-export-read-allocations")
+                    module.bind_transport_run.assert_not_called()
+                    if transport is None:
+                        provider.assert_not_called()
+                    else:
+                        module.prepared_transport.assert_called_once_with(root, root / "client/file-client.toml",
+                                                                        file_api=True, require_initialized=False)
+                    self.assertEqual({str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}, before)
+                    self.assertFalse(output.exists())
+            # Ordinary data/recovery commands keep their original admission and sidecar.
+            module = mock.Mock()
+            args = ["file-command.py", "--root", str(root), "query", "--run-dir", str(run)]
+            with mock.patch.object(file_command.sys, "argv", args), mock.patch.object(file_command.sys, "platform", "linux"), \
+                 mock.patch.object(file_command, "transport_module", return_value=module), \
+                 mock.patch.object(file_command.os, "execve", side_effect=RuntimeError("captured exec"), create=True), \
+                 contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "captured exec"):
+                file_command.main()
+            module.prepared_transport.assert_called_with(root, root / "client/file-client.toml", file_api=True)
+            module.bind_transport_run.assert_called_once_with(root, run, module.prepared_transport.return_value,
+                                                             [str(root / "bin/ec_file_cli")])
+
     def test_repair_metrics_only_forwards_explicit_choice_without_changing_run(self):
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent).resolve()
@@ -170,7 +240,7 @@ class PortableExperiments(unittest.TestCase):
             self.assertEqual(json.loads((root / "cluster.json").read_text())["authenticated_user"],
                              {"uid": 1000, "gid": 1000})
             for name in ("experiment-runner.py", "experiment-menu.py", "file-command.py", "ack-service-acceptance.py",
-                         "ack-expected-scripts.json", "gc-acceptance.py"):
+                         "ack-expected-scripts.json", "gc-acceptance.py", "tree-gc-runner.py"):
                 self.assertEqual((root / "scripts" / name).read_bytes(), (SCRIPTS / name).read_bytes())
             expected = json.loads((root / "scripts/ack-expected-scripts.json").read_text())
             self.assertEqual(set(expected), {"experiment-runner.py", "run-cluster.py", "generate.py",

@@ -1,12 +1,16 @@
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <folly/ScopeGuard.h>
 #include <folly/experimental/TestUtil.h>
 #include <folly/experimental/coro/BlockingWait.h>
+#include <folly/json.h>
 #include <gtest/gtest.h>
 
 #include "client/ec/EcFileClient.h"
+#include "client/ec/EcAllocationExport.h"
 #include "client/storage/StorageClientInMem.h"
 #include "fbs/meta/EcRequestDigest.h"
 #include "fbs/meta/MockService.h"
@@ -96,6 +100,181 @@ TEST(TestEcTreeReadJournal, ExclusiveTypedJournalPreservesIdentityAndRejectsDrif
   EXPECT_TRUE(sameBytes((*resumed)->record(), *run));
   ASSERT_TRUE((*resumed)->latest()->snapshot);
   EXPECT_EQ((*resumed)->latest()->snapshot->state, meta::EcTreeReadState::Released);
+}
+
+// Real immutable journal bytes, including the existing lock. Export must not
+// create, replace or append any entry, even after the read has been released.
+std::string fileBytes(const std::filesystem::path &path) {
+  std::ifstream input(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+std::map<std::string, std::string> journalBytes(const std::filesystem::path &path) {
+  std::map<std::string, std::string> result;
+  for (const auto &entry : std::filesystem::directory_iterator(path))
+    result.emplace(entry.path().filename().string(), fileBytes(entry.path()));
+  return result;
+}
+std::string bytesDigest(std::string_view bytes) {
+  std::array<std::string_view, 10> parts{};
+  parts[0] = bytes;
+  auto digest = meta::computeEcLogicalSha256(parts, bytes.size());
+  EXPECT_TRUE(digest);
+  return digest ? serde::SerdeMethod<storage::EcSha256>::serdeToReadable(*digest) : "";
+}
+
+TEST(TestEcTreeReadJournal, ReadOnlyExportRejectsMissingLockIncompleteAndConflictingOutput) {
+  folly::test::TemporaryDirectory temporary;
+  const auto parent = std::filesystem::canonical(temporary.path().string());
+  const auto path = parent / "range", output = parent / "export.json";
+  auto run = prepareEcTreeRead(readSession(), "export-test", 8, 0, 80);
+  ASSERT_OK(run);
+  auto opened = EcTreeReadJournal::create(path, *run);
+  ASSERT_OK(opened);
+  auto journal = std::move(*opened);
+  auto before = journalBytes(path);
+  EXPECT_FALSE(exportEcTreeReadAllocations(path, output));  // live lock, no output
+  EXPECT_FALSE(std::filesystem::exists(output));
+  EXPECT_EQ(journalBytes(path), before);
+  journal.reset();
+  EXPECT_FALSE(exportEcTreeReadAllocations(path, output));  // no successful snapshot
+  EXPECT_FALSE(std::filesystem::exists(output));
+  auto inspected = EcTreeReadJournal::inspectExisting(path);
+  ASSERT_OK(inspected);
+  EcTreeReadProgress progress;
+  progress.acquisitionIssued = true;
+  progress.snapshot = zeroRecord(*run, 80);
+  progress.dataReady = progress.localComplete = true;
+  EXPECT_FALSE((*inspected)->append(progress));
+  inspected->reset();
+  EXPECT_EQ(journalBytes(path), before);
+  ASSERT_TRUE(std::filesystem::remove(path / ".lock"));
+  before = journalBytes(path);
+  EXPECT_FALSE(EcTreeReadJournal::inspectExisting(path));
+  EXPECT_FALSE(exportEcTreeReadAllocations(path, output));
+  EXPECT_EQ(journalBytes(path), before);
+  EXPECT_FALSE(std::filesystem::exists(path / ".lock"));
+  // Ordinary resume retains its old API. Inspection never performs this repair.
+  auto resumed = EcTreeReadJournal::resume(path);
+  ASSERT_OK(resumed);
+  progress.errorCode = StatusCode::kIOError;
+  ASSERT_OK((*resumed)->append(progress));
+  resumed->reset();
+  EXPECT_FALSE(exportEcTreeReadAllocations(path, output));
+  resumed = EcTreeReadJournal::resume(path);
+  ASSERT_OK(resumed);
+  progress.errorCode = 0;
+  ASSERT_OK((*resumed)->append(progress));
+  resumed->reset();
+  before = journalBytes(path);
+  EXPECT_FALSE(exportEcTreeReadAllocations(path, path / "inside.json"));
+  ASSERT_OK(exportEcTreeReadAllocations(path, output));
+  const auto saved = fileBytes(output);
+  EXPECT_FALSE(exportEcTreeReadAllocations(path, output));
+  EXPECT_EQ(fileBytes(output), saved);
+  EXPECT_EQ(journalBytes(path), before);
+  // Existing-state corruption must not become a plausible partial export.
+  {
+    std::ofstream altered(path / "record.data", std::ios::binary | std::ios::app);
+    altered << "trailing";
+  }
+  EXPECT_FALSE(exportEcTreeReadAllocations(path, parent / "bad.json"));
+  EXPECT_FALSE(std::filesystem::exists(parent / "bad.json"));
+}
+
+TEST(TestEcTreeReadJournal, SnapshotExportBoundsZeroEofAndEightDistinctRevisions) {
+  folly::test::TemporaryDirectory temporary;
+  const auto parent = std::filesystem::canonical(temporary.path().string());
+  auto run = prepareEcTreeRead(readSession(), "export-bound-test", 8, 0, 640);
+  ASSERT_OK(run);
+  EXPECT_FALSE(prepareEcTreeRead(readSession(), "too-many", 8, 0, 641));
+  for (auto eof : {uint64_t{0}, uint64_t{1}, uint64_t{640}}) {
+    const auto path = parent / ("zero-" + std::to_string(eof));
+    auto opened = EcTreeReadJournal::create(path, *run);
+    ASSERT_OK(opened);
+    EcTreeReadProgress progress;
+    progress.acquisitionIssued = true;
+    progress.snapshot = zeroRecord(*run, eof);
+    progress.snapshot->state = meta::EcTreeReadState::Released;
+    progress.snapshot->closeAuthority = Uuid::random();
+    progress.releaseIssued = progress.dataReady = progress.localComplete = true;
+    ASSERT_OK((*opened)->append(progress));
+    opened->reset();
+    const auto before = journalBytes(path);
+    const auto output = parent / ("zero-" + std::to_string(eof) + ".json");
+    ASSERT_OK(exportEcTreeReadAllocations(path, output));
+    const auto value = folly::parseJson(fileBytes(output));
+    EXPECT_EQ(value["selection"]["readable_length_decimal"].asString(), std::to_string(eof));
+    EXPECT_EQ(value["slots"].size(), eof == 0 ? 0u : eof == 1 ? 1u : 8u);
+    EXPECT_TRUE(value["revisions"].empty());
+    EXPECT_EQ(journalBytes(path), before);
+  }
+  // A bounded, valid on-disk metadata fixture, not a network/data-read proof.
+  auto snapshot = zeroRecord(*run, 640);
+  snapshot.root.root = Uuid::random();
+  std::array<std::string_view, 10> logical{};
+  logical[0] = "x";
+  auto hash = meta::computeEcLogicalSha256(logical, 1);
+  ASSERT_OK(hash);
+  for (size_t stripe = 0; stripe < 8; ++stripe) {
+    auto &entry = snapshot.stripes[stripe];
+    entry.slot.kind = meta::EcTreeSlotKind::Data;
+    entry.slot.revision = 3;  // equal numeric revisions on distinct stripes stay distinct
+    entry.slot.generation = 4;
+    entry.slot.logicalLength = 1;
+    entry.slot.contentSha256 = *hash;
+    entry.snapshot.emplace();
+    auto &pin = *entry.snapshot;
+    pin.object = run->session.object;
+    pin.owner = run->session.owner;
+    pin.pin = run->intent.selection.pins[stripe].pin;
+    pin.stripe = stripe;
+    pin.revision = 3;
+    pin.generation = 4;
+    std::array<storage::EcScopeEndpoint, 12> endpoints;
+    for (size_t shard = 0; shard < 12; ++shard) {
+      auto &endpoint = pin.endpoints[shard];
+      endpoint.identity.object = run->session.object.incarnation;
+      endpoint.identity.stripe = stripe;
+      endpoint.identity.generation = 4;
+      endpoint.identity.shard = shard;
+      endpoint.identity.allocation = Uuid::random();
+      endpoint.operation = Uuid::random();
+      endpoint.endpoint = {{flat::ChainId(200 + shard), flat::TargetId(300 + shard), flat::NodeId(100 + shard)},
+                           Uuid::random(), Uuid::random()};
+      endpoints[shard] = endpoint.endpoint.controlEndpoint();
+    }
+    auto digest = storage::computeEcScopeEndpointDigest(endpoints);
+    ASSERT_OK(digest);
+    pin.endpointSetDigest = *digest;
+  }
+  EcTreeReadProgress progress;
+  progress.acquisitionIssued = progress.dataReady = progress.localComplete = true;
+  progress.snapshot = snapshot;
+  const auto path = parent / "eight", output = parent / "eight.json";
+  auto opened = EcTreeReadJournal::create(path, *run);
+  ASSERT_OK(opened);
+  ASSERT_OK((*opened)->append(progress));
+  opened->reset();
+  ASSERT_OK(exportEcTreeReadAllocations(path, output));
+  const auto bytes = fileBytes(output);
+  EXPECT_LT(bytes.size(), 256u << 10);
+  const auto value = folly::parseJson(bytes);
+  ASSERT_EQ(value["revisions"].size(), 8u);
+  for (size_t stripe = 0; stripe < 8; ++stripe) {
+    const auto &revision = value["revisions"][stripe];
+    EXPECT_EQ(revision["stripe_decimal"].asString(), std::to_string(stripe));
+    EXPECT_EQ(revision["revision_decimal"].asString(), "3");
+    EXPECT_EQ(revision["allocations"].size(), 12u);
+  }
+  // Per-stripe validation alone does not catch one UUID reused on two stripes.
+  progress.snapshot->stripes[1].snapshot->endpoints[0].identity.allocation =
+      progress.snapshot->stripes[0].snapshot->endpoints[0].identity.allocation;
+  opened = EcTreeReadJournal::create(parent / "duplicate", *run);
+  ASSERT_OK(opened);
+  ASSERT_OK((*opened)->append(progress));
+  opened->reset();
+  EXPECT_FALSE(exportEcTreeReadAllocations(parent / "duplicate", parent / "duplicate.json"));
+  EXPECT_FALSE(std::filesystem::exists(parent / "duplicate.json"));
 }
 
 struct TreeCalls {
@@ -439,6 +618,73 @@ TEST_F(TestEcTreeReadClient, DataUsesNativeQuorumParityAndZeroFillsLogicalTail) 
   ASSERT_ERROR(blockingWait(client_->readTree(journal_, control())), StatusCode::kTokenStale);
   EXPECT_EQ(storage_->calls, count);
   EXPECT_EQ(calls_->oldRelease, 0);
+}
+
+TEST_F(TestEcTreeReadClient, ReleasedReadExportPreservesTwelveIdentitiesAndJournalBytes) {
+  create(0, 80, 80);
+  installData();
+  ASSERT_OK(blockingWait(client_->readTree(journal_, control())));
+  ASSERT_OK(blockingWait(client_->releaseTree(journal_, control())));
+  ASSERT_TRUE(journal_->latest());
+  ASSERT_TRUE(journal_->latest()->snapshot);
+  ASSERT_EQ(journal_->latest()->snapshot->state, meta::EcTreeReadState::Released);
+  const auto sequence = journal_->latest()->sequence;
+  const auto expected = *journal_->latest()->snapshot->stripes[0].snapshot;
+  const auto run = journal_->record();
+  journal_.reset();
+  blockingWait(client_->close());
+  client_.reset();
+  meta_->stop();
+  meta_.reset();  // export must not require even the mock services to remain live
+  const auto before = journalBytes(path_);
+  const auto storageCalls = storage_->calls.load();
+  const auto acquire = calls_->acquire.load(), query = calls_->query.load(), release = calls_->release.load();
+  const auto output = path_.parent_path() / "read-allocations.json";
+  ASSERT_OK(exportEcTreeReadAllocations(path_, output));
+  const auto bytes = fileBytes(output);
+  const auto value = folly::parseJson(bytes);
+  EXPECT_EQ(value["kind"].asString(), "ec_tree_read_allocations");
+  EXPECT_EQ(value["scope"].asString(), "captured_read_snapshot");
+  EXPECT_FALSE(value["gc_authorized"].asBool());
+  EXPECT_FALSE(value["network_io_performed"].asBool());
+  EXPECT_EQ(value["object"]["incarnation"].asString(), run.session.object.incarnation.toHexString());
+  EXPECT_EQ(value["birth"].asString(), run.session.birth.toHexString());
+  EXPECT_EQ(value["range"].asString(), run.intent.range.toHexString());
+  EXPECT_EQ(value["journal"]["snapshot_state"].asString(), "released");
+  EXPECT_EQ(value["journal"]["record_sha256"].asString(), bytesDigest(before.at("record.data")));
+  EXPECT_EQ(value["journal"]["latest_state_sha256"].asString(),
+            bytesDigest(before.at(fmt::format("state-{:020}.data", sequence))));
+  ASSERT_EQ(value["revisions"].size(), 1u);
+  const auto &revision = value["revisions"][0];
+  ASSERT_EQ(revision["allocations"].size(), 12u);
+  ASSERT_EQ(revision["endpoints"].size(), 12u);
+  for (size_t shard = 0; shard < 12; ++shard) {
+    const auto &identity = expected.endpoints[shard].identity;
+    const auto &physical = expected.endpoints[shard].endpoint;
+    const auto &item = revision["allocations"][shard];
+    EXPECT_EQ(item["version"].asInt(), identity.version);
+    EXPECT_EQ(item["object"].asString(), identity.object.toHexString());
+    EXPECT_EQ(item["stripe_decimal"].asString(), std::to_string(identity.stripe));
+    EXPECT_EQ(item["generation_decimal"].asString(), std::to_string(identity.generation));
+    EXPECT_EQ(item["shard"].asInt(), shard);
+    EXPECT_EQ(item["allocation"].asString(), identity.allocation.toHexString());
+    const auto &endpoint = revision["endpoints"][shard];
+    EXPECT_EQ(endpoint["origin_operation"].asString(), expected.endpoints[shard].operation.toHexString());
+    EXPECT_EQ(endpoint["node_decimal"].asString(), std::to_string(physical.placement.node.toUnderType()));
+    EXPECT_EQ(endpoint["chain_decimal"].asString(), std::to_string(physical.placement.chain.toUnderType()));
+    EXPECT_EQ(endpoint["target_decimal"].asString(), std::to_string(physical.placement.target.toUnderType()));
+    EXPECT_EQ(endpoint["engine_uuid"].asString(), physical.engineUuid.toHexString());
+    EXPECT_EQ(endpoint["target_incarnation"].asString(), physical.targetIncarnation.toHexString());
+  }
+  EXPECT_EQ(bytes.find("test-token"), std::string::npos);
+  EXPECT_EQ(bytes.find("readGrants"), std::string::npos);
+  EXPECT_EQ(journalBytes(path_), before);
+  EXPECT_EQ(storage_->calls.load(), storageCalls);
+  EXPECT_EQ(calls_->acquire.load(), acquire);
+  EXPECT_EQ(calls_->query.load(), query);
+  EXPECT_EQ(calls_->release.load(), release);
+  ASSERT_OK(exportEcTreeReadAllocations(path_, path_.parent_path() / "repeat.json"));
+  EXPECT_EQ(fileBytes(path_.parent_path() / "repeat.json"), bytes);
 }
 
 TEST_F(TestEcTreeReadClient, ExplicitRdmaPolicyReachesEveryNativeBlockRead) {

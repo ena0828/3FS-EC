@@ -146,10 +146,11 @@ def main():
                 include(source_path, f"lib/{soname}", "shared-library")
 
     if bundle_manifest.get("file_api") is True:
-        script = Path(__file__).with_name("cluster") / "file-cli-acceptance.py"
-        if not script.is_file():
-            raise RuntimeError(f"Missing file API acceptance source: {script}")
-        include(script, "scripts/file-cli-acceptance.py", "script")
+        for name in ("file-cli-acceptance.py", "tree-gc-acceptance.py"):
+            script = Path(__file__).with_name("cluster") / name
+            if not script.is_file():
+                raise RuntimeError(f"Missing file API acceptance source: {script}")
+            include(script, "scripts/" + name, "script")
 
     if bundle_manifest.get("profile") == "native-gc-local-14-storage-14-targets" and bundle_manifest.get("file_api") is True:
         script = Path(__file__).with_name("cluster") / "spare-fault-acceptance.py"

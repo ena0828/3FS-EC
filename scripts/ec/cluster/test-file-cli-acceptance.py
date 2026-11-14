@@ -237,19 +237,19 @@ class FileCliAcceptanceTests(unittest.TestCase):
         main = next(node for node in ast.parse(path.read_text()).body
                     if isinstance(node, ast.FunctionDef) and node.name == 'main')
         blocks = [node for node in main.body if isinstance(node, ast.If) and
-                  ('bundle_manifest.get(\'file_api\')' in ast.unparse(node.test) or
-                   ast.unparse(node.test) == 'args.ec_file_mount')]
+                  ast.unparse(node.test) in ("bundle_manifest.get('file_api') is True", 'args.ec_file_mount')]
         self.assertEqual(len(blocks), 2)
         code = compile(ast.fix_missing_locations(ast.Module(body=blocks, type_ignores=[])), '<package-preflight>', 'exec')
         with tempfile.TemporaryDirectory() as temp:
             package = Path(temp) / 'package-services.py'
             sources = package.with_name('cluster')
             sources.mkdir()
-            names = ['file-cli-acceptance.py', 'prepare-fuse-file.py', 'prepare-fuse-read.py', 'generate.py',
-                     'native_v2_config.py', 'mode4-mount-acceptance.py', 'mode4-usrbio-acceptance.py', 'fuse-read-acceptance.py']
+            names = ['file-cli-acceptance.py', 'tree-gc-acceptance.py', 'prepare-fuse-file.py', 'prepare-fuse-read.py', 'generate.py',
+                     'native_v2_config.py', 'mode4-mount-acceptance.py', 'mode4-usrbio-acceptance.py',
+                     'fuse-read-acceptance.py', 'mode4-lifecycle-acceptance.py']
             for name in names:
                 (sources / name).write_text('# source')
-            for file_api, mount, expected in [(False, False, []), (True, False, names[:1]), (True, True, names)]:
+            for file_api, mount, expected in [(False, False, []), (True, False, names[:2]), (True, True, names)]:
                 copied = []
                 env = dict(Path=Path, __file__=str(package), bundle_manifest={'file_api': file_api},
                            args=SimpleNamespace(ec_file_mount=mount),

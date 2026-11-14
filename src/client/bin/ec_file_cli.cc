@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "client/bin/EcRepairMetricsJson.h"
+#include "client/ec/EcAllocationExport.h"
 #include "client/ec/EcFileAppendClient.h"
 #include "client/ec/EcFilePwriteClient.h"
 #include "client/ec/EcFileRepairClient.h"
@@ -149,6 +150,7 @@ int execute(int argc, char **argv) {
                  "Local journal fsync is not remote file fsync.\n"
                  "Mode4: mode4-create/open/resume-open/close/inspect; mode4-pwrite/resume/query/seal.\n"
                  "Mode4 reads: mode4-read/resume-read/release-read; release is explicit and separate.\n"
+                 "Local-only: mode4-export-read-allocations uses run_dir and a new output_file.\n"
                  "Mode4 append: mode4-append/resume-append/query-append/seal-append (no offset input).\n"
                  "Mode4 sync: mode4-fsync uses accepted session + new run; resume-fsync preserves that barrier.\n"
                  "Resolve all prior write/truncate runs before sync; sync never executes prepared input journals.\n"
@@ -188,7 +190,8 @@ int execute(int argc, char **argv) {
   // Arm it before start so a partial IB initialization is also cleaned up.
   const std::string command = argv[1];
   // These exact commands inspect local journals and never create a network.
-  const bool localOnly = command == "inspect" || command == "mode4-inspect";
+  const bool localOnly = command == "inspect" || command == "mode4-inspect" ||
+                         command == "mode4-export-read-allocations";
   const bool useRdma = !localOnly && *storageTransport == EcStorageTransportPolicy::RdmaOnly;
   SCOPE_EXIT {
     if (useRdma) net::IBManager::stop();

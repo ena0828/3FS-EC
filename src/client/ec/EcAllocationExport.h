@@ -3,6 +3,12 @@
 #include "client/ec/EcStripeRunRecord.h"
 
 namespace hf3fs::client::ec {
+// Local-only export of one completed tree-read snapshot (at most eight stripes).
+// Requires an existing exclusive journal lock; creates only a new output archive.
+// Includes Released snapshots but conveys no retirement/GC or full-history authority.
+Result<Void> exportEcTreeReadAllocations(const std::filesystem::path &readRun,
+                                         const std::filesystem::path &output);
+
 // Pure validation shared by metadata export and the explicit recovery writer.
 // The caller supplies a real authenticated RPC33 response, never a grant.
 Result<Void> validatePublishedEcStripeRun(const EcStripeRunRecord &,

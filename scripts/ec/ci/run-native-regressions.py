@@ -85,6 +85,9 @@ CLIENT_MANDATORY |= {
     "TestEcStripeRunRecord.HelperDirectV3PersistsSelectionAndRejectsDowngradedJson",
     "TestEcStripeRunRecord.PublishedHelperDirectSourceCreatesIndependentRecoveryWrite",
     "TestEcAllocationExport.PublishedHelperDirectJournalExportsOriginalAllocationsAfterReadRelease",
+    "TestEcTreeReadJournal.ReadOnlyExportRejectsMissingLockIncompleteAndConflictingOutput",
+    "TestEcTreeReadJournal.SnapshotExportBoundsZeroEofAndEightDistinctRevisions",
+    "TestEcTreeReadClient.ReleasedReadExportPreservesTwelveIdentitiesAndJournalBytes",
 }
 
 SERVICE_MANDATORY = {
@@ -130,6 +133,9 @@ TRANSPORT_REQUIRED = {
         "TestEcTransportPolicy.LocalRdmaRequirementPreservesOriginalFiveFieldWireAndCoreOptions",
         "TestEcTransportPolicy.MissingExplicitEndpointDoesNotBorrowOtherServicesOrNetworks",
         "TestEcTransportPolicy.RejectsImplicitAndInvalidPoliciesBeforeControlledDataDispatch",
+        "TestEcTransportPolicy.UnstartedStorageClientConstructsAndDestroys",
+        "TestEcTransportPolicy.ExplicitTcpPolicyOnUnstartedClientReturnsNotInitialized",
+        "TestEcTransportPolicy.ExplicitRdmaPolicyOnUnstartedClientReturnsNotInitialized",
         "TestEcTransportPolicy.SynchronousPoolCannotSatisfyRdmaEvenWithRdmaAddress",
         "TestEcTreeReadClient.ExplicitRdmaPolicyReachesEveryNativeBlockRead",
         "TestEcTreeReadClient.InvalidStoragePolicyHasNoRangeOrStorageSideEffect",

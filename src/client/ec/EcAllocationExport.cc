@@ -6,10 +6,12 @@
 #include <folly/json.h>
 #include <memory>
 #include <span>
+#include <set>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "client/meta/MetaClient.h"
+#include "client/ec/EcTreeReadJournal.h"
 #include "fbs/meta/EcRequestDigest.h"
 
 namespace hf3fs::client::ec {
@@ -201,6 +203,108 @@ folly::dynamic allocationJson(const meta::EcV2AllocationBinding &binding) {
                                                                                          std::move(integrity));
 }
 }  // namespace
+
+Result<Void> exportEcTreeReadAllocations(const std::filesystem::path &readRun,
+                                         const std::filesystem::path &output) {
+  try {
+    // No symlink ancestors, relative aliases, replacement or output inside the
+    // source journal. This is metadata inspection, not a new read or pin.
+    if (!readRun.is_absolute() || !output.is_absolute() || output.filename().empty() ||
+        output.filename() == "." || output.filename() == ".." || readRun != std::filesystem::canonical(readRun) ||
+        output.parent_path() != std::filesystem::canonical(output.parent_path()) || output == readRun)
+      return makeError(StatusCode::kInvalidArg, "snapshot export requires canonical separate absolute paths");
+    for (auto parent = output.parent_path(); !parent.empty(); parent = parent.parent_path()) {
+      if (parent == readRun) return makeError(StatusCode::kInvalidArg, "export cannot modify its journal directory");
+      if (parent == parent.parent_path()) break;
+    }
+    CHECK_RESULT(journal, EcTreeReadJournal::inspectExisting(readRun));
+    const auto &run = journal->record();
+    if (!journal->latest() || !journal->latest()->snapshot || !journal->latest()->dataReady ||
+        !journal->latest()->localComplete || journal->latest()->errorCode)
+      return makeError(StatusCode::kInvalidArg, "export requires a locally completed successful read snapshot");
+    const auto &latest = *journal->latest();
+    const auto &snapshot = *latest.snapshot;
+    RETURN_ON_ERROR(validateEcTreeReadSnapshot(run, snapshot));
+    // The decoder rejects noncanonical bytes. These encodings are therefore
+    // exactly the immutable record/latest-state bytes read under the lock,
+    // including their typed framing; not a reserialized JSON observation.
+    CHECK_RESULT(recordBytes, encodeEcTreeReadRun(run));
+    CHECK_RESULT(stateBytes, encodeEcTreeReadProgress(latest));
+    std::array<std::string_view, 10> recordParts{}, stateParts{};
+    recordParts[0] = recordBytes;
+    stateParts[0] = stateBytes;
+    CHECK_RESULT(recordDigest, meta::computeEcLogicalSha256(recordParts, recordBytes.size()));
+    CHECK_RESULT(stateDigest, meta::computeEcLogicalSha256(stateParts, stateBytes.size()));
+    folly::dynamic slots = folly::dynamic::array, revisions = folly::dynamic::array;
+    std::set<Uuid> allocationsSeen;
+    std::set<std::pair<uint64_t, uint64_t>> revisionsSeen;
+    for (size_t index = 0; index < snapshot.stripeCount; ++index) {
+      const auto &entry = snapshot.stripes[index];
+      folly::dynamic slot = folly::dynamic::object("stripe_decimal", std::to_string(entry.slot.stripe))(
+          "kind", entry.slot.kind == meta::EcTreeSlotKind::Data ? "data" : "zero");
+      if (entry.slot.kind == meta::EcTreeSlotKind::Data) {
+        const auto &pin = *entry.snapshot;
+        // Revision numbers are local to a stripe; equal numbers on distinct
+        // stripes must not be merged. A fixed snapshot contains each pair once.
+        if (!revisionsSeen.emplace(pin.stripe, pin.revision).second)
+          return makeError(StatusCode::kDataCorruption, "duplicate snapshot revision");
+        slot["revision_decimal"] = std::to_string(pin.revision);
+        folly::dynamic allocations = folly::dynamic::array, endpoints = folly::dynamic::array;
+        for (const auto &endpoint : pin.endpoints) {
+          const auto &id = endpoint.identity;
+          if (!allocationsSeen.insert(id.allocation).second)
+            return makeError(StatusCode::kDataCorruption, "allocation reused across snapshot stripes");
+          allocations.push_back(folly::dynamic::object("version", id.version)("object", id.object.toHexString())(
+              "stripe_decimal", std::to_string(id.stripe))("generation_decimal", std::to_string(id.generation))(
+              "shard", id.shard)("allocation", id.allocation.toHexString()));
+          const auto &physical = endpoint.endpoint;
+          endpoints.push_back(folly::dynamic::object("shard", id.shard)(
+              "origin_operation", endpoint.operation.toHexString())(
+              "node_decimal", std::to_string(physical.placement.node.toUnderType()))(
+              "chain_decimal", std::to_string(physical.placement.chain.toUnderType()))(
+              "target_decimal", std::to_string(physical.placement.target.toUnderType()))(
+              "engine_uuid", physical.engineUuid.toHexString())(
+              "target_incarnation", physical.targetIncarnation.toHexString()));
+        }
+        revisions.push_back(folly::dynamic::object("stripe_decimal", std::to_string(pin.stripe))(
+            "revision_decimal", std::to_string(pin.revision))("generation_decimal", std::to_string(pin.generation))(
+            "logical_length_decimal", std::to_string(entry.slot.logicalLength))(
+            "content_sha256", hex(entry.slot.contentSha256))("endpoint_set_sha256", hex(pin.endpointSetDigest))(
+            "allocations", std::move(allocations))("endpoints", std::move(endpoints)));
+      }
+      slots.push_back(std::move(slot));
+    }
+    const char *state = snapshot.state == meta::EcTreeReadState::Released ? "released" :
+                        snapshot.state == meta::EcTreeReadState::Closing ? "closing" : "active";
+    folly::dynamic value = folly::dynamic::object("schema", 1)("kind", "ec_tree_read_allocations")(
+        "scope", "captured_read_snapshot")("metadata_observation_only", true)("gc_authorized", false)(
+        "network_io_performed", false)("cluster", run.cluster)("object", objectJson(run.session.object))(
+        "birth", run.session.birth.toHexString())(
+        "owner", folly::dynamic::object("uid_decimal", std::to_string(run.session.owner.uid.toUnderType()))(
+            "client_namespace", run.session.owner.client.toHexString()))("session", run.intent.session.toHexString())(
+        "range", run.intent.range.toHexString())("request", run.intent.request.toHexString())("shard_bytes", run.shardBytes)(
+        "root", folly::dynamic::object("node", snapshot.root.root.toHexString())(
+            "sequence_decimal", std::to_string(snapshot.root.sequence))(
+            "epoch_decimal", std::to_string(snapshot.root.epoch))(
+            "visible_length_decimal", std::to_string(snapshot.root.visibleLength)))(
+        "selection", folly::dynamic::object("offset_decimal", std::to_string(run.intent.selection.offset))(
+            "requested_length_decimal", std::to_string(run.intent.selection.length))(
+            "readable_length_decimal", std::to_string(snapshot.readableLength))("stripe_count", snapshot.stripeCount))(
+        "journal", folly::dynamic::object("record_sha256", hex(recordDigest))("latest_state_sha256", hex(stateDigest))(
+            "latest_sequence_decimal", std::to_string(latest.sequence))("attempt_decimal", std::to_string(latest.attempt))(
+            "snapshot_state", state))("slots", std::move(slots))("revisions", std::move(revisions));
+    auto bytes = folly::toJson(value) + "\n";
+    if (bytes.size() > (256u << 10)) return makeError(StatusCode::kInvalidFormat, "snapshot export exceeds fixed bound");
+    CHECK_RESULT(archive, Archive::open(output));
+    RETURN_ON_ERROR(archive->write(bytes));
+    // journal remains locked until the exclusive archive and parent are synced.
+    return Void{};
+  } catch (const std::bad_alloc &) {
+    return makeError(StatusCode::kNotEnoughMemory);
+  } catch (const std::exception &) {
+    return makeError(StatusCode::kIOError);
+  }
+}
 
 Result<Void> validatePublishedEcStripeRun(const EcStripeRunRecord &run,
                                           const EcStripeRunObservation &observed,
