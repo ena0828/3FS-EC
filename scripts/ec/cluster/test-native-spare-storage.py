@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure topology and supervisor seams; never signals a real process."""
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -202,6 +203,136 @@ class SpareStorageTests(unittest.TestCase):
             self.assertEqual(cluster.stage, 'maintenance_failed')
             self.assertEqual(json.loads((root / 'state/physical-pool.json').read_text()), pool)
             self.assertEqual(c.submit(req)['state'], 'failed')
+
+    def replacement_fixture(self, root, response, *, sleep_step=1):
+        """Real controller/wait with owned-process and RPC seams, no services."""
+        (root / 'state').mkdir()
+        (root / 'config').mkdir()
+        (root / 'logs').mkdir()
+        m = manifest(str(root))
+        pool = inventory(m)
+        (root / 'state/physical-pool.json').write_text(json.dumps(pool))
+        (root / 'state/placement.json').write_text(json.dumps(dict(schema=1, pool=pool[:12], action_id=None)))
+        (root / 'config/meta_main.toml').write_text('[server.meta]\nenable_ec_v2=true\n')
+        candidate = fault.replacement_placement(m, pool, pool[:12], [[10001, 10013]], {10001})
+        old_meta = Process(100)
+        cluster = SimpleNamespace(
+            root=root, config=root / 'config', run_dir=root / 'logs', manifest=m,
+            run_id='owned-run', stage='ready', halt=threading.Event(),
+            processes=[(f'storage-{n}', Process(n)) for n in range(10002, 10015)] + [('meta', old_meta)],
+            node_ready=mock.Mock(return_value=True),
+        )
+        c, records = controller(cluster)
+        c.faulted[10001] = {'exit_code': -9}
+        c._discover = mock.Mock()
+        cluster.healthy = c.healthy
+        cluster.start_service = mock.Mock(side_effect=lambda name: cluster.processes.append((name, Process(101))))
+        req = dict(operation='replace-placement', run='owned-run', action_id=str(uuid.UUID(int=906)),
+                   replacements=[[10001, 10013]])
+        probes = []
+
+        def admin(command, name):
+            if command[0] == 'get-config':
+                self.assertEqual(records[req['action_id']]['state'], 'running')
+                probes.append((command[-1], cluster.run_dir / name))
+                (cluster.run_dir / name).write_text(f'actual RPC attempt {len(probes)}')
+                response(len(probes), command[-1], candidate)
+            return ''
+
+        cluster.admin = mock.Mock(side_effect=admin)
+        spec = importlib.util.spec_from_file_location('spare_replacement_wait', Path(__file__).with_name('run-cluster.py'))
+        module = importlib.util.module_from_spec(spec)
+        # The original wait itself is portable; only unused Linux imports need
+        # stubs on Windows. No process, socket, or native program is started.
+        with mock.patch.dict(sys.modules, {'fcntl': mock.Mock(), 'resource': mock.Mock()}):
+            spec.loader.exec_module(module)
+        cluster.wait = MethodType(module.Cluster.wait, cluster)
+        clock = [0]
+        self.enterContext(mock.patch.object(module.time, 'monotonic', side_effect=lambda: clock[0]))
+        self.enterContext(mock.patch.object(module.time, 'sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + sleep_step)))
+        self.enterContext(mock.patch.object(fault, 'replace_private', side_effect=lambda path, text: path.write_text(text)))
+
+        def exclusive(path, value):
+            with path.open('xb') as out:
+                out.write(value)
+        self.enterContext(mock.patch.object(fault, 'write_new', side_effect=exclusive))
+        c.submit(req)
+        return cluster, c, req, probes, old_meta
+
+    def test_replacement_waits_for_actual_rpc_and_preserves_failed_partial_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def response(attempt, path, candidate):
+                if attempt == 1:
+                    path.write_bytes(b'partial-invalid-toml')
+                    raise RuntimeError('Core RPC connection failed')
+                path.write_text(configuration.to_toml({'server': {'meta': {'ec_targets': candidate}}}))
+
+            cluster, c, req, probes, old = self.replacement_fixture(root, response)
+            c.execute_one()
+            record = c.submit(req)
+            self.assertEqual(record['state'], 'completed')
+            self.assertEqual((old.terms, old.waits, len(probes)), (1, 1, 2))
+            cluster.start_service.assert_called_once_with('meta')
+            self.assertEqual([call.args[0][0] for call in cluster.admin.call_args_list],
+                             ['set-config', 'get-config', 'get-config'])
+            self.assertTrue(cluster.node_ready())  # old registration alone was insufficient
+            self.assertEqual(probes[0][0].read_bytes(), b'partial-invalid-toml')
+            self.assertEqual(len({path for pair in probes for path in pair}), 4)
+            self.assertTrue(all(path.is_file() for pair in probes for path in pair))
+            output = root / 'logs' / f"action-{req['action_id']}-effective-meta.toml"
+            self.assertEqual(output.read_bytes(), probes[1][0].read_bytes())
+            self.assertEqual(record['steps'][-1]['actual_meta_config_sha256'],
+                             hashlib.sha256(probes[1][0].read_bytes()).hexdigest())
+            c.execute_one()
+            cluster.start_service.assert_called_once()
+            self.assertEqual(len(probes), 2)
+
+    def test_replacement_successful_rpc_invalid_dump_is_not_retried_or_completed(self):
+        for failure in ('wrong-placement', 'invalid-toml', 'missing-dump'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+
+                def response(attempt, path, candidate):
+                    if failure == 'wrong-placement':
+                        changed = copy.deepcopy(candidate)
+                        changed[0]['node'] = 10014
+                        path.write_text(configuration.to_toml({'server': {'meta': {'ec_targets': changed}}}))
+                    elif failure == 'invalid-toml':
+                        path.write_text('[broken')
+
+                cluster, c, req, probes, old = self.replacement_fixture(root, response)
+                c.execute_one()
+                self.assertEqual(c.submit(req)['state'], 'failed')
+                self.assertEqual((old.terms, old.waits, len(probes)), (1, 1, 1))
+                self.assertEqual(cluster.stage, 'maintenance_failed')
+                self.assertFalse((root / 'logs' / f"action-{req['action_id']}-effective-meta.toml").exists())
+                self.assertEqual(len(c._read(req['action_id'])['steps']), 1)
+                cluster.start_service.assert_called_once_with('meta')
+
+    def test_replacement_rpc_readiness_timeout_preserves_attempts_and_failed_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def response(attempt, path, candidate):
+                path.write_bytes(f'partial-{attempt}'.encode())
+                raise RuntimeError('Core RPC unavailable')
+
+            cluster, c, req, probes, old = self.replacement_fixture(root, response, sleep_step=90)
+            c.execute_one()
+            record = c.submit(req)
+            self.assertEqual(record['state'], 'failed')
+            self.assertEqual(record['error']['type'], 'TimeoutError')
+            self.assertEqual((old.terms, old.waits, len(probes)), (1, 1, 2))
+            self.assertEqual([path.read_bytes() for path, _ in probes], [b'partial-1', b'partial-2'])
+            self.assertTrue(all(log.is_file() for _, log in probes))
+            self.assertEqual(cluster.stage, 'maintenance_failed')
+            self.assertFalse((root / 'logs' / f"action-{req['action_id']}-effective-meta.toml").exists())
+            cluster.start_service.assert_called_once_with('meta')
+            self.assertEqual(len(record['steps']), 1)
+            with self.assertRaises(ValueError):
+                c.submit(dict(req, action_id=str(uuid.UUID(int=907))))
 
     def test_restart_requires_prior_owned_fault_and_rechecks_same_instance(self):
         with tempfile.TemporaryDirectory() as tmp:

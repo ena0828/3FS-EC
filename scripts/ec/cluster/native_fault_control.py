@@ -331,12 +331,31 @@ class FaultController:
                 c.admin(['set-config', '-t', 'META', '-f', config, '--desc', f"spare placement {request['action_id']}"],
                         f"action-{request['action_id']}-set-meta.log")
                 c.start_service('meta')
-                c.wait('replacement Meta', lambda: c.node_ready(100, 'META'))
-                output = c.run_dir / f"action-{request['action_id']}-effective-meta.toml"
-                c.admin(['get-config', '-n', '100', '-o', output], f"action-{request['action_id']}-get-meta.log")
-                effective = tomllib.loads(output.read_text(encoding='utf-8'))
+                # Mgmtd may still report the old process as connected. Probe the
+                # actual replacement Core RPC, preserving every failed attempt.
+                probe = 0
+                observed = None
+
+                def meta_config_ready():
+                    nonlocal probe, observed
+                    stem = f"action-{request['action_id']}-get-meta-{probe:04d}"
+                    probe += 1
+                    observed = c.run_dir / (stem + '.toml')
+                    log = c.run_dir / (stem + '.log')
+                    if any(path.exists() or path.is_symlink() for path in (observed, log)):
+                        raise ValueError('Replacement Meta probe evidence already exists')
+                    c.admin(['get-config', '-n', '100', '-o', observed], log.name)
+                    return True
+
+                c.wait('replacement Meta actual config', meta_config_ready)
+                # Validate outside wait: corrupt or wrong config is not a
+                # transient readiness error, and must not trigger another RPC.
+                effective_bytes = observed.read_bytes()
+                effective = tomllib.loads(effective_bytes.decode('utf-8'))
                 if effective['server']['meta']['ec_targets'] != candidate:
                     raise RuntimeError('Actual Meta config did not adopt exact placement')
+                output = c.run_dir / f"action-{request['action_id']}-effective-meta.toml"
+                write_new(output, effective_bytes)
                 record['steps'].append({
                     'placement': candidate,
                     'actual_meta_config_sha256': hashlib.sha256(output.read_bytes()).hexdigest(),

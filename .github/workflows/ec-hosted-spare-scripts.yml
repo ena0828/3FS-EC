@@ -56,7 +56,7 @@ jobs:
           suites = {
               "cluster/test-native-v2-config.py": 24,
               "cluster/test-native-multiprocess-config.py": 7,
-              "cluster/test-native-spare-storage.py": 8,
+              "cluster/test-native-spare-storage.py": 11,
               "cluster/test-native-rdma-preflight.py": 11,
               "cluster/test-supervisor-command.py": 9,
               "cluster/test-native-managed-domain.py": 14,
