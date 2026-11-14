@@ -10,7 +10,8 @@ class TestEcMountedTruncateRecovery : public TestEcFileNativeWrite {
     // All assertions use pre-cleanup snapshots. Ordinary stop may attempt the
     // original debt recovery; it must not be mistaken for the tested syscall.
     if (mount_) {
-      EXPECT_OK(mount_->stop());
+      const auto stopped = mount_->stop();
+      EXPECT_TRUE(stopped) << (stopped ? "" : stopped.error().describe());
       mount_.reset();
     }
     if (rmw_) rmw_->stopAndJoin();

@@ -64,16 +64,27 @@ TEST_F(TestEcV2NativeHelperPlan, FlatDirectSingleAndDoubleTargetsKeepPermanentDe
       ASSERT_OK(output);
       EXPECT_EQ(output->logicalData, write.logicalData);
       EXPECT_EQ(output->pinned.manifest.revision, candidate.revision);
+      // The public read output carries only the fixed pin/manifest, not bearer grants.
+      // Replay its original Acquire request; do not create another pin or request identity.
+      auto acquire = request<AcquireEcReadV2Req>();
+      acquire.uuid = pin.acquireRequest;
+      acquire.object = pin.object;
+      acquire.stripe = pin.stripe;
+      acquire.pin = pin.pin;
+      auto granted = blockingWait(metaClient_->acquireEcReadV2(acquire));
+      ASSERT_OK(granted);
+      ASSERT_EQ(serde::serialize(granted->manifest), serde::serialize(output->pinned.manifest));
+      ASSERT_EQ(serde::serialize(granted->snapshot), serde::serialize(output->pinned.snapshot));
       // Read every actual target, rather than accepting only the ten-shard logical decode.
       auto encoded = storage::EcCodec::encode(write.logicalData, create.shardBytes);
       ASSERT_OK(encoded);
       for (uint16_t shard = 0; shard != 12; ++shard) {
-        ASSERT_TRUE(output->pinned.readGrants[shard]);
+        ASSERT_TRUE(granted->readGrants[shard]);
         EcV2AllocationBinding allocation;
         allocation.fragment = output->pinned.manifest.fragments[shard];
         storage::EcReadBlockV2Req read;
         read.request = access(allocation);
-        read.grant = *output->pinned.readGrants[shard];
+        read.grant = *granted->readGrants[shard];
         std::string allBytes;
         for (uint32_t block = 0; block != 4; ++block) {
           read.blockIndex = block;
