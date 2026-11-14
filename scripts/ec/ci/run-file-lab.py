@@ -701,8 +701,9 @@ def core_gate(source, build, fdb, path):
     core = module(source / 'scripts/ec/ci/run-core-tests.py', 'lab_core_receipts')
     common = module(source / 'scripts/ec/test-native-fragments.py', 'lab_core_common')
     record = read_json(path)
-    require(record['status'] == 'passed' and record['exitcode'] == 0 and record['passed_tests'] == 21
-            and not record['failures'] and not record['signals'], 'real core21 acceptance is required')
+    expected_count = len(core.META_CASES) + len(core.FUSE_CASES)
+    require(record['status'] == 'passed' and record['exitcode'] == 0 and record['passed_tests'] == expected_count
+            and not record['failures'] and not record['signals'], 'real current core acceptance is required')
     require(record['source'] == str(source) and record['build'] == str(build)
             and record['work'] == str(path.parent), 'core receipt path binding differs')
     require(record['runner_sha256'] == sha(source / 'scripts/ec/ci/run-core-tests.py'), 'core driver changed')
@@ -727,7 +728,7 @@ def core_gate(source, build, fdb, path):
         require(meta['binaries'][name]['sha256'] == sha(fdb / name), 'accepted FDB binary changed')
     core.command_ok(record['fuse']['listing'])
     core.command_ok(record['fuse']['execution'])
-    return {'path': str(path), 'sha256': sha(path), 'passed_tests': 21,
+    return {'path': str(path), 'sha256': sha(path), 'passed_tests': expected_count,
             'binaries': {binary: record[stage]['binary_sha256']
                          for stage, binary in (('meta', 'test_meta'), ('fuse', 'test_fuse_ec'))}}
 

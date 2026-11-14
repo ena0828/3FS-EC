@@ -59,7 +59,7 @@ jobs:
               "cluster/test-native-managed-domain.py": 14,
               "cluster/test-portable-experiments.py": 5,
               "cluster/test-prepare-fuse-file.py": 4,
-              "ci/test-run-file-lab.py": 29,
+              "ci/test-run-file-lab.py": 30,
               "ci/test-run-core-tests.py": 16,
               "ci/test-run-spare-lab.py": 10,
               "ci/test-run-fault-matrix.py": 6,

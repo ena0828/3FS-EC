@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
+import xml.etree.ElementTree as ET
 
 spec = importlib.util.spec_from_file_location('file_lab_under_test', Path(__file__).with_name('run-file-lab.py'))
 lab = importlib.util.module_from_spec(spec)
@@ -33,6 +34,100 @@ def passed_mount():
 
 
 class FileLabGates(unittest.TestCase):
+    def test_core_gate_accepts_current_exact_26_and_rejects_stale_failed_or_incomplete_evidence(self):
+        # Synthetic private receipts/files exercise the actual parsers and
+        # validators. No ELF, FDB process or acceptance workload is executed.
+        source = Path(__file__).resolve().parents[3]
+        core = lab.module(source / 'scripts/ec/ci/run-core-tests.py', 'core_gate_fixture')
+        common = lab.module(source / 'scripts/ec/test-native-fragments.py', 'core_gate_common_fixture')
+        self.assertEqual((len(core.META_CASES), len(core.FUSE_CASES)), (12, 14))
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp).resolve()
+            build, fdb, output = parent / 'build', parent / 'fdb', parent / 'acceptance'
+            (build / 'tests').mkdir(parents=True)
+            fdb.mkdir()
+            for path in (build / 'tests/test_meta', build / 'tests/test_fuse_ec', fdb / 'fdbcli', fdb / 'fdbserver'):
+                path.write_bytes(b'synthetic non-executable receipt fixture\n')
+
+            def xml(path, names, failed=False):
+                root = ET.Element('testsuites', tests=str(len(names)), failures=str(int(failed)), errors='0')
+                suite = ET.SubElement(root, 'testsuite')
+                for index, name in enumerate(names):
+                    classname, method = name.rsplit('.', 1)
+                    case = ET.SubElement(suite, 'testcase', classname=classname, name=method,
+                                         status='run', result='completed')
+                    if failed and index == 0:
+                        ET.SubElement(case, 'failure').text = 'synthetic failure'
+                ET.ElementTree(root).write(path, encoding='utf-8', xml_declaration=True)
+
+            def listing(path, names):
+                lines, previous = [], None
+                for name in names:
+                    suite, method = name.rsplit('.', 1)
+                    if suite != previous:
+                        lines.append(suite + '.')
+                        previous = suite
+                    lines.append('  ' + method)
+                path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+            record = {'status': 'passed', 'exitcode': 0, 'passed_tests': 26, 'failures': [], 'signals': [],
+                      'source': str(source), 'build': str(build), 'work': str(output),
+                      'runner_sha256': lab.sha(source / 'scripts/ec/ci/run-core-tests.py'),
+                      'helpers_sha256': {name: lab.sha(source / 'scripts/ec' / name)
+                                         for name in ('test-meta-catalog.py', 'test-native-fragments.py')}}
+            for name, cases, binary, log in (('meta', core.META_CASES, 'test_meta', 'test-list.log'),
+                                             ('fuse', core.FUSE_CASES, 'test_fuse_ec', 'list.log')):
+                folder = output / name
+                folder.mkdir(parents=True)
+                xml(folder / 'tests.xml', cases)
+                listing(folder / log, cases)
+                record[name] = {'status': 'passed', 'passed_tests': len(cases), 'skipped_tests': 0,
+                                'xml_sha256': lab.sha(folder / 'tests.xml'),
+                                'listing_sha256': lab.sha(folder / log),
+                                'binary_sha256': lab.sha(build / 'tests' / binary)}
+            meta = {'status': 'passed', 'exitcode': 0, 'bootstrap': 'passed', 'failures': [],
+                    'selected': list(core.META_CASES), 'passed_tests': len(core.META_CASES),
+                    'test_results': common.xml_tests(output / 'meta/tests.xml'),
+                    'commands': [{'argv': [str(build / 'tests/test_meta'), *core.flags(core.META_FILTER), *ending],
+                                  'exitcode': 0} for ending in (['--gtest_list_tests'],
+                                      ['--gtest_output=xml:' + str(output / 'meta/tests.xml')])],
+                    'server': {'exitcode_before_cleanup': None, 'exitcode_after_cleanup': -15,
+                               'cleanup': {'leader_reaped': True}},
+                    'binaries': {name: {'path': str(path), 'sha256': lab.sha(path), 'sha256_after': lab.sha(path)}
+                                 for name, path in (('test_meta', build / 'tests/test_meta'),
+                                                    ('fdbserver', fdb / 'fdbserver'), ('fdbcli', fdb / 'fdbcli'))}}
+            (output / 'meta/results.json').write_text(json.dumps(meta), encoding='utf-8')
+            record['meta']['receipt_sha256'] = lab.sha(output / 'meta/results.json')
+            record['fuse'].update(listing={'exitcode': 0}, execution={'exitcode': 0})
+            path = output / 'results.json'
+
+            def check(value):
+                path.write_text(json.dumps(value), encoding='utf-8')
+                return lab.core_gate(source, build, fdb, path)
+
+            accepted = check(record)
+            self.assertEqual(accepted['passed_tests'], 26)
+            self.assertEqual(accepted['binaries']['test_meta'], lab.sha(build / 'tests/test_meta'))
+            for update in ({'passed_tests': 21}, {'status': 'failed'}, {'exitcode': 1}, {'failures': ['synthetic']}):
+                with self.subTest(update=update), self.assertRaises(ValueError):
+                    check(dict(record, **update))
+            for names, failed in ((core.META_CASES, True), (core.META_CASES[:-1], False)):
+                xml(output / 'meta/tests.xml', names, failed)
+                bad = copy.deepcopy(record)
+                bad['meta']['xml_sha256'] = lab.sha(output / 'meta/tests.xml')
+                with self.subTest(xml_names=len(names), failed=failed), self.assertRaises(ValueError):
+                    check(bad)
+            xml(output / 'meta/tests.xml', core.META_CASES)
+            listing(output / 'fuse/list.log', core.FUSE_CASES[:-1])
+            bad = copy.deepcopy(record)
+            bad['fuse']['listing_sha256'] = lab.sha(output / 'fuse/list.log')
+            with self.assertRaises(ValueError):
+                check(bad)
+            listing(output / 'fuse/list.log', core.FUSE_CASES)
+            (build / 'tests/test_meta').write_bytes(b'changed synthetic binary')
+            with self.assertRaises(ValueError):
+                check(record)
+
     def test_ec_failure_markers_keep_order_and_reject_unknown_or_partial_fields(self):
         raw = (b'private prefix EC_FILE_MOUNT_FAILURE operation=truncate stage=guard code=100 '
                b'debt=1 retained_reader=0 local_join_unconfirmed=0 exception=0\n'
