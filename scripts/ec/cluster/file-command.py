@@ -11,6 +11,7 @@ import sys
 
 RIGHTS = {"read": 1, "write": 2, "read-write": 3}
 NAMESPACE_COMMANDS = {"unlink", "resume-unlink", "inspect-unlink"}
+LOCAL_EXPORT_COMMANDS = {"export-read-allocations", "export-output-identities"}
 
 
 def transport_module():
@@ -44,7 +45,7 @@ def parser():
                  "read", "resume-read", "release-read", "export-read-allocations", "truncate", "resume-truncate", "query-truncate",
                  "close-truncate-debt", "append", "resume-append", "query-append", "seal-append",
                  "fsync", "resume-fsync", "repair", "resume-repair", "query-repair", "close-repair-debt",
-                 "unlink", "resume-unlink", "inspect-unlink"):
+                 "unlink", "resume-unlink", "inspect-unlink", "export-output-identities"):
         item = sub.add_parser(name)
         item.add_argument("--run-dir", type=Path, required=True, help="该操作的固定日志目录；新操作必须使用新目录")
         if name in ("repair", "resume-repair", "query-repair", "close-repair-debt"):
@@ -56,8 +57,11 @@ def parser():
             item.add_argument("--offset", type=decimal, required=True, help="字节偏移")
         if name in ("pwrite", "append"):
             item.add_argument("--input", type=Path, required=True)
-        if name in ("read", "resume-read", "export-read-allocations"):
+        if name in ("read", "resume-read", *LOCAL_EXPORT_COMMANDS):
             item.add_argument("--output", type=Path, required=True, help="新的独占输出文件")
+        if name == "export-output-identities":
+            item.add_argument("--kind", choices=("pwrite", "repair", "truncate"), required=True,
+                              help="原日志类型；仅导出固定候选身份，不查询Meta或认定输出已物化")
         if name == "read":
             item.add_argument("--length", type=decimal, required=True, help="最大读取字节数，实际受 EOF 限制")
         if name == "repair":
@@ -109,7 +113,7 @@ def command(args):
     mapping = {"session": "session_run_dir", "offset": "offset_decimal", "input": "input_file",
                "output": "output_file", "length": "length_decimal", "path": "file_path",
                "shard_bytes": "shard_bytes", "permission": "permission", "inode": "inode_decimal",
-               "incarnation": "incarnation", "birth": "birth"}
+               "incarnation": "incarnation", "birth": "birth", "kind": "output_kind"}
     for source, target in mapping.items():
         if hasattr(args, source):
             value = getattr(args, source)
@@ -150,7 +154,7 @@ def main():
         return 0
     if sys.platform != "linux":
         raise ValueError("实际运行须在 Linux/WSL 中进行")
-    if args.action != "export-read-allocations" and args.action not in NAMESPACE_COMMANDS:
+    if args.action not in LOCAL_EXPORT_COMMANDS and args.action not in NAMESPACE_COMMANDS:
         module = transport_module()
         binding = module.prepared_transport(args.root, args.root / "client/file-client.toml", file_api=True)
         module.bind_transport_run(args.root, args.run_dir, binding, [argv[0]])

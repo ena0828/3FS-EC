@@ -30,6 +30,37 @@ spec.loader.exec_module(file_command)
 
 
 class PortableExperiments(unittest.TestCase):
+    def test_output_identity_export_forwards_original_paths_without_transport_or_new_identity(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent).resolve()
+            run, output = root / 'original journal', root / 'new identities.json'
+            (root / 'cluster.json').write_text(json.dumps({'root': str(root), 'file_api': True,
+                'data_transport': {'schema': 1, 'mode': 'rdma', 'interface': 'eth0',
+                                   'ipv4': '192.0.2.1', 'ib_device': 'mlx5_0'}}))
+            for kind in ('pwrite', 'repair', 'truncate'):
+                args = ['file-command.py', '--root', str(root), 'export-output-identities',
+                        '--run-dir', str(run), '--output', str(output), '--kind', kind]
+                module = mock.Mock()
+                with self.subTest(kind=kind), mock.patch.object(file_command.sys, 'argv', args), \
+                     mock.patch.object(file_command.sys, 'platform', 'linux'), \
+                     mock.patch.object(file_command, 'transport_module', return_value=module), \
+                     mock.patch.object(file_command.os, 'execve', side_effect=RuntimeError('captured exec'), create=True) as execute, \
+                     contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'captured exec'):
+                    file_command.main()
+                argv = execute.call_args.args[1]
+                self.assertEqual(argv, [str(root / 'bin/ec_file_cli'),
+                    '--cfg=' + str(root / 'client/file-client.toml'), '--config.run_dir=' + str(run),
+                    '--config.output_file=' + str(output), '--config.output_kind=' + kind,
+                    '--config.storage_transport=rdma', 'mode4-export-output-identities'])
+                module.bind_transport_run.assert_not_called()
+                module.prepared_transport.assert_called_once_with(root, root / 'client/file-client.toml',
+                                                                 file_api=True, require_initialized=False)
+                self.assertFalse(run.exists()); self.assertFalse(output.exists())
+            for extra in ([], ['--kind', 'session'], ['--kind', 'pwrite', '--session', str(run)]):
+                with self.subTest(invalid=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    file_command.parser().parse_args(['--root', str(root), 'export-output-identities',
+                        '--run-dir', str(run), '--output', str(output), *extra])
+
     def test_unlink_wrapper_preserves_fixed_inputs_and_never_creates_data_transport_evidence(self):
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent).resolve(); run = root / 'fixed unlink'; session = root / 'closed session'

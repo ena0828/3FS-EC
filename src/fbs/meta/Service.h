@@ -22,6 +22,7 @@
 #include "fbs/meta/Ec.h"
 #include "fbs/meta/EcFileAppend.h"
 #include "fbs/meta/EcFileOutput.h"
+#include "fbs/meta/EcFileOutputResolution.h"
 #include "fbs/meta/EcFileRange.h"
 #include "fbs/meta/EcFileRepairRpc.h"
 #include "fbs/meta/EcFileRpc.h"
@@ -906,6 +907,39 @@ struct QueryEcFileOutputRsp : RspBase {
   SERDE_STRUCT_FIELD(observation, EcFileOutputObservation{});
 };
 
+struct ConfirmEcFileOutputResolutionReq : ReqBase {
+  SERDE_STRUCT_FIELD(identity, EcFileOutputIdentity{});
+  SERDE_STRUCT_FIELD(resolutionId, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (client.uuid.is_nil() || resolutionId.is_nil()) return makeError(StatusCode::kInvalidArg);
+    return identity.valid();
+  }
+};
+struct QueryEcFileOutputResolutionReq : ReqBase {
+  SERDE_STRUCT_FIELD(identity, EcFileOutputIdentity{});
+  SERDE_STRUCT_FIELD(resolutionId, Uuid::zero());
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    if (client.uuid.is_nil() || resolutionId.is_nil()) return makeError(StatusCode::kInvalidArg);
+    return identity.valid();
+  }
+};
+struct ConfirmEcFileOutputResolutionRsp : RspBase {
+  SERDE_STRUCT_FIELD(clientNamespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(resolution, EcFileOutputResolution{});
+};
+struct QueryEcFileOutputResolutionRsp : RspBase {
+  SERDE_STRUCT_FIELD(clientNamespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(resolution, EcFileOutputResolution{});
+};
+
 // An explicit administrative metadata operation. The same client namespace
 // and request UUID bind one exact historical revision permanently.
 struct EcRevisionRetirementReq : ReqBase {
@@ -1406,6 +1440,8 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(prepareEcFileRepairDirect, 70, PrepareEcFileRepairDirectReq, EcFileRepairDirectRsp);
   META_SERVICE_METHOD(prepareEcRepairDirectV2, 71, PrepareEcRepairDirectV2Req, PrepareEcRepairDirectV2Rsp);
   META_SERVICE_METHOD(queryEcFileOutput, 72, QueryEcFileOutputReq, QueryEcFileOutputRsp);
+  META_SERVICE_METHOD(confirmEcFileOutputResolution, 73, ConfirmEcFileOutputResolutionReq, ConfirmEcFileOutputResolutionRsp);
+  META_SERVICE_METHOD(queryEcFileOutputResolution, 74, QueryEcFileOutputResolutionReq, QueryEcFileOutputResolutionRsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
   META_SERVICE_METHOD(bindEcRmwOutput, 52, BindEcRmwOutputReq, BindEcRmwOutputRsp);

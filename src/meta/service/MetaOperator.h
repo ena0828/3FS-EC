@@ -128,6 +128,8 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<EcFileRepairDirectRsp> prepareEcFileRepairDirect(PrepareEcFileRepairDirectReq req);
   CoTryTask<PrepareEcRepairDirectV2Rsp> prepareEcRepairDirectV2(PrepareEcRepairDirectV2Req req);
   CoTryTask<QueryEcFileOutputRsp> queryEcFileOutput(QueryEcFileOutputReq req);
+  CoTryTask<ConfirmEcFileOutputResolutionRsp> confirmEcFileOutputResolution(ConfirmEcFileOutputResolutionReq req);
+  CoTryTask<QueryEcFileOutputResolutionRsp> queryEcFileOutputResolution(QueryEcFileOutputResolutionReq req);
   CoTryTask<EcFileRepairRsp> closeEcFileRepairDebt(CloseEcFileRepairDebtReq req);
 
   CoTryTask<MkdirsRsp> mkdirs(MkdirsReq req);

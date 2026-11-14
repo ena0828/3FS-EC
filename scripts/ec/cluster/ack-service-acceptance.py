@@ -163,8 +163,10 @@ def command(runner,w,argv,*,pass_fds=()):
                     'An inherited collector lease requires the original control CLI and configuration')
     namespace_control=(runner.transport_role=='file' and argv and
                        argv[-1] in ('mode4-unlink','mode4-resume-unlink','mode4-inspect-unlink'))
-    if namespace_control and not pass_fds:
-        validate_leased_file_command(runner,argv)
+    export_command=(runner.transport_role=='file' and argv and
+                    argv[-1] in ('mode4-export-read-allocations','mode4-export-output-identities'))
+    if (namespace_control or export_command) and not pass_fds:
+        local_export=validate_leased_file_command(runner,argv)
     binding=runner.check_transport()
     if namespace_control:
         # This facade sends only the fixed Meta Remove request. A configured
@@ -174,7 +176,8 @@ def command(runner,w,argv,*,pass_fds=()):
     if local_export:
         # Read-only journal export still verifies the prepared profile. It does
         # not send data RPCs or create a transport sidecar for the journal.
-        return _owned_command(runner,w,argv,None,kind='local_read_export',pass_fds=pass_fds)
+        kind='local_output_identity_export' if argv[-1]=='mode4-export-output-identities' else 'local_read_export'
+        return _owned_command(runner,w,argv,None,kind=kind,pass_fds=pass_fds)
     if binding is not None:
         # This shared child owner also runs the formal file acceptance driver.
         # Control-only admin calls have no data-transport claim.
@@ -204,6 +207,7 @@ def validate_leased_file_command(runner,argv):
         'read':{'session_run_dir','offset_decimal','length_decimal','output_file'},
         'resume-read':{'output_file'}, 'release-read':set(),
         'export-read-allocations':{'output_file'},
+        'export-output-identities':{'output_file','output_kind'},
         'repair':{'session_run_dir','repair_stripe_decimal','repair_mask_decimal','repair_source_order',
                   'repair_mode','repair_window_decimal','repair_delivery'},
         'resume-repair':set(), 'query-repair':set(), 'close-repair-debt':set(),
@@ -222,11 +226,13 @@ def validate_leased_file_command(runner,argv):
     if action=='repair':required=required-{'repair_delivery'}
     require(required<=values.keys() and values.keys()<=required|optional,'Leased file argument set differs')
     require(values.get('storage_transport','tcp') in ('tcp','rdma'),'Invalid leased transport')
+    if action=='export-output-identities':
+        require(values['output_kind'] in ('pwrite','repair','truncate'),'Invalid output journal kind')
     for key in ('run_dir','session_run_dir','input_file','output_file'):
         if key in values:
             path=Path(values[key])
             require(path.is_absolute() and path==path.resolve(),'Leased file paths must be canonical absolute paths')
-    return action=='export-read-allocations'
+    return action in ('export-read-allocations','export-output-identities')
 
 
 def validate_collector_command(root,argv,*,expected_executable=None):

@@ -49,12 +49,17 @@ class EcTruncateJournal {
  public:
   static Result<std::unique_ptr<EcTruncateJournal>> create(const std::filesystem::path &, EcTruncateRun);
   static Result<std::unique_ptr<EcTruncateJournal>> resume(const std::filesystem::path &);
+  // Existing lock only; no journal writes or durability reconfirmation.
+  static Result<std::unique_ptr<EcTruncateJournal>> inspectExisting(const std::filesystem::path &);
   ~EcTruncateJournal();
   EcTruncateJournal(const EcTruncateJournal &) = delete;
   EcTruncateJournal &operator=(const EcTruncateJournal &) = delete;
   const EcTruncateRun &record() const { return record_; }
   const std::optional<EcTruncateJournalState> &latest() const { return latest_; }
   bool poisoned() const { return poisoned_; }
+  // Exact bytes retained only by inspectExisting; never serialize them to a public archive.
+  std::string_view inspectionRecordBytes() const { return inspectionRecordBytes_; }
+  std::string_view inspectionLatestStateBytes() const { return inspectionLatestStateBytes_; }
   // Capacity only, not a durability or cleanup-completion observation.
   uint64_t remainingStates() const;
   Result<Void> append(EcTruncateJournalState);
@@ -64,12 +69,14 @@ class EcTruncateJournal {
       : directory_(directory),
         lock_(lock),
         record_(std::move(record)) {}
-  static Result<std::unique_ptr<EcTruncateJournal>> open(const std::filesystem::path &, std::optional<EcTruncateRun>);
+  static Result<std::unique_ptr<EcTruncateJournal>> open(const std::filesystem::path &, std::optional<EcTruncateRun>, bool readOnly = false);
   Result<Void> writeNew(std::string_view, std::string_view);
   Result<std::string> read(std::string_view) const;
   int directory_ = -1, lock_ = -1;
   EcTruncateRun record_;
   std::optional<EcTruncateJournalState> latest_;
   bool poisoned_ = false;
+  bool readOnly_ = false;
+  std::string inspectionRecordBytes_, inspectionLatestStateBytes_;
 };
 }  // namespace hf3fs::client::ec

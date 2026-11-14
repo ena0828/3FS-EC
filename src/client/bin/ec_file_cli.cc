@@ -12,6 +12,7 @@
 #include "client/bin/EcRepairMetricsJson.h"
 #include "client/ec/EcAllocationExport.h"
 #include "client/ec/EcFileAppendClient.h"
+#include "client/ec/EcFileOutputIdentity.h"
 #include "client/ec/EcFilePwriteClient.h"
 #include "client/ec/EcFileRepairClient.h"
 #include "client/ec/EcFileRunFactory.h"
@@ -72,6 +73,7 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(length_decimal, "");
   CONFIG_ITEM(input_file, "");
   CONFIG_ITEM(output_file, "");
+  CONFIG_ITEM(output_kind, "");
   CONFIG_ITEM(repair_stripe_decimal, "");
   CONFIG_ITEM(repair_mask_decimal, "");
   CONFIG_ITEM(repair_mode, "");
@@ -153,6 +155,8 @@ int execute(int argc, char **argv) {
                  "Mode4: mode4-create/open/resume-open/close/inspect; mode4-pwrite/resume/query/seal.\n"
                  "Mode4 reads: mode4-read/resume-read/release-read; release is explicit and separate.\n"
                  "Local-only: mode4-export-read-allocations uses run_dir and a new output_file.\n"
+                 "Local-only: mode4-export-output-identities uses output_kind=pwrite|repair|truncate, run_dir, "
+                 "and a new output_file; candidate identities are not remote output or GC evidence.\n"
                  "Mode4 append: mode4-append/resume-append/query-append/seal-append (no offset input).\n"
                  "Mode4 sync: mode4-fsync uses accepted session + new run; resume-fsync preserves that barrier.\n"
                  "Resolve all prior write/truncate runs before sync; sync never executes prepared input journals.\n"
@@ -195,9 +199,11 @@ int execute(int argc, char **argv) {
   // This outer guard outlives every command's manager, worker and network.
   // Arm it before start so a partial IB initialization is also cleaned up.
   const std::string command = argv[1];
+  if (command == "mode4-export-output-identities") return executeMode4(cfg, command);
   // These exact commands inspect local journals and never create a network.
   const bool localOnly = command == "inspect" || command == "mode4-inspect" ||
-                         command == "mode4-export-read-allocations" || command == "mode4-inspect-unlink";
+                         command == "mode4-export-read-allocations" || command == "mode4-inspect-unlink" ||
+                         command == "mode4-export-output-identities";
   const bool namespaceOnly = isMode4NamespaceCommand(command);
   const bool useRdma = !localOnly && !namespaceOnly && *storageTransport == EcStorageTransportPolicy::RdmaOnly;
   SCOPE_EXIT {

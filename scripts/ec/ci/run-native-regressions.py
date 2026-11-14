@@ -94,6 +94,9 @@ CLIENT_MANDATORY |= {
 }
 CLIENT_MANDATORY |= {
     'TestEcRevisionRetirementCommands.OutputObservationArchivesMissingAndChecksFixedIdentity',
+    'TestEcRevisionRetirementCommands.ResolutionUnknownRetainsOriginalIdsAndQueryNeverConfirmsMissing',
+    'TestEcRevisionRetirementCommands.ResolutionChecksCompleteDtoAndArchivesBothKindsWithoutCollectionClaim',
+    'TestEcRevisionRetirementCommands.ResolutionUsageAndExclusiveArchiveFailuresDoNotDispatch',
     "TestEcStripeRead.ReplacementAndSelfMoveRetainOutputChargeAcrossLateCleanupAndClose",
     "TestEcStripeClient.InvalidRepairDeliveryIsRejectedBeforeAnyMetadataCall",
     "TestEcStripeRunRecord.HelperDirectV3PersistsSelectionAndRejectsDowngradedJson",
@@ -102,6 +105,15 @@ CLIENT_MANDATORY |= {
     "TestEcTreeReadJournal.ReadOnlyExportRejectsMissingLockIncompleteAndConflictingOutput",
     "TestEcTreeReadJournal.SnapshotExportBoundsZeroEofAndEightDistinctRevisions",
     "TestEcTreeReadClient.ReleasedReadExportPreservesTwelveIdentitiesAndJournalBytes",
+}
+CLIENT_MANDATORY |= {
+    'TestEcFileOutputIdentity.' + name for name in (
+        'PwriteExportsOnlyFixedChildrenAndRejectsSessionAndUnusedSlots',
+        'RepairExportsOriginalIntentWithoutInventingRemoteObservation',
+        'TruncateDistinguishesUnknownRequiredAndUnusedTailWithoutAbsenceProof',
+        'ExistingLocksRejectWritersMissingLocksAndReadonlyAppendForAllKinds',
+        'HashesOriginalBytesAndPreservesSourceOnOutputAndStateFailures',
+    )
 }
 
 SERVICE_MANDATORY = {

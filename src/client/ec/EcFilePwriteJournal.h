@@ -94,12 +94,17 @@ class EcFilePwriteJournal {
  public:
   static Result<std::unique_ptr<EcFilePwriteJournal>> create(const std::filesystem::path &, EcPwriteRunRecord);
   static Result<std::unique_ptr<EcFilePwriteJournal>> resume(const std::filesystem::path &);
+  // Existing lock only; no journal writes or durability reconfirmation.
+  static Result<std::unique_ptr<EcFilePwriteJournal>> inspectExisting(const std::filesystem::path &);
   ~EcFilePwriteJournal();
   EcFilePwriteJournal(const EcFilePwriteJournal &) = delete;
   EcFilePwriteJournal &operator=(const EcFilePwriteJournal &) = delete;
   const EcPwriteRunRecord &record() const { return record_; }
   const std::optional<EcPwriteRunProgress> &latest() const { return latest_; }
   bool poisoned() const { return poisoned_; }
+  // Exact bytes retained only by inspectExisting; never serialize them to a public archive.
+  std::string_view inspectionRecordBytes() const { return inspectionRecordBytes_; }
+  std::string_view inspectionLatestStateBytes() const { return inspectionLatestStateBytes_; }
   Result<Void> append(EcPwriteRunProgress);
 
  private:
@@ -108,13 +113,15 @@ class EcFilePwriteJournal {
         lock_(l),
         record_(std::move(r)) {}
   static Result<std::unique_ptr<EcFilePwriteJournal>> open(const std::filesystem::path &,
-                                                           std::optional<EcPwriteRunRecord>);
+                                                           std::optional<EcPwriteRunRecord>, bool readOnly = false);
   Result<Void> writeNew(std::string_view, std::string_view);
   Result<std::string> read(std::string_view) const;
   int directory_ = -1, lock_ = -1;
   EcPwriteRunRecord record_;
   std::optional<EcPwriteRunProgress> latest_;
   bool poisoned_ = false;
+  bool readOnly_ = false;
+  std::string inspectionRecordBytes_, inspectionLatestStateBytes_;
 };
 // Factories generate IDs only for an explicit NEW run. Caller fsyncs create()
 // before any RPC. prepareWrite consumes an accepted session, never an fd claim.

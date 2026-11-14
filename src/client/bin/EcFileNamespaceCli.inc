@@ -1,5 +1,6 @@
-// Meta-only namespace operations use a durable original request. No storage
-// worker, RMW transport or IB device is needed to acknowledge one unlink.
+// Meta-only namespace operations use a durable original request. No RMW
+// worker or IB device is needed to acknowledge one unlink. MetaClient's
+// StorageClient dependency still owns its normal messenger lifecycle.
 bool isMode4NamespaceCommand(std::string_view command) {
   return command == "mode4-unlink" || command == "mode4-resume-unlink" || command == "mode4-inspect-unlink";
 }

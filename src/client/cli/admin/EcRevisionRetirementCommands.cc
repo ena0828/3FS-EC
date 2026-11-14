@@ -8,11 +8,13 @@
 #include <folly/ScopeGuard.h>
 #include <folly/json.h>
 #include <sys/stat.h>
+#include <type_traits>
 #include <unistd.h>
 
 #include "AdminClientIdentity.h"
 #include "AdminEnv.h"
 #include "client/cli/common/Utils.h"
+#include "fbs/meta/EcFileOutputResolution.h"
 
 namespace hf3fs::client::cli {
 namespace {
@@ -288,6 +290,159 @@ CoTryTask<Dispatcher::OutputTable> handleFileOutput(IEnv &ienv,
   }
 }
 
+// These are metadata-resolution archives, never a Storage GC acknowledgement.
+// The original business identity and resolutionId are durable before Confirm.
+struct FileOutputResolutionArchive {
+  SERDE_STRUCT_FIELD(schema, uint16_t{1});
+  SERDE_STRUCT_FIELD(action, std::string{});
+  SERDE_STRUCT_FIELD(phase, std::string{"prepared"});
+  SERDE_STRUCT_FIELD(outcome, std::string{"not_confirmed"});
+  SERDE_STRUCT_FIELD(client_namespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(request_id, Uuid::zero());
+  SERDE_STRUCT_FIELD(resolution_id, Uuid::zero());
+  SERDE_STRUCT_FIELD(identity, meta::EcFileOutputIdentity{});
+  SERDE_STRUCT_FIELD(resolution, (std::optional<meta::EcFileOutputResolution>{}));
+  SERDE_STRUCT_FIELD(metadata_resolution_only, true);
+  SERDE_STRUCT_FIELD(candidate_reservations_release_eligible, false);
+  SERDE_STRUCT_FIELD(collected, false);
+  SERDE_STRUCT_FIELD(physical_reclamation_confirmed, false);
+  SERDE_STRUCT_FIELD(status_code, uint32_t{});
+
+ public:
+  std::string archiveJson() const {
+    auto value = folly::parseJson(serde::toJsonString(*this));
+    value["uint64_encoding"] = "unsigned_decimal_strings";
+    value["identity"]["object"]["inode"] = std::to_string(identity.object.inode.u64());
+    if (resolution) {
+      const auto &r = *resolution;
+      auto &j = value["resolution"];
+      j["identity"]["object"]["inode"] = std::to_string(r.identity.object.inode.u64());
+      j["childEpoch"] = std::to_string(r.childEpoch);
+      j["issuanceSequence"] = std::to_string(r.issuanceSequence);
+      for (size_t n = 0; n < r.candidates.size(); ++n) {
+        const auto &candidate = r.candidates[n];
+        auto &json = j["candidates"][n];
+        json["identity"]["stripe"] = std::to_string(candidate.identity.stripe);
+        json["identity"]["generation"] = std::to_string(candidate.identity.generation);
+        json["endpoint"]["placement"]["target"] = std::to_string(candidate.endpoint.placement.target.toUnderType());
+      }
+      auto closure = [](folly::dynamic &json, const meta::EcFileOutputDrain &closed) {
+        const auto &i = closed.identity;
+        auto &id = json["identity"];
+        id["object"]["inode"] = std::to_string(i.object.inode.u64());
+        id["objectEpoch"] = std::to_string(i.objectEpoch);
+        id["generation"] = std::to_string(i.generation);
+        id["revision"] = std::to_string(i.revision);
+        for (size_t n = 0; n < i.endpoints.endpoints.size(); ++n)
+          id["endpoints"]["endpoints"][n]["placement"]["target"] =
+              std::to_string(i.endpoints.endpoints[n].placement.target.toUnderType());
+      };
+      closure(j["outputClosure"], r.outputClosure);
+      if (r.sourceClosure) closure(j["sourceClosure"], *r.sourceClosure);
+    }
+    return folly::toJson(value);
+  }
+};
+auto fileOutputResolutionParser(std::string name) {
+  argparse::ArgumentParser parser(std::move(name));
+  for (const auto *option : {"--inode", "--object-incarnation", "--owner-uid", "--owner-client", "--parent",
+                             "--child", "--owner-kind", "--resolution-id", "--client-namespace", "--request-id", "--output"})
+    parser.add_argument(option).required();
+  return parser;
+}
+template <typename Request>
+Result<Request> fileOutputResolutionRequest(const argparse::ArgumentParser &parser, const flat::UserInfo &user) {
+  // Usage check only: token authenticity and effective UID are checked by Meta.
+  if (!user.isRoot() || user.token.empty())
+    return makeError(StatusCode::kAuthenticationFail, "output resolution requires configured root credentials");
+  CHECK_RESULT(inode, unsignedDecimal(parser.get<std::string>("--inode")));
+  CHECK_RESULT(uid, unsignedDecimal(parser.get<std::string>("--owner-uid")));
+  if (uid > std::numeric_limits<uint32_t>::max()) return makeError(StatusCode::kInvalidArg);
+  CHECK_RESULT(object, parseAdminNonNilUuid(parser.get<std::string>("--object-incarnation")));
+  CHECK_RESULT(owner, parseAdminNonNilUuid(parser.get<std::string>("--owner-client")));
+  CHECK_RESULT(parent, parseAdminNonNilUuid(parser.get<std::string>("--parent")));
+  CHECK_RESULT(child, parseAdminNonNilUuid(parser.get<std::string>("--child")));
+  CHECK_RESULT(resolution, parseAdminNonNilUuid(parser.get<std::string>("--resolution-id")));
+  CHECK_RESULT(client, parseAdminNonNilUuid(parser.get<std::string>("--client-namespace")));
+  CHECK_RESULT(request, parseAdminNonNilUuid(parser.get<std::string>("--request-id")));
+  const auto output = parser.get<std::string>("--output");
+  if (output.empty() || output.find('\0') != std::string::npos) return makeError(StatusCode::kInvalidArg);
+  Request req;
+  req.user = user;
+  req.client = ClientId(client);
+  req.uuid = request;
+  req.resolutionId = resolution;
+  req.identity.object = {meta::InodeId(inode), object};
+  req.identity.owner = {flat::Uid(static_cast<uint32_t>(uid)), owner};
+  req.identity.parent = parent;
+  req.identity.child = child;
+  const auto kind = parser.get<std::string>("--owner-kind");
+  if (kind == "pwrite") req.identity.ownerKind = meta::EcFileOutputOwner::Pwrite;
+  else if (kind == "truncate-tail") req.identity.ownerKind = meta::EcFileOutputOwner::TruncateTail;
+  else if (kind == "repair") req.identity.ownerKind = meta::EcFileOutputOwner::Repair;
+  else return makeError(StatusCode::kInvalidArg, "owner-kind requires pwrite, truncate-tail or repair");
+  RETURN_ON_ERROR(req.valid());
+  return req;
+}
+template <bool Confirm>
+CoTryTask<Dispatcher::OutputTable> handleFileOutputResolution(IEnv &ienv,
+                                                              const argparse::ArgumentParser &parser,
+                                                              const Dispatcher::Args &args) {
+  auto &env = dynamic_cast<AdminEnv &>(ienv);
+  ENSURE_USAGE(args.empty());
+  using Request = std::conditional_t<Confirm, meta::ConfirmEcFileOutputResolutionReq, meta::QueryEcFileOutputResolutionReq>;
+  using Response = std::conditional_t<Confirm, meta::ConfirmEcFileOutputResolutionRsp, meta::QueryEcFileOutputResolutionRsp>;
+  auto request = fileOutputResolutionRequest<Request>(parser, env.userInfo);
+  CO_RETURN_ON_ERROR(request);
+  const auto &req = *request;
+  FileOutputResolutionArchive archive;
+  archive.action = Confirm ? "confirm_file_output_resolution" : "query_file_output_resolution";
+  archive.client_namespace = req.client.uuid;
+  archive.request_id = req.uuid;
+  archive.resolution_id = req.resolutionId;
+  archive.identity = req.identity;
+  auto journal = Journal::create(Path(parser.get<std::string>("--output")), archive);
+  CO_RETURN_ON_ERROR(journal);
+  bool invoked = false;
+  try {
+    auto client = env.metaClientGetter();
+    if (!client || client->clientId().uuid != req.client.uuid)
+      co_return makeError(StatusCode::kInvalidArg, "set config.client_uuid to the persisted client-namespace");
+    invoked = true;
+    Result<Response> result = makeError(StatusCode::kNotImplemented);
+    if constexpr (Confirm)
+      result = co_await folly::coro::co_withCancellation({}, client->confirmEcFileOutputResolution(req));
+    else
+      result = co_await folly::coro::co_withCancellation({}, client->queryEcFileOutputResolution(req));
+    if (result) {
+      const auto &r = result->resolution;
+      auto valid = r.valid();
+      if (!valid || result->clientNamespace != req.client.uuid || result->requestId != req.uuid ||
+          r.resolutionId != req.resolutionId || serde::serialize(r.identity) != serde::serialize(req.identity) ||
+          (Confirm && r.confirmingClientNamespace != req.client.uuid))
+        result = makeError(StorageClientCode::kProtocolMismatch);
+    }
+    archive.phase = "result";
+    if (result) {
+      archive.outcome = Confirm ? "confirmed" : "observed";
+      archive.candidate_reservations_release_eligible = result->resolution.candidateReservationsReleaseEligible;
+      archive.resolution = std::move(result->resolution);
+    } else {
+      // Confirm may have committed before a failed/mismatching reply. Never
+      // turn it into absence or generate another resolutionId to try again.
+      archive.outcome = Confirm ? "unknown" : "not_observed";
+      archive.status_code = result.error().code();
+    }
+    auto saved = (*journal)->append(archive);
+    if (!saved) co_return makeError(Confirm ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kIOError);
+    if (!result)
+      co_return makeError(result.error().code(), "resolution unconfirmed; retain original IDs and archive; no collection is confirmed");
+    co_return Dispatcher::OutputTable{{archive.archiveJson()}};
+  } catch (...) {
+    co_return makeError(Confirm && invoked ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kIOError);
+  }
+}
+
 CoTryTask<Dispatcher::OutputTable> handle(IEnv &ienv,
                                           const argparse::ArgumentParser &parser,
                                           const Dispatcher::Args &args,
@@ -484,6 +639,12 @@ CoTryTask<Dispatcher::OutputTable> handleTree(IEnv &ienv,
 }  // namespace
 
 CoTryTask<void> registerEcRevisionRetirementHandlers(Dispatcher &dispatcher) {
+  CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
+      [] { return fileOutputResolutionParser("ec-confirm-file-output-resolution"); },
+      [](IEnv &env, const auto &p, const auto &a) { return handleFileOutputResolution<true>(env, p, a); }));
+  CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
+      [] { return fileOutputResolutionParser("ec-query-file-output-resolution"); },
+      [](IEnv &env, const auto &p, const auto &a) { return handleFileOutputResolution<false>(env, p, a); }));
   CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
       [] { return fileOutputParser(); },
       [](IEnv &env, const auto &p, const auto &a) { return handleFileOutput(env, p, a); }));

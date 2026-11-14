@@ -1,6 +1,16 @@
 // Included inside ec_file_cli's anonymous namespace. Mode 4 is deliberately
 // separate from legacy mode-3 append-at/range run formats and permissions.
 int executeMode4(const Config &cfg, const std::string &command) {
+  if (command == "mode4-export-output-identities") {
+    auto exported = exportEcFileOutputIdentities(cfg.run_dir(), cfg.output_kind(), cfg.output_file());
+    if (!exported) {
+      std::cerr << "unconfirmed local identity export: " << exported.error().describe() << '\n';
+      return 1;
+    }
+    std::cout << "{\"kind\":\"ec_file_output_identities_exported\",\"candidate_identities_only\":true,"
+                 "\"network_io_performed\":false}\n";
+    return 0;
+  }
   // No token, RPC client, worker or IB device is needed for this local archive.
   if (command == "mode4-export-read-allocations") {
     auto exported = exportEcTreeReadAllocations(cfg.run_dir(), cfg.output_file());

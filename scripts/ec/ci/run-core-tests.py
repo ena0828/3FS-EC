@@ -17,7 +17,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 
-META_FILTER = "TestEcFileNativeWrite.*:TestEcMountedTruncateRecovery.*:TestEcStorageTransportConfig.*"
+META_FILTER = "TestEcFileNativeWrite.*:TestEcMountedTruncateRecovery.*:TestEcStorageTransportConfig.*:TestEcFileOutputResolution.*"
 FUSE_FILTER = "TestEcFuseRead.*:TestEcFuseShutdown.*:TestEcFileMount.*:TestEcFuseTransportConfig.*"
 META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
     "AppendLostAcceptanceUsesSameEofAndFsyncRequiresPublishedData",
@@ -34,7 +34,12 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
     "EightConflictsKeepDebtAndRecoveryCapacity",
     "FixedDeadlineStopsConflictRecovery",
     "LostCommittedBeginReplyIsNotRetried",
-)) + ("TestEcStorageTransportConfig.RejectsImplicitModesAndHotTransportChanges",)
+)) + ("TestEcStorageTransportConfig.RejectsImplicitModesAndHotTransportChanges",) + tuple(
+    "TestEcFileOutputResolution." + name for name in (
+        "UnissuedZeroAndIssuedDataCloseBeforePermanentQualification",
+        "BoundAndInconsistentPermanentEvidenceNeverQualify",
+        "OriginalFenceConflictsWithLateIssuanceAndCannotReopen",
+    ))
 # The two flat manager cases also verify opt-in repair metrics, joined failure
 # scopes and history/default-off isolation against real Meta/FDB + Storage.
 REPAIR_CASES = (
@@ -50,7 +55,7 @@ REPAIR_CASES = (
 AUTH_USER_CASES = tuple(f"TestAuth/{backend}.{case}" for backend in (0, 1)
                         for case in ("Basic", "ExplicitPrimaryGroup"))
 SERVICE_CONTRACT_CASES = AUTH_USER_CASES + (
-    "TestMetaServiceReflection.RegistersAll72IncludingBeyondDefaultFieldRank",
+    "TestMetaServiceReflection.RegistersAll74IncludingBeyondDefaultFieldRank",
 )
 TARGET_META_CASES = (
     "TestEcTargetRetirementCatalog.RealFdbImmutableIntentAndRequestIdentity",
@@ -91,7 +96,7 @@ def parser():
     for name in ("source", "build", "fdb-bin-dir", "work"):
         result.add_argument("--" + name, required=True, type=Path)
     result.add_argument("--profile", choices=("core", "repair", "target-meta", "auth-user", "service-contracts"), default="core",
-                        help="core: 14 Meta + 15 FUSE; repair: file and flat repair, Direct delivery and recovery fixtures; "
+                        help="core: 17 Meta + 15 FUSE; repair: file and flat repair, Direct delivery and recovery fixtures; "
                              "target-meta: 9 retirement catalogue, RPC and evidence cases; "
                              "auth-user: default and explicit primary GID with MemKV and FDB; "
                              "service-contracts: auth-user plus all Meta dispatch IDs")

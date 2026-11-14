@@ -54,8 +54,11 @@ Result<std::unique_ptr<EcFilePwriteJournal>> EcFilePwriteJournal::create(const s
 Result<std::unique_ptr<EcFilePwriteJournal>> EcFilePwriteJournal::resume(const std::filesystem::path &path) {
   return open(path, std::nullopt);
 }
+Result<std::unique_ptr<EcFilePwriteJournal>> EcFilePwriteJournal::inspectExisting(const std::filesystem::path &path) {
+  return open(path, std::nullopt, true);
+}
 Result<std::unique_ptr<EcFilePwriteJournal>> EcFilePwriteJournal::open(const std::filesystem::path &path,
-                                                                       std::optional<EcPwriteRunRecord> initial) {
+                                                                       std::optional<EcPwriteRunRecord> initial, bool readOnly) {
   try {
     if (path.string().find('\0') != std::string::npos || !path.is_absolute() || path.filename().empty() ||
         path.filename() == "." || path.filename() == "..")
@@ -78,13 +81,17 @@ Result<std::unique_ptr<EcFilePwriteJournal>> EcFilePwriteJournal::open(const std
       return makeError(StatusCode::kInvalidFormat, "run directory must be owner-only");
     if (initial && (::fchmod(directory.value, 0700) || ::fsync(parent.value)))
       return makeError(io("persist new run directory").error());
-    Fd lock(::openat(directory.value, ".lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600));
+    Fd lock(::openat(directory.value,
+                     ".lock",
+                     (readOnly ? O_RDONLY : (O_RDWR | O_CREAT)) | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+                     0600));
     if (lock.value < 0) return makeError(io("open run lock").error());
     RETURN_ON_ERROR(privateRegular(lock.value));
     if (::flock(lock.value, LOCK_EX | LOCK_NB))
       return makeError(StorageClientCode::kResourceBusy, "file run is already owned");
     auto journal =
         std::unique_ptr<EcFilePwriteJournal>(new EcFilePwriteJournal(directory.release(), lock.release(), {}));
+    journal->readOnly_ = readOnly;
     if (initial) {
       journal->record_ = std::move(*initial);
       RETURN_ON_ERROR(journal->writeNew("record.json", *encoded));
@@ -93,6 +100,7 @@ Result<std::unique_ptr<EcFilePwriteJournal>> EcFilePwriteJournal::open(const std
     CHECK_RESULT(recordText, journal->read("record.json"));
     CHECK_RESULT(record, decodeEcPwriteRunRecord(recordText));
     journal->record_ = std::move(record);
+    if (readOnly) journal->inspectionRecordBytes_ = std::move(recordText);
     uint64_t count = 0, maximum = 0;
     Fd duplicate(::dup(journal->directory_));
     if (duplicate.value < 0) return makeError(io("duplicate run directory").error());
@@ -125,10 +133,13 @@ Result<std::unique_ptr<EcFilePwriteJournal>> EcFilePwriteJournal::open(const std
       if (progress.sequence != sequence) return makeError(StatusCode::kInvalidFormat, "sequence/name mismatch");
       RETURN_ON_ERROR(progress.validate(journal->record_, journal->latest_ ? &*journal->latest_ : nullptr));
       journal->latest_ = std::move(progress);
+      if (readOnly) journal->inspectionLatestStateBytes_ = std::move(text);
     }
     // Visibility after an uncertain local fsync is not enough. Reconfirm every
     // immutable file above and this directory before permitting another RPC.
-    if (::fsync(journal->directory_) || ::fsync(parent.value)) return makeError(io("reconfirm run directory").error());
+    // Inspection is metadata-only and never grants permission for an RPC.
+    if (!readOnly && (::fsync(journal->directory_) || ::fsync(parent.value)))
+      return makeError(io("reconfirm run directory").error());
     return journal;
   } catch (const std::bad_alloc &) {
     return makeError(StatusCode::kNotEnoughMemory);
@@ -157,7 +168,7 @@ Result<std::string> EcFilePwriteJournal::read(std::string_view name) const {
     tail = ::read(fd.value, &trailing, 1);
   } while (tail < 0 && errno == EINTR);
   if (tail != 0) return makeError(StatusCode::kInvalidFormat, "journal entry changed length");
-  if (::fsync(fd.value)) return makeError(io("reconfirm immutable journal file").error());
+  if (!readOnly_ && ::fsync(fd.value)) return makeError(io("reconfirm immutable journal file").error());
   return text;
 }
 Result<Void> EcFilePwriteJournal::writeNew(std::string_view name, std::string_view bytes) {
@@ -174,6 +185,7 @@ Result<Void> EcFilePwriteJournal::writeNew(std::string_view name, std::string_vi
   return Void{};
 }
 Result<Void> EcFilePwriteJournal::append(EcPwriteRunProgress progress) {
+  if (readOnly_) return makeError(StatusCode::kInvalidArg, "inspection cannot append journal state");
   if (poisoned_)
     return makeError(StatusCode::kIOError, "file run requires close and explicit resume after persistence error");
   try {

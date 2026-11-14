@@ -138,6 +138,47 @@ class OwnedLeaseTests(unittest.TestCase):
                 self.assertIsNone(runner.child)
                 self.assertTrue(runner.commands[0]['process_exited'])
 
+    def test_local_output_exports_join_with_or_without_lease_and_reject_wrong_kind(self):
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=123, st_nlink=1)
+        original_fstat = os.fstat
+        for action, kind in [('export-read-allocations', None)] + [
+                ('export-output-identities', value) for value in ('pwrite', 'repair', 'truncate')]:
+            for lease in ((), (9876,)):
+                with self.subTest(action=action, kind=kind, lease=lease):
+                    runner = self.runner(); runner.transport_role = 'file'
+                    runner.config = self.root / 'client/file-client.toml'
+                    runner.check_transport = Mock(return_value={'mode': 'rdma'})
+                    argv = self.file_argv('export-read-allocations')
+                    argv[-1] = 'mode4-' + action
+                    if kind is not None: argv.insert(-1, '--config.output_kind=' + kind)
+                    child = Mock(pid=456, returncode=0); child.poll.return_value = 0
+                    with patch.object(ACK.sys, 'platform', 'linux'), \
+                         patch.object(ACK.os, 'geteuid', return_value=123, create=True), \
+                         patch.object(ACK.os, 'fstat', side_effect=lambda fd: info if fd == 9876 else original_fstat(fd)), \
+                         patch.object(WRAPPER, 'bind_transport_run') as bind, \
+                         patch.object(ACK.subprocess, 'Popen', return_value=child) as popen:
+                        ACK.command(runner, WRAPPER, argv, pass_fds=lease)
+                        self.assertEqual(popen.call_args.kwargs.get('pass_fds', ()), lease)
+                        bind.assert_not_called()
+                    child.wait.assert_called_once()
+                    self.assertIsNone(runner.child)
+                    self.assertTrue(runner.commands[0]['process_exited'])
+                    runner.check_transport.assert_called_once()
+                    self.assertNotIn('transport', runner.commands[0])
+                    self.assertEqual(runner.commands[0]['kind'],
+                                     'local_output_identity_export' if kind is not None else 'local_read_export')
+                    self.assertFalse((self.root / 'client/runs/original').exists())
+        runner = self.runner(); runner.transport_role = 'file'
+        runner.config = self.root / 'client/file-client.toml'
+        argv = self.file_argv('export-read-allocations')
+        argv[-1] = 'mode4-export-output-identities'
+        with patch.object(ACK.subprocess, 'Popen') as forbidden:
+            for fields in ([], ['--config.output_kind=session'],
+                           ['--config.output_kind=pwrite', '--config.output_kind=pwrite']):
+                with self.subTest(fields=fields), self.assertRaises(RuntimeError):
+                    ACK.command(runner, WRAPPER, argv[:-1] + fields + argv[-1:])
+            forbidden.assert_not_called()
+
     def test_file_lease_rejects_program_config_operation_and_path_drift(self):
         runner = self.runner(); runner.transport_role = 'file'
         runner.config = self.root / 'client/file-client.toml'

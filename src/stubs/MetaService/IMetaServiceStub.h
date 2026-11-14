@@ -89,6 +89,8 @@ class IMetaServiceStub {
   IMETA_STUB_METHOD(prepareEcFileRepairDirect, PrepareEcFileRepairDirectReq, EcFileRepairDirectRsp);
   IMETA_STUB_METHOD(prepareEcRepairDirectV2, PrepareEcRepairDirectV2Req, PrepareEcRepairDirectV2Rsp);
   IMETA_STUB_METHOD(queryEcFileOutput, QueryEcFileOutputReq, QueryEcFileOutputRsp);
+  IMETA_STUB_METHOD(confirmEcFileOutputResolution, ConfirmEcFileOutputResolutionReq, ConfirmEcFileOutputResolutionRsp);
+  IMETA_STUB_METHOD(queryEcFileOutputResolution, QueryEcFileOutputResolutionReq, QueryEcFileOutputResolutionRsp);
   IMETA_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 #undef IMETA_STUB_METHOD

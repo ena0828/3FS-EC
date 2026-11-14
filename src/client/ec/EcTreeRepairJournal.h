@@ -45,12 +45,17 @@ class EcTreeRepairJournal {
  public:
   static Result<std::unique_ptr<EcTreeRepairJournal>> create(const std::filesystem::path &, EcTreeRepairRun);
   static Result<std::unique_ptr<EcTreeRepairJournal>> resume(const std::filesystem::path &);
+  // Existing lock only; no journal writes or durability reconfirmation.
+  static Result<std::unique_ptr<EcTreeRepairJournal>> inspectExisting(const std::filesystem::path &);
   ~EcTreeRepairJournal();
   EcTreeRepairJournal(const EcTreeRepairJournal &) = delete;
   EcTreeRepairJournal &operator=(const EcTreeRepairJournal &) = delete;
   const EcTreeRepairRun &record() const { return record_; }
   const std::optional<EcTreeRepairState> &latest() const { return latest_; }
   bool poisoned() const { return poisoned_; }
+  // Exact bytes retained only by inspectExisting; never serialize them to a public archive.
+  std::string_view inspectionRecordBytes() const { return inspectionRecordBytes_; }
+  std::string_view inspectionLatestStateBytes() const { return inspectionLatestStateBytes_; }
   Result<Void> append(EcTreeRepairState);
 
  private:
@@ -59,12 +64,14 @@ class EcTreeRepairJournal {
         lock_(lock),
         record_(std::move(record)) {}
   static Result<std::unique_ptr<EcTreeRepairJournal>> open(const std::filesystem::path &,
-                                                           std::optional<EcTreeRepairRun>);
+                                                           std::optional<EcTreeRepairRun>, bool readOnly = false);
   Result<Void> writeNew(std::string_view, std::string_view);
   Result<std::string> read(std::string_view) const;
   int directory_ = -1, lock_ = -1;
   EcTreeRepairRun record_;
   std::optional<EcTreeRepairState> latest_;
   bool poisoned_ = false;
+  bool readOnly_ = false;
+  std::string inspectionRecordBytes_, inspectionLatestStateBytes_;
 };
 }  // namespace hf3fs::client::ec
