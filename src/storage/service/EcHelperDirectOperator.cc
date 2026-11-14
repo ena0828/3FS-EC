@@ -27,7 +27,8 @@ std::array<uint8_t, 16> directBytes(const Uuid &value) {
 }
 Result<net::Address> directAddress(const hf3fs::client::RoutingInfo &routing,
                                    const EcScopeEndpoint &endpoint,
-                                   ChainVer version) {
+                                   ChainVer version,
+                                   net::Address::Type transportType) {
   const auto node = routing.getNode(endpoint.nodeId);
   const auto target = routing.getTarget(endpoint.targetId);
   const auto chain = routing.getChain(endpoint.chainId);
@@ -41,7 +42,7 @@ Result<net::Address> directAddress(const hf3fs::client::RoutingInfo &routing,
   for (const auto &group : node->app.serviceGroups)
     if (group.services.contains("StorageSerde"))
       for (const auto &address : group.endpoints)
-        if (address.type == net::Address::TCP) return address;
+        if (address.type == transportType) return address;
   return makeError(StorageClientCode::kRoutingError);
 }
 EcFragmentAccessV2 directAccess(const EcRepairFragment &fragment, ChainVer version) {
@@ -58,9 +59,14 @@ auto directUnknown() {
 }
 }  // namespace
 
-CoTryTask<EcHelperDirectHopRsp> StorageOperator::executeEcHelperDirect(const EcHelperDirectHopReq &request) {
+CoTryTask<EcHelperDirectHopRsp> StorageOperator::executeEcHelperDirect(const EcHelperDirectHopReq &request,
+                                                                     net::Address::Type transportType) {
   const auto receivedAt = std::chrono::steady_clock::now();
   EcHelperDirectHopRsp response;
+  if (transportType != net::Address::TCP && transportType != net::Address::RDMA) {
+    response.result = makeError(StatusCode::kInvalidArg, "direct helper requires explicit TCP or RDMA ingress");
+    co_return response;
+  }
   if (!ecHelpers_) {
     response.result = makeError(StatusCode::kAuthenticationFail);
     co_return response;
@@ -85,7 +91,7 @@ CoTryTask<EcHelperDirectHopRsp> StorageOperator::executeEcHelperDirect(const EcH
     // Copy only after bounded admission. A network waiter disappearing cannot
     // cancel these owned frames or destroy their tickets while a child runs.
     response.result = co_await folly::coro::co_withCancellation(
-        CancellationToken{}, executeEcHelperDirectOwned(request, receivedAt).scheduleOn(&ecHelpers_->executor));
+        CancellationToken{}, executeEcHelperDirectOwned(request, receivedAt, transportType).scheduleOn(&ecHelpers_->executor));
   } catch (...) {
     // Includes construction/await/response failures outside the owned body.
     // Conservatively retain uncertainty even if this particular copy failed early.
@@ -95,7 +101,9 @@ CoTryTask<EcHelperDirectHopRsp> StorageOperator::executeEcHelperDirect(const EcH
 }
 
 CoTryTask<EcHelperDirectHopResult> StorageOperator::executeEcHelperDirectOwned(
-    EcHelperDirectHopReq request, std::chrono::steady_clock::time_point receivedAt) {
+    EcHelperDirectHopReq request,
+    std::chrono::steady_clock::time_point receivedAt,
+    net::Address::Type transportType) {
   bool dispatchedMutation = false;
   // The stored closure and all referenced locals outlive this immediately joined
   // task. No callback, borrowed request, or observer is handed to background work.
@@ -177,7 +185,7 @@ CoTryTask<EcHelperDirectHopResult> StorageOperator::executeEcHelperDirectOwned(
       if (!mgmtd) return makeError(StorageClientCode::kRoutingError);
       auto routing = mgmtd->getRoutingInfo();
       if (!routing) return makeError(StorageClientCode::kRoutingError);
-      return directAddress(*routing, endpoint, version);
+      return directAddress(*routing, endpoint, version, transportType);
     };
     const auto options = [&]() -> Result<net::UserRequestOptions> {
       RETURN_ON_ERROR(check());
@@ -186,6 +194,7 @@ CoTryTask<EcHelperDirectHopResult> StorageOperator::executeEcHelperDirectOwned(
       net::UserRequestOptions out;
       out.timeout = Duration(remaining);
       out.sendRetryTimes = 0;
+      out.requireRdma = transportType == net::Address::RDMA;
       return out;
     };
     CO_RETURN_ON_ERROR(check());

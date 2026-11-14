@@ -177,13 +177,30 @@ jobs:
             --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
             --core-record "$RUNNER_TEMP/ec-native/acceptance/results.json"
 
-      - name: Run central two-Storage faults with spare placement and original-instance recovery
-        timeout-minutes: 35
+      - name: Run all six serial Storage process-fault cases with original-instance recovery
+        timeout-minutes: 95
         shell: bash
         run: |
-          python3 -B scripts/ec/ci/system-job-budget.py check --profile target-meta --stage spare
-          exec python3 -B scripts/ec/ci/run-spare-lab.py \
+          # Six serial cases share this admission estimate; it is not a worst-case
+          # completion or cleanup guarantee. Any budget refusal fails the job.
+          python3 -B scripts/ec/ci/system-job-budget.py check --profile target-meta --stage matrix
+          uid=$(id -u)
+          gid=$(id -g)
+          runner_user=$(id -un)
+          runner_home=$HOME
+          test "$uid" -ne 0
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          # Short fresh owner-only parent keeps every control.sock below 104 bytes.
+          # Retain all case evidence; the driver creates the fresh run child.
+          matrix_parent=$(mktemp -d /tmp/ec-m.XXXXXX)
+          printf 'FAULT_MATRIX_WORK=%s\n' "$matrix_parent/run"
+          exec sudo -n prlimit --memlock=3221225472:3221225472 --nofile=65536:65536 -- \
+            setpriv --reuid="$uid" --regid="$gid" --init-groups \
+            env HOME="$runner_home" USER="$runner_user" LOGNAME="$runner_user" \
+            GITHUB_SHA="$GITHUB_SHA" LD_LIBRARY_PATH=/usr/local/lib /usr/bin/python3 -B \
+            "$GITHUB_WORKSPACE/scripts/ec/ci/run-fault-matrix.py" \
             --source "$GITHUB_WORKSPACE" --build "$RUNNER_TEMP/ec-native/build" \
             --fdb-bin-dir "$RUNNER_TEMP/ec-native/fdb/bin" \
             --core-record "$RUNNER_TEMP/ec-native/acceptance/results.json" \
-            --strategy central --failures 2
+            --work "$matrix_parent/run"

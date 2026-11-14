@@ -19,6 +19,7 @@
 #include "common/logging/LogInit.h"
 #include "common/monitor/Monitor.h"
 #include "common/net/Client.h"
+#include "common/net/ib/IBDevice.h"
 #include "fbs/meta/EcRequestDigest.h"
 #include "stubs/common/RealStubFactory.h"
 #include "stubs/mgmtd/MgmtdServiceStub.h"
@@ -69,6 +70,8 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(replacement_mask, uint16_t{0});
   CONFIG_ITEM(source_order, std::vector<uint16_t>{});
   CONFIG_ITEM(block_window, uint8_t{0});
+  CONFIG_ITEM(storage_transport, "tcp");
+  CONFIG_OBJ(ib_devices, net::IBDevice::Config);
   CONFIG_ITEM(deadline_seconds, uint32_t{300});
   CONFIG_ITEM(worker_threads, uint32_t{4});
   CONFIG_ITEM(max_operations, uint32_t{2});
@@ -291,7 +294,8 @@ Result<Void> run(EcStripeRunJournal &journal,
     RETURN_ON_ERROR(journal.append(state));
   }
   auto control = [&] {
-    return EcStripeControl{std::chrono::steady_clock::now() + std::chrono::seconds(config.deadline_seconds()), {}};
+    return EcStripeControl{std::chrono::steady_clock::now() + std::chrono::seconds(config.deadline_seconds()),
+                           {}, *parseEcStorageTransport(config.storage_transport())};
   };
   auto recordFailure = [&](Status error) -> Result<Void> {
     state.errorCode = error.code();
@@ -419,6 +423,8 @@ int execute(int argc, char **argv) {
   if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
     std::cout
         << "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/new-run new-write|new-read|new-repair\n"
+           "Client Storage EC: --config.storage_transport=tcp|rdma (default tcp; no fallback).\n"
+           "Select it per invocation, including resume; Meta-owned data configuration is independent.\n"
            "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/new-run "
            "--config.source_run=/absolute/published-run --config.input_file=/absolute/restored-data "
            "new-recovery-write\n"
@@ -453,10 +459,18 @@ int execute(int argc, char **argv) {
     std::cerr << "one command, a 1..3600-second deadline and 1..32 worker threads are required\n";
     return 2;
   }
+  auto storageTransport = parseEcStorageTransport(config.storage_transport());
+  if (!storageTransport) {
+    std::cerr << storageTransport.error().describe() << '\n';
+    return 2;
+  }
+  std::cerr << "CLIENT_ORIGINATED_STORAGE_TRANSPORT=" << config.storage_transport()
+            << "; Meta/Mgmtd control plane remains TCP; Meta-owned data uses independent configuration; "
+               "selection is not RDMA success or a comparable performance sample\n";
   const std::string command = argv[1];
   if (config.meta_client().network_type() != net::Address::TCP ||
       config.mgmtd_client().network_type() != net::Address::TCP) {
-    std::cerr << "this bounded V2 CLI requires TCP Meta/mgmtd routing; Storage V2 data calls are TCP\n";
+    std::cerr << "this bounded V2 CLI requires TCP Meta/mgmtd routing\n";
     return 2;
   }
   auto journalResult = journal(config, command, executable);
@@ -474,6 +488,19 @@ int execute(int argc, char **argv) {
   if (!token) {
     std::cerr << token.error().describe() << '\n';
     return 2;
+  }
+  // This outer guard outlives every command's manager, worker and network.
+  // Arm it before start so a partial IB initialization is also cleaned up.
+  const bool useRdma = *storageTransport == EcStorageTransportPolicy::RdmaOnly;
+  SCOPE_EXIT {
+    if (useRdma) net::IBManager::stop();
+  };
+  if (useRdma) {
+    auto ibStarted = net::IBManager::start(config.ib_devices());
+    if (!ibStarted) {
+      std::cerr << "cannot initialize requested RDMA devices: " << ibStarted.error().describe() << '\n';
+      return 2;
+    }
   }
   logging::initOrDie(config.log());
   auto monitorStarted = monitor::Monitor::start(config.monitor());
@@ -524,7 +551,7 @@ int execute(int argc, char **argv) {
   SCOPE_EXIT { metadata->stop(); };
   if (command == "export-allocations") {
     const EcStripeControl control{std::chrono::steady_clock::now() + std::chrono::seconds(config.deadline_seconds()),
-                                  {}};
+                                  {}, *storageTransport};
     auto exported = blockingWait(exportEcAllocations(
         metadata,
         record,

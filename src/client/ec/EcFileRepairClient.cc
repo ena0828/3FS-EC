@@ -23,13 +23,14 @@ auto observeResult(EcRepairObservation *observation, EcRepairPoint point, F &&ca
 }
 bool same(const auto &a, const auto &b) { return serde::serialize(a) == serde::serialize(b); }
 Result<Void> active(EcStripeControl c) {
+  RETURN_ON_ERROR(validateEcStorageTransport(c.transport));
   if (c.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
   if (std::chrono::steady_clock::now() >= c.deadline) return makeError(StorageClientCode::kTimeout);
   return Void{};
 }
 storage::client::EcRequestControl options(EcStripeControl c, EcRepairObservation *observation) {
   // This helper belongs only to copyOne, including its recovery primitives.
-  return {c.deadline, c.cancellation, storage::client::EcRequestControl::TransportPolicy::TcpOnly,
+  return {c.deadline, c.cancellation, c.transport,
           observation ? &observation->healthyCopyRpc() : nullptr};
 }
 Result<VersionedChainId> route(hf3fs::client::ICommonMgmtdClient &mgmtd, const meta::EcV2PhysicalEndpoint &e) {
@@ -300,7 +301,7 @@ CoTryTask<Void> EcFileRepairClient::transfer(meta::EcFileRepairAccess a, const E
       bindings.targets[index++] = {access(a.targets[n], *v), a.writes[n]};
     }
   auto transport = NativeEcRepairTransport::create(
-      *plan, storage_, std::move(bindings), a.helpers, observation, std::move(direct));
+      *plan, storage_, std::move(bindings), a.helpers, observation, std::move(direct), c.transport);
   CO_RETURN_ON_ERROR(transport);
   auto mode = r.intent.mode == meta::EcFileRepairMode::CentralSerial    ? EcRepairMode::CentralSerial
               : r.intent.mode == meta::EcFileRepairMode::ClientPipeline ? EcRepairMode::ClientPipeline

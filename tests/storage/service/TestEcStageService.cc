@@ -1518,6 +1518,7 @@ class TestEcNativeRepairService : public TestEcStageService {
 };
 
 #include "EcHelperDirectNativeTests.inc"
+#include "EcHelperTransportNativeTests.inc"
 
 TEST_F(TestEcNativeRepairService, ThreeNativeStrategiesRepairSingleAndDoubleTargetsThroughTcp) {
   using namespace hf3fs::client::ec;

@@ -25,16 +25,26 @@ Result<VerifiedEcRmwPlan> EcRmwRuntime::verify(const Entry &entry, const EcRmwGr
   if (entry.plan->worker().nodeId != node_) return makeError(StatusCode::kAuthenticationFail);
   return EcRmwAuthorization::verify(*key_, grant, entry.plan, entry.plan->worker(), authority_, right, clock_());
 }
-Result<bool> EcRmwRuntime::prepareInstall(std::shared_ptr<const EcRmwPlan> plan, const EcRmwGrant &grant) {
+Result<bool> EcRmwRuntime::prepareInstall(std::shared_ptr<const EcRmwPlan> plan,
+                                          const EcRmwGrant &grant,
+                                          TransportPolicy transport) {
+  if (!client::isExplicitEcTransportPolicy(transport)) return makeError(StatusCode::kInvalidArg);
   if (!plan || plan->worker().nodeId != node_) return makeError(StatusCode::kAuthenticationFail);
   auto verified =
       EcRmwAuthorization::verify(*key_, grant, plan, plan->worker(), authority_, EcRmwRight::Install, clock_());
   RETURN_ON_ERROR(verified);
   std::lock_guard lock(mutex_);
   if (closing_) return makeError(StorageClientCode::kResourceBusy);
-  if (!entry_) return true;
+  if (installBinding_ && installBinding_->planId == plan->input().planId &&
+      (installBinding_->digest != plan->digest() || installBinding_->transport != transport))
+    return makeError(StatusCode::kTokenMismatch);
+  if (!entry_) {
+    installBinding_ = InstallBinding{plan->input().planId, plan->digest(), transport};
+    return true;
+  }
   const bool same = entry_->plan->input().planId == plan->input().planId;
-  if (same && entry_->plan->digest() != plan->digest()) return makeError(StatusCode::kTokenMismatch);
+  if (same && (entry_->plan->digest() != plan->digest() || entry_->transport != transport))
+    return makeError(StatusCode::kTokenMismatch);
   if (entry_->observation.state == EcRmwLocalState::Running || entry_->observation.state == EcRmwLocalState::Queued) {
     if (same) return false;
     return makeError(StorageClientCode::kResourceBusy);
@@ -43,6 +53,7 @@ Result<bool> EcRmwRuntime::prepareInstall(std::shared_ptr<const EcRmwPlan> plan,
     return false;
   if (!same && entry_->observation.state != EcRmwLocalState::Complete)
     return makeError(StorageClientCode::kResourceBusy);
+  installBinding_ = InstallBinding{plan->input().planId, plan->digest(), transport};
   entry_.reset();  // No running job; releases its old ticket and reservation.
   return true;
 }
@@ -50,12 +61,15 @@ Result<Void> EcRmwRuntime::install(std::shared_ptr<const EcRmwPlan> plan,
                                    const EcRmwGrant &grant,
                                    std::shared_ptr<NativeEcRmwIo> io) {
   if (!plan || !io || io->planDigest() != plan->digest()) return makeError(StatusCode::kTokenMismatch);
-  return installInternal(std::move(plan), grant, std::move(io));
+  const auto transport = io->transportPolicy();
+  return installInternal(std::move(plan), grant, std::move(io), transport);
 }
 Result<Void> EcRmwRuntime::installInternal(std::shared_ptr<const EcRmwPlan> plan,
                                            const EcRmwGrant &grant,
-                                           std::shared_ptr<EcRmwIo> io) {
-  if (!plan || !io) return makeError(StatusCode::kInvalidArg);
+                                           std::shared_ptr<EcRmwIo> io,
+                                           TransportPolicy transport) {
+  if (!plan || !io || !client::isExplicitEcTransportPolicy(transport))
+    return makeError(StatusCode::kInvalidArg);
   if (plan->worker().nodeId != node_) return makeError(StatusCode::kAuthenticationFail);
   auto verified =
       EcRmwAuthorization::verify(*key_, grant, plan, plan->worker(), authority_, EcRmwRight::Install, clock_());
@@ -63,8 +77,12 @@ Result<Void> EcRmwRuntime::installInternal(std::shared_ptr<const EcRmwPlan> plan
   RETURN_ON_ERROR(io->check());
   std::lock_guard lock(mutex_);
   if (closing_) return makeError(StorageClientCode::kResourceBusy);
+  if (installBinding_ && (installBinding_->planId != plan->input().planId ||
+                          installBinding_->digest != plan->digest() || installBinding_->transport != transport))
+    return makeError(StatusCode::kTokenMismatch);
   if (entry_ && entry_->plan->input().planId == plan->input().planId) {
-    if (entry_->plan->digest() != plan->digest()) return makeError(StatusCode::kTokenMismatch);
+    if (entry_->plan->digest() != plan->digest() || entry_->transport != transport)
+      return makeError(StatusCode::kTokenMismatch);
     if (entry_->observation.state != EcRmwLocalState::Complete || entry_->observation.error == StatusCode::kOK)
       return Void{};  // Running/successful replay cannot restart; failed same-plan retry may reupload.
   }
@@ -77,29 +95,36 @@ Result<Void> EcRmwRuntime::installInternal(std::shared_ptr<const EcRmwPlan> plan
   entry->patch = std::move(*patch);
   entry->io = std::move(io);
   entry->installed = grant;
+  entry->transport = transport;
   entry->observation.planId = entry->plan->input().planId;
   entry->observation.planDigest = entry->plan->digest();
+  installBinding_ = InstallBinding{entry->plan->input().planId, entry->plan->digest(), transport};
   entry_ = std::move(entry);
   wake_.notify_one();
   return Void{};
 }
-Result<Void> EcRmwRuntime::put(const Uuid &id, const EcRmwGrant &grant, uint32_t block, std::string_view bytes) {
+Result<Void> EcRmwRuntime::put(const Uuid &id, const EcRmwGrant &grant, uint32_t block,
+                              std::string_view bytes, TransportPolicy transport) {
+  if (!client::isExplicitEcTransportPolicy(transport)) return makeError(StatusCode::kInvalidArg);
   std::lock_guard lock(mutex_);
   if (closing_) return makeError(StorageClientCode::kResourceBusy);
   if (!entry_ || entry_->plan->input().planId != id) return makeError(StatusCode::kKVStoreNotFound);
   RETURN_ON_ERROR(verify(*entry_, grant, EcRmwRight::Upload));
+  if (entry_->transport != transport) return makeError(StatusCode::kTokenMismatch);
   if (entry_->observation.state != EcRmwLocalState::Receiving) return makeError(StatusCode::kTokenStale);
   RETURN_ON_ERROR(entry_->io->check());
   RETURN_ON_ERROR(entry_->patch->put(block, bytes));
   entry_->observation.received = entry_->patch->received();
   return Void{};
 }
-Result<EcRmwObservation> EcRmwRuntime::submit(const Uuid &id, const EcRmwGrant &grant) {
+Result<EcRmwObservation> EcRmwRuntime::submit(const Uuid &id, const EcRmwGrant &grant, TransportPolicy transport) {
+  if (!client::isExplicitEcTransportPolicy(transport)) return makeError(StatusCode::kInvalidArg);
   std::lock_guard lock(mutex_);
   if (closing_) return makeError(StorageClientCode::kResourceBusy);
   if (!entry_ || entry_->plan->input().planId != id) return makeError(StatusCode::kKVStoreNotFound);
   auto verified = verify(*entry_, grant, EcRmwRight::Execute);
   RETURN_ON_ERROR(verified);
+  if (entry_->transport != transport) return makeError(StatusCode::kTokenMismatch);
   if (entry_->observation.state != EcRmwLocalState::Receiving) return entry_->observation;
   RETURN_ON_ERROR(entry_->io->check());
   auto patch = entry_->patch->finish();

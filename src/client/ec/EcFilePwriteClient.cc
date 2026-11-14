@@ -9,6 +9,7 @@ namespace hf3fs::client::ec {
 namespace {
 using folly::coro::blockingWait;
 Result<Void> active(const EcStripeControl &c) {
+  RETURN_ON_ERROR(validateEcStorageTransport(c.transport));
   if (c.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
   if (std::chrono::steady_clock::now() >= c.deadline) return makeError(StorageClientCode::kTimeout);
   return Void{};
@@ -33,7 +34,10 @@ EcPwriteOutcome outcome(const EcFilePwriteJournal &j, std::optional<Status> erro
   }
   return out;
 }
-Result<net::Address> address(hf3fs::client::ICommonMgmtdClient &mgmtd, const meta::EcV2PhysicalEndpoint &worker) {
+Result<net::Address> address(hf3fs::client::ICommonMgmtdClient &mgmtd,
+                             const meta::EcV2PhysicalEndpoint &worker, EcStorageTransportPolicy policy) {
+  RETURN_ON_ERROR(validateEcStorageTransport(policy));
+  const auto type = policy == EcStorageTransportPolicy::RdmaOnly ? net::Address::RDMA : net::Address::TCP;
   auto route = mgmtd.getRoutingInfo();
   if (!route || !route->raw()) return makeError(StorageClientCode::kRoutingError);
   const auto &e = worker.placement;
@@ -48,7 +52,7 @@ Result<net::Address> address(hf3fs::client::ICommonMgmtdClient &mgmtd, const met
   for (const auto &g : node->app.serviceGroups)
     if (g.services.contains("StorageSerde"))
       for (const auto &a : g.endpoints)
-        if (a.type == net::Address::TCP) return a;
+        if (a.type == type) return a;
   return makeError(StorageClientCode::kRoutingError);
 }
 }  // namespace
@@ -260,10 +264,10 @@ Result<Void> EcFilePwriteClient::upload(EcFilePwriteJournal &j,
       !storage::ec_rmw_detail::sameEndpoint(claims.worker, worker.worker.controlEndpoint()) || claims.rights != 14 ||
       claims.authority.is_nil() || claims.grantId.is_nil())
     return makeError(StatusCode::kTokenMismatch);
-  CHECK_RESULT(destination, address(*mgmtd_, worker.worker));
+  CHECK_RESULT(destination, address(*mgmtd_, worker.worker, control.transport));
   auto rpcControl = [&] {
     storage::client::EcRequestControl c;
-    c.transport = storage::client::EcRequestControl::TransportPolicy::TcpOnly;
+    c.transport = control.transport;
     c.cancellation = control.cancellation;
     c.deadline = std::min(control.deadline, std::chrono::steady_clock::now() + std::chrono::seconds(300));
     return c;

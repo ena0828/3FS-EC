@@ -15,8 +15,9 @@ namespace {
 class RoutedReadTransport final : public EcBlockReadTransport {
  public:
   RoutedReadTransport(std::shared_ptr<storage::client::StorageClient> client,
-                      std::array<std::optional<Status>, 12> failures)
-      : native_(std::move(client)),
+                      std::array<std::optional<Status>, 12> failures,
+                      EcStorageTransportPolicy transport)
+      : native_(std::move(client), nullptr, transport),
         failures_(std::move(failures)) {}
   CoTryTask<storage::EcReadBlockResultV2> read(storage::EcReadBlockV2Req request, EcReadControl control) override {
     const auto index = request.request.identity.shard;
@@ -167,7 +168,8 @@ CoTryTask<EcStripeReadOutput> readReady(std::shared_ptr<EcStripeClientCore> core
   bounds.maxPayloadBytes =
       (2 * storage::kEcIntegrityMaxBlocks + 12 * core->limits.readBlocks) * storage::kEcIntegrityBlockBytes;
   bounds.maxOperationTime = core->limits.maxOperationTime;
-  reader = std::make_unique<EcBlockRead>(std::make_shared<RoutedReadTransport>(core->storage, std::move(failures)),
+  reader = std::make_unique<EcBlockRead>(std::make_shared<RoutedReadTransport>(
+                                           core->storage, std::move(failures), state->control.transport),
                                          core->executor,
                                          bounds);
   EcStripeReadOutput output;

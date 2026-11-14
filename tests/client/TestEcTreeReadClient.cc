@@ -176,8 +176,11 @@ class TreeStorage final : public storage::client::StorageClientInMem {
   using StorageClientInMem::StorageClientInMem;
   storage::EcCodec::Shards shards;
   std::atomic<unsigned> active{0}, calls{0}, mask{0};
+  std::atomic<unsigned> transportMask{0};
   CoTryTask<storage::EcReadBlockResultV2> readEcBlockV2Controlled(storage::EcReadBlockV2Req wire,
-                                                                  storage::client::EcRequestControl) override {
+                                                                  storage::client::EcRequestControl control) override {
+    transportMask.fetch_or(control.transport == EcStorageTransportPolicy::TcpOnly ? 1u :
+                           control.transport == EcStorageTransportPolicy::RdmaOnly ? 2u : 4u);
     ++active;
     SCOPE_EXIT { --active; };
     ++calls;
@@ -421,6 +424,7 @@ TEST_F(TestEcTreeReadClient, DataUsesNativeQuorumParityAndZeroFillsLogicalTail) 
   EXPECT_EQ(std::string_view(reinterpret_cast<const char *>(output->data.bytes().data()), output->data.size()),
             expected);
   EXPECT_EQ(storage_->active, 0);
+  EXPECT_EQ(storage_->transportMask.load(), 1u);
   EXPECT_EQ(storage_->mask.load() & ((1u << 10) | (1u << 11)), (1u << 10) | (1u << 11));
   EXPECT_EQ(calls_->acquire, 1);
   EXPECT_EQ(calls_->refresh, 1);
@@ -435,6 +439,37 @@ TEST_F(TestEcTreeReadClient, DataUsesNativeQuorumParityAndZeroFillsLogicalTail) 
   ASSERT_ERROR(blockingWait(client_->readTree(journal_, control())), StatusCode::kTokenStale);
   EXPECT_EQ(storage_->calls, count);
   EXPECT_EQ(calls_->oldRelease, 0);
+}
+
+TEST_F(TestEcTreeReadClient, ExplicitRdmaPolicyReachesEveryNativeBlockRead) {
+  create(0, 80, 80);
+  installData();
+  auto selected = control();
+  selected.transport = EcStorageTransportPolicy::RdmaOnly;
+  auto output = blockingWait(client_->readTree(journal_, selected));
+  ASSERT_OK(output);
+  EXPECT_GT(storage_->calls.load(), 0u);
+  EXPECT_EQ(storage_->transportMask.load(), 2u);
+  EXPECT_EQ(storage_->active.load(), 0u);
+  std::string expected = "0123456789abcdefXYZ";
+  expected.resize(80, '\0');
+  EXPECT_EQ(std::string_view(reinterpret_cast<const char *>(output->data.bytes().data()), output->data.size()), expected);
+  ASSERT_OK(blockingWait(client_->releaseTree(journal_, selected)));
+}
+
+TEST_F(TestEcTreeReadClient, InvalidStoragePolicyHasNoRangeOrStorageSideEffect) {
+  create(0, 80, 80);
+  ASSERT_FALSE(journal_->latest());
+  for (auto policy : {EcStorageTransportPolicy::Automatic, static_cast<EcStorageTransportPolicy>(255)}) {
+    auto selected = control();
+    selected.transport = policy;
+    ASSERT_ERROR(blockingWait(client_->readTree(journal_, selected)), StatusCode::kInvalidArg);
+    EXPECT_EQ(calls_->acquire.load(), 0u);
+    EXPECT_EQ(calls_->query.load(), 0u);
+    EXPECT_EQ(calls_->refresh.load(), 0u);
+    EXPECT_EQ(storage_->calls.load(), 0u);
+    EXPECT_FALSE(journal_->latest());
+  }
 }
 }  // namespace
 }  // namespace hf3fs::client::ec

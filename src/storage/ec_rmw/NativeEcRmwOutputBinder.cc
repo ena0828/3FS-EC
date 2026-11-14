@@ -13,6 +13,9 @@ CoTryTask<std::array<EcCapabilityV2, 12>> NativeEcRmwOutputBinder::bind(const Ec
   req.child = p.operationId;
   req.execution = execution_;
   req.computed = computed;
+  // Meta52 is a separate control plane, not a fallback for Storage data I/O.
+  // Keep the original deadline/cancellation while selecting its explicit TCP endpoint.
+  control.transport = client::EcRequestControl::TransportPolicy::TcpOnly;
   auto result = co_await transport_->bind(*address, std::move(req), control);
   if (!result) co_return makeError(std::move(result.error()));
   if (result->planDigest != plan.digest()) co_return makeError(StorageCode::kEcSealOutcomeUnknown);

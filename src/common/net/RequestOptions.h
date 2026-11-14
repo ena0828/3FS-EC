@@ -25,6 +25,10 @@ struct UserRequestOptions {
   SERDE_STRUCT_FIELD(compression, std::optional<CompressionOptions>{});
   SERDE_STRUCT_FIELD(logLongRunningThreshold, std::optional<Duration>{});
   SERDE_STRUCT_FIELD(reportMetrics, std::optional<bool>{});
+
+ public:
+  // Local admission only: never serialized or merged into wire/core options.
+  bool requireRdma = false;
 };
 
 struct CoreRequestOptions {

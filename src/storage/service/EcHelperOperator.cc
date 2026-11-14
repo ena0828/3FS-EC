@@ -22,7 +22,9 @@ std::array<uint8_t, 16> bytes(const Uuid &value) {
   std::copy(std::begin(value.data), std::end(value.data), result.begin());
   return result;
 }
-Result<net::Address> helperAddress(const hf3fs::client::RoutingInfo &routing, const EcScopeEndpoint &endpoint) {
+Result<net::Address> helperAddress(const hf3fs::client::RoutingInfo &routing,
+                                   const EcScopeEndpoint &endpoint,
+                                   net::Address::Type transportType) {
   auto node = routing.getNode(endpoint.nodeId);
   auto target = routing.getTarget(endpoint.targetId);
   if (!node || node->type != flat::NodeType::STORAGE || node->status != flat::NodeStatus::HEARTBEAT_CONNECTED ||
@@ -33,9 +35,9 @@ Result<net::Address> helperAddress(const hf3fs::client::RoutingInfo &routing, co
   for (const auto &group : node->app.serviceGroups) {
     if (!group.services.contains("StorageSerde")) continue;
     for (const auto &address : group.endpoints)
-      if (address.type == net::Address::TCP) return address;
+      if (address.type == transportType) return address;
   }
-  return makeError(StorageClientCode::kRoutingError, "fixed helper has no TCP StorageSerde endpoint");
+  return makeError(StorageClientCode::kRoutingError, "fixed helper has no matching transport StorageSerde endpoint");
 }
 }  // namespace
 
@@ -60,9 +62,14 @@ Result<Void> StorageOperator::initEcHelpers() {
   return Void{};
 }
 
-CoTryTask<EcHelperHopRsp> StorageOperator::executeEcHelper(const EcHelperHopReq &request) {
+CoTryTask<EcHelperHopRsp> StorageOperator::executeEcHelper(const EcHelperHopReq &request,
+                                                         net::Address::Type transportType) {
   const auto receivedAt = std::chrono::steady_clock::now();
   EcHelperHopRsp response;
+  if (transportType != net::Address::TCP && transportType != net::Address::RDMA) {
+    response.result = makeError(StatusCode::kInvalidArg, "helper requires explicit TCP or RDMA ingress");
+    co_return response;
+  }
   if (!ecHelpers_) {
     response.result = makeError(StatusCode::kAuthenticationFail, "native EC helpers are disabled");
     co_return response;
@@ -83,12 +90,13 @@ CoTryTask<EcHelperHopRsp> StorageOperator::executeEcHelper(const EcHelperHopReq 
   // child completes. Session and budget outlive the owned response/postchecks.
   response.result = co_await folly::coro::co_withCancellation(
       CancellationToken{},
-      executeEcHelperOwned(request, receivedAt).scheduleOn(&ecHelpers_->executor));
+      executeEcHelperOwned(request, receivedAt, transportType).scheduleOn(&ecHelpers_->executor));
   co_return response;
 }
 
 CoTryTask<EcHelperHopResult> StorageOperator::executeEcHelperOwned(EcHelperHopReq request,
-                                                                   std::chrono::steady_clock::time_point receivedAt) {
+                                                                   std::chrono::steady_clock::time_point receivedAt,
+                                                                   net::Address::Type transportType) {
   try {
     auto planResult = EcRepairPlan::create(request.plan);
     CO_RETURN_ON_ERROR(planResult);
@@ -209,7 +217,7 @@ CoTryTask<EcHelperHopResult> StorageOperator::executeEcHelperOwned(EcHelperHopRe
       if (!mgmtd) co_return makeError(StorageClientCode::kRoutingError);
       auto routing = mgmtd->getRoutingInfo();
       if (!routing) co_return makeError(StorageClientCode::kRoutingError);
-      auto address = helperAddress(*routing, plan->input().sources[position + 1].endpoint);
+      auto address = helperAddress(*routing, plan->input().sources[position + 1].endpoint, transportType);
       CO_RETURN_ON_ERROR(address);
       CO_RETURN_ON_ERROR(validate());
       CO_RETURN_ON_ERROR(ticket->checkExecution());
@@ -220,7 +228,8 @@ CoTryTask<EcHelperHopResult> StorageOperator::executeEcHelperOwned(EcHelperHopRe
       if (remaining <= std::chrono::steady_clock::duration::zero()) co_return makeError(StorageClientCode::kTimeout);
       options.timeout = Duration(remaining);
       options.sendRetryTimes = 0;
-      // Request and ticket stay on this coroutine frame until the TCP Waiter
+      options.requireRdma = transportType == net::Address::RDMA;
+      // Request and ticket stay on this coroutine frame until the selected transport Waiter
       // returns. Timeout can leave a downstream server running; Meta drains it.
       auto response = co_await ecHelpers_->messenger.executeEcHelper(*address, request, &options);
       CO_RETURN_ON_ERROR(response);

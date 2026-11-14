@@ -28,6 +28,8 @@
 namespace hf3fs::storage::client {
 
 namespace {
+using EcTransportPolicy = EcRequestControl::TransportPolicy;
+
 EcRpcMethod observedEcMethod(StorageClient::MethodType method) noexcept {
   using Method = StorageClient::MethodType;
   switch (method) {
@@ -52,6 +54,27 @@ EcRpcMethod observedEcMethod(StorageClient::MethodType method) noexcept {
   }
 }
 }  // namespace
+
+namespace detail {
+const net::Address *selectStorageRpcEndpoint(const flat::NodeInfo &nodeInfo,
+                                             bool allowTcp,
+                                             bool tcpOnly,
+                                             bool rdmaOnly) {
+  if (tcpOnly && rdmaOnly) return nullptr;
+  const net::Address *tcpAddress = nullptr;
+  for (const auto &group : nodeInfo.app.serviceGroups) {
+    // Explicit EC RDMA also filters by service, even when TCP is disallowed.
+    // The legacy chunk path (all flags false) keeps its original RDMA routing.
+    if ((allowTcp || rdmaOnly) && !group.services.contains("StorageSerde")) continue;
+    for (const auto &address : group.endpoints) {
+      if (!tcpOnly && address.type == net::Address::Type::RDMA) return &address;
+      if (!rdmaOnly && allowTcp && !tcpAddress && address.type == net::Address::Type::TCP)
+        tcpAddress = &address;
+    }
+  }
+  return tcpAddress;
+}
+}  // namespace detail
 
 /* Performance metrics */
 
@@ -926,7 +949,8 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
                                                       bool *dispatched,
                                                       bool allowTcp,
                                                       bool tcpOnly,
-                                                      EcRpcObservation *observation) {
+                                                      EcRpcObservation *observation,
+                                                      bool rdmaOnly) {
   EcRpcObservation::Scope rpcMetric(
       observation, observation ? observedEcMethod(requestCtx.methodType) : EcRpcMethod::Count);
   if (dispatched) *dispatched = false;
@@ -939,28 +963,19 @@ CoTryTask<Rsp> StorageClientImpl::callMessengerMethod(StorageMessenger &messenge
   net::UserRequestOptions options;
   options.timeout = requestCtx.requestTimeout;
   options.sendRetryTimes = sendRetryTimes;
+  options.requireRdma = rdmaOnly;
 
   if (auto reqInfo = RequestInfo::get(); reqInfo && reqInfo->canceled()) {
     XLOGF(WARN, "Request {} {} canceled", reqInfo->describe(), fmt::ptr(&request));
     co_return makeError(StorageClientCode::kRequestCanceled);
   }
 
-  // EC messages own their inline payload and may use TCP without an RDMA
-  // buffer. Prefer RDMA across all groups, then select exactly one TCP address.
-  // Existing chunk APIs keep allowTcp=false because their buffers may use RDMA.
-  const auto *selectedAddress = [&]() -> const net::Address * {
-    const net::Address *tcpAddress = nullptr;
-    for (const auto &serviceGroup : nodeInfo.app.serviceGroups) {
-      if (allowTcp && !serviceGroup.services.contains("StorageSerde")) continue;
-      for (const auto &address : serviceGroup.endpoints) {
-        if (!tcpOnly && address.type == net::Address::Type::RDMA) return &address;
-        if (allowTcp && !tcpAddress && address.type == net::Address::Type::TCP) tcpAddress = &address;
-      }
-    }
-    return tcpAddress;
-  }();
+  // EC owns inline payloads; an explicit transport never falls back to another.
+  // The legacy automatic/chunk route retains its original preference/order.
+  const auto *selectedAddress = detail::selectStorageRpcEndpoint(nodeInfo, allowTcp, tcpOnly, rdmaOnly);
   if (!selectedAddress) {
-    XLOGF(DBG1, "No supported storage endpoint found on node (allowTcp={}): {:?}", allowTcp, nodeInfo);
+    XLOGF(DBG1, "No supported storage endpoint (allowTcp={}, tcpOnly={}, rdmaOnly={}): {:?}",
+          allowTcp, tcpOnly, rdmaOnly, nodeInfo);
     co_return makeError(allowTcp ? StorageClientCode::kRoutingError : StorageClientCode::kNoRDMAInterface);
   }
 
@@ -2749,14 +2764,11 @@ CoTryTask<EcReadResult> StorageClientImpl::readEcFragmentImpl(const WireReq &wir
     CO_RETURN_ON_ERROR(checkControl());
     requestCtx.requestTimeout = Duration(control->deadline - std::chrono::steady_clock::now());
   }
-  auto response = co_await callMessengerMethod<WireReq, EcReadRsp, method>(messenger_,
-                                                                           requestCtx,
-                                                                           *nodeInfo,
-                                                                           wireRequest,
-                                                                           1,
-                                                                           nullptr,
-                                                                           true,
-                                                                           control != nullptr);
+  auto response = co_await callMessengerMethod<WireReq, EcReadRsp, method>(
+      messenger_, requestCtx, *nodeInfo, wireRequest, 1, nullptr, true,
+      control && control->transport == EcTransportPolicy::TcpOnly,
+      nullptr,
+      control && control->transport == EcTransportPolicy::RdmaOnly);
   // A native RPC timer can finish before the outer coroutine deadline.
   // Controlled reads expose one timeout code while preserving the cause.
   if (control && !response && response.error().code() == RPCCode::kTimeout)
@@ -2879,8 +2891,8 @@ CoTryTask<EcReadResult> StorageClientImpl::authorizedReadEcFragmentControlled(Ec
   if (control.deadline - now > std::chrono::hours(1)) {
     co_return makeError(StatusCode::kInvalidArg, "controlled EC read deadline exceeds one hour");
   }
-  if (control.transport != EcRequestControl::TransportPolicy::TcpOnly) {
-    co_return makeError(StatusCode::kNotImplemented, "controlled EC reads currently require explicit TCP-only policy");
+  if (!isExplicitEcTransportPolicy(control.transport)) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled EC reads require an explicit TCP-only or RDMA-only policy");
   }
   try {
     // Folly timeout waits for its child to finish after requesting cancellation.
@@ -2974,16 +2986,11 @@ CoTryTask<Response> StorageClientImpl::stageRequestV2(const WireReq &wire,
   bool localDispatched = false;
   auto *dispatched = wasDispatched ? wasDispatched : &localDispatched;
   *dispatched = false;
-  auto response =
-      co_await callMessengerMethod<WireReq, Response, Method>(durable ? getStorageMessengerForUpdates() : messenger_,
-                                                              context,
-                                                              *node,
-                                                              request,
-                                                              0,
-                                                              dispatched,
-                                                              true,
-                                                              control != nullptr,
-                                                              control ? control->observation : nullptr);
+  auto response = co_await callMessengerMethod<WireReq, Response, Method>(
+      durable ? getStorageMessengerForUpdates() : messenger_, context, *node, request, 0, dispatched, true,
+      control && control->transport == EcTransportPolicy::TcpOnly,
+      control ? control->observation : nullptr,
+      control && control->transport == EcTransportPolicy::RdmaOnly);
   if (!response) {
     if (durable && *dispatched) co_return makeError(ecSealOutcomeUnknown(response.error()));
     // Native Waiter timeout and the outer coroutine timer have the same
@@ -3023,8 +3030,8 @@ CoTryTask<Response> StorageClientImpl::controlledStageRequestV2(WireReq request,
   if (control.deadline <= now) co_return makeError(StorageClientCode::kTimeout);
   if (control.cancellation.isCancellationRequested()) co_return makeError(StorageClientCode::kRequestCanceled);
   if (control.deadline - now > std::chrono::hours(1)) co_return makeError(StatusCode::kInvalidArg);
-  if (control.transport != EcRequestControl::TransportPolicy::TcpOnly) {
-    co_return makeError(StatusCode::kNotImplemented, "controlled V2 data calls require TCP-only policy");
+  if (!isExplicitEcTransportPolicy(control.transport)) {
+    co_return makeError(StatusCode::kNotImplemented, "controlled V2 data calls require an explicit TCP-only or RDMA-only policy");
   }
   bool dispatched = false;
   const auto interrupted = [&](status_code_t code) -> Status {
@@ -3335,9 +3342,9 @@ CoTryTask<EcGcAck> StorageClientImpl::exchangeEcGcControlled(EcGcRequest request
   };
   try {
     CO_RETURN_ON_ERROR(check());
-    if (control.transport != EcRequestControl::TransportPolicy::TcpOnly ||
+    if (!isExplicitEcTransportPolicy(control.transport) ||
         control.deadline - std::chrono::steady_clock::now() > std::chrono::seconds(kEcGcMaxTtlSeconds))
-      co_return makeError(StatusCode::kInvalidArg, "GC requires finite TCP deadline within 300 seconds");
+      co_return makeError(StatusCode::kInvalidArg, "GC requires an explicit transport and a finite deadline within 300 seconds");
     const auto &claims = request.claims;
     if (claims.version != kEcGcControlVersion || (!collect && claims.action != EcGcAction::Query) ||
         claims.keyId != key->keyId() || claims.authority.is_nil() || claims.nonce.is_nil() ||
@@ -3361,18 +3368,13 @@ CoTryTask<EcGcAck> StorageClientImpl::exchangeEcGcControlled(EcGcRequest request
     if (remaining <= std::chrono::steady_clock::duration::zero()) co_return makeError(StorageClientCode::kTimeout);
     const DebugOptions debug;
     ClientRequestContext context(MethodType::exchangeEcGc, flat::UserInfo(), debug, config_, 1, 0, Duration(remaining));
-    // Resolve only the signed historical node's actual TCP address; no current
+    // Resolve only the signed historical node's selected transport; no current
     // chain/target failover and no retry after dispatch. Waiter owns its timer.
     auto response = co_await folly::coro::co_withCancellation(
-        {},
-        callMessengerMethod<EcGcRequest, EcGcRsp, &StorageMessenger::exchangeEcGc>(messenger_,
-                                                                                   context,
-                                                                                   *node,
-                                                                                   request,
-                                                                                   0,
-                                                                                   &dispatched,
-                                                                                   true,
-                                                                                   true));
+        {}, callMessengerMethod<EcGcRequest, EcGcRsp, &StorageMessenger::exchangeEcGc>(
+                messenger_, context, *node, request, 0, &dispatched, true,
+                control.transport == EcTransportPolicy::TcpOnly, nullptr,
+                control.transport == EcTransportPolicy::RdmaOnly));
     if (!response) {
       if (collect && dispatched) co_return makeError(unknown(std::move(response.error())));
       if (response.error().code() == RPCCode::kTimeout)
@@ -3414,9 +3416,9 @@ CoTryTask<EcTargetRetirementObservation> StorageClientImpl::controlEcTargetRetir
     return Void{};
   };
   CO_RETURN_ON_ERROR(check());
-  if (control.transport != EcRequestControl::TransportPolicy::TcpOnly ||
+  if (!isExplicitEcTransportPolicy(control.transport) ||
       control.deadline - std::chrono::steady_clock::now() > std::chrono::seconds(kEcTargetRetirementMaxTtlSeconds))
-    co_return makeError(StatusCode::kInvalidArg, "target retirement requires finite TCP-only control");
+    co_return makeError(StatusCode::kInvalidArg, "target retirement requires finite control with an explicit transport");
   CO_RETURN_ON_ERROR(verifyEcTargetRetirement(*key, request, request.claims.clusterAuthority,
                                             request.claims.nodeId, action, wall()));
   if (!ecControlConcurrency_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy);
@@ -3443,10 +3445,16 @@ CoTryTask<EcTargetRetirementObservation> StorageClientImpl::controlEcTargetRetir
     // Cancellation after dispatch is observed afterward, never by detaching work.
     if (action == EcTargetRetirementAction::Prepare) {
       response = co_await callMessengerMethod<EcTargetRetirementRequest, EcTargetRetirementRsp,
-          &StorageMessenger::prepareEcTargetRetirement>(messenger_, context, *node, request, 0, &dispatched, true, true);
+          &StorageMessenger::prepareEcTargetRetirement>(
+              messenger_, context, *node, request, 0, &dispatched, true,
+              control.transport == EcTransportPolicy::TcpOnly, nullptr,
+              control.transport == EcTransportPolicy::RdmaOnly);
     } else {
       response = co_await callMessengerMethod<EcTargetRetirementRequest, EcTargetRetirementRsp,
-          &StorageMessenger::queryEcTargetRetirement>(messenger_, context, *node, request, 0, &dispatched, true, true);
+          &StorageMessenger::queryEcTargetRetirement>(
+              messenger_, context, *node, request, 0, &dispatched, true,
+              control.transport == EcTransportPolicy::TcpOnly, nullptr,
+              control.transport == EcTransportPolicy::RdmaOnly);
     }
     if (!response) {
       if (dispatched) co_return makeError(StorageCode::kEcSealOutcomeUnknown);
@@ -3492,8 +3500,8 @@ CoTryTask<EcTargetDiscoveryObservation> StorageClientImpl::getEcTargetIdentityCo
   };
   CO_RETURN_ON_ERROR(check());
   if (control.deadline - std::chrono::steady_clock::now() > std::chrono::seconds(kEcTargetDiscoveryMaxTtlSeconds) ||
-      control.transport != EcRequestControl::TransportPolicy::TcpOnly)
-    co_return makeError(StatusCode::kInvalidArg, "discovery requires TCP and a deadline within 60 seconds");
+      !isExplicitEcTransportPolicy(control.transport))
+    co_return makeError(StatusCode::kInvalidArg, "discovery requires an explicit transport and a deadline within 60 seconds");
   CO_RETURN_ON_ERROR(
       verifyEcTargetDiscovery(*key, request, request.claims.clusterAuthority, request.claims.nodeId, wall()));
   if (!ecControlConcurrency_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy);
@@ -3512,16 +3520,11 @@ CoTryTask<EcTargetDiscoveryObservation> StorageClientImpl::getEcTargetIdentityCo
       context(MethodType::getEcTargetIdentity, flat::UserInfo(), debug, config_, 1, 0, Duration(remaining));
   // No asynchronous task is detached. Once dispatched, the native Waiter owns
   // its finite timer and the coroutine retains request/key until it returns.
-  auto response = co_await callMessengerMethod<EcTargetDiscoveryRequest,
-                                               EcTargetDiscoveryRsp,
-                                               &StorageMessenger::getEcTargetIdentity>(messenger_,
-                                                                                       context,
-                                                                                       *node,
-                                                                                       request,
-                                                                                       0,
-                                                                                       nullptr,
-                                                                                       true,
-                                                                                       true);
+  auto response = co_await callMessengerMethod<EcTargetDiscoveryRequest, EcTargetDiscoveryRsp,
+      &StorageMessenger::getEcTargetIdentity>(
+          messenger_, context, *node, request, 0, nullptr, true,
+          control.transport == EcTransportPolicy::TcpOnly, nullptr,
+          control.transport == EcTransportPolicy::RdmaOnly);
   if (!response) {
     if (response.error().code() == RPCCode::kTimeout)
       co_return makeError(response.error().convert(StorageClientCode::kTimeout));
@@ -3549,8 +3552,8 @@ CoTryTask<EcGcDiscoveryObservation> StorageClientImpl::getEcGcCapabilityControll
   };
   CO_RETURN_ON_ERROR(check());
   if (control.deadline - std::chrono::steady_clock::now() > std::chrono::seconds(kEcGcDiscoveryMaxTtlSeconds) ||
-      control.transport != EcRequestControl::TransportPolicy::TcpOnly)
-    co_return makeError(StatusCode::kInvalidArg, "discovery requires TCP and a deadline within 60 seconds");
+      !isExplicitEcTransportPolicy(control.transport))
+    co_return makeError(StatusCode::kInvalidArg, "discovery requires an explicit transport and a deadline within 60 seconds");
   CO_RETURN_ON_ERROR(verifyEcGcDiscovery(*key, request, request.claims.authority, request.claims.nodeId, wall()));
   if (!ecControlConcurrency_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy);
   auto release = folly::makeGuard([this] { ecControlConcurrency_.signal(); });
@@ -3568,16 +3571,11 @@ CoTryTask<EcGcDiscoveryObservation> StorageClientImpl::getEcGcCapabilityControll
       context(MethodType::getEcGcCapability, flat::UserInfo(), debug, config_, 1, 0, Duration(remaining));
   // No asynchronous task is detached. Once dispatched, the native Waiter owns
   // its finite timer and the coroutine retains request/key until it returns.
-  auto response =
-      co_await callMessengerMethod<EcGcDiscoveryRequest, EcGcDiscoveryRsp, &StorageMessenger::getEcGcCapability>(
-          messenger_,
-          context,
-          *node,
-          request,
-          0,
-          nullptr,
-          true,
-          true);
+  auto response = co_await callMessengerMethod<EcGcDiscoveryRequest, EcGcDiscoveryRsp,
+      &StorageMessenger::getEcGcCapability>(
+          messenger_, context, *node, request, 0, nullptr, true,
+          control.transport == EcTransportPolicy::TcpOnly, nullptr,
+          control.transport == EcTransportPolicy::RdmaOnly);
   if (!response) {
     if (response.error().code() == RPCCode::kTimeout)
       co_return makeError(response.error().convert(StorageClientCode::kTimeout));
@@ -3654,7 +3652,7 @@ CoTryTask<EcHelperHopResult> StorageClientImpl::executeEcHelper(EcHelperHopReq r
   };
   CO_RETURN_ON_ERROR(check());
   if (control.deadline - std::chrono::steady_clock::now() > std::chrono::hours(1) ||
-      control.transport != EcRequestControl::TransportPolicy::TcpOnly)
+      !isExplicitEcTransportPolicy(control.transport))
     co_return makeError(StatusCode::kInvalidArg);
   auto plan = EcRepairPlan::create(request.plan);
   CO_RETURN_ON_ERROR(plan);
@@ -3675,16 +3673,11 @@ CoTryTask<EcHelperHopResult> StorageClientImpl::executeEcHelper(EcHelperHopReq r
   if (remaining <= std::chrono::steady_clock::duration::zero()) co_return makeError(StorageClientCode::kTimeout);
   ClientRequestContext
       context(MethodType::executeEcHelper, flat::UserInfo(), debug, config_, 1, 0, Duration(remaining));
-  auto response =
-      co_await callMessengerMethod<EcHelperHopReq, EcHelperHopRsp, &StorageMessenger::executeEcHelper>(messenger_,
-                                                                                                       context,
-                                                                                                       *node,
-                                                                                                       request,
-                                                                                                       0,
-                                                                                                       nullptr,
-                                                                                                       true,
-                                                                                                       true,
-                                                                                                       control.observation);
+  auto response = co_await callMessengerMethod<EcHelperHopReq, EcHelperHopRsp,
+      &StorageMessenger::executeEcHelper>(
+          messenger_, context, *node, request, 0, nullptr, true,
+          control.transport == EcTransportPolicy::TcpOnly, control.observation,
+          control.transport == EcTransportPolicy::RdmaOnly);
   CO_RETURN_ON_ERROR(response);
   CO_RETURN_ON_ERROR(response->result);
   CO_RETURN_ON_ERROR(check());
@@ -3708,7 +3701,7 @@ CoTryTask<EcHelperDirectHopResult> StorageClientImpl::executeEcHelperDirect(EcHe
       return Void{};
     };
     CO_RETURN_ON_ERROR(check());
-    if (control.transport != EcRequestControl::TransportPolicy::TcpOnly ||
+    if (!isExplicitEcTransportPolicy(control.transport) ||
         control.deadline - std::chrono::steady_clock::now() > std::chrono::hours(1))
       co_return makeError(StatusCode::kInvalidArg);
     auto plan = EcRepairPlan::create(request.plan);
@@ -3736,15 +3729,19 @@ CoTryTask<EcHelperDirectHopResult> StorageClientImpl::executeEcHelperDirect(EcHe
     const DebugOptions debug;
     ClientRequestContext context(MethodType::executeEcHelperDirect, flat::UserInfo(), debug, config_, 1, 0,
                                   Duration(remaining));
-    // This boundary includes task construction and every later validation. No
-    // later local error proves that the last helper did not append either target.
-    // Do not pass this sticky flag to callMessengerMethod, which resets its flag.
-    dispatched = true;
+    // callMessengerMethod marks the boundary after endpoint/local-cancel checks.
+    // After that point no error proves the last helper did not append a target.
     auto response = co_await folly::coro::co_withCancellation(
         control.cancellation,
         callMessengerMethod<EcHelperDirectHopReq, EcHelperDirectHopRsp, &StorageMessenger::executeEcHelperDirect>(
-            messenger_, context, *node, request, 0, nullptr, true, true, control.observation));
-    if (!response || !response->result) co_return unknown();
+            messenger_, context, *node, request, 0, &dispatched, true,
+            control.transport == EcTransportPolicy::TcpOnly, control.observation,
+            control.transport == EcTransportPolicy::RdmaOnly));
+    if (!response) {
+      if (dispatched) co_return unknown();
+      co_return makeError(response.error());
+    }
+    if (!response->result) co_return unknown();
     if (!check() || std::chrono::steady_clock::now() >= deadline) co_return unknown();
     node = getEcNodeInfo(getCurrentRoutingInfo(),
                          {source.endpoint.chainId, request.sourceRouteVersions[position]},

@@ -11,6 +11,7 @@ Result<Void> EcStripeClientCore::validControl(const EcStripeControl &control) co
   return active(control);
 }
 Result<Void> EcStripeClientCore::active(const EcStripeControl &control) const {
+  RETURN_ON_ERROR(validateEcStorageTransport(control.transport));
   if (stop.isCancellationRequested() || control.cancellation.isCancellationRequested())
     return makeError(StorageClientCode::kRequestCanceled);
   if (std::chrono::steady_clock::now() >= control.deadline) return makeError(StorageClientCode::kTimeout);

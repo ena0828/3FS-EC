@@ -4,6 +4,7 @@
 #include <limits>
 namespace hf3fs::client::ec::detail {
 Result<Void> EcFileClientCore::active(const EcStripeControl &c) const {
+  RETURN_ON_ERROR(validateEcStorageTransport(c.transport));
   if (stop.isCancellationRequested() || c.cancellation.isCancellationRequested())
     return makeError(StorageClientCode::kRequestCanceled);
   const auto now = std::chrono::steady_clock::now();

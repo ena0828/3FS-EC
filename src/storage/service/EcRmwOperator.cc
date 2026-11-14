@@ -109,14 +109,19 @@ Result<Void> StorageOperator::initEcRmw() {
   ecRmw_ = std::move(*runtime);
   return Void{};
 }
-CoTryTask<EcRmwStatusRsp> StorageOperator::installEcRmw(const EcRmwInstallReq &wire) {
+CoTryTask<EcRmwStatusRsp> StorageOperator::installEcRmw(const EcRmwInstallReq &wire,
+                                                        net::Address::Type transportType) {
   EcRmwStatusRsp out;
+  if (transportType != net::Address::TCP && transportType != net::Address::RDMA) {
+    out.result = makeError(StatusCode::kInvalidArg, "RMW requires explicit TCP or RDMA ingress");
+    co_return out;
+  }
   if (!ecRmw_) {
     out.result = makeError(StatusCode::kAuthenticationFail);
     co_return out;
   }
   try {
-    out.result = co_await folly::coro::co_withCancellation({}, installEcRmwOwned(wire));
+    out.result = co_await folly::coro::co_withCancellation({}, installEcRmwOwned(wire, transportType));
   } catch (const std::bad_alloc &) {
     out.result = makeError(StatusCode::kNotEnoughMemory);
   } catch (...) {
@@ -124,7 +129,10 @@ CoTryTask<EcRmwStatusRsp> StorageOperator::installEcRmw(const EcRmwInstallReq &w
   }
   co_return out;
 }
-CoTryTask<EcRmwStatus> StorageOperator::installEcRmwOwned(EcRmwInstallReq req) {
+CoTryTask<EcRmwStatus> StorageOperator::installEcRmwOwned(EcRmwInstallReq req, net::Address::Type transportType) {
+  const auto policy = transportType == net::Address::RDMA
+                          ? client::EcRequestControl::TransportPolicy::RdmaOnly
+                          : client::EcRequestControl::TransportPolicy::TcpOnly;
   const auto received = std::chrono::steady_clock::now();
   const auto wall = rmwMillis();
   if (req.deadlineUnixMillis <= wall || req.deadlineUnixMillis - wall > 300000)
@@ -135,7 +143,7 @@ CoTryTask<EcRmwStatus> StorageOperator::installEcRmwOwned(EcRmwInstallReq req) {
   auto plan = std::move(*planResult);
   if ((plan->input().sourceKind == EcRmwSourceKind::Data) != req.reads.has_value())
     co_return makeError(StatusCode::kAuthenticationFail);
-  auto prepare = ecRmw_->prepareInstall(plan, req.grant);
+  auto prepare = ecRmw_->prepareInstall(plan, req.grant, policy);
   CO_RETURN_ON_ERROR(prepare);
   if (!*prepare) co_return rmwStatus(ecRmw_->query(plan->input().planId, req.grant));
   auto lease = ecRmwResources_->acquire();
@@ -155,7 +163,7 @@ CoTryTask<EcRmwStatus> StorageOperator::installEcRmwOwned(EcRmwInstallReq req) {
                                rmwUuid(identity.engine),
                                rmwUuid(identity.incarnation)};
   client::EcRequestControl control;
-  control.transport = client::EcRequestControl::TransportPolicy::TcpOnly;
+  control.transport = policy;
   control.deadline = received + std::chrono::milliseconds(req.deadlineUnixMillis - wall);
   const auto validate = [this, target, identity, actual, plan, grant = req.grant, control]() -> Result<Void> {
     if (config_.read_only()) return makeError(StatusCode::kReadOnlyMode);
@@ -217,8 +225,13 @@ CoTryTask<EcRmwStatus> StorageOperator::installEcRmwOwned(EcRmwInstallReq req) {
   CO_RETURN_ON_ERROR(ecRmw_->install(plan, req.grant, std::move(*io)));
   co_return rmwStatus(ecRmw_->query(plan->input().planId, req.grant));
 }
-CoTryTask<EcRmwStatusRsp> StorageOperator::putEcRmw(const EcRmwPutReq &req) {
+CoTryTask<EcRmwStatusRsp> StorageOperator::putEcRmw(const EcRmwPutReq &req,
+                                                        net::Address::Type transportType) {
   EcRmwStatusRsp out;
+  if (transportType != net::Address::TCP && transportType != net::Address::RDMA) {
+    out.result = makeError(StatusCode::kInvalidArg, "RMW requires explicit TCP or RDMA ingress");
+    co_return out;
+  }
   if (!ecRmw_) {
     out.result = makeError(StatusCode::kAuthenticationFail);
     co_return out;
@@ -227,24 +240,36 @@ CoTryTask<EcRmwStatusRsp> StorageOperator::putEcRmw(const EcRmwPutReq &req) {
     out.result = makeError(StatusCode::kReadOnlyMode);
     co_return out;
   }
-  auto put = ecRmw_->put(req.planId, req.grant, req.blockIndex, req.payload.data);
+  const auto policy = transportType == net::Address::RDMA
+                          ? client::EcRequestControl::TransportPolicy::RdmaOnly
+                          : client::EcRequestControl::TransportPolicy::TcpOnly;
+  auto put = ecRmw_->put(req.planId, req.grant, req.blockIndex, req.payload.data, policy);
   out.result =
       put ? rmwStatus(ecRmw_->query(req.planId, req.grant)) : Result<EcRmwStatus>(makeError(std::move(put.error())));
   co_return out;
 }
-CoTryTask<EcRmwStatusRsp> StorageOperator::actionEcRmw(const EcRmwActionReq &req) {
+CoTryTask<EcRmwStatusRsp> StorageOperator::actionEcRmw(const EcRmwActionReq &req,
+                                                        net::Address::Type transportType) {
   EcRmwStatusRsp out;
+  if (transportType != net::Address::TCP && transportType != net::Address::RDMA) {
+    out.result = makeError(StatusCode::kInvalidArg, "RMW requires explicit TCP or RDMA ingress");
+    co_return out;
+  }
   if (!ecRmw_) {
     out.result = makeError(StatusCode::kAuthenticationFail);
     co_return out;
   }
+  // Pure observation may use the TCP control plane even for an RDMA job.
+  // Submit, unlike Query, can dispatch data I/O and must match the installed policy.
   if (req.action == EcRmwActionRequest::Query)
     out.result = rmwStatus(ecRmw_->query(req.planId, req.grant));
   else if (req.action == EcRmwActionRequest::Submit) {
     if (config_.read_only())
       out.result = makeError(StatusCode::kReadOnlyMode);
     else
-      out.result = rmwStatus(ecRmw_->submit(req.planId, req.grant));
+      out.result = rmwStatus(ecRmw_->submit(req.planId, req.grant,
+          transportType == net::Address::RDMA ? client::EcRequestControl::TransportPolicy::RdmaOnly
+                                              : client::EcRequestControl::TransportPolicy::TcpOnly));
   } else
     out.result = makeError(StatusCode::kInvalidArg);
   co_return out;  // Submission never waits for nested network/compute work.

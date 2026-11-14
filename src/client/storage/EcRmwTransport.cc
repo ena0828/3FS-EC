@@ -1,5 +1,7 @@
 #include "EcRmwTransport.h"
 
+#include <type_traits>
+
 #include <folly/experimental/coro/WithCancellation.h>
 
 #include "common/serde/ClientContext.h"
@@ -8,8 +10,12 @@
 
 namespace hf3fs::storage::client {
 namespace {
-Result<Void> ready(const net::Address &a, const EcRequestControl &c) {
-  if (a.type != net::Address::TCP || c.transport != EcRequestControl::TransportPolicy::TcpOnly ||
+Result<Void> ready(const net::Address &a, const EcRequestControl &c, bool metaControl) {
+  const bool matching = c.transport == EcRequestControl::TransportPolicy::TcpOnly
+                            ? a.type == net::Address::TCP
+                            : c.transport == EcRequestControl::TransportPolicy::RdmaOnly &&
+                                  a.type == net::Address::RDMA && !metaControl;
+  if (!matching ||
       c.deadline == std::chrono::steady_clock::time_point::max())
     return makeError(StatusCode::kInvalidArg);
   if (c.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
@@ -32,20 +38,21 @@ CoTryTask<Rsp> EcRmwTransport::call(std::shared_ptr<EcRmwTransport> self,
                                     bool irreversible) {
   bool dispatched = false;
   try {
-    auto checked = ready(address, control);
+    auto checked = ready(address, control, std::is_same_v<Req, meta::BindEcRmwOutputReq>);
     if (!checked) co_return makeError(std::move(checked.error()));
     const auto remaining = control.deadline - std::chrono::steady_clock::now();
     if (remaining <= std::chrono::steady_clock::duration::zero()) co_return makeError(StorageClientCode::kTimeout);
     net::UserRequestOptions options;
     options.timeout = Duration(remaining);
     options.sendRetryTimes = 0;
+    options.requireRdma = address.type == net::Address::RDMA;
     auto context = self->client_.serdeCtx(address);
     dispatched = true;
     // Native finite Waiter completes before the frame/request/control dies.
     // Cancellation cannot abandon a borrowed request or falsely report drain.
     auto result = co_await folly::coro::co_withCancellation({}, Method(context, request, &options, nullptr));
     if (!result) co_return makeError(normalized(std::move(result.error()), irreversible));
-    checked = ready(address, control);
+    checked = ready(address, control, std::is_same_v<Req, meta::BindEcRmwOutputReq>);
     if (!checked) co_return makeError(normalized(std::move(checked.error()), irreversible));
     co_return std::move(*result);
   } catch (const std::bad_alloc &) {

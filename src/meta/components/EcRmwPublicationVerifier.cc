@@ -10,7 +10,8 @@ namespace {
 using namespace storage;
 using Control = storage::client::EcRequestControl;
 Result<Void> ready(const Control &c) {
-  if (c.transport != Control::TransportPolicy::TcpOnly || c.deadline == std::chrono::steady_clock::time_point::max())
+  if (!storage::client::isExplicitEcTransportPolicy(c.transport) ||
+      c.deadline == std::chrono::steady_clock::time_point::max())
     return makeError(StatusCode::kInvalidArg);
   if (c.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
   if (std::chrono::steady_clock::now() >= c.deadline) return makeError(StorageClientCode::kTimeout);

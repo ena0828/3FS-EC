@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Use the existing public-job time anchor for sequential system acceptance.
+"""Use the verified public-job start anchor for per-stage admission.
 
-The combined file/spare admission estimate is not a cleanup guarantee. No
-workflow cancellation, credential, build or service operation is performed.
+STAGES controls admission; the workflow sets each step timeout. Legacy 90/80
+receipt constants do not reserve a combined file/matrix budget or guarantee
+completion or cleanup. No workflow cancellation, credential, build or service
+operation is performed.
 """
 import argparse
 import importlib.util
@@ -12,7 +14,7 @@ from pathlib import Path
 import sys
 
 
-STAGES = {"repair": (80, 75), "file": (90, 45), "spare": (40, 35),
+STAGES = {"repair": (80, 75), "file": (90, 45), "spare": (40, 35), "matrix": (100, 95),
           "regression": (40, 35), "service-contracts": (80, 75), "target-meta": (80, 75), "core": (100, 95)}
 PROFILE_REFS = {
     "system": ("refs/heads/feat/ec-system-acceptance",),
@@ -33,8 +35,12 @@ def budget_module(profile="system", ref=None):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.REF = ref
+    # Keep legacy anchor receipt fields for schema/consistency validation.
+    # remaining() derives time left from the verified start, CLOCK_BOOTTIME and
+    # the 350-minute job cap. check() uses STAGES, not these combined estimates;
+    # neither these fields nor file admission guarantee file + matrix completion.
     module.REQUIRED_MINUTES = 90
-    module.LAB_STEP_MINUTES = 80  # File 45 + spare 35; both remain separately capped.
+    module.LAB_STEP_MINUTES = 80
     module.RECORD_NAME = "ec-" + profile + "-job-budget.json"
     module.BODY_NAME = "ec-" + profile + "-job-budget-api.json"
     return module
@@ -66,7 +72,7 @@ def main():
     args = parser.parse_args()
     if (args.command == "record" and args.stage is not None) or (args.command == "check" and args.stage is None):
         parser.error("record takes no stage; check requires --stage")
-    if args.profile == "system" and args.stage in ("regression", "service-contracts", "target-meta", "core"):
+    if args.profile == "system" and args.stage in ("regression", "service-contracts", "target-meta", "core", "matrix"):
         parser.error("this stage requires --profile target-meta")
     base = budget_module(args.profile, ref=os.environ.get("GITHUB_REF"))
     parent, identity = base.context()

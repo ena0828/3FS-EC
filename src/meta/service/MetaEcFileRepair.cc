@@ -21,7 +21,8 @@ uint64_t wallSeconds() {
 }
 Control controlFor(const Config &c) {
   Control r;
-  r.transport = Control::TransportPolicy::TcpOnly;
+  r.transport = c.ec_storage_transport() == "rdma" ? Control::TransportPolicy::RdmaOnly
+                                                               : Control::TransportPolicy::TcpOnly;
   r.deadline = std::chrono::steady_clock::now() + c.ec_verify_timeout().asMs();
   return r;
 }

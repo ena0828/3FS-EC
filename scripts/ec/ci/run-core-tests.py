@@ -17,8 +17,8 @@ import sys
 import xml.etree.ElementTree as ET
 
 
-META_FILTER = "TestEcFileNativeWrite.*:TestEcMountedTruncateRecovery.*"
-FUSE_FILTER = "TestEcFuseRead.*:TestEcFuseShutdown.*:TestEcFileMount.*"
+META_FILTER = "TestEcFileNativeWrite.*:TestEcMountedTruncateRecovery.*:TestEcStorageTransportConfig.*"
+FUSE_FILTER = "TestEcFuseRead.*:TestEcFuseShutdown.*:TestEcFileMount.*:TestEcFuseTransportConfig.*"
 META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
     "AppendLostAcceptanceUsesSameEofAndFsyncRequiresPublishedData",
     "CommittedSourceChildWithoutExecutionCanBeFencedAndReleased",
@@ -33,7 +33,7 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
     "EightConflictsKeepDebtAndRecoveryCapacity",
     "FixedDeadlineStopsConflictRecovery",
     "LostCommittedBeginReplyIsNotRetried",
-))
+)) + ("TestEcStorageTransportConfig.RejectsImplicitModesAndHotTransportChanges",)
 REPAIR_CASES = (
     "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
     "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
@@ -75,6 +75,7 @@ FUSE_CASES = (
     "TestEcFileMount.DroppedWaiterStillJoinsOwnedWorkerAndHeldOutputKeepsAdmission",
     "TestEcFileMount.TerminalHistoryDoesNotConsumeActiveQuotaAndNamesNeverRepeat",
     "TestEcFileMount.OutputLeaseDefersTerminalIndexRemovalAndLegacyFormatIsRejected",
+    "TestEcFuseTransportConfig.ExplicitPolicyCannotChangeDuringAMount",
 )
 COMMAND_TIMEOUT = 1800
 META_DEADLINE = 4200  # Two commands plus bounded FDB bootstrap and owned cleanup.
@@ -87,7 +88,7 @@ def parser():
     for name in ("source", "build", "fdb-bin-dir", "work"):
         result.add_argument("--" + name, required=True, type=Path)
     result.add_argument("--profile", choices=("core", "repair", "target-meta", "auth-user", "service-contracts"), default="core",
-                        help="core: 12 Meta + 14 FUSE; repair: file and flat repair, Direct delivery and recovery fixtures; "
+                        help="core: 13 Meta + 15 FUSE; repair: file and flat repair, Direct delivery and recovery fixtures; "
                              "target-meta: 9 retirement catalogue, RPC and evidence cases; "
                              "auth-user: default and explicit primary GID with MemKV and FDB; "
                              "service-contracts: auth-user plus all Meta dispatch IDs")

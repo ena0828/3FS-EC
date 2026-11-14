@@ -174,26 +174,33 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
 
   CoTryTask<EcHelperHopRsp> executeEcHelper(serde::CallContext &ctx, const EcHelperHopReq &request) {
     reportDefaultQueueLatency(ctx);
-    return storageOperator_.executeEcHelper(request);
+    // Copy ingress identity before returning the task; never retain CallContext/Transport.
+    const auto transportType = ctx.transport() ? ctx.transport()->serverAddr().type : net::Address::LOCAL;
+    return storageOperator_.executeEcHelper(request, transportType);
   }
 
   CoTryTask<EcHelperDirectHopRsp> executeEcHelperDirect(serde::CallContext &ctx,
                                                      const EcHelperDirectHopReq &request) {
     reportDefaultQueueLatency(ctx);
-    return storageOperator_.executeEcHelperDirect(request);
+    // Copy ingress identity before returning the task; never retain CallContext/Transport.
+    const auto transportType = ctx.transport() ? ctx.transport()->serverAddr().type : net::Address::LOCAL;
+    return storageOperator_.executeEcHelperDirect(request, transportType);
   }
 
   CoTryTask<EcRmwStatusRsp> installEcRmw(serde::CallContext &ctx, const EcRmwInstallReq &request) {
     reportDefaultQueueLatency(ctx);
-    return storageOperator_.installEcRmw(request);
+    const auto transportType = ctx.transport() ? ctx.transport()->serverAddr().type : net::Address::LOCAL;
+    return storageOperator_.installEcRmw(request, transportType);
   }
   CoTryTask<EcRmwStatusRsp> putEcRmw(serde::CallContext &ctx, const EcRmwPutReq &request) {
     reportDefaultQueueLatency(ctx);
-    return storageOperator_.putEcRmw(request);
+    const auto transportType = ctx.transport() ? ctx.transport()->serverAddr().type : net::Address::LOCAL;
+    return storageOperator_.putEcRmw(request, transportType);
   }
   CoTryTask<EcRmwStatusRsp> actionEcRmw(serde::CallContext &ctx, const EcRmwActionReq &request) {
     reportDefaultQueueLatency(ctx);
-    return storageOperator_.actionEcRmw(request);
+    const auto transportType = ctx.transport() ? ctx.transport()->serverAddr().type : net::Address::LOCAL;
+    return storageOperator_.actionEcRmw(request, transportType);
   }
 
   CoTryTask<EcSealStageV2Rsp> sealEcStageV2(serde::CallContext &ctx, const EcSealStageV2Req &request) {

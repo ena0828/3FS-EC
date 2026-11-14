@@ -292,5 +292,117 @@ TEST(TestEcRmw, ShortSubmitAndStopJoinTheActualOwnedTask) {
   }
   EXPECT_TRUE(lifetime.expired());  // Receiving never submitted: old scope/lease no longer retained.
 }
+
+TEST(TestEcRmw, TransportAffinityRejectsMutationsButKeepsQueryAndJoin) {
+  using Policy = EcRmwRuntime::TransportPolicy;
+  const std::string patch = "transport-owned";
+  auto plan = EcRmwPlan::create(zeroPlan(patch));
+  ASSERT_OK(plan);
+  auto key = AuthorizationTestAccess::key();
+  auto grant = AuthorizationTestAccess::grant(*key, **plan);
+  ASSERT_OK(grant);
+  auto runtime = EcRmwRuntime::create(key, Uuid::from(91, 92), (*plan)->worker().nodeId, [] { return uint64_t(1000); });
+  ASSERT_OK(runtime);
+  auto io = std::make_shared<MemoryIo>(*plan);
+  io->delay = true;
+  auto entered = io->entered.get_future();
+  auto cleanup = folly::makeGuard([&] {
+    io->resume.post();
+    EXPECT_TRUE(bool((*runtime)->stopAndJoin()));
+  });
+  // Real Runtime worker/session state with memory IO, not an RDMA network test.
+  ASSERT_OK(RuntimeTestAccess::install(**runtime, *plan, *grant, io, Policy::RdmaOnly));
+  ASSERT_ERROR((*runtime)->prepareInstall(*plan, *grant, Policy::TcpOnly), StatusCode::kTokenMismatch);
+  ASSERT_ERROR((*runtime)->put((*plan)->input().planId, *grant, 0, patch), StatusCode::kTokenMismatch);
+  auto receiving = (*runtime)->query((*plan)->input().planId, *grant);
+  ASSERT_OK(receiving);
+  EXPECT_EQ(receiving->state, EcRmwLocalState::Receiving);
+  EXPECT_EQ(receiving->received.count(), 0);
+  ASSERT_OK((*runtime)->put((*plan)->input().planId, *grant, 0, patch, Policy::RdmaOnly));
+  ASSERT_ERROR((*runtime)->submit((*plan)->input().planId, *grant), StatusCode::kTokenMismatch);
+  ASSERT_OK((*runtime)->submit((*plan)->input().planId, *grant, Policy::RdmaOnly));
+  ASSERT_EQ(entered.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  ASSERT_ERROR((*runtime)->prepareInstall(*plan, *grant), StatusCode::kTokenMismatch);
+  auto replay = (*runtime)->prepareInstall(*plan, *grant, Policy::RdmaOnly);
+  ASSERT_OK(replay);
+  EXPECT_FALSE(*replay);  // Matching replay observes; it cannot start another job.
+  auto running = (*runtime)->query((*plan)->input().planId, *grant);
+  ASSERT_OK(running);
+  EXPECT_EQ(running->state, EcRmwLocalState::Running);
+  auto stopped = std::async(std::launch::async, [&] { return (*runtime)->stopAndJoin(); });
+  EXPECT_EQ(stopped.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+  io->resume.post();
+  ASSERT_OK(stopped.get());
+  auto done = (*runtime)->query((*plan)->input().planId, *grant);
+  ASSERT_OK(done);
+  EXPECT_EQ(done->state, EcRmwLocalState::Complete);
+  EXPECT_EQ(done->error, StatusCode::kOK);
+  EXPECT_EQ(io->binds, 1);
+  EXPECT_EQ(io->writes, 12);
+}
+
+TEST(TestEcRmw, TransportInstallReservationSurvivesAdmissionGap) {
+  using Policy = EcRmwRuntime::TransportPolicy;
+  const std::string patch = "reserved";
+  auto first = EcRmwPlan::create(zeroPlan(patch));
+  ASSERT_OK(first);
+  auto input = zeroPlan(patch);
+  input.planId = Uuid::from(205, 206);
+  input.operationId = Uuid::from(211, 212);
+  auto second = EcRmwPlan::create(input);
+  ASSERT_OK(second);
+  auto key = AuthorizationTestAccess::key();
+  auto firstGrant = AuthorizationTestAccess::grant(*key, **first);
+  auto secondGrant = AuthorizationTestAccess::grant(*key, **second);
+  ASSERT_OK(firstGrant);
+  ASSERT_OK(secondGrant);
+  auto runtime = EcRmwRuntime::create(key, Uuid::from(91, 92), (*first)->worker().nodeId, [] { return uint64_t(1000); });
+  ASSERT_OK(runtime);
+  auto firstIo = std::make_shared<MemoryIo>(*first);
+  auto secondIo = std::make_shared<MemoryIo>(*second);
+  ASSERT_OK(RuntimeTestAccess::install(**runtime, *first, *firstGrant, firstIo));
+  std::promise<Result<bool>> prepared;
+  auto atGap = prepared.get_future();
+  std::promise<void> resume;
+  auto resumeFuture = resume.get_future();
+  std::future<Result<Void>> late;
+  bool unblocked = false;
+  auto cleanup = folly::makeGuard([&] {
+    if (!unblocked) resume.set_value();
+    if (late.valid()) late.wait();
+    EXPECT_TRUE(bool((*runtime)->stopAndJoin()));
+  });
+  // An actual concurrent installer pauses after Runtime has released its idle
+  // Entry, at the production admission-await boundary (no synthetic result).
+  late = std::async(std::launch::async, [&]() -> Result<Void> {
+    auto wanted = (*runtime)->prepareInstall(*first, *firstGrant, Policy::TcpOnly);
+    const bool continueInstall = wanted && *wanted;
+    prepared.set_value(std::move(wanted));
+    resumeFuture.wait();
+    if (!continueInstall) return makeError(StatusCode::kInvalidArg);
+    return RuntimeTestAccess::install(**runtime, *first, *firstGrant, firstIo);
+  });
+  ASSERT_EQ(atGap.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  auto preparedFirst = atGap.get();
+  ASSERT_OK(preparedFirst);
+  ASSERT_TRUE(*preparedFirst);
+  ASSERT_ERROR((*runtime)->query((*first)->input().planId, *firstGrant), StatusCode::kKVStoreNotFound);
+  ASSERT_ERROR((*runtime)->prepareInstall(*first, *firstGrant, Policy::RdmaOnly), StatusCode::kTokenMismatch);
+  auto preparedSecond = (*runtime)->prepareInstall(*second, *secondGrant, Policy::RdmaOnly);
+  ASSERT_OK(preparedSecond);
+  ASSERT_TRUE(*preparedSecond);
+  ASSERT_OK(RuntimeTestAccess::install(**runtime, *second, *secondGrant, secondIo, Policy::RdmaOnly));
+  resume.set_value();
+  unblocked = true;
+  ASSERT_ERROR(late.get(), StatusCode::kTokenMismatch);
+  auto retained = (*runtime)->query((*second)->input().planId, *secondGrant);
+  ASSERT_OK(retained);
+  EXPECT_EQ(retained->state, EcRmwLocalState::Receiving);
+  EXPECT_EQ(retained->received.count(), 0);
+  ASSERT_ERROR((*runtime)->put((*second)->input().planId, *secondGrant, 0, patch), StatusCode::kTokenMismatch);
+  ASSERT_OK((*runtime)->put((*second)->input().planId, *secondGrant, 0, patch, Policy::RdmaOnly));
+  EXPECT_EQ(firstIo->binds, 0);
+  EXPECT_EQ(secondIo->binds, 0);
+}
 }  // namespace
 }  // namespace hf3fs::storage

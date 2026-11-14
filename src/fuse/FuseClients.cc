@@ -59,6 +59,11 @@ Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
                                FuseConfig &fuseConfig) {
   config = &fuseConfig;
   fullyStopped = false;
+  const auto &transport = fuseConfig.ec_storage_transport();
+  if (transport != "tcp" && transport != "rdma")
+    return makeError(StatusCode::kInvalidConfig, "EC storage transport must be tcp or rdma");
+  ecStorageTransport = transport == "rdma" ? storage::client::EcRequestControl::TransportPolicy::RdmaOnly
+                                           : storage::client::EcRequestControl::TransportPolicy::TcpOnly;
   if (fuseConfig.batch_io_coros() <= 0 || fuseConfig.io_jobq_size() <= 0 || fuseConfig.io_jobq_sizes().hi() <= 0 ||
       fuseConfig.io_jobq_sizes().lo() <= 0)
     return makeError(StatusCode::kInvalidArg, "owned ring shutdown requires consumers and nonempty queues");
@@ -229,7 +234,8 @@ Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
                                        ecRmw,
                                        [this](const flat::UserInfo &u) { return userConfig.getConfig(u).readonly(); }},
                                       flat::Token(fuseToken),
-                                      std::chrono::seconds(fuseConfig.ec_file().maximum_operation_seconds()));
+                                      std::chrono::seconds(fuseConfig.ec_file().maximum_operation_seconds()),
+                                      ecStorageTransport);
     RETURN_ON_ERROR(mounted);
     ecFiles = std::move(*mounted);
     // Store the owner before recovery: all failure/exception exits reach the
@@ -365,7 +371,7 @@ Result<Void> FuseClients::stop() noexcept {
 }
 
 client::ec::EcStripeControl FuseClients::ecControl() const {
-  return {std::chrono::steady_clock::now() + ecOperationTime, cancelIos.getToken()};
+  return {std::chrono::steady_clock::now() + ecOperationTime, cancelIos.getToken(), ecStorageTransport};
 }
 CoTask<void> FuseClients::retireDeliveredEcRead(client::ec::EcReadReceipt receipt, flat::UserInfo user, bool allT2) {
   if (!ecRetireCompleted || !allT2 || !ecDispatcher) co_return;

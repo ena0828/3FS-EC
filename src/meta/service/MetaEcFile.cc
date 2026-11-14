@@ -22,7 +22,8 @@ uint64_t wallSeconds() {
 }
 Control controlFor(const Config &config) {
   Control out;
-  out.transport = Control::TransportPolicy::TcpOnly;
+  out.transport = config.ec_storage_transport() == "rdma" ? Control::TransportPolicy::RdmaOnly
+                                                               : Control::TransportPolicy::TcpOnly;
   out.deadline = std::chrono::steady_clock::now() + config.ec_verify_timeout().asMs();
   return out;
 }
@@ -126,7 +127,12 @@ CoTryTask<EcFilePwriteRsp> observe(Tx &txn, const EcFilePwriteReq &req, const Uu
 }
 Result<net::Address> workerAddress(const EcV2Coordinator &coordinator,
                                    client::ICommonMgmtdClient &mgmtd,
-                                   const EcV2PhysicalEndpoint &worker) {
+                                   const EcV2PhysicalEndpoint &worker,
+                                   Control::TransportPolicy transport) {
+  if (!storage::client::isExplicitEcTransportPolicy(transport))
+    return makeError(StatusCode::kInvalidArg);
+  const auto required = transport == Control::TransportPolicy::RdmaOnly ? net::Address::RDMA
+                                                                         : net::Address::TCP;
   RETURN_ON_ERROR(coordinator.route(worker));
   auto routing = mgmtd.getRoutingInfo();
   if (!routing || !routing->raw()) return makeError(MgmtdClientCode::kRoutingInfoNotReady);
@@ -135,9 +141,9 @@ Result<net::Address> workerAddress(const EcV2Coordinator &coordinator,
   for (const auto &group : node->app.serviceGroups) {
     if (!group.services.contains("StorageSerde")) continue;
     for (const auto &address : group.endpoints)
-      if (address.type == net::Address::TCP) return address;
+      if (address.type == required) return address;
   }
-  return makeError(StorageClientCode::kRoutingError, "fixed RMW worker has no TCP StorageSerde endpoint");
+  return makeError(StorageClientCode::kRoutingError, "fixed RMW worker has no StorageSerde endpoint for the selected transport");
 }
 // Cleanup keeps candidate and source scope evidence separate. The source
 // cannot drain until the entire candidate/worker scope has stopped executing.
@@ -363,7 +369,7 @@ CoTryTask<EcFilePwriteRsp> MetaOperator::advanceEcFilePwrite(AdvanceEcFilePwrite
     CO_RETURN_ON_ERROR(issued);
     const auto &p = issued->observed.plan->input();
     const auto &worker = issued->observed.record.candidates[p.workerIndex].endpoint;
-    auto address = workerAddress(*ecV2Coordinator_, *mgmtd_, worker);
+    auto address = workerAddress(*ecV2Coordinator_, *mgmtd_, worker, control.transport);
     CO_RETURN_ON_ERROR(address);
     storage::EcRmwInstallReq install;
     install.plan.input = p;

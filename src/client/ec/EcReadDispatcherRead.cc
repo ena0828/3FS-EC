@@ -66,6 +66,7 @@ CoTryTask<EcDispatchReadOutcome> EcReadDispatcherCore::readRun(EcReadSpool::Run 
   // One bounded cleanup attempt is independent of a canceled data waiter. It
   // never invents another range; F3 cleanup uses Query44 and original Release36.
   EcStripeControl cleanup;
+  cleanup.transport = c.transport;
   cleanup.deadline = std::chrono::steady_clock::now() + limits.cleanupAttemptTime;
   auto released = co_await file->releaseRead(run.journal, cleanup);
   const bool joined = !file->localJoinUnconfirmed();

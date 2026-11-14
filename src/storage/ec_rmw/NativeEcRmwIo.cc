@@ -46,7 +46,7 @@ Result<std::shared_ptr<NativeEcRmwIo>> NativeEcRmwIo::create(std::shared_ptr<con
                                                              std::function<Result<Void>()> localFence,
                                                              client::EcRequestControl control) {
   if (!plan || !key || !dataKey || !target || !lease || !client || !binder || !route || !clock || !localFence ||
-      control.transport != client::EcRequestControl::TransportPolicy::TcpOnly)
+      !client::isExplicitEcTransportPolicy(control.transport))
     return makeError(StatusCode::kInvalidArg);
   const auto &p = plan->input();
   const auto &b = ticket.binding();

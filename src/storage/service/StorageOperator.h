@@ -131,11 +131,16 @@ class StorageOperator {
   CoTryTask<EcReadRsp> authorizedReadEcFragment(const EcAuthorizedReadReq &req);
   CoTryTask<EcReconcileRsp> authorizedReconcileEcFragment(const EcAuthorizedReconcileReq &req);
 
-  CoTryTask<EcHelperHopRsp> executeEcHelper(const EcHelperHopReq &request);
-  CoTryTask<EcHelperDirectHopRsp> executeEcHelperDirect(const EcHelperDirectHopReq &request);
-  CoTryTask<EcRmwStatusRsp> installEcRmw(const EcRmwInstallReq &);
-  CoTryTask<EcRmwStatusRsp> putEcRmw(const EcRmwPutReq &);
-  CoTryTask<EcRmwStatusRsp> actionEcRmw(const EcRmwActionReq &);
+  CoTryTask<EcHelperHopRsp> executeEcHelper(const EcHelperHopReq &request,
+                                           net::Address::Type transportType = net::Address::TCP);
+  CoTryTask<EcHelperDirectHopRsp> executeEcHelperDirect(const EcHelperDirectHopReq &request,
+                                                       net::Address::Type transportType = net::Address::TCP);
+  CoTryTask<EcRmwStatusRsp> installEcRmw(const EcRmwInstallReq &,
+                                         net::Address::Type transportType = net::Address::TCP);
+  CoTryTask<EcRmwStatusRsp> putEcRmw(const EcRmwPutReq &,
+                                         net::Address::Type transportType = net::Address::TCP);
+  CoTryTask<EcRmwStatusRsp> actionEcRmw(const EcRmwActionReq &,
+                                         net::Address::Type transportType = net::Address::TCP);
   CoTryTask<EcTargetRetirementRsp> prepareEcTargetRetirement(const EcTargetRetirementRequest &req);
   CoTryTask<EcTargetRetirementRsp> queryEcTargetRetirement(const EcTargetRetirementRequest &req);
   CoTryTask<EcScopeControlRsp> revokeEcScope(const EcScopeControlRequest &req);
@@ -211,14 +216,17 @@ class StorageOperator {
   friend class StorageEcStageAuthorizationTestAccess;
 
   Result<Void> initEcHelpers();
-  CoTryTask<EcHelperHopResult> executeEcHelperOwned(EcHelperHopReq, std::chrono::steady_clock::time_point receivedAt);
+  CoTryTask<EcHelperHopResult> executeEcHelperOwned(EcHelperHopReq,
+                                                   std::chrono::steady_clock::time_point receivedAt,
+                                                   net::Address::Type transportType);
   CoTryTask<EcHelperDirectHopResult> executeEcHelperDirectOwned(EcHelperDirectHopReq,
-                                                              std::chrono::steady_clock::time_point receivedAt);
+                                                              std::chrono::steady_clock::time_point receivedAt,
+                                                              net::Address::Type transportType);
   std::unique_ptr<EcHelperRuntime> ecHelpers_;
 
   Result<Void> initEcGc();
   Result<Void> initEcRmw();
-  CoTryTask<EcRmwStatus> installEcRmwOwned(EcRmwInstallReq);
+  CoTryTask<EcRmwStatus> installEcRmwOwned(EcRmwInstallReq, net::Address::Type transportType);
   std::shared_ptr<const EcRmwKey> ecRmwKey_;
   Uuid ecRmwAuthority_ = Uuid::zero();
   std::unique_ptr<EcRmwRuntime> ecRmw_;

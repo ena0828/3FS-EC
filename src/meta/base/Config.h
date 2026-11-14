@@ -107,6 +107,9 @@ struct Config : ConfigBase<Config> {
   CONFIG_OBJ_ARRAY(ec_targets, EcTargetConfig, 13, [](auto &) { return 0ul; });
   CONFIG_ITEM(ec_max_verifying_stripes, 1u, ConfigCheckers::checkPositive);
   CONFIG_ITEM(ec_verify_timeout, 60_s);
+  // Data RPCs owned by Meta (verification and truncate-tail execution).
+  // The value is explicit and is not hot updated during an owned operation.
+  CONFIG_ITEM(ec_storage_transport, "tcp", [](const auto &value) { return value == "tcp" || value == "rdma"; });
   CONFIG_HOT_UPDATED_ITEM(readonly, false);
   CONFIG_HOT_UPDATED_ITEM(authenticate, false);
   CONFIG_HOT_UPDATED_ITEM(grv_cache, false);

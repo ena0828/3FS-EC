@@ -16,6 +16,14 @@ namespace hf3fs::storage::client {
 
 class ClientRequestContext;
 
+namespace detail {
+// Pointer borrows nodeInfo. No network call or fallback after dispatch is made.
+const net::Address *selectStorageRpcEndpoint(const flat::NodeInfo &nodeInfo,
+                                             bool allowTcp,
+                                             bool tcpOnly,
+                                             bool rdmaOnly);
+}  // namespace detail
+
 class StorageClientImpl : public StorageClient {
  public:
   StorageClientImpl(const ClientId &clientId, const Config &config, hf3fs::client::ICommonMgmtdClient &mgmtdClient);
@@ -205,7 +213,8 @@ class StorageClientImpl : public StorageClient {
                                      bool *dispatched = nullptr,
                                      bool allowTcp = false,
                                      bool tcpOnly = false,
-                                     EcRpcObservation *observation = nullptr);
+                                     EcRpcObservation *observation = nullptr,
+                                     bool rdmaOnly = false);
 
   template <typename Op, typename BatchReq, typename BatchRsp, auto Method>
   CoTryTask<BatchRsp> sendBatchRequest(StorageMessenger &messenger,

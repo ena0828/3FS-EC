@@ -38,8 +38,9 @@ struct RuntimeTestAccess {
   static Result<Void> install(EcRmwRuntime &runtime,
                               std::shared_ptr<const EcRmwPlan> plan,
                               const EcRmwGrant &grant,
-                              std::shared_ptr<EcRmwIo> io) {
-    return runtime.installInternal(std::move(plan), grant, std::move(io));
+                              std::shared_ptr<EcRmwIo> io,
+                              EcRmwRuntime::TransportPolicy transport = EcRmwRuntime::TransportPolicy::TcpOnly) {
+    return runtime.installInternal(std::move(plan), grant, std::move(io), transport);
   }
 };
 inline EcRmwPlanInput zeroPlan(std::string_view patch, uint32_t shardBytes = 65536) {

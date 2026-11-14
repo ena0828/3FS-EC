@@ -45,6 +45,9 @@ class ClientContext {
                       Timestamp *timestamp = nullptr,
                       RpcCallSizes *sizes = nullptr) {
     if (sizes) *sizes = {};
+    if (customOptions && customOptions->requireRdma && !usesRdmaTransport()) {
+      co_return makeError(StatusCode::kInvalidArg, "RPC requires an RDMA transport");
+    }
     auto options = *options_.load(std::memory_order_acquire);
     if (customOptions != nullptr) {
       options.merge(*customOptions);
@@ -151,6 +154,10 @@ class ClientContext {
   Result<Rsp> callSync(const Req &req,
                        const net::UserRequestOptions *customOptions = nullptr,
                        Timestamp *timestamp = nullptr) {
+    // The synchronous pool creates TcpSocket, even for an RDMA-tagged address.
+    if (customOptions && customOptions->requireRdma) {
+      return makeError(StatusCode::kInvalidArg, "Synchronous RPC does not support RDMA");
+    }
     auto options = *options_.load(std::memory_order_acquire);
     if (customOptions != nullptr) {
       options.merge(*customOptions);
@@ -206,6 +213,14 @@ class ClientContext {
   net::Address addr() const { return destAddr_; }
 
  private:
+  bool usesRdmaTransport() const noexcept {
+    if (const auto *transport = std::get_if<net::Transport *>(&connectionSource_)) {
+      // This constructor has no destAddr_; inspect the actual transport.
+      return *transport && (*transport)->isRDMA();
+    }
+    return std::holds_alternative<net::IOWorker *>(connectionSource_) && destAddr_.isRDMA();
+  }
+
   static void reportMetrics(const monitor::TagSet &tags, Timestamp *ts, uint64_t requestSize, uint64_t responseSize);
 
   std::variant<net::IOWorker *, net::sync::ConnectionPool *, net::Transport *> connectionSource_;

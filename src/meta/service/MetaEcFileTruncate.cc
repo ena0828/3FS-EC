@@ -20,7 +20,8 @@ uint64_t wallSeconds() {
 }
 Control controlFor(const Config &c) {
   Control r;
-  r.transport = Control::TransportPolicy::TcpOnly;
+  r.transport = c.ec_storage_transport() == "rdma" ? Control::TransportPolicy::RdmaOnly
+                                                               : Control::TransportPolicy::TcpOnly;
   r.deadline = std::chrono::steady_clock::now() + c.ec_verify_timeout().asMs();
   return r;
 }
@@ -116,7 +117,12 @@ CoTryTask<EcFileTruncateRsp> observe(Tx &tx, const EcFileTruncateReq &req) {
 }
 Result<net::Address> workerAddress(const EcV2Coordinator &coordinator,
                                    client::ICommonMgmtdClient &mgmtd,
-                                   const EcV2PhysicalEndpoint &worker) {
+                                   const EcV2PhysicalEndpoint &worker,
+                                   Control::TransportPolicy transport) {
+  if (!storage::client::isExplicitEcTransportPolicy(transport))
+    return makeError(StatusCode::kInvalidArg);
+  const auto required = transport == Control::TransportPolicy::RdmaOnly ? net::Address::RDMA
+                                                                         : net::Address::TCP;
   RETURN_ON_ERROR(coordinator.route(worker));
   const auto routes = mgmtd.getRoutingInfo();
   if (!routes || !routes->raw()) return makeError(MgmtdClientCode::kRoutingInfoNotReady);
@@ -125,8 +131,8 @@ Result<net::Address> workerAddress(const EcV2Coordinator &coordinator,
   for (const auto &group : node->app.serviceGroups)
     if (group.services.contains("StorageSerde"))
       for (const auto &address : group.endpoints)
-        if (address.type == net::Address::TCP) return address;
-  return makeError(StorageClientCode::kRoutingError, "truncate worker has no fixed TCP endpoint");
+        if (address.type == required) return address;
+  return makeError(StorageClientCode::kRoutingError, "truncate worker has no StorageSerde endpoint for the selected transport");
 }
 CoTryTask<Void> closeDebt(kv::IKVEngine &db,
                           storage::client::StorageClient &storage,
@@ -333,7 +339,8 @@ CoTryTask<EcFileTruncateRsp> MetaOperator::advanceEcFileTruncate(AdvanceEcFileTr
           plan.operationId != i.child || plan.patchLength || plan.patchOffset)
         co_return makeError(StatusCode::kDataCorruption);
       auto address =
-          workerAddress(*ecV2Coordinator_, *mgmtd_, issued->observed.record.candidates[plan.workerIndex].endpoint);
+          workerAddress(*ecV2Coordinator_, *mgmtd_,
+                        issued->observed.record.candidates[plan.workerIndex].endpoint, control.transport);
       CO_RETURN_ON_ERROR(address);
       CO_RETURN_ON_ERROR(ready(control));
       storage::EcRmwInstallReq install;

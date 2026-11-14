@@ -1,6 +1,7 @@
 #pragma once
 
 #include "client/ec/EcBlockRead.h"
+#include "client/ec/EcStorageTransport.h"
 #include "client/ec/NativeEcRepairTransport.h"
 #include "client/meta/MetaClient.h"
 
@@ -9,6 +10,7 @@ namespace hf3fs::client::ec {
 struct EcStripeControl {
   std::chrono::steady_clock::time_point deadline;
   CancellationToken cancellation;
+  EcStorageTransportPolicy transport = EcStorageTransportPolicy::TcpOnly;
 };
 
 // All IDs are supplied and persisted by the caller. Request UUIDs are separate

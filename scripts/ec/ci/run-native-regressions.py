@@ -107,6 +107,37 @@ SERVICE_MANDATORY |= {
     )
 }
 
+# Strict transport policy cases are functional checks, not RDMA hardware acceptance.
+TRANSPORT_REQUIRED = {
+    "storage": {
+        "TestEcRmw.TransportAffinityRejectsMutationsButKeepsQueryAndJoin",
+        "TestEcRmw.TransportInstallReservationSurvivesAdmissionGap",
+    },
+    "service": {
+        "TestEcNativeRepairService.HelperTransportRdmaPolicyNeverFallsBackToTcp",
+        "TestEcNativeRepairService.HelperTransportRejectsUnknownIngressBeforeOwnedWork",
+        "TestEcNativeRepairService.HelperTransportTcpIngressSelectsOnlyTcpAtEveryHop",
+        "TestEcRmwNative.ExplicitRdmaNativeIoRejectsTcpOnlyTargetsBeforeBegin",
+    },
+    "client": {
+        "TestEcNativeTransportPolicy.ParserAndPublicControlRejectImplicitSelection",
+        "TestEcNativeTransportPolicy.ReadAdaptersPreservePolicyAndRejectInvalidBeforeDispatch",
+        "TestEcNativeTransportPolicy.RepairPolicyReachesRecoveryStagesAndBothHelperModes",
+        "TestEcTransportPolicy.ActualContextRejectsForcedTcpAndNullTransportBeforeEncoding",
+        "TestEcTransportPolicy.ExplicitRoutesFilterServiceAndNeverFallBack",
+        "TestEcTransportPolicy.LegacyAutomaticAndChunkRoutesKeepTheirOriginalPreference",
+        "TestEcTransportPolicy.LocalRdmaRequirementPreservesOriginalFiveFieldWireAndCoreOptions",
+        "TestEcTransportPolicy.MissingExplicitEndpointDoesNotBorrowOtherServicesOrNetworks",
+        "TestEcTransportPolicy.RejectsImplicitAndInvalidPoliciesBeforeControlledDataDispatch",
+        "TestEcTransportPolicy.SynchronousPoolCannotSatisfyRdmaEvenWithRdmaAddress",
+        "TestEcTreeReadClient.ExplicitRdmaPolicyReachesEveryNativeBlockRead",
+        "TestEcTreeReadClient.InvalidStoragePolicyHasNoRangeOrStorageSideEffect",
+    },
+}
+MANDATORY |= TRANSPORT_REQUIRED["storage"]
+SERVICE_MANDATORY |= TRANSPORT_REQUIRED["service"]
+CLIENT_MANDATORY |= TRANSPORT_REQUIRED["client"]
+
 # Exact names prevent unrelated green suites from satisfying the control profile.
 TARGET_RETIREMENT_REQUIRED = {
     "storage": {
@@ -294,7 +325,13 @@ def main():
         source / "tests/storage/store/TestEcCodec.cc", source / "tests/storage/store/TestEcRmw.cc",
         source / "tests/client/TestEcTargetRetirementCommands.cc",
         source / "tests/client/TestEcRpcFrameSizes.cc", source / "tests/client/TestEcRepairPipeline.cc",
-        source / "tests/storage/service/TestEcStageService.cc")}
+        source / "tests/storage/service/TestEcStageService.cc",
+        source / "tests/storage/service/EcHelperTransportNativeTests.inc",
+        source / "tests/storage/service/EcRmwNativeTests.inc",
+        source / "tests/storage/EcRmwTestAccess.h",
+        source / "tests/client/TestEcTransportPolicy.cc",
+        source / "tests/client/TestEcNativeTransportPolicy.cc",
+        source / "tests/client/TestEcTreeReadClient.cc")}
     if args.require_target_retirement:
         inputs.update({str(source / path): digest(source / path) for path in (
             "tests/storage/store/TestEcTargetRetirementControl.cc",
@@ -309,6 +346,7 @@ def main():
               "required_rpc_frame_cases": list(RPC_FRAME_CASES),
               "required_rpc_observer_cases": list(RPC_OBSERVER_CASES),
               "required_service_cases": sorted(SERVICE_MANDATORY),
+              "required_transport_cases": {kind: sorted(names) for kind, names in TRANSPORT_REQUIRED.items()},
               "scope": "native functional regressions; not a benchmark or real Storage process fault"}
     result = 1
     try:

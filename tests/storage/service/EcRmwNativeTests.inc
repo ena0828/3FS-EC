@@ -66,7 +66,9 @@ class TestEcRmwNative : public TestEcNativeRepairService {
                                                 std::shared_ptr<const EcCapabilityKey> data,
                                                 std::shared_ptr<RmwFixtureBinder> binder,
                                                 std::shared_ptr<EcRmwResources> resources,
-                                                std::array<EcCapabilityV2, 12> reads = {}) {
+                                                std::array<EcCapabilityV2, 12> reads = {},
+                                                client::EcRequestControl::TransportPolicy transport =
+                                                    client::EcRequestControl::TransportPolicy::TcpOnly) {
     CHECK_RESULT(loaded, components_->targetMap.getByTargetId(plan->worker().targetId));
     auto target = loaded->storageTarget;
     CHECK_RESULT(state, target->ecScopeState());
@@ -85,6 +87,8 @@ class TestEcRmwNative : public TestEcNativeRepairService {
     RETURN_ON_ERROR(lease);
     const auto actual = state.second;
     const auto targetId = plan->worker().targetId;
+    auto requestControl = control();
+    requestControl.transport = transport;
     return NativeEcRmwIo::create(
         plan,
         grant,
@@ -107,7 +111,7 @@ class TestEcRmwNative : public TestEcNativeRepairService {
           if (current->storageTarget != target) return makeError(StorageCode::kTargetStateInvalid);
           return target->checkEcScopeTarget(actual);
         },
-        control());
+        requestControl);
   }
 };
 TEST_F(TestEcRmwNative, LostSealReplyReopensSamePlanAndVerifiesAllTwelveActualOutputs) {
@@ -289,4 +293,73 @@ TEST_F(TestEcRmwNative, LostSealReplyReopensSamePlanAndVerifiesAllTwelveActualOu
   }
   ASSERT_OK(EcCodec::verify(views, tail.targetLogicalLength, tail.shardBytes));
   EXPECT_EQ(shortened->commitment.logicalSha256, *sha256(prefix));
+}
+
+
+TEST_F(TestEcRmwNative, ExplicitRdmaNativeIoRejectsTcpOnlyTargetsBeforeBegin) {
+  using namespace ec_rmw_detail;
+  using Policy = client::EcRequestControl::TransportPolicy;
+  const std::string patch = "strict-rdma";
+  auto input = zeroPlan(patch, 31);
+  for (size_t i = 0; i != 12; ++i) input.targets[i].endpoint = endpoints_[i];
+  auto plan = EcRmwPlan::create(input);
+  ASSERT_OK(plan);
+  auto key = AuthorizationTestAccess::key();
+  auto grant = AuthorizationTestAccess::grant(*key, **plan);
+  ASSERT_OK(grant);
+  auto authority = EcRmwAuthorization::verify(*key, *grant, *plan, (*plan)->worker(),
+                                              Uuid::from(91, 92), EcRmwRight::Execute, 1000);
+  ASSERT_OK(authority);
+  auto data = std::make_shared<EcCapabilityKey>(std::span<const uint8_t, 32>(keyBytes_));
+  auto binder = std::make_shared<RmwFixtureBinder>(data, key);
+  auto resources = EcRmwResources::create();
+  auto io = makeIo(*plan, *grant, key, data, binder, resources, {}, Policy::RdmaOnly);
+  auto cleanup = folly::makeGuard([&] {
+    if (io) io->reset();
+    resources->closeAndWait();
+  });
+  ASSERT_OK(io);
+  EXPECT_EQ((*io)->transportPolicy(), Policy::RdmaOnly);
+  size_t begins, queries;
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    begins = replyDrop_.beginCalls;
+    queries = replyDrop_.queryCalls;
+  }
+  const auto before = replyDrop_.snapshot();
+  auto result = blockingWait(EcRmwExecution::run(*authority, patch, *io));
+  ASSERT_ERROR(result, StorageClientCode::kRoutingError);
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    EXPECT_EQ(replyDrop_.beginCalls, begins);
+    EXPECT_EQ(replyDrop_.queryCalls, queries);
+  }
+  EXPECT_EQ(replyDrop_.snapshot().appendCalls, before.appendCalls);
+  net::Client::Config networkConfig;
+  smallClient(networkConfig);
+  networkConfig.set_force_use_tcp(true);
+  auto network = std::make_shared<client::EcRmwTransport>(networkConfig);
+  ASSERT_OK(network->start());
+  auto stopNetwork = folly::makeGuard([&] { network->stopAndJoin(); });
+  auto selected = address_;
+  selected.type = net::Address::RDMA;
+  auto requestControl = control();
+  requestControl.transport = Policy::RdmaOnly;
+  EcRmwInstallReq install;
+  install.plan.input = input;
+  install.grant = *grant;
+  install.deadlineUnixMillis = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count()) + 10000;
+  // Without requireRdma propagation, force_use_tcp would reach the live TCP
+  // receiver and report its disabled-runtime AuthenticationFail instead.
+  ASSERT_ERROR(blockingWait(network->install(selected, install, requestControl)), StatusCode::kInvalidArg);
+  EcRmwActionReq action;
+  action.planId = input.planId;
+  action.grant = *grant;
+  action.action = EcRmwActionRequest::Query;
+  ASSERT_ERROR(blockingWait(network->action(selected, action, requestControl)), StatusCode::kInvalidArg);
+  action.action = EcRmwActionRequest::Submit;
+  ASSERT_ERROR(blockingWait(network->action(selected, action, requestControl)), StorageCode::kEcSealOutcomeUnknown);
+  RecordProperty("transport_coverage", "real target ticket and NativeEcRmwIo with RDMA policy; TCP-only route "
+                                      "rejected before Begin; fixture binder is not Meta; no RDMA hardware run");
 }

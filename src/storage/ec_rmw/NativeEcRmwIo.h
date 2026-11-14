@@ -44,6 +44,7 @@ class NativeEcRmwIo final : public EcRmwIo {
                                                        std::function<Result<Void>()> freshLocalFence,
                                                        client::EcRequestControl);
   const EcSha256 &planDigest() const noexcept { return plan_->digest(); }
+  client::EcRequestControl::TransportPolicy transportPolicy() const noexcept { return control_.transport; }
   Result<Void> check() const override;
   CoTryTask<std::string> readSource(uint8_t) override;
   CoTryTask<Void> bindOutput(const EcRmwOutputCommitment &) override;

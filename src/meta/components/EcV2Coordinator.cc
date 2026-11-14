@@ -299,7 +299,9 @@ CoTryTask<std::shared_ptr<const EcV2PublishEvidence>> EcV2Coordinator::verifyFor
   const auto deadline = SteadyClock::now() + config_.ec_verify_timeout();
   storage::client::EcRequestControl control;
   control.deadline = deadline;
-  control.transport = storage::client::EcRequestControl::TransportPolicy::TcpOnly;
+  control.transport = config_.ec_storage_transport() == "rdma"
+                          ? storage::client::EcRequestControl::TransportPolicy::RdmaOnly
+                          : storage::client::EcRequestControl::TransportPolicy::TcpOnly;
   std::array<storage::EcCapabilityV2, 12> grants;
   // All grants belong to this committed issuance snapshot. Never refresh an
   // individual block's grant while a concurrent T0 may have closed the scope.

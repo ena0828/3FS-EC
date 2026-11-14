@@ -19,6 +19,7 @@
 #include "common/logging/LogInit.h"
 #include "common/monitor/Monitor.h"
 #include "common/net/Client.h"
+#include "common/net/ib/IBDevice.h"
 #include "stubs/common/RealStubFactory.h"
 #include "stubs/mgmtd/MgmtdServiceStub.h"
 using namespace hf3fs;
@@ -75,6 +76,8 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(repair_source_order, "");
   CONFIG_ITEM(repair_window_decimal, "");
   CONFIG_ITEM(repair_metrics, false);
+  CONFIG_ITEM(storage_transport, "tcp");
+  CONFIG_OBJ(ib_devices, net::IBDevice::Config);
   CONFIG_ITEM(deadline_seconds, uint32_t{300});
   CONFIG_ITEM(worker_threads, uint32_t{4});
   CONFIG_ITEM(log, "INFO:normal; normal=file:path=ec-file.log,async=true,sync_level=ERR");
@@ -120,7 +123,8 @@ Result<std::string> tokenFile(const std::string &path) {
 }
 
 EcStripeControl control(const Config &c) {
-  return {std::chrono::steady_clock::now() + std::chrono::seconds(c.deadline_seconds()), {}};
+  return {std::chrono::steady_clock::now() + std::chrono::seconds(c.deadline_seconds()),
+          {}, *parseEcStorageTransport(c.storage_transport())};
 }
 void printProgress(const EcFileRunJournal &j) {
   if (j.latest()) {
@@ -133,6 +137,8 @@ void printProgress(const EcFileRunJournal &j) {
 int execute(int argc, char **argv) {
   if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
     std::cout << "ec_file_cli --cfg=FILE [--config.FIELD=VALUE] COMMAND\n"
+                 "Client Storage EC: --config.storage_transport=tcp|rdma (default tcp; no fallback).\n"
+                 "Select it per invocation, including resume; Meta-owned data configuration is independent.\n"
                  "Commands: describe, new-range-read, new-append-at, resume, release, inspect\n"
                  "One command only. New commands require explicit inode_decimal/incarnation; read requires "
                  "offset_decimal/length_decimal.\n"
@@ -169,10 +175,33 @@ int execute(int argc, char **argv) {
   if (argc != 2 || !cfg.deadline_seconds() || cfg.deadline_seconds() > 3600 || !cfg.worker_threads() ||
       cfg.worker_threads() > 32 || cfg.meta_client().network_type() != net::Address::TCP ||
       cfg.mgmtd_client().network_type() != net::Address::TCP) {
-    std::cerr << "require one command, finite 1..3600s deadline, 1..32 threads and TCP\n";
+    std::cerr << "require one command, finite 1..3600s deadline, 1..32 threads and TCP Meta/Mgmtd\n";
     return 2;
   }
+  auto storageTransport = parseEcStorageTransport(cfg.storage_transport());
+  if (!storageTransport) {
+    std::cerr << storageTransport.error().describe() << '\n';
+    return 2;
+  }
+  // This outer guard outlives every command's manager, worker and network.
+  // Arm it before start so a partial IB initialization is also cleaned up.
   const std::string command = argv[1];
+  // These exact commands inspect local journals and never create a network.
+  const bool localOnly = command == "inspect" || command == "mode4-inspect";
+  const bool useRdma = !localOnly && *storageTransport == EcStorageTransportPolicy::RdmaOnly;
+  SCOPE_EXIT {
+    if (useRdma) net::IBManager::stop();
+  };
+  if (useRdma) {
+    auto ibStarted = net::IBManager::start(cfg.ib_devices());
+    if (!ibStarted) {
+      std::cerr << "cannot initialize requested RDMA devices: " << ibStarted.error().describe() << '\n';
+      return 2;
+    }
+  }
+  std::cerr << "CLIENT_ORIGINATED_STORAGE_TRANSPORT=" << cfg.storage_transport()
+            << "; Meta/Mgmtd control plane remains TCP; Meta-owned data uses independent configuration; "
+               "selection is not RDMA success or a comparable performance sample\n";
   if (isMode4RepairCommand(command)) return executeMode4Repair(cfg, command);
   if (command.starts_with("mode4-")) return executeMode4(cfg, command);
   const bool existing = command == "resume" || command == "release" || command == "inspect";

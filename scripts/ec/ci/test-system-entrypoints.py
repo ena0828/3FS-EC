@@ -137,10 +137,12 @@ class SystemEntrypoints(unittest.TestCase):
 
     def test_required_target_retirement_cases_are_selected_by_real_driver(self):
         driver = regression.module(Path(__file__).parent.parent / "test-native-fragments.py", "retirement_native_driver")
-        filters = {"storage": driver.STORAGE_FILTER, "service": driver.SERVICE_FILTER, "client": driver.CLIENT_FILTER}
+        filters = {"storage": driver.STORAGE_FILTER + ":" + driver.LEGACY_FILTER,
+                   "service": driver.SERVICE_FILTER, "client": driver.CLIENT_FILTER}
         self.assertTrue(all(regression.TARGET_RETIREMENT_REQUIRED.values()))
         required = {**regression.TARGET_RETIREMENT_REQUIRED, "client": regression.CLIENT_MANDATORY}
         required["service"] = required["service"] | regression.SERVICE_MANDATORY
+        required["storage"] = required["storage"] | regression.MANDATORY
         for kind, names in required.items():
             for name in names:
                 with self.subTest(suite=kind, case=name):
@@ -246,6 +248,27 @@ class SystemEntrypoints(unittest.TestCase):
                            "listing": {"exitcode": 0}, "execution": {"exitcode": 0}})
         original = {"status": "passed", "exitcode": 0, "failures": [], "suites": suites}
         regression.check_suites(original, build, built)
+        # Remove each required transport case from both listing and XML so
+        # a consistent but incomplete green receipt cannot pass the gate.
+        for index, kind in enumerate(("storage", "service", "client")):
+            for name in regression.TRANSPORT_REQUIRED[kind]:
+                for failure in ("missing", "skipped", "failed", "unexecuted", "duplicate"):
+                    value = copy.deepcopy(original)
+                    suite = value["suites"][index]
+                    cases = suite["xml_results"]["cases"]
+                    case = next(row for row in cases if row["name"] == name)
+                    if failure == "missing":
+                        suite["listed_tests"] = [row for row in suite["listed_tests"] if row["name"] != name]
+                        cases.remove(case)
+                    elif failure == "duplicate":
+                        suite["listed_tests"].append({"name": name, "disabled": False})
+                        cases.append(dict(case))
+                    elif failure == "unexecuted":
+                        case["executed"] = False
+                    else:
+                        case[failure] = True
+                    with self.subTest(kind=kind, case=name, failure=failure), self.assertRaises(ValueError):
+                        regression.check_suites(value, build, built)
         def omit_window_two_recovery(receipt):
             service = receipt["suites"][1]
             name = "TestEcNativeRepairService.WindowTwoLostAppendReplyRecoversBothOriginalTargets"
@@ -296,7 +319,7 @@ class SystemEntrypoints(unittest.TestCase):
                 remaining=mock.Mock())
             for stage, minutes, step in (("repair", 80, 75), ("file", 90, 45), ("spare", 40, 35),
                                          ("regression", 40, 35), ("service-contracts", 80, 75),
-                                         ("target-meta", 80, 75), ("core", 100, 95)):
+                                         ("target-meta", 80, 75), ("core", 100, 95), ("matrix", 100, 95)):
                 for delta, expected in ((0, 0), (-1, 1)):
                     base.remaining.return_value = minutes * 60 * base.NANO + delta
                     with contextlib.redirect_stdout(io.StringIO()) as output:
@@ -315,10 +338,11 @@ class SystemEntrypoints(unittest.TestCase):
             self.assertEqual(budget.budget_module("target-meta", ref=ref).REF, ref)
             with self.assertRaises(ValueError):
                 budget.budget_module("system", ref=ref)
-        with mock.patch.object(budget.sys, "argv", ["budget", "check", "--profile", "system",
-                                                     "--stage", "service-contracts"]), \
-             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            budget.main()
+        for stage in ("service-contracts", "matrix"):
+            with mock.patch.object(budget.sys, "argv", ["budget", "check", "--profile", "system",
+                                                         "--stage", stage]), \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                budget.main()
         ref = "refs/heads/fix/ec-retirement-keys"
         fixed = budget.budget_module("target-meta", ref=ref)
         self.assertEqual(fixed.REF, ref)

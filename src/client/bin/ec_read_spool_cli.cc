@@ -15,6 +15,7 @@
 #include "common/logging/LogInit.h"
 #include "common/monitor/Monitor.h"
 #include "common/net/Client.h"
+#include "common/net/ib/IBDevice.h"
 #include "stubs/common/RealStubFactory.h"
 #include "stubs/mgmtd/MgmtdServiceStub.h"
 using namespace hf3fs;
@@ -56,6 +57,8 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(owner_decimal, "");
   CONFIG_ITEM(archive_file, "");
   CONFIG_ITEM(output_file, "");
+  CONFIG_ITEM(storage_transport, "tcp");
+  CONFIG_OBJ(ib_devices, net::IBDevice::Config);
   CONFIG_ITEM(deadline_seconds, uint32_t{300});
   CONFIG_ITEM(worker_threads, uint32_t{2});
   CONFIG_ITEM(retained_runs, uint32_t{64});
@@ -105,7 +108,8 @@ Result<std::string> tokenFile(const std::string &path) {
 }
 
 EcStripeControl control(const Config &cfg) {
-  return {std::chrono::steady_clock::now() + std::chrono::seconds(cfg.deadline_seconds()), {}};
+  return {std::chrono::steady_clock::now() + std::chrono::seconds(cfg.deadline_seconds()),
+          {}, *parseEcStorageTransport(cfg.storage_transport())};
 }
 [[noreturn]] void failStopMaintenance() noexcept {
   constexpr char message[] =
@@ -142,6 +146,8 @@ int execute(int argc, char **argv) {
   if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
     std::cout
         << "ec_read_spool_cli --cfg=FILE [--config.FIELD=VALUE] COMMAND\n"
+           "Client Storage EC: --config.storage_transport=tcp|rdma (default tcp; no fallback).\n"
+           "Select it per invocation, including resume; Meta-owned data configuration is independent.\n"
            "Commands: create-state, inspect, cleanup, retire, resume-read\n"
            "Unmount first. Every command obtains the original private spool's exclusive flock.\n"
            "inspect is local-only and does not require a reachable cluster or token.\n"
@@ -157,6 +163,14 @@ int execute(int argc, char **argv) {
     std::cerr << "invalid explicit configuration/command\n";
     return 2;
   }
+  auto storageTransport = parseEcStorageTransport(cfg.storage_transport());
+  if (!storageTransport) {
+    std::cerr << storageTransport.error().describe() << '\n';
+    return 2;
+  }
+  std::cerr << "CLIENT_ORIGINATED_STORAGE_TRANSPORT=" << cfg.storage_transport()
+            << "; Meta/Mgmtd control plane remains TCP; Meta-owned data uses independent configuration; "
+               "selection is not RDMA success or a comparable performance sample\n";
   const std::string command = argv[1];
   if (command != "create-state" && command != "inspect" && command != "cleanup" && command != "retire" &&
       command != "resume-read") {
@@ -186,7 +200,7 @@ int execute(int argc, char **argv) {
   if (!sequence || !*sequence || !range || !owner || *owner > UINT32_MAX || !cfg.deadline_seconds() ||
       cfg.deadline_seconds() > 3600 || !cfg.worker_threads() || cfg.worker_threads() > 8 ||
       cfg.meta_client().network_type() != net::Address::TCP || cfg.mgmtd_client().network_type() != net::Address::TCP) {
-    std::cerr << "exact receipt, finite deadline, 1..8 worker threads and TCP are required\n";
+    std::cerr << "exact receipt, finite deadline, 1..8 worker threads and TCP Meta/Mgmtd are required\n";
     return 2;
   }
   EcReadReceipt receipt{spool->clientNamespace(), *sequence, static_cast<uint32_t>(*owner), *range};
@@ -196,6 +210,19 @@ int execute(int argc, char **argv) {
     return 2;
   }
   flat::UserInfo user{flat::Uid(cfg.user_info().uid()), flat::Gid(cfg.user_info().gid()), std::move(*token)};
+  // This outer guard outlives every command's manager, worker and network.
+  // Arm it before start so a partial IB initialization is also cleaned up.
+  const bool useRdma = *storageTransport == EcStorageTransportPolicy::RdmaOnly;
+  SCOPE_EXIT {
+    if (useRdma) net::IBManager::stop();
+  };
+  if (useRdma) {
+    auto ibStarted = net::IBManager::start(cfg.ib_devices());
+    if (!ibStarted) {
+      std::cerr << "cannot initialize requested RDMA devices: " << ibStarted.error().describe() << '\n';
+      return 2;
+    }
+  }
   logging::initOrDie(cfg.log());
   auto monitored = monitor::Monitor::start(cfg.monitor());
   if (!monitored) return 2;

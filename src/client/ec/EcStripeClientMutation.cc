@@ -21,7 +21,7 @@ Status unconfirmedStageException(status_code_t cause, std::string_view message) 
   }
 }
 storage::client::EcRequestControl transportControl(EcStripeControl control) {
-  return {control.deadline, control.cancellation, storage::client::EcRequestControl::TransportPolicy::TcpOnly};
+  return {control.deadline, control.cancellation, control.transport};
 }
 EcStripeMutationOutcome failure(EcStripeMutationOutcome value,
                                 Status error,
@@ -613,7 +613,8 @@ CoTask<EcStripeMutationOutcome> EcStripeClientCore::repairOwned(EcStripeRepair i
                                                       std::move(bindings),
                                                       std::move(issued->helpers),
                                                       nullptr,
-                                                      std::move(prepared->delegation));
+                                                      std::move(prepared->delegation),
+                                                      control.transport);
       if (!transport) co_return fail(transport.error());
       out.phase = EcStripePhase::Repair;
       const auto dataStarted = std::chrono::steady_clock::now();

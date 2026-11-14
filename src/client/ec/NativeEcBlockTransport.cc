@@ -5,16 +5,18 @@
 
 namespace hf3fs::client::ec {
 NativeEcBlockTransport::NativeEcBlockTransport(std::shared_ptr<storage::client::StorageClient> client,
-                                               storage::client::EcRpcObservation *observation)
-    : client_(std::move(client)), observation_(observation) {}
+                                               storage::client::EcRpcObservation *observation,
+                                               EcStorageTransportPolicy transport)
+    : client_(std::move(client)), observation_(observation), transport_(transport) {}
 CoTryTask<storage::EcReadBlockResultV2> NativeEcBlockTransport::read(storage::EcReadBlockV2Req request,
                                                                      EcReadControl control) {
+  CO_RETURN_ON_ERROR(validateEcStorageTransport(transport_));
   auto client = client_;
   if (!client) co_return makeError(StorageClientCode::kNotInitialized);
   storage::client::EcRequestControl options;
   options.deadline = control.deadline;
   options.cancellation = control.cancellation;
-  options.transport = storage::client::EcRequestControl::TransportPolicy::TcpOnly;
+  options.transport = transport_;
   options.observation = observation_;
   // Keep our own fixed request for verification; the controlled RPC receives
   // its own value and owns it until ClientContext completion.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "EcStorageTransport.h"
+
 #include <atomic>
 #include <optional>
 
@@ -28,7 +30,8 @@ class NativeEcRepairTransport final : public EcRepairTransport {
       EcRepairNativeBindings bindings,
       std::optional<std::array<storage::EcHelperCapability, 10>> helpers = std::nullopt,
       EcRepairObservation *observation = nullptr,
-      std::optional<storage::EcHelperDirectDelegation> direct = std::nullopt);
+      std::optional<storage::EcHelperDirectDelegation> direct = std::nullopt,
+      EcStorageTransportPolicy transport = EcStorageTransportPolicy::TcpOnly);
   bool supportsHelperChain() const override { return helpers_.has_value(); }
   bool supportsHelperDirect() const override { return helpers_.has_value() && direct_.has_value(); }
   CoTryTask<void> begin(Plan, uint8_t target, EcRepairControl) override;
@@ -44,13 +47,15 @@ class NativeEcRepairTransport final : public EcRepairTransport {
                           EcRepairNativeBindings bindings,
                           std::optional<std::array<storage::EcHelperCapability, 10>> helpers,
                           EcRepairObservation *observation,
-                          std::optional<storage::EcHelperDirectDelegation> direct)
+                          std::optional<storage::EcHelperDirectDelegation> direct,
+                          EcStorageTransportPolicy transport)
       : observation_(observation),
         plan_(std::move(plan)),
         client_(std::move(client)),
         bindings_(std::move(bindings)),
         helpers_(std::move(helpers)),
-        direct_(std::move(direct)) {}
+        direct_(std::move(direct)),
+        transport_(transport) {}
   Result<Void> check(const Plan &, const EcRepairControl &) const;
   Status preserveOutcome(uint8_t target, Status error);
   // Borrowed only until the enclosing owned pipeline and every call join.
@@ -60,6 +65,7 @@ class NativeEcRepairTransport final : public EcRepairTransport {
   EcRepairNativeBindings bindings_;
   std::optional<std::array<storage::EcHelperCapability, 10>> helpers_;
   std::optional<storage::EcHelperDirectDelegation> direct_;
+  const EcStorageTransportPolicy transport_;
   std::array<std::atomic<bool>, 2> alreadySealed_{};
   // A failed observer or pre-admission check cannot resolve a previously
   // dispatched mutation. Only a verified Reconcile/Seal clears this state.

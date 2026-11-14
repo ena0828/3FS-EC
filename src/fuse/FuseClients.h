@@ -222,6 +222,8 @@ struct FuseClients {
   std::filesystem::path ecArchiveDirectory;
   bool ecRetireCompleted = false;
   std::chrono::seconds ecOperationTime{300};
+  storage::client::EcRequestControl::TransportPolicy ecStorageTransport =
+      storage::client::EcRequestControl::TransportPolicy::TcpOnly;
   folly::coro::AsyncScope ioScope;
   std::atomic_bool ioClaimsClosed{false};
   std::atomic_bool ioStopping{false};

@@ -15,6 +15,7 @@
 namespace hf3fs::client::ec {
 namespace {
 Result<Void> active(const EcStripeControl &control) {
+  RETURN_ON_ERROR(validateEcStorageTransport(control.transport));
   if (control.cancellation.isCancellationRequested()) return makeError(StorageClientCode::kRequestCanceled);
   if (std::chrono::steady_clock::now() >= control.deadline) return makeError(StorageClientCode::kTimeout);
   return Void{};

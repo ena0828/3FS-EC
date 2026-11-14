@@ -59,7 +59,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                 bad[field]["cleanup"]["leader_reaped"] = False
             with self.subTest(field=field), self.assertRaises(ValueError):
                 RUNNER.check_meta_receipt(bad, binary, output, cases, test_filter)
-        self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 26)
+        self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 28)
         combined, combined_filter, combined_fuse = RUNNER.selection("service-contracts")
         self.assertEqual(combined, expected + (
             "TestMetaServiceReflection.RegistersAll71IncludingBeyondDefaultFieldRank",))
@@ -229,8 +229,8 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                 RUNNER.check_meta_receipt(invalid, binary, output, cases, test_filter)
 
     def test_fixed_sets_and_required_cli(self):
-        self.assertEqual(len(set(RUNNER.META_CASES)), 12)
-        self.assertEqual(len(set(RUNNER.FUSE_CASES)), 14)
+        self.assertEqual(len(set(RUNNER.META_CASES)), 13)
+        self.assertEqual(len(set(RUNNER.FUSE_CASES)), 15)
         parsed = RUNNER.parser().parse_args(["--source", "/source", "--build", "/build",
                                             "--fdb-bin-dir", "/fdb", "--work", "/private/new"])
         self.assertEqual(parsed.work, Path("/private/new"))

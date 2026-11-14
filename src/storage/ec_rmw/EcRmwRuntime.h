@@ -28,6 +28,7 @@ struct EcRmwObservation {
 class EcRmwRuntime final {
  public:
   using Clock = std::function<uint64_t()>;
+  using TransportPolicy = client::EcRequestControl::TransportPolicy;
   static Result<std::unique_ptr<EcRmwRuntime>> create(std::shared_ptr<const EcRmwKey>,
                                                       Uuid authority,
                                                       flat::NodeId localNode,
@@ -36,10 +37,13 @@ class EcRmwRuntime final {
   // Receiving replay discards only volatile bytes and renews the same plan;
   // running/complete-success replay never restarts the job. The caller acquires
   // the one-job reservation and the actual scope ticket only when true.
-  Result<bool> prepareInstall(std::shared_ptr<const EcRmwPlan>, const EcRmwGrant &);
+  Result<bool> prepareInstall(std::shared_ptr<const EcRmwPlan>, const EcRmwGrant &,
+                              TransportPolicy = TransportPolicy::TcpOnly);
   Result<Void> install(std::shared_ptr<const EcRmwPlan>, const EcRmwGrant &, std::shared_ptr<NativeEcRmwIo>);
-  Result<Void> put(const Uuid &planId, const EcRmwGrant &, uint32_t block, std::string_view ownedCallBytes);
-  Result<EcRmwObservation> submit(const Uuid &planId, const EcRmwGrant &);
+  Result<Void> put(const Uuid &planId, const EcRmwGrant &, uint32_t block, std::string_view ownedCallBytes,
+                   TransportPolicy = TransportPolicy::TcpOnly);
+  Result<EcRmwObservation> submit(const Uuid &planId, const EcRmwGrant &,
+                                 TransportPolicy = TransportPolicy::TcpOnly);
   Result<EcRmwObservation> query(const Uuid &planId, const EcRmwGrant &) const;
   // Outside any callback/worker/network Processor. No timeout/detach. Closing
   // rejects new work; a running task is joined with all borrowed I/O alive.
@@ -48,11 +52,18 @@ class EcRmwRuntime final {
 
  private:
   friend struct ec_rmw_detail::RuntimeTestAccess;
+  struct InstallBinding {
+    Uuid planId;
+    EcSha256 digest;
+    TransportPolicy transport;
+  };
   struct Entry {
     std::shared_ptr<const EcRmwPlan> plan;
     std::unique_ptr<EcRmwPatchBuffer> patch;
     std::shared_ptr<EcRmwIo> io;
     EcRmwGrant installed;
+    // Local session affinity survives io.reset(); it is not part of the wire/MAC or disk format.
+    TransportPolicy transport = TransportPolicy::TcpOnly;
     std::optional<VerifiedEcRmwPlan> execute;
     std::string ownedPatch;
     EcRmwObservation observation;
@@ -62,7 +73,8 @@ class EcRmwRuntime final {
         authority_(authority),
         node_(node),
         clock_(std::move(clock)) {}
-  Result<Void> installInternal(std::shared_ptr<const EcRmwPlan>, const EcRmwGrant &, std::shared_ptr<EcRmwIo>);
+  Result<Void> installInternal(std::shared_ptr<const EcRmwPlan>, const EcRmwGrant &, std::shared_ptr<EcRmwIo>,
+                               TransportPolicy = TransportPolicy::TcpOnly);
   Result<VerifiedEcRmwPlan> verify(const Entry &, const EcRmwGrant &, EcRmwRight) const;
   void work() noexcept;
   std::shared_ptr<const EcRmwKey> key_;
@@ -73,6 +85,9 @@ class EcRmwRuntime final {
   std::mutex stopMutex_;
   std::condition_variable wake_;
   std::unique_ptr<Entry> entry_;
+  // Survives prepareInstall releasing an idle Entry while native admission awaits.
+  // It is not an installed job, a recovery result, or durable authorization.
+  std::optional<InstallBinding> installBinding_;
   bool closing_ = false;
   bool joined_ = false;
   std::thread worker_;

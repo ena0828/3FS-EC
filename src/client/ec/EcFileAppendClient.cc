@@ -28,6 +28,7 @@ Result<std::unique_ptr<EcFileAppendClient>> EcFileAppendClient::connect(std::sha
   }
 }
 Result<Void> EcFileAppendClient::check(const EcAppendJournal &j, EcStripeControl c) const {
+  RETURN_ON_ERROR(validateEcStorageTransport(c.transport));
   RETURN_ON_ERROR(j.record().validate());
   if (j.poisoned() || !same(j.record().session.intent.owner, writer_.owner()))
     return makeError(StatusCode::kTokenMismatch);
