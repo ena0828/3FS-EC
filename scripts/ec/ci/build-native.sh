@@ -12,6 +12,12 @@ local_source=
 local_work=
 local_revision=
 local_container=false
+local_managed=false
+managed_resume=false
+if [[ -n "${EC_LOCAL_BUILD_ATTEMPT:-}" ]]; then
+    local_managed=true
+    [[ "${EC_LOCAL_BUILD_MODE:-}" == resume ]] && managed_resume=true
+fi
 container_fdb_cache=
 container_arrow_cache=
 container_arrow_source_pack=
@@ -104,6 +110,8 @@ if [[ -n "$local_source$local_work$local_revision" ]]; then
 fi
 if "$local_container"; then
     "$local_mode" || { usage; exit 2; }
+elif "$local_managed"; then
+    "$local_mode" && [[ "$build_jobs" =~ ^(1|2|4|8|12|16)$ ]] || { usage; exit 2; }
 elif [[ "$build_jobs" != 1 && "$build_jobs" != 2 && "$build_jobs" != 4 ]]; then
     usage; exit 2
 fi
@@ -115,6 +123,12 @@ if [[ -n "$container_arrow_source_pack$container_arrow_source_pack_sha256" ]]; t
     "$local_container" && [[ -n "$container_arrow_source_pack" && -n "$container_arrow_source_pack_sha256" ]] || { usage; exit 2; }
 fi
 # END ARGUMENT PARSER
+if "$local_managed"; then
+    "$local_mode" && ! "$local_container" || { usage; exit 2; }
+    [[ "$backend" == isal && "$with_lab" == true && "$with_regression" == true ]] || { usage; exit 2; }
+    /usr/bin/python3 -I "$local_source/scripts/ec/ci/local-incremental-build.py" child-check \
+        --source "$local_source" --work "$local_work" --revision "$local_revision" --build-jobs "$build_jobs"
+fi
 if "$local_mode"; then
     # No environment impersonation: the requested revision is checked against Git.
     source_root="$local_source"
@@ -123,8 +137,10 @@ if "$local_mode"; then
     [[ "$(realpath -e -- "${BASH_SOURCE[0]}")" == "$source_root/scripts/ec/ci/build-native.sh" ]]
     local_profile_args=()
     if "$local_container"; then local_profile_args=(--container-build-only); fi
-    local_preflight=$(/usr/bin/python3 -I "$source_root/scripts/ec/ci/prepare-local-build.py" \
-        --source "$source_root" --work "$work" --revision "$source_revision" --backend "$backend" "${local_profile_args[@]}")
+    if ! "$managed_resume"; then
+        local_preflight=$(/usr/bin/python3 -I "$source_root/scripts/ec/ci/prepare-local-build.py" \
+            --source "$source_root" --work "$work" --revision "$source_revision" --backend "$backend" "${local_profile_args[@]}")
+    fi
     dependency_prefix="$work/deps"
 else
     [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_OS:-}" == Linux ]] || {
@@ -142,15 +158,19 @@ fi
 [[ "$(git -C "$source_root" rev-parse --show-toplevel)" == "$source_root" ]]
 [[ "$(git -C "$source_root" rev-parse HEAD)" == "$source_revision" ]]
 git -C "$source_root" diff --quiet HEAD --ignore-submodules=all
+if ! "$managed_resume"; then
 git -C "$source_root" submodule foreach --recursive 'git diff --quiet HEAD && test -z "$(git ls-files --others --exclude-standard)"'
 [[ ! -e "$work" && ! -L "$work" && ! -e "$source_root/target" && ! -L "$source_root/target" ]] || {
     echo "Refusing to reuse an existing build or Cargo target directory" >&2; exit 2;
 }
 mkdir -m 700 -- "$work"
 mkdir -- "$work/provenance" "$work/cargo-target" "$work/bin"
+fi
 if "$local_mode"; then
-    printf '%s\n' "$local_preflight" > "$work/provenance/local-preflight.json"
-    unset local_preflight
+    if ! "$managed_resume"; then
+        printf '%s\n' "$local_preflight" > "$work/provenance/local-preflight.json"
+        unset local_preflight
+    fi
     # Set before any rustup/cargo/rustc command. Never change the user's defaults.
     export RUSTUP_HOME="$work/rustup-home" CARGO_HOME="$work/cargo-home"
     export RUSTUP_TOOLCHAIN=1.99.1
@@ -172,7 +192,7 @@ sha256sum scripts/ec/install-build-deps.sh scripts/ec/cluster/fetch-fdb.sh \
     scripts/ec/cluster/prepare-fdb-cache.py \
     patches/apply.sh patches/folly.patch patches/rocksdb.patch patches/rocksdb.patch.2 \
     cmake/AddCrate.cmake cmake/ApacheArrow.cmake cmake/Jemalloc.cmake \
-    scripts/ec/ci/build-native.sh scripts/ec/ci/prepare-local-build.py scripts/ec/ci/run-core-tests.py \
+    scripts/ec/ci/build-native.sh scripts/ec/ci/prepare-local-build.py scripts/ec/ci/local-incremental-build.py scripts/ec/ci/run-core-tests.py \
     scripts/ec/ci/container-build-resources.py \
     scripts/ec/ci/prepare-libfuse-cache.py scripts/ec/ci/prepare-arrow-cache.py \
     scripts/ec/ci/prepare-arrow-source-cache.py \
@@ -290,8 +310,20 @@ try:
     else:
         groups = cgroup_rows(Path('/sys/fs/cgroup'), Path('/proc/self/cgroup').read_text(),
                              Path('/proc/self/mountinfo').read_text())
-        record = resource_plan(jobs, memory, len(os.sched_getaffinity(0)), groups)
-    if sys.argv[3] == 'true' and sys.argv[4] == 'false':
+        if os.environ.get('EC_LOCAL_BUILD_ATTEMPT'):
+            import importlib.util
+            helper = Path(sys.argv[5]) / 'scripts/ec/ci/local-incremental-build.py'
+            spec = importlib.util.spec_from_file_location('managed_local', helper)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            attempt, intent = module.context()
+            previous = None
+            if intent['previous_attempt']:
+                previous = module.read(Path(intent['previous_attempt']) / 'monitor.json')
+            record = module.resource_plan(jobs, memory, len(os.sched_getaffinity(0)), groups, previous)
+        else:
+            record = resource_plan(jobs, memory, len(os.sched_getaffinity(0)), groups)
+    if sys.argv[3] == 'true' and sys.argv[4] == 'false' and not os.environ.get('EC_LOCAL_BUILD_ATTEMPT'):
         floor = resource_plan(2, memory, len(os.sched_getaffinity(0)), groups)
         record['local_conservative_floor'] = floor['j2_thresholds']
         if floor['effective_jobs'] is None:
@@ -309,6 +341,23 @@ print(json.dumps({'build_resources': record}), flush=True)
 require(record['effective_jobs'] == jobs, 'build resource admission refused')
 PY
 
+configure_build_environment() {
+# Child ExternalProjects do not inherit the top-level Clang toolchain flags.
+# Give them an explicit GCC 12 compiler instead of Clang with GCC 13+ headers.
+export CC=/usr/bin/gcc-12
+export CXX=/usr/bin/g++-12
+export CMAKE_BUILD_PARALLEL_LEVEL=1
+export CARGO_BUILD_JOBS=1
+export MAKEFLAGS=-j1
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_TEST_DEBUG=0
+export LIBCLANG_PATH=/usr/lib/llvm-18/lib
+export PKG_CONFIG_PATH="$dependency_prefix/lib/pkgconfig"
+export LD_LIBRARY_PATH="$dependency_prefix/lib"
+# END BUILD ENVIRONMENT
+}
+
+if ! "$managed_resume"; then
 # Reuse the repository's dependency set, including Arrow's transitive closure.
 # No system FoundationDB package hooks or services are installed.
 if ! "$local_mode"; then
@@ -330,19 +379,8 @@ if not match or tuple(map(int, match.groups())) < (3, 28, 0):
     raise SystemExit("CMake >= 3.28 is required to avoid Arrow's legacy explicit -j8 path")
 PY
 
-# Child ExternalProjects do not inherit the top-level Clang toolchain flags.
-# Give them an explicit GCC 12 compiler instead of Clang with GCC 13+ headers.
-export CC=/usr/bin/gcc-12
-export CXX=/usr/bin/g++-12
-export CMAKE_BUILD_PARALLEL_LEVEL=1
-export CARGO_BUILD_JOBS=1
-export MAKEFLAGS=-j1
-export CARGO_PROFILE_DEV_DEBUG=0
-export CARGO_PROFILE_TEST_DEBUG=0
-export LIBCLANG_PATH=/usr/lib/llvm-18/lib
-export PKG_CONFIG_PATH="$dependency_prefix/lib/pkgconfig"
-export LD_LIBRARY_PATH="$dependency_prefix/lib"
-# END BUILD ENVIRONMENT
+configure_build_environment
+
 
 # BEGIN ARROW SOURCE CACHE
 arrow_source_cmake_args=()
@@ -593,6 +631,19 @@ git -C third_party/folly diff --binary | sha256sum
 git -C third_party/rocksdb diff --binary | sha256sum
 
 ln -s -- "$work/cargo-target" "$source_root/target"
+else
+    configure_build_environment
+    export RUSTUP_HOME="$work/rustup-home" RUSTUP_TOOLCHAIN=1.99.1
+    export CARGO_HOME="$work/cargo-home" CARGO_TARGET_DIR="$work/cargo-target" CARGO_NET_OFFLINE=true
+    export EC_REAL_CARGO
+    EC_REAL_CARGO=$(command -v cargo)
+    export PATH="$work/bin:$PATH"
+    [[ "$(rustc --version)" == 'rustc 1.99.1 '* ]]
+    [[ "$("$EC_REAL_CARGO" --version)" == 'cargo 1.99.1 '* ]]
+    backend_cmake_args=("-DHF3FS_EC_BACKEND=$backend" "-DHF3FS_EC_ISAL_ROOT=$work/isal-prefix")
+    arrow_source_cmake_args=()
+    gcc_toolchain="$work/gcc12"
+fi
 ulimit -n 65536
 # BEGIN REQUESTED BUILD
 local_cmake_args=()
@@ -615,6 +666,9 @@ cmake -S "$source_root" -B "$work/build" -G Ninja \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DHF3FS_EXTERNAL_BUILD_JOBS=1 "${backend_cmake_args[@]}" \
     "-DCMAKE_JOB_POOLS=ec_compile=$build_jobs;ec_link=1" \
     -DCMAKE_JOB_POOL_COMPILE=ec_compile -DCMAKE_JOB_POOL_LINK=ec_link "${arrow_source_cmake_args[@]}"
+if [[ "${local_managed:-false}" == true ]]; then
+    /usr/bin/python3 -I "$source_root/scripts/ec/ci/local-incremental-build.py" checkpoint
+fi
 build_targets=(test_meta test_fuse_ec)
 if "$with_regression"; then
     build_targets+=(test_storage_store test_storage_service test_client)
@@ -778,16 +832,18 @@ if container_arrow_source_pack:
     common['arrow_source_cache_provenance'] = arrow_source_cache.verify_preparation(source, work)
 record = dict(common, targets=list(paths), binaries={name: sha(path) for name, path in paths.items()},
               ec_regression_targets_requested=with_regression == 'true', lab_targets_requested=with_lab == 'true')
-path = work / 'provenance/native-build.json'
+proof_directory = (Path(os.environ['EC_LOCAL_BUILD_ATTEMPT']) / 'staged'
+                   if os.environ.get('EC_LOCAL_BUILD_ATTEMPT') else work / 'provenance')
+path = proof_directory / 'native-build.json'
 with path.open('x') as out:
     json.dump(record, out, indent=2)
     out.write('\n')
-print(json.dumps({'native_build': record, 'receipt_sha256': sha(path)}))
+print(json.dumps({'native_build_staged' if os.environ.get('EC_LOCAL_BUILD_ATTEMPT') else 'native_build': record, 'receipt_sha256': sha(path)}))
 if with_lab == 'true':
     lab = dict(common, targets=list(lab_names),
                binaries={name: record['binaries'][name] for name in lab_names},
                native_build_receipt_sha256=sha(path))
-    path = work / 'provenance/lab-build.json'
+    path = proof_directory / 'lab-build.json'
     with path.open('x') as out:
         json.dump(lab, out, indent=2)
         out.write('\n')

@@ -107,6 +107,33 @@ def check_filesystem(kind, container_build_only):
             'Container build-only paths require ext4/xfs; ordinary local paths require ext4')
 
 
+def managed_existing_paths(source, work, original):
+    """Read-only ordinary-host refresh; does not adopt or rewrite a build epoch."""
+    import resource
+    require(os.getuid() == os.geteuid() != 0 and os.getgid() == os.getegid(),
+            'Managed resume requires unchanged ordinary real/effective UID/GID')
+    require((original['uid'], original['gid']) == (os.getuid(), os.getgid()), 'Original build owner changed')
+    for name, item in original['tools'].items():
+        actual = shutil.which(name)
+        require(actual is not None and Path(actual).samefile(item['path']),
+                'Actual PATH tool differs from original provider: ' + name)
+    for path in (source, work):
+        canonical(path)
+        info = path.stat()
+        require(info.st_uid == os.getuid() and info.st_gid == os.getgid() and not info.st_mode & 0o022,
+                'Managed source/work ownership or permissions changed')
+        kind = subprocess.check_output(['findmnt', '-n', '-o', 'FSTYPE', '-T', str(path)], text=True).strip()
+        check_filesystem(kind, False)
+    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    require(hard == resource.RLIM_INFINITY or hard >= 65536, 'Hard nofile limit must allow 65536')
+    disk = os.statvfs(work)
+    free = disk.f_bavail * disk.f_frsize
+    require(free >= 8 * GIB and disk.f_favail >= 25000, 'Managed incremental free-space floor not met')
+    return {'uid': os.getuid(), 'gid': os.getgid(), 'filesystem': 'ext4', 'disk_free_bytes': free,
+            'free_inodes': disk.f_favail, 'nofile_hard': hard,
+            'scope': 'incremental guard only; 8 GiB/25000 inodes do not guarantee peak storage use'}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', required=True, type=Path)

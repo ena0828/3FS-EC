@@ -100,6 +100,18 @@ class BuildInputs(unittest.TestCase):
             with self.subTest(argv=argv):
                 result = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True)
                 self.assertEqual((result.returncode, result.stdout.strip()), (0, expected), result.stderr)
+        managed_args = ['--local-source', '/fixed/source', '--local-work', '/fixed/native',
+                        '--local-revision', 'a' * 40]
+        for jobs in ('8', '12', '16'):
+            argv = managed_args + ['--build-jobs', jobs]
+            managed_env = dict(os.environ, EC_LOCAL_BUILD_ATTEMPT='/fixed/attempt', EC_LOCAL_BUILD_MODE='fresh')
+            good = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True,
+                                  capture_output=True, env=managed_env)
+            self.assertEqual((good.returncode, good.stdout.strip()), (0, 'scalar false false ' + jobs), good.stderr)
+            ordinary = dict(os.environ)
+            ordinary.pop('EC_LOCAL_BUILD_ATTEMPT', None)
+            bad = subprocess.run([bash, '-s', '--', *argv], input=parser, text=True, capture_output=True, env=ordinary)
+            self.assertNotEqual(bad.returncode, 0)
         bad_pack = [[], ['--container-arrow-source-pack', '/cache/arrow.pack'],
                     ['--container-arrow-source-pack-sha256', 'b' * 64],
                     ['--container-arrow-source-pack', 'relative', '--container-arrow-source-pack-sha256', 'b' * 64],
@@ -547,7 +559,7 @@ rustup() { record "rustup $*"; }
 
     def test_real_final_receipt_profiles_and_loader_mismatch(self):
         blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", SCRIPT.read_text(), re.S)
-        block, = [item for item in blocks if "path = work / 'provenance/native-build.json'" in item]
+        block, = [item for item in blocks if "path = proof_directory / 'native-build.json'" in item]
         code = compile(block, str(SCRIPT) + ':actual-final-receipt', 'exec')
         fixed_isal = '40ccd5e5abaff0451feff750d2b011370a546ac4706d1b06b9285ac26eda2c3c'
         for backend, mode, bad_loader, container_mode in [
