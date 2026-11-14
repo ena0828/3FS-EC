@@ -1,12 +1,22 @@
 #include "EcRmwPlanIssuer.h"
 
 #include <bit>
+#include <folly/logging/xlog.h>
 #include <limits>
 
 #include "meta/store/EcFileRepairCatalog.h"
 
 namespace hf3fs::meta::server {
 using namespace storage;
+namespace {
+void logBindCommitFailure(const Uuid &child, size_t attempt, status_code_t code) noexcept {
+  try {
+    XLOGF(WARN, "EC_RMW_BIND stage=commit child={} attempt={} code={}", child.toHexString(), attempt, code);
+  } catch (...) {
+    // Diagnostics must never replace the original transaction outcome.
+  }
+}
+}  // namespace
 Result<std::shared_ptr<EcRmwPlanIssuer>> EcRmwPlanIssuer::create(Config c,
                                                                  std::shared_ptr<kv::IKVEngine> db,
                                                                  std::shared_ptr<const EcRmwKey> rmw,
@@ -58,27 +68,37 @@ CoTryTask<EcRmwIssuedExecution> EcRmwPlanIssuer::bind(EcObjectRef object,
                                                       Uuid child,
                                                       EcRmwGrant execution,
                                                       EcRmwComputedCommitment computed) const {
-  auto raw = db_->createReadWriteTransaction();
-  if (!raw) co_return makeError(StatusCode::kKVStoreNotFound);
-  EcFileTreeTxnBudget txn(*raw, EcFileTreeTxnBudget::Profile::Rmw);
-  auto current = co_await EcFileExecutionCatalog::get(txn, owner, object, child);
-  if (!current) co_return makeError(std::move(current.error()));
-  auto allowed = EcRmwAuthorization::verify(*rmw_,
-                                            execution,
-                                            current->plan,
-                                            current->plan->worker(),
-                                            config_.authority,
-                                            EcRmwRight::Execute,
-                                            config_.now());
-  if (!allowed) co_return makeError(std::move(allowed.error()));
-  auto verified = EcRmwComputationAuthorization::verify(*rmw_, current->plan, computed);
-  if (!verified) co_return makeError(std::move(verified.error()));
-  auto bound = co_await EcFileExecutionCatalog::bindOutput(txn, owner, object, child, *verified);
-  if (!bound) co_return makeError(std::move(bound.error()));
-  // bindOutput already performs the one ECFE/ECSP issuance increment.
-  auto committed = co_await txn.commit();
-  if (!committed) co_return makeError(std::move(committed.error()));
-  co_return sign(std::move(*bound));
+  // Only a definitively uncommitted conflict may replay this exact binding.
+  // Each fresh transaction rechecks the live owner, plan, grant and issuance gate.
+  constexpr size_t kMaxAttempts = 4;
+  for (size_t attempt = 1;; ++attempt) {
+    auto raw = db_->createReadWriteTransaction();
+    if (!raw) co_return makeError(StatusCode::kKVStoreNotFound);
+    EcFileTreeTxnBudget txn(*raw, EcFileTreeTxnBudget::Profile::Rmw);
+    auto current = co_await EcFileExecutionCatalog::get(txn, owner, object, child);
+    if (!current) co_return makeError(std::move(current.error()));
+    auto allowed = EcRmwAuthorization::verify(*rmw_,
+                                              execution,
+                                              current->plan,
+                                              current->plan->worker(),
+                                              config_.authority,
+                                              EcRmwRight::Execute,
+                                              config_.now());
+    if (!allowed) co_return makeError(std::move(allowed.error()));
+    auto verified = EcRmwComputationAuthorization::verify(*rmw_, current->plan, computed);
+    if (!verified) co_return makeError(std::move(verified.error()));
+    auto bound = co_await EcFileExecutionCatalog::bindOutput(txn, owner, object, child, *verified);
+    if (!bound) co_return makeError(std::move(bound.error()));
+    // bindOutput already performs the one ECFE/ECSP issuance increment.
+    auto committed = co_await txn.commit();
+    if (!committed) {
+      const auto code = committed.error().code();
+      logBindCommitFailure(child, attempt, code);
+      if (code == TransactionCode::kConflict && attempt < kMaxAttempts) continue;
+      co_return makeError(std::move(committed.error()));
+    }
+    co_return sign(std::move(*bound));
+  }
 }
 Result<EcCapabilityV2> EcRmwPlanIssuer::dataGrant(const EcRepairFragment &f,
                                                   const EcRmwPlan &plan,

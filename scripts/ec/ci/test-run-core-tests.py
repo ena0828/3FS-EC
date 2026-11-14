@@ -59,7 +59,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                 bad[field]["cleanup"]["leader_reaped"] = False
             with self.subTest(field=field), self.assertRaises(ValueError):
                 RUNNER.check_meta_receipt(bad, binary, output, cases, test_filter)
-        self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 34)
+        self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 38)
         combined, combined_filter, combined_fuse = RUNNER.selection("service-contracts")
         self.assertEqual(combined, expected + (
             "TestMetaServiceReflection.RegistersAll76IncludingBeyondDefaultFieldRank",))
@@ -246,7 +246,22 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                 RUNNER.check_meta_receipt(invalid, binary, output, cases, test_filter)
 
     def test_fixed_sets_and_required_cli(self):
-        self.assertEqual(len(set(RUNNER.META_CASES)), 19)
+        self.assertEqual(len(set(RUNNER.META_CASES)), 23)
+        source = (Path(__file__).resolve().parents[3] / "tests/meta/EcRmwBindConflictNativeTests.inc").read_text(encoding="utf-8")
+        bind_cases = tuple("TestEcRmwBindConflict." + name for name in (
+            "OneConflictBindsOriginalComputedOutput", "FourConflictsStopWithoutBinding",
+            "CommittedUnknownIsNotRetried", "ClosingDuringConflictPreventsIssuance"))
+        self.assertIn("TestEcRmwBindConflict.*", RUNNER.META_FILTER)
+        for name in bind_cases:
+            self.assertIn(name, RUNNER.META_CASES)
+            self.assertIn("TEST_F(TestEcRmwBindConflict, " + name.split(".")[1] + ")", source)
+            with self.assertRaises(ValueError):
+                RUNNER.check_listing([{"name": case, "disabled": False}
+                                      for case in RUNNER.META_CASES if case != name], RUNNER.META_CASES)
+            failed = xml(RUNNER.META_CASES)
+            next(case for case in failed["cases"] if case["name"] == name)["failed"] = True
+            with self.assertRaises(ValueError):
+                RUNNER.check_xml(failed, RUNNER.META_CASES)
         self.assertEqual(len(set(RUNNER.FUSE_CASES)), 15)
         parsed = RUNNER.parser().parse_args(["--source", "/source", "--build", "/build",
                                             "--fdb-bin-dir", "/fdb", "--work", "/private/new"])

@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <folly/ScopeGuard.h>
 
 #include "common/kv/IKVEngine.h"
 #include "common/kv/KeyPrefix.h"
@@ -16,6 +17,7 @@
 #include "meta/store/EcFileTreeTxnBudget.h"
 #include "tests/GtestHelpers.h"
 #include "tests/meta/EcMountedTruncateFault.h"
+#include "tests/meta/EcRmwBindConflictFault.h"
 
 namespace hf3fs::meta::server::detail {
 // Test-owned, fixed-capacity observation. No keys, values, credentials, callback
@@ -31,6 +33,8 @@ class EcNativeTxnObservation {
     uint32_t rawCommitCalls = 0;
     RawCommit rawCommit = RawCommit::NotCalled;
     uint32_t rawError = StatusCode::kOK;
+    // Preserve the actual FDB success when a test deliberately loses its ACK.
+    bool deliberatelyLostCommitAck = false;
     bool approximateAttempted = false;
     bool approximateAvailable = false;
     int64_t approximateBytes = -1;
@@ -74,7 +78,8 @@ class EcNativeTxnObservation {
     std::ostringstream trace;
     trace << "raw,raw_attempt,budget_attempt,point,profile,limit_bytes,limit_ops,read,mutation,conflict,ops,"
              "poison,budget_commit,budget_error,raw_commit_calls,raw_commit,raw_error,approx_attempted,"
-             "approx_available,approx_bytes,approx_error,raw_lifetime_us,approx_us,commit_us,write_call_families\n";
+             "approx_available,approx_bytes,approx_error,raw_lifetime_us,approx_us,commit_us,write_call_families,"
+             "deliberately_lost_commit_ack\n";
     for (size_t i = 0; i < std::min(count, kCapacity); ++i) {
       const auto &e = events_[i];
       const auto &b = e.budget;
@@ -93,6 +98,7 @@ class EcNativeTxnObservation {
       EXPECT_LE(b.usage.totalBytes(), b.limits.bytes);
       EXPECT_LE(b.usage.keyOperations, b.limits.keyOperations);
       if (b.commitOutcome == Budget::CommitOutcome::Succeeded) {
+        EXPECT_FALSE(e.deliberatelyLostCommitAck);
         EXPECT_EQ(e.rawCommitCalls, 1u);
         EXPECT_EQ(e.rawCommit, RawCommit::Succeeded);
         EXPECT_TRUE(e.approximateAttempted);
@@ -100,8 +106,15 @@ class EcNativeTxnObservation {
         EXPECT_GE(e.approximateBytes, 0);
         EXPECT_EQ(e.approximateError, StatusCode::kOK);
       } else if (b.commitOutcome == Budget::CommitOutcome::Failed) {
-        EXPECT_EQ(e.rawCommit, RawCommit::Failed);
-        EXPECT_EQ(b.commitError, e.rawError);
+        if (e.deliberatelyLostCommitAck) {
+          EXPECT_EQ(e.rawCommitCalls, 1u);
+          EXPECT_EQ(e.rawCommit, RawCommit::Succeeded);
+          EXPECT_EQ(e.rawError, StatusCode::kOK);
+          EXPECT_EQ(b.commitError, TransactionCode::kMaybeCommitted);
+        } else {
+          EXPECT_EQ(e.rawCommit, RawCommit::Failed);
+          EXPECT_EQ(b.commitError, e.rawError);
+        }
       } else if (b.commitOutcome == Budget::CommitOutcome::Rejected) {
         EXPECT_EQ(e.rawCommitCalls, 0u);
       }
@@ -112,7 +125,7 @@ class EcNativeTxnObservation {
             << unsigned(e.rawCommit) << ',' << e.rawError << ',' << e.approximateAttempted << ','
             << e.approximateAvailable << ',' << e.approximateBytes << ',' << e.approximateError << ','
             << e.rawLifetimeMicros << ',' << e.approximateMicros << ',' << e.commitMicros << ',' << e.writtenFamilies
-            << '\n';
+            << ',' << e.deliberatelyLostCommitAck << '\n';
     }
     if (expectRmw) EXPECT_GT(rmw, 0u) << "no actual outer Rmw wrapper was observed";
     ::testing::Test::RecordProperty("ec_txn_observation_event_count", std::to_string(count));
@@ -142,11 +155,13 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
   EcObservedNativeTransaction(std::unique_ptr<kv::IReadWriteTransaction> inner,
                               std::shared_ptr<EcNativeTxnObservation> observation,
                               std::shared_ptr<EcMountedTruncateFault> fault = nullptr,
-                              std::shared_ptr<kv::IKVEngine> rawEngine = nullptr)
+                               std::shared_ptr<kv::IKVEngine> rawEngine = nullptr,
+                               std::shared_ptr<EcRmwBindConflictFault> bindFault = nullptr)
       : inner_(std::move(inner)),
         observation_(std::move(observation)),
         fault_(std::move(fault)),
-        rawEngine_(std::move(rawEngine)) {
+        rawEngine_(std::move(rawEngine)),
+        bindFault_(std::move(bindFault)) {
     event_.rawId = observation_->nextId();
     observation_->started();
   }
@@ -178,6 +193,8 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
     event_.rawAttempt = nextAttempt;
     started_ = Clock::now();
     faultToken_ = 0;
+    bindFaultToken_ = 0;
+    wroteAllocation_ = false;
   }
   CoTryTask<void> addReadConflict(std::string_view k) override { return inner_->addReadConflict(k); }
   CoTryTask<void> addReadConflictRange(std::string_view a, std::string_view b) override {
@@ -185,6 +202,16 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
   }
   CoTryTask<void> set(std::string_view k, std::string_view v) override {
     recordFamily(k);
+    if (bindFault_) {
+      if (k.starts_with(kv::toStr(kv::KeyPrefix::EcV2Allocation))) wroteAllocation_ = true;
+      try {
+        const auto selected = bindFault_->selectSet(k, v);
+        if (selected) bindFaultToken_ = *selected;
+      } catch (...) {
+        bindFaultToken_ = 0;
+        bindFault_->setupFailed(StatusCode::kIOError);
+      }
+    }
     if (fault_) {
       try {
         const auto selected = fault_->selectSet(k, v);
@@ -207,6 +234,25 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
   }
   CoTryTask<void> commit() override {
     ++event_.rawCommitCalls;
+    const auto bindAttempt = bindFault_ ? bindFault_->beginCommit(bindFaultToken_, wroteAllocation_)
+                                       : std::optional<EcRmwBindConflictFault::Attempt>{};
+    bool bindFinished = false, bindPrepared = false;
+    auto finishBind = folly::makeGuard([&] {
+      if (bindAttempt && !bindFinished) bindFault_->abandon(*bindAttempt);
+    });
+    if (bindAttempt) {
+      try {
+        if (rawEngine_ && dynamic_cast<kv::FDBTransaction *>(inner_.get())) {
+          auto prepared = co_await bindFault_->beforeCommit(*rawEngine_, *bindAttempt);
+          if (prepared) bindPrepared = true;
+          else bindFault_->setupFailed(prepared.error().code());
+        } else {
+          bindFault_->setupFailed(StatusCode::kInvalidArg);
+        }
+      } catch (...) {
+        bindFault_->setupFailed(StatusCode::kIOError);
+      }
+    }
     bool injected = false;
     if (fault_ && faultToken_) {
       try {
@@ -251,6 +297,14 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
           result ? EcNativeTxnObservation::RawCommit::Succeeded : EcNativeTxnObservation::RawCommit::Failed;
       if (!result) event_.rawError = result.error().code();
       if (fault_) fault_->originalCommitted(injected, result ? StatusCode::kOK : result.error().code());
+      if (bindAttempt) {
+        const bool lost = bindFault_->finish(*bindAttempt, result ? StatusCode::kOK : result.error().code(), bindPrepared);
+        bindFinished = true;
+        if (lost) {
+          event_.deliberatelyLostCommitAck = true;
+          co_return makeError(TransactionCode::kMaybeCommitted);
+        }
+      }
       co_return result;
     } catch (...) {
       event_.commitMicros = micros(Clock::now() - committing);
@@ -278,7 +332,10 @@ class EcObservedNativeTransaction final : public kv::IReadWriteTransaction,
   std::shared_ptr<EcNativeTxnObservation> observation_;
   std::shared_ptr<EcMountedTruncateFault> fault_;
   std::shared_ptr<kv::IKVEngine> rawEngine_;
+  std::shared_ptr<EcRmwBindConflictFault> bindFault_;
   uint64_t faultToken_ = 0;
+  uint64_t bindFaultToken_ = 0;
+  bool wroteAllocation_ = false;
   EcNativeTxnObservation::Event event_;
   Clock::time_point started_ = Clock::now();
 };
@@ -287,10 +344,12 @@ class EcObservedNativeEngine final : public kv::IKVEngine {
  public:
   EcObservedNativeEngine(std::shared_ptr<kv::IKVEngine> inner,
                          std::shared_ptr<EcNativeTxnObservation> observation,
-                         std::shared_ptr<EcMountedTruncateFault> fault = nullptr)
+                         std::shared_ptr<EcMountedTruncateFault> fault = nullptr,
+                         std::shared_ptr<EcRmwBindConflictFault> bindFault = nullptr)
       : inner_(std::move(inner)),
         observation_(std::move(observation)),
-        fault_(std::move(fault)) {}
+        fault_(std::move(fault)),
+        bindFault_(std::move(bindFault)) {}
   std::unique_ptr<kv::IReadOnlyTransaction> createReadonlyTransaction() override {
     // Preserve the engine's read-only factory semantics. RMW service budgets
     // use createReadWriteTransaction even for their committed observations.
@@ -299,12 +358,13 @@ class EcObservedNativeEngine final : public kv::IKVEngine {
   std::unique_ptr<kv::IReadWriteTransaction> createReadWriteTransaction() override {
     auto inner = inner_->createReadWriteTransaction();
     if (!inner) return nullptr;
-    return std::make_unique<EcObservedNativeTransaction>(std::move(inner), observation_, fault_, inner_);
+    return std::make_unique<EcObservedNativeTransaction>(std::move(inner), observation_, fault_, inner_, bindFault_);
   }
 
  private:
   std::shared_ptr<kv::IKVEngine> inner_;
   std::shared_ptr<EcNativeTxnObservation> observation_;
   std::shared_ptr<EcMountedTruncateFault> fault_;
+  std::shared_ptr<EcRmwBindConflictFault> bindFault_;
 };
 }  // namespace hf3fs::meta::server::detail

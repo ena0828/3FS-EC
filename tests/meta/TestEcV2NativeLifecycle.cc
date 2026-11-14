@@ -95,6 +95,10 @@ void smallClient(net::Client::Config &config) {
 
 struct PublishReplyDrop {
   std::shared_ptr<detail::EcMountedTruncateFault> mountedTruncate;
+  std::shared_ptr<detail::EcRmwBindConflictFault> bindConflict;
+  Uuid bindTrackedChild = Uuid::zero();
+  size_t bindReplies = 0;
+  status_code_t bindStatus = StorageClientCode::kNotInitialized;
   bool mountedDropBegin = false;
   size_t mountedBeginDrops = 0;
   int mountedShutdownResult = -1;
@@ -154,6 +158,17 @@ class DropPublishMetaService : public MetaSerdeService {
       : MetaSerdeService(meta),
         fault_(fault) {}
 
+  CoTryTask<BindEcRmwOutputRsp> bindEcRmwOutput(serde::CallContext &ctx, const BindEcRmwOutputReq &req) {
+    auto response = co_await MetaSerdeService::bindEcRmwOutput(ctx, req);
+    if (fault_.bindConflict) {
+      std::lock_guard lock(fault_.mutex);
+      if (fault_.bindTrackedChild == req.child) {
+        ++fault_.bindReplies;
+        fault_.bindStatus = response ? StatusCode::kOK : response.error().code();
+      }
+    }
+    co_return response;
+  }
   CoTryTask<EcFileTruncateRsp> queryEcFileTruncate(serde::CallContext &ctx, const QueryEcFileTruncateReq &req) {
     const auto trace = fault_.mountedTruncate;
     const auto event = trace ? trace->enter(detail::EcMountedTruncateFault::Method::Query, req.intent, req.uuid)
@@ -576,6 +591,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   virtual bool enableTargetRetirement() const { return false; }
   virtual bool enableFileRmw() const { return false; }
   virtual bool enableMountedTruncateFault() const { return false; }
+  virtual bool enableRmwBindConflictFault() const { return false; }
   struct Mutation {
     std::string logical;
     storage::EcCodec::Shards shards;
@@ -623,7 +639,9 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
     if (enableFileRmw()) {
       txnObservation_ = std::make_shared<detail::EcNativeTxnObservation>();
       if (enableMountedTruncateFault()) replyDrop_.mountedTruncate = std::make_shared<detail::EcMountedTruncateFault>();
-      kv_ = std::make_shared<detail::EcObservedNativeEngine>(kv_, txnObservation_, replyDrop_.mountedTruncate);
+      if (enableRmwBindConflictFault()) replyDrop_.bindConflict = std::make_shared<detail::EcRmwBindConflictFault>();
+      kv_ = std::make_shared<detail::EcObservedNativeEngine>(
+          kv_, txnObservation_, replyDrop_.mountedTruncate, replyDrop_.bindConflict);
     }
     ASSERT_NO_FATAL_FAILURE(writeKey());
     ASSERT_NO_FATAL_FAILURE(startStorage());
@@ -1447,6 +1465,7 @@ class TestEcV2NativeHelperPlan : public TestEcV2NativeLifecycle {
 // clang-format off
 // The following fragments require TestEcFileNativeWrite to be defined first.
 #include "EcFileNativeWriteTests.inc"
+#include "EcRmwBindConflictNativeTests.inc"
 #include "EcFileOutputNativeTests.inc"
 #include "EcFileOutputResolutionNativeTests.inc"
 #include "EcFileRepairNativeTests.inc"
