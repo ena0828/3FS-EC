@@ -141,7 +141,7 @@ class NativeAdapterTests(unittest.TestCase):
                 i = {'inode_decimal': '42', 'object_incarnation': uid(2), 'owner_uid': 1000,
                      'owner_client': uid(4), 'parent': uid(6 if args.kind == 'pwrite' else 30),
                      'child': uid(7 if args.kind == 'pwrite' else 31), 'owner_kind': args.kind}
-                observation = classification_fixture.observation(i, 5 if self.classification_mode == 'published' else 6,
+                observation = classification_fixture.observation(i, 'Published' if self.classification_mode == 'published' else 'Aborted',
                                                                  bound=self.classification_mode != 'released')
                 adapter = Adapter(plan, {} if self.classification_mode == 'missing' else {i['child']: observation})
                 adapter.exported = [i]

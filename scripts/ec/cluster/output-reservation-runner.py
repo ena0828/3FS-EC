@@ -30,7 +30,7 @@ MAX_INVENTORY = 32 * 1024 * 1024
 # Existing MetaCode::kNotFound in common/utils/StatusCodeDetails.h; never
 # substitute transport Unknown, auth failure or an incomplete archive.
 META_NOT_FOUND = 3000
-KIND = {'pwrite': 1, 'truncate-tail': 2, 'repair': 3}
+KIND = {'pwrite': 'Pwrite', 'truncate-tail': 'TruncateTail', 'repair': 'Repair'}
 CLOSE = {'pwrite': 'seal', 'repair': 'close-repair-debt', 'truncate': 'close-truncate-debt'}
 QUERY = {'pwrite': 'query', 'repair': 'query-repair', 'truncate': 'query-truncate'}
 
@@ -398,8 +398,9 @@ class Classifier:
         value = observation['value'].get('observation')
         require(type(value) is dict, 'Missing ECFE is not a resolution')
         rows = candidates(value, identity)
-        require(type(value.get('state')) is int and value['state'] in (5, 6), 'Candidate execution is not terminal')
-        if value['state'] == 5:
+        require(type(value.get('state')) is str and value['state'] in ('Published', 'Aborted'),
+                'Candidate execution is not terminal')
+        if value['state'] == 'Published':
             require(value.get('allocations') is not None, 'Published allocation binding missing')
             state = 'Published_retained'
             classified = [{**r, 'classification': state, 'eligible': False} for r in rows]
@@ -425,7 +426,9 @@ class Classifier:
                     result['value'].get('metadata_resolution_only') is True, 'Resolution differs from exact candidate set')
             gc.uid(r.get('confirmingClientNamespace'))
             seq = gc.decimal(r.get('issuanceSequence'))
-            require(type(r.get('kind')) is int and r['kind'] == (1 if seq == '0' else 2), 'Resolution kind differs')
+            require(type(r.get('kind')) is str and
+                    r['kind'] == ('NoIssuanceAfterClose' if seq == '0' else 'NeverBoundAfterClose'),
+                    'Resolution kind differs')
             for field in ('candidateDigest', 'executionDigest', 'outputClosureDigest', 'sourceClosureDigest'):
                 nonzero_digest(r.get(field))
             state = 'NoIssuanceAfterClose' if seq == '0' else 'NeverBoundAfterClose'

@@ -30,19 +30,27 @@ def identity(n=0):
             'owner_client': uid(11), 'parent': uid(20 + n), 'child': uid(100 + n), 'owner_kind': 'repair'}
 
 
-def observation(i, state=6, bound=True, seq='1'):
+def readable_identity(i):
+    # Independent C++ readable-JSON fixture, not the production projection.
+    return {'object': {'inode': i['inode_decimal'], 'incarnation': i['object_incarnation']},
+            'owner': {'uid': i['owner_uid'], 'client': i['owner_client']},
+            'parent': i['parent'], 'child': i['child'],
+            'ownerKind': {'pwrite': 'Pwrite', 'truncate-tail': 'TruncateTail', 'repair': 'Repair'}[i['owner_kind']]}
+
+
+def observation(i, state='Aborted', bound=True, seq='1'):
     rows, allocations = [], []
     for n in range(12):
         fragment = {'object': i['object_incarnation'], 'stripe': '0', 'generation': '3',
                     'shard': n, 'allocation': uid(int(uuid.UUID(i['child'])) * 100 + n)}
         endpoint = {'placement': {'node': 61, 'chain': n + 1, 'target': str(n + 1)},
                     'engineUuid': uid(300), 'targetIncarnation': uid(301 + n)}
-        rows.append({'identity': fragment, 'operation': i['child'], 'writer': m.dto_identity(i)['owner'],
+        rows.append({'identity': fragment, 'operation': i['child'], 'writer': readable_identity(i)['owner'],
                      'endpoint': endpoint})
-        allocations.append({'object': m.dto_identity(i)['object'], 'writer': m.dto_identity(i)['owner'],
+        allocations.append({'object': readable_identity(i)['object'], 'writer': readable_identity(i)['owner'],
                             'fragment': {'identity': fragment, 'operation': i['child'], 'placement': endpoint['placement']},
                             'engineUuid': endpoint['engineUuid'], 'targetIncarnation': endpoint['targetIncarnation']})
-    return {'version': 1, 'identity': m.dto_identity(i), 'state': state, 'stripe': '0', 'generation': '3',
+    return {'version': 1, 'identity': readable_identity(i), 'state': state, 'stripe': '0', 'generation': '3',
             'issuanceSequence': seq, 'candidates': rows, 'allocations': allocations if bound else None,
             'outputT2Confirmed': True, 'recordDigest': '1' * 64, 'physicalReclamationConfirmed': False}
 
@@ -77,6 +85,8 @@ class Adapter:
         f = op['expected']; action = f['action']
         row = {'schema': 1, **copy.deepcopy(f), 'phase': 'result', 'status_code': 0,
                'outcome': 'observed' if action in ('observe_file_output', 'query_file_output_resolution', 'query_absent') else 'confirmed'}
+        if 'identity' in f:
+            row['identity'] = readable_identity(next(i for i in self.exported if i['child'] == f['identity']['child']))
         if action == 'observe_file_output':
             row.update(uint64_encoding='unsigned_decimal_strings', physical_reclamation_confirmed=False,
                        metadata_observation_only=True)
@@ -92,11 +102,11 @@ class Adapter:
                     self.confirm_failure = False
                     return {**row, 'status_code': 4085, 'outcome': 'unknown'}
                 o = self.observations[f['identity']['child']]
-                self.resolutions[rid] = {'identity': f['identity'], 'resolutionId': rid,
+                self.resolutions[rid] = {'identity': copy.deepcopy(row['identity']), 'resolutionId': rid,
                     'confirmingClientNamespace': self.namespace, 'candidates': o['candidates'],
                     'candidateReservationsReleaseEligible': True, 'collected': False,
                     'physicalReclamationConfirmed': False, 'issuanceSequence': o['issuanceSequence'],
-                    'kind': 1 if o['issuanceSequence'] == '0' else 2,
+                    'kind': 'NoIssuanceAfterClose' if o['issuanceSequence'] == '0' else 'NeverBoundAfterClose',
                     **{k: '2' * 64 for k in ('candidateDigest', 'executionDigest', 'outputClosureDigest', 'sourceClosureDigest')}}
             if rid not in self.resolutions: return {**row, 'status_code': m.META_NOT_FOUND, 'outcome': 'not_observed'}
             return {**row, 'resolution': copy.deepcopy(self.resolutions[rid]),
@@ -149,6 +159,9 @@ class Adapter:
                 self.loss = None
                 raise LostOwner('after simulated remote result; no joined evidence')
             prepared = {'schema': 1, **op['expected'], 'phase': 'prepared', 'status_code': 0}
+            if 'identity' in op['expected']:
+                prepared['identity'] = readable_identity(next(i for i in self.exported
+                                                             if i['child'] == op['expected']['identity']['child']))
             if self.torn_result == op['expected']['action']:
                 self.torn_result = None
                 (attempt / 'archive.jsonl').write_bytes(m.encoded(prepared) + b'{"phase":"res'); rc = 1
@@ -193,6 +206,54 @@ class OutputReservationTests(unittest.TestCase):
         self.assertFalse(result['business_action_completed']); self.assertFalse(result['physical_capacity_returned'])
         count = len(self.adapter.calls)
         self.assertEqual(self.run_classifier(), result); self.assertEqual(len(self.adapter.calls), count)
+
+    def test_admin_readable_enum_contract_accepts_names_and_rejects_numeric_shapes(self):
+        cases = [('pwrite', 'Aborted', False, '0', 'NoIssuanceAfterClose'),
+                 ('truncate-tail', 'Aborted', False, '7', 'NeverBoundAfterClose'),
+                 ('repair', 'Published', True, '1', 'Published_retained'),
+                 ('repair', 'Aborted', True, '1', 'Bound_classified')]
+        variants = [(case, None, None) for case in cases]
+        variants += [(case, 'owner', bad) for case, bad in zip(cases, (1, 2, 3, True))]
+        variants += [(cases[3], 'state', bad) for bad in (5, 6, True, '6', 'aborted', 'Missing')]
+        variants += [(case, 'resolution', bad) for case, bad in
+                     ((cases[0], 1), (cases[1], 2), (cases[0], True),
+                      (cases[1], '2'), (cases[1], 'never_bound_after_close'))]
+        for n, (case, field, bad) in enumerate(variants):
+            kind, state, bound, seq, expected = case
+            with self.subTest(kind=kind, state=state, field=field, bad=bad):
+                folder = m.gc.private(self.base / f'enum-{n:02d}', create=True)
+                for name in ('operations', 'attempts'): m.gc.private(folder / name, create=True)
+                plan = {**self.plan, 'output_kind': 'truncate' if kind == 'truncate-tail' else kind}
+                m.save(folder / 'plan.json', plan)
+                original = {**identity(), 'owner_kind': kind}
+                observed = observation(original, state, bound, seq)
+                adapter = Adapter(plan, {original['child']: observed}); adapter.exported = [original]
+                self.assertEqual(m.dto_identity(original), readable_identity(original))
+                def corrupt(op, row):
+                    if field == 'owner' and 'identity' in row:
+                        row['identity']['ownerKind'] = bad
+                    elif field == 'state' and row.get('observation') is not None:
+                        row['observation']['state'] = bad
+                    elif field == 'resolution' and row.get('resolution') is not None:
+                        row['resolution']['kind'] = bad
+                    return row
+                adapter.corrupt = corrupt
+                classifier = m.Classifier(folder, plan, adapter)
+                if field is not None:
+                    with self.assertRaises(m.gc.CheckError): classifier.child(0, original)
+                    self.assertFalse(any(c['expected']['action'] in ('collect', 'confirm_absent')
+                                         for c in adapter.calls))
+                else:
+                    result = classifier.child(0, original)
+                    self.assertEqual(result['state'], expected)
+                    self.assertEqual(len(result['candidates']), 12)
+                    self.assertEqual(sum(r['eligible'] for r in result['candidates']),
+                                     0 if state == 'Published' else 12)
+                    # Real adapter argv maps the readable name back to the fixed CLI spelling.
+                    op = classifier.admin('argv-only', 'observe_file_output', original)
+                    cli = SimpleNamespace(root=self.base, launcher=SimpleNamespace(admin_command_line=lambda parts: parts))
+                    parts = m.NativeAdapter.argv(cli, op, folder / 'unused.jsonl')[-1]
+                    self.assertEqual(parts[parts.index('--owner-kind') + 1], kind)
 
     def test_mixed_set_requires_explicit_authorization_and_preserves_failures(self):
         self.adapter.present = {0, 3, 7, 11}
@@ -244,7 +305,7 @@ class OutputReservationTests(unittest.TestCase):
         self.identities[:] = [identity(n) for n in range(3)]
         self.adapter.observations = {self.identities[0]['child']: observation(self.identities[0], bound=False, seq='0'),
                                      self.identities[1]['child']: observation(self.identities[1], bound=False, seq='7'),
-                                     self.identities[2]['child']: observation(self.identities[2], state=5)}
+                                     self.identities[2]['child']: observation(self.identities[2], state='Published')}
         result = self.run_classifier()
         self.assertEqual([c['state'] for c in result['children']],
                          ['NoIssuanceAfterClose', 'NeverBoundAfterClose', 'Published_retained'])

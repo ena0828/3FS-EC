@@ -181,14 +181,13 @@ class Reservations:
                             resolution.get('resolutionId') == row.get('resolution_id') and
                             resolution.get('candidateReservationsReleaseEligible') is True and
                             resolution.get('collected') is False and resolution.get('physicalReclamationConfirmed') is False and
-                            type(resolution.get('kind')) is int and resolution['kind'] ==
-                            (1 if row['classification'] == 'NoIssuanceAfterClose' else 2) and
-                            observation['state'] == 6 and observation.get('allocations') is None and
+                            type(resolution.get('kind')) is str and resolution['kind'] == row['classification'] and
+                            observation['state'] == 'Aborted' and observation.get('allocations') is None and
                             child['state'] == row['classification'],
                             'Resolution does not settle these original candidates')
                 else:
                     require(all(type(proof.get(k)) is type(v) and proof[k] == v for k, v in old.items()) and
-                            proof.get('claim_id') == row.get('claim_id') and observation['state'] == 6 and
+                            proof.get('claim_id') == row.get('claim_id') and observation['state'] == 'Aborted' and
                             child['state'] == 'Bound_classified' and
                             observation.get('allocations') is not None and
                             proof.get('action') in (('collect', 'query') if row['classification'] == 'Collected'
@@ -196,7 +195,7 @@ class Reservations:
                             'Terminal fragment evidence belongs to another candidate')
             else:
                 require(row['classification'] == 'Published_retained' and child['state'] == 'Published_retained' and
-                        observation['state'] == 5, 'Unclassified candidate')
+                        observation['state'] == 'Published', 'Unclassified candidate')
             eligible.append(row['eligible'])
         require(all(eligible) or not any(eligible), 'Partial candidate eligibility cannot release a twelve-slot reservation')
         require(type(result['eligible_candidate_count']) is int and result['eligible_candidate_count'] == sum(eligible),
