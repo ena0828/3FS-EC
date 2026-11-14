@@ -11,6 +11,7 @@
 #include <linux/magic.h>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -32,6 +33,7 @@
 #include "tests/EcRepairTestData.h"
 #include "tests/GtestHelpers.h"
 #include "tests/lib/UnitTestFabric.h"
+#include "tests/meta/EcPendingWriteFault.h"
 #include "tests/storage/EcRmwTestAccess.h"
 
 namespace hf3fs::storage {
@@ -57,6 +59,49 @@ void smallClient(net::Client::Config &config) {
 }
 
 struct StageReplyDropState {
+  struct DirectBudgetHold {
+    struct Snapshot {
+      size_t held = 0, entered = 0, finished = 0, duplicatePositionFour = 0;
+    };
+    // Fixed before any request starts. Only these independently signed plans
+    // participate; a separately rejected request is never part of this count.
+    std::set<EcSha256> allowed;
+    std::set<EcSha256> atPositionFour;
+    std::mutex mutex;
+    std::condition_variable changed;
+    Snapshot state;
+    folly::coro::Baton release;
+    std::atomic<bool> posted{false};
+    bool enter(const EcSha256 &digest, uint8_t position, uint32_t block) {
+      std::lock_guard lock(mutex);
+      if (!allowed.contains(digest) || position >= 10 || block != 0) return false;
+      ++state.entered;
+      if (position == 4) {
+        if (!atPositionFour.insert(digest).second) ++state.duplicatePositionFour;
+        state.held = atPositionFour.size();
+      }
+      changed.notify_all();
+      return true;
+    }
+    void finish() {
+      std::lock_guard lock(mutex);
+      ++state.finished;
+      changed.notify_all();
+    }
+    Snapshot snapshot() {
+      std::lock_guard lock(mutex);
+      return state;
+    }
+    template <class Predicate>
+    bool waitFor(Predicate predicate) {
+      std::unique_lock lock(mutex);
+      return changed.wait_for(lock, std::chrono::seconds(10), [&] { return predicate(state); });
+    }
+    void unblock() {
+      if (!posted.exchange(true)) release.post();
+    }
+    ~DirectBudgetHold() { unblock(); }
+  };
   struct DirectTrace {
     Uuid operation = Uuid::zero();
     std::array<uint16_t, 10> enteredBlocks{};
@@ -174,6 +219,7 @@ struct StageReplyDropState {
   std::condition_variable directChanged;
   DirectTrace direct;
   std::shared_ptr<ReadDelay> directDelay;
+  std::shared_ptr<DirectBudgetHold> directBudget;
   uint8_t directDelayPosition = 4;
   bool waitDirect(const std::function<bool(const DirectTrace &)> &predicate) {
     std::unique_lock lock(mutex);
@@ -212,8 +258,10 @@ class StageReplyDropStorageService : public StorageService {
     const auto position = request.packet.nextHelper;
     bool tracked = false;
     std::shared_ptr<StageReplyDropState::ReadDelay> delay;
+    std::shared_ptr<StageReplyDropState::DirectBudgetHold> budget;
     {
       std::lock_guard lock(fault_.mutex);
+      budget = fault_.directBudget;
       tracked = request.plan.operationId == fault_.direct.operation && position < 10 && request.packet.blockIndex < 16;
       if (tracked) {
         ++fault_.direct.entered;
@@ -222,7 +270,13 @@ class StageReplyDropStorageService : public StorageService {
         fault_.directChanged.notify_all();
       }
     }
+    bool budgetTracked = false;
+    if (budget) {
+      auto plan = EcRepairPlan::create(request.plan);
+      if (plan) budgetTracked = budget->enter((*plan)->digest(), position, request.packet.blockIndex);
+    }
     auto finished = folly::makeGuard([&] {
+      if (budgetTracked) budget->finish();
       if (!tracked) return;
       std::lock_guard lock(fault_.mutex);
       ++fault_.direct.finished;
@@ -232,6 +286,9 @@ class StageReplyDropStorageService : public StorageService {
       delay->entered.set_value();
       co_await delay->resume;
     }
+    // Arrival at this fifth TCP handler proves four real upstream Operator
+    // permits are still owned. This handler has not entered its Operator yet.
+    if (budgetTracked && position == 4) co_await budget->release;
     auto result = co_await StorageService::executeEcHelperDirect(ctx, request);
     bool drop = false;
     if (tracked && result && result->result) {

@@ -135,7 +135,7 @@ bool safeIntercept(int fd, const void *bytes, size_t count, off_t offset) noexce
 }
 }  // namespace hf3fs::test::ec_pending
 
-// GNU/lld --wrap rewrites only the test_meta executable's undefined references.
+// GNU/lld --wrap rewrites only the opted-in test executables' undefined references.
 // Rust's static FileExt::write_at calls pwrite64 on this Linux 64-bit target.
 // Both spellings are covered; real shared-library internals are not claimed.
 static_assert(sizeof(off_t) == sizeof(int64_t));

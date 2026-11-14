@@ -1,5 +1,289 @@
 // Included in the real TCP/Rust Engine fixture. No transport or disk result is
-// synthesized; faults occur only around an actual handler or its successful reply.
+// synthesized; faults wrap actual handlers, replies or a matched data syscall.
+TEST_F(TestEcNativeRepairService, HelperDirectPendingWriteEioReopensAndReplaysSameAllocation) {
+  namespace fault = hf3fs::test::ec_pending;
+  constexpr uint32_t blockBytes = kEcIntegrityBlockBytes;
+  SCOPE_EXIT { fault::reset(); };
+  auto value = prepare({0, 11}, 2 * blockBytes, 2);
+  ASSERT_OK(value);
+  ASSERT_OK(beginDirect(*value));
+  armDirect(*value);
+  std::array<uint64_t, 2> initialUsed{};
+  for (uint8_t i = 0; i != 2; ++i) {
+    auto used = committedBytes(value->plan->input().targets[i]);
+    ASSERT_OK(used);
+    initialUsed[i] = *used;
+  }
+  const auto firstBytes = repair_test::blockBytes(value->data, value->plan->input().targets[1], 0);
+  const auto pendingBytes = repair_test::blockBytes(value->data, value->plan->input().targets[1], 1);
+  const auto classDirectory = std::filesystem::canonical(directory_.path().string()) / "engine-ec-v2" / "128KiB";
+
+  // Only target one is written while capturing: equal bytes on target zero
+  // cannot select a different allocation. Both writes still come from the
+  // real last helper's reconstruction and authenticated Append RPC.
+  fault::captureNext(classDirectory, firstBytes);
+  auto first = directRequest(*value, 0, 2);
+  ASSERT_OK(first);
+  ASSERT_OK(blockingWait(client_->executeEcHelperDirect(*first, control())));
+  ASSERT_TRUE(replyDrop_.waitDirect([](const auto &t) { return t.entered == t.finished; }));
+  const auto captured = fault::observation();
+  ASSERT_EQ(captured.captures, 1);
+  ASSERT_EQ(captured.failures, 0);
+  ASSERT_EQ(captured.interceptionErrors, 0);
+  auto other = directRequest(*value, 0, 1);
+  ASSERT_OK(other);
+  ASSERT_OK(blockingWait(client_->executeEcHelperDirect(*other, control())));
+  ASSERT_TRUE(replyDrop_.waitDirect([](const auto &t) { return t.entered == t.finished; }));
+  for (const auto &fixed : value->bindings.targets) {
+    auto state = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+    ASSERT_OK(state);
+    ASSERT_EQ(state->prefixBytes, blockBytes);
+    ASSERT_FALSE(state->pendingBlock);
+    ASSERT_FALSE(state->needsReconcile);
+  }
+  fault::failNext(captured, blockBytes, pendingBytes);
+  auto both = directRequest(*value, 1);
+  ASSERT_OK(both);
+  ASSERT_ERROR(blockingWait(client_->executeEcHelperDirect(*both, control())), StorageCode::kEcSealOutcomeUnknown);
+  ASSERT_TRUE(replyDrop_.waitDirect([](const auto &t) { return t.entered == t.finished; }));
+  const auto failed = fault::observation();
+  ASSERT_EQ(failed.captures, 1);
+  ASSERT_EQ(failed.failures, 1);
+  ASSERT_EQ(failed.interceptionErrors, 0);
+  ASSERT_EQ(failed.device, captured.device);
+  ASSERT_EQ(failed.inode, captured.inode);
+  ASSERT_EQ(failed.offset, captured.offset + blockBytes);
+  ASSERT_EQ(directTrace().appends.size(), 3);  // Target zero's second block completed before the EIO.
+  ASSERT_EQ(directTrace().appendAttempts.size(), 4);
+  std::array<EcStageStateV2, 2> reconciled{};
+  for (uint8_t i = 0; i != 2; ++i) {
+    const auto &fixed = value->bindings.targets[i];
+    auto state = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+    ASSERT_OK(state);
+    ASSERT_OK(validateEcStageStateV2(*state, fixed.request, fixed.grant.claims));
+    EXPECT_EQ(state->state, 1);
+    EXPECT_EQ(state->prefixBytes, i == 0 ? 2 * blockBytes : blockBytes);
+    EXPECT_EQ(state->pendingBlock, i == 1);
+    if (i == 1) ASSERT_TRUE(state->needsReconcile);
+    auto barrier = blockingWait(client_->reconcileEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+    ASSERT_OK(barrier);
+    ASSERT_FALSE(barrier->needsReconcile);
+    ASSERT_EQ(barrier->pendingBlock, i == 1);
+    ASSERT_EQ(barrier->prefixBytes, state->prefixBytes);
+    ASSERT_EQ(barrier->revision, state->revision);
+    reconciled[i] = *barrier;
+    auto used = committedBytes(value->plan->input().targets[i]);
+    ASSERT_OK(used);
+    EXPECT_EQ(*used, initialUsed[i]);  // Neither unsealed stage can count as committed data.
+  }
+
+  // Only scalar observations and immutable request identities cross this
+  // boundary. No Engine/target/fd lease survives the actual stop/join/reopen.
+  fault::reset();
+  ASSERT_NO_FATAL_FAILURE(reopenStorage());
+  for (uint8_t i = 0; i != 2; ++i) {
+    const auto &fixed = value->bindings.targets[i];
+    auto state = blockingWait(client_->queryEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+    ASSERT_OK(state);
+    ASSERT_OK(validateEcStageStateV2(*state, fixed.request, fixed.grant.claims));
+    ASSERT_EQ(state->state, 1);
+    ASSERT_TRUE(state->needsReconcile);
+    EXPECT_EQ(state->pendingBlock, i == 1);
+    EXPECT_EQ(state->prefixBytes, reconciled[i].prefixBytes);
+    EXPECT_EQ(state->revision, reconciled[i].revision);
+    auto barrier = blockingWait(client_->reconcileEcStageV2Controlled({fixed.request, fixed.grant}, control()));
+    ASSERT_OK(barrier);
+    ASSERT_FALSE(barrier->needsReconcile);
+    ASSERT_EQ(barrier->pendingBlock, i == 1);
+    ASSERT_EQ(barrier->prefixBytes, reconciled[i].prefixBytes);
+  }
+  fault::captureNext(classDirectory, pendingBytes);
+  auto replay = directRequest(*value, 1);
+  ASSERT_OK(replay);
+  ASSERT_OK(blockingWait(client_->executeEcHelperDirect(*replay, control())));
+  ASSERT_TRUE(replyDrop_.waitDirect([](const auto &t) { return t.entered == t.finished; }));
+  const auto resumed = fault::observation();
+  ASSERT_EQ(resumed.captures, 1);
+  ASSERT_EQ(resumed.failures, 0);
+  ASSERT_EQ(resumed.interceptionErrors, 0);
+  EXPECT_EQ(resumed.device, captured.device);
+  EXPECT_EQ(resumed.inode, captured.inode);
+  EXPECT_EQ(resumed.offset, captured.offset + blockBytes);
+  EXPECT_EQ(directTrace().appends.size(), 5);  // The already-complete target still receives real duplicate Append.
+  EXPECT_EQ(directTrace().appendAttempts.size(), 6);
+  ASSERT_NO_FATAL_FAILURE(expectDirectSealedBytes(*value));
+  for (uint8_t i = 0; i != 2; ++i) {
+    auto used = committedBytes(value->plan->input().targets[i]);
+    ASSERT_OK(used);
+    EXPECT_EQ(*used, initialUsed[i] + 2 * blockBytes);
+  }
+  RecordProperty("coverage", "Storage50 direct reconstruction; real target-one pending pwrite EIO after target-zero "
+                             "success; original allocation dev/ino/offset after orderly Engine reopen; real duplicate "
+                             "Append/Seal/readback; not Meta publication or power-failure recovery");
+}
+
+TEST_F(TestEcNativeRepairService, HelperDirectGlobalBudgetSaturationKeepsControlResponsive) {
+  // Only this case enables the real control executor. Reopen before starting
+  // requests so its key/authority and system clock are initialized normally;
+  // the fixture's later data/helper clock=1000 does not replace that clock.
+  const auto controlPath = traces_.path() / "direct-budget-control.key";
+  std::array<uint8_t, 32> controlBytes{};
+  for (size_t i = 0; i != controlBytes.size(); ++i) controlBytes[i] = uint8_t(i + 151);
+  const int fd = ::open(controlPath.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  const auto written = ::write(fd, controlBytes.data(), controlBytes.size());
+  const auto closed = ::close(fd);
+  ASSERT_EQ(written, ssize_t(controlBytes.size()));
+  ASSERT_EQ(closed, 0);
+  auto key = EcScopeControlKey::loadFile(std::filesystem::path(controlPath.string()));
+  ASSERT_OK(key);
+  const auto authority = Uuid::random();
+  config_.storage().set_enable_ec_scope_control(true);
+  config_.storage().set_ec_scope_control_key_file(controlPath);
+  config_.storage().set_ec_scope_control_authority(fmt::to_string(authority));
+  ASSERT_NO_FATAL_FAILURE(reopenStorage());
+  ASSERT_EQ(config_.coroutines_pool_default().coroutines_num(), 128);
+
+  constexpr size_t heldPlans = 16;
+  std::vector<Case> values;
+  values.reserve(heldPlans + 1);
+  auto hold = std::make_shared<StageReplyDropState::DirectBudgetHold>();
+  // Prepare the seventeenth plan before saturation as well. Every plan has
+  // independent real source stages and operation scopes; no admission token
+  // or private semaphore is synthesized to fill the budget.
+  for (size_t i = 0; i != heldPlans + 1; ++i) {
+    auto value = prepare({0}, 31, 1);
+    ASSERT_OK(value);
+    ASSERT_OK(beginDirect(*value));
+    for (const auto &existing : values)
+      ASSERT_NE(existing.plan->input().operationId, value->plan->input().operationId);
+    if (i != heldPlans) ASSERT_TRUE(hold->allowed.insert(value->plan->digest()).second);
+    values.push_back(std::move(*value));
+  }
+  ASSERT_EQ(hold->allowed.size(), heldPlans);
+  ASSERT_FALSE(hold->allowed.contains(values.back().plan->digest()));
+  {
+    std::lock_guard lock(replyDrop_.mutex);
+    replyDrop_.directBudget = hold;
+  }
+  std::vector<std::future<Result<EcHelperDirectHopResult>>> calls;
+  calls.reserve(heldPlans);
+  SCOPE_EXIT {
+    hold->unblock();
+    for (auto &call : calls) if (call.valid()) call.wait();
+    // A timed-out client does not prove remote completion. The shared tracker
+    // remains in the service fixture through its normal stop/join teardown.
+  };
+  for (size_t i = 0; i != heldPlans; ++i) {
+    auto wire = directRequest(values[i]);
+    ASSERT_OK(wire);
+    wire->deadlineUnixMillis =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count() + 30000;
+    calls.push_back(std::async(std::launch::async, [this, request = std::move(*wire)]() mutable {
+      auto ctl = control();
+      ctl.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
+      return blockingWait(client_->executeEcHelperDirect(std::move(request), ctl));
+    }));
+  }
+  ASSERT_TRUE(hold->waitFor([](const auto &state) { return state.held == heldPlans; }));
+  const auto expectHeld = [&] {
+    const auto snapshot = hold->snapshot();
+    ASSERT_EQ(snapshot.held, heldPlans);
+    ASSERT_EQ(snapshot.duplicatePositionFour, 0);
+    ASSERT_EQ(snapshot.entered, heldPlans * 5);  // 64 upstream permits + 16 pre-Operator barriers.
+    ASSERT_EQ(snapshot.finished, 0);
+    for (auto &call : calls) ASSERT_EQ(call.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+  };
+  ASSERT_NO_FATAL_FAILURE(expectHeld());
+  net::UserRequestOptions options;
+  options.timeout = 2_s;
+  options.sendRetryTimes = 0;
+  auto extra = directRequest(values.back());
+  ASSERT_OK(extra);
+  auto rejected = blockingWait(messenger_->executeEcHelperDirect(address_, *extra, &options));
+  ASSERT_OK(rejected);  // Actual RPC50 response, not the SDK's own helper limit or a network timeout.
+  ASSERT_ERROR(rejected->result, StorageClientCode::kResourceBusy);
+  ASSERT_NO_FATAL_FAILURE(expectHeld());
+
+  const auto &plan = values.front().plan->input();
+  const auto &source = plan.sources[0];
+  EcScopeControlClaims claims;
+  claims.clusterAuthority = authority;
+  claims.nodeId = source.endpoint.nodeId;
+  claims.chainId = source.endpoint.chainId;
+  claims.targetId = source.endpoint.targetId;
+  claims.engineUuid = source.endpoint.engineUuid;
+  claims.targetIncarnation = source.endpoint.targetIncarnation;
+  claims.object = source.identity.object;
+  claims.scopeKind = EcGrantScope::WriteOperation;
+  claims.scopeId = plan.operationId;
+  claims.ownerUid = plan.ownerUid;
+  claims.clientNamespace = plan.clientNamespace;
+  claims.revocationId = Uuid::random();
+  claims.nonce = Uuid::random();
+  claims.endpointSetDigest = values.front().plan->endpointSetDigest();
+  claims.issuedAtSeconds =
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  claims.expiresAtSeconds = claims.issuedAtSeconds + 120;
+  auto revoke = signEcScopeControl(**key, claims, claims.issuedAtSeconds);
+  ASSERT_OK(revoke);
+  auto pending = blockingWait(messenger_->revokeEcScope(address_, *revoke, &options));
+  ASSERT_OK(pending);
+  ASSERT_OK(pending->result);
+  ASSERT_OK(verifyEcScopeControlAck(**key, *pending->result, *revoke));
+  EXPECT_EQ(pending->result->claims.state, EcScopeControlState::Pending);
+  EXPECT_TRUE(pending->result->claims.durable);
+  EXPECT_GE(pending->result->claims.inflight, 1u);
+  ASSERT_NO_FATAL_FAILURE(expectHeld());
+  claims.action = EcScopeControlAction::Query;
+  claims.nonce = Uuid::random();
+  auto query = signEcScopeControl(**key, claims, claims.issuedAtSeconds);
+  ASSERT_OK(query);
+  auto stillPending = blockingWait(messenger_->queryEcScopeDrain(address_, *query, &options));
+  ASSERT_OK(stillPending);
+  ASSERT_OK(stillPending->result);
+  ASSERT_OK(verifyEcScopeControlAck(**key, *stillPending->result, *query));
+  EXPECT_EQ(stillPending->result->claims.state, EcScopeControlState::Pending);
+  EXPECT_TRUE(stillPending->result->claims.durable);
+  EXPECT_GE(stillPending->result->claims.inflight, 1u);
+  ASSERT_NO_FATAL_FAILURE(expectHeld());
+
+  hold->unblock();
+  for (size_t i = 0; i != calls.size(); ++i) {
+    auto result = calls[i].get();
+    if (i == 0 || !result) {
+      ASSERT_ERROR(result, StorageCode::kEcSealOutcomeUnknown);
+    } else {
+      EXPECT_EQ(result->appendedTargetMask, 1);
+      EXPECT_EQ(result->planDigest, values[i].plan->digest());
+    }
+  }
+  // Released children can race for admission and fail conservatively. Joining
+  // frontend calls alone is insufficient; observe the actual tracked bodies.
+  ASSERT_TRUE(hold->waitFor([](const auto &state) { return state.entered == state.finished; }));
+  EXPECT_EQ(hold->snapshot().duplicatePositionFour, 0);
+  claims.nonce = Uuid::random();
+  auto finalQuery = signEcScopeControl(**key, claims, claims.issuedAtSeconds);
+  ASSERT_OK(finalQuery);
+  auto drained = blockingWait(messenger_->queryEcScopeDrain(address_, *finalQuery, &options));
+  ASSERT_OK(drained);
+  ASSERT_OK(drained->result);
+  ASSERT_OK(verifyEcScopeControlAck(**key, *drained->result, *finalQuery));
+  EXPECT_EQ(drained->result->claims.state, EcScopeControlState::Drained);
+  EXPECT_TRUE(drained->result->claims.durable);
+  EXPECT_EQ(drained->result->claims.inflight, 0);
+  // Same seventeenth plan/allocation, now with a fresh finite call deadline.
+  // Its earlier refusal was before dispatch; it is outside the revoked scope.
+  auto admitted = directRequest(values.back());
+  ASSERT_OK(admitted);
+  ASSERT_OK(blockingWait(client_->executeEcHelperDirect(*admitted, control())));
+  ASSERT_NO_FATAL_FAILURE(expectDirectSealedBytes(values.back()));
+  RecordProperty("coverage", "16 independent Storage50 chains hold 64 real upstream permits and 80 defaultPool128 "
+                             "frames; real RPC50 ResourceBusy; signed TCP control25/26 Pending then locally Drained; "
+                             "permit reuse; one Engine and twelve logical targets, not distributed T2");
+}
+
 TEST_F(TestEcNativeRepairService, HelperDirectW1W2W4WriteOriginalTargetsWithSmallReplies) {
   for (uint8_t window : {1, 2, 4}) {
     auto value = prepare(window == 1 ? std::vector<uint16_t>{0} : std::vector<uint16_t>{0, 11},
