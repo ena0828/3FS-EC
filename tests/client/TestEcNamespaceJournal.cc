@@ -2,6 +2,7 @@
 #include <folly/experimental/TestUtil.h>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <utility>
 
 #include "client/ec/EcNamespaceJournal.h"
 #include "tests/GtestHelpers.h"
@@ -24,7 +25,7 @@ Result<std::unique_ptr<EcFilePwriteJournal>> acceptedSession(const std::filesyst
   i.openRequest = record.openRequest;
   i.rights = record.rights;
   RETURN_ON_ERROR(journal->append(state));
-  return journal;
+  return std::move(journal);
 }
 }  // namespace
 TEST(TestEcNamespaceJournal, AcceptedAndClosedSessionBindDurableIdentityWithoutChangingOriginal) {
