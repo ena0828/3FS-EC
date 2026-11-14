@@ -50,6 +50,7 @@ class NativeAdapterTests(unittest.TestCase):
         b.ack = SimpleNamespace(sync_parent=lambda _: None, checked_pass_fds=lambda fds: fds,
                                hash_file=lambda _w, path: sha(path), command=self.execute, collector_command=self.execute)
         b.plan = {'schema': 1, 'trace_id': uid(1), 'namespace': '/ec-lab', 'shard_bytes': 11469,
+                  'collector_limits': {'nodes': 2064, 'commands': 16384},
                   'repair': {'strategy': 'helper', 'delivery': 'direct', 'window': 2,
                              'targets': [0, 11], 'sources': list(range(1, 11))}}
         b.plan['steps'] = [{'name': name, 'spec': self.spec(kind, instance), 'model': {}}
@@ -137,7 +138,8 @@ class NativeAdapterTests(unittest.TestCase):
                 expect = gc.load(argv[9])
                 binding = {'client_namespace': uid(4), 'cluster': 'test-cluster',
                            'files': {str(self.root / 'cluster.json'): sha(self.root / 'cluster.json')}}
-                plan = gc.new_plan(self.root, expect, binding, 256, 8192)
+                self.assertEqual(argv[10:14], ['--max-nodes', '2064', '--max-commands', '16384'])
+                plan = gc.new_plan(self.root, expect, binding, int(argv[11]), int(argv[13]))
                 self.save(run / 'plan.json', plan)
             plan = gc.load(run / 'plan.json')
             # Actual collector uses a separate six-digit attempt directory and
@@ -159,6 +161,12 @@ class NativeAdapterTests(unittest.TestCase):
             self.save(run / 'completion.json', completion)
         elif action in ('create', 'resume-open', 'close'):
             values = [self.session | {'error_code': 0, 'session_state': 3 if action == 'close' else 1, 'shard_bytes': 11469}]
+        elif action in ('unlink', 'resume-unlink'):
+            self.assertTrue((run.parent / 'close/done.json').is_file())
+            values = [self.session | {'schema': 1, 'kind': 'ec_file_namespace_unlink', 'command': 'mode4-' + action,
+                'cluster': 'test-cluster', 'path': '/ec-lab/kv-' + uid(1) + '-put-0', 'request': uid(41),
+                'namespace_unlink_acknowledged': True, 'revalidated': True, 'network_io_performed': True,
+                'physical_capacity_returned': False, 'namespace_deleted': False, 'failure': None}]
         elif action in ('pwrite', 'resume'):
             values = [self.session | {'operation': uid(6), 'error_code': 0, 'offset_decimal': '0', 'length_decimal': '896'},
                       {'observed': True, 'logical_closed': True, 'logical_complete': True,
@@ -209,6 +217,10 @@ class NativeAdapterTests(unittest.TestCase):
         collector_join = Path(evict['gc']['run']) / 'attempts/000000/joined.json'
         self.assertEqual(evict['files'][str(collector_join)], sha(collector_join))
         self.assertFalse(evict['physical_capacity_returned']); self.assertFalse(evict['namespace_deleted'])
+        self.assertTrue(evict['namespace_unlink']['namespace_unlink_acknowledged'])
+        calls = [item[0] for item in self.calls]
+        self.assertLess(calls.index('close'), calls.index('unlink'))
+        self.assertLess(calls.index('unlink'), calls.index('start'))
         before = len(self.calls)
         self.assertEqual(self.backend.perform('evict-0', self.spec('evict')), evict)
         self.assertEqual(len(self.calls), before)
@@ -232,6 +244,24 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual([x[0] for x in self.calls].count('pwrite'), 1)
         self.assertEqual([x[0] for x in self.calls].count('resume'), 1)
         self.assertEqual(completed['state'], 'confirmed')
+
+    def test_lost_unlink_reply_preserves_original_request_before_any_gc_credit(self):
+        self.backend.perform('put-0', self.spec('put'))
+        self.backend.perform('get-0', self.spec('get'))
+        self.backend.perform('repair-0', self.spec('repair'))
+        self.fail_action = 'unlink'
+        with self.assertRaisesRegex(RuntimeError, 'FIXTURE'):
+            self.backend.perform('evict-0', self.spec('evict'))
+        folder = self.backend.actions / 'evict-0'
+        original = (folder / 'unlink-run/record.json').read_bytes()
+        self.assertFalse((folder / 'collector-run').exists())
+        self.assertFalse((folder / 'completion.json').exists())
+        result = self.backend.perform('evict-0', self.spec('evict'))
+        self.assertEqual((folder / 'unlink-run/record.json').read_bytes(), original)
+        self.assertTrue(result['namespace_unlink']['namespace_unlink_acknowledged'])
+        calls = [item[0] for item in self.calls]
+        self.assertEqual(calls.count('unlink'), 1); self.assertEqual(calls.count('resume-unlink'), 1)
+        self.assertLess(calls.index('resume-unlink'), calls.index('start'))
 
     def test_missing_started_journal_never_recreates_mutation_identity(self):
         self.fail_action = 'create'; self.fail_without_record = True

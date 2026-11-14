@@ -4,6 +4,32 @@
 class TestEcFileNativeWrite : public TestEcV2NativeLifecycle {
  protected:
   bool enableFileRmw() const override { return true; }
+  Result<QueryEcFileOutputReq> fileOutputRequest(const EcFileOutputIdentity &identity) {
+    auto tx = kv_->createReadWriteTransaction();
+    core::UserStore store;
+    auto root = blockingWait(store.getUser(*tx, flat::Uid{0}));
+    RETURN_ON_ERROR(root);
+    if (!*root) return makeError(StatusCode::kAuthenticationFail);
+    auto req = request<QueryEcFileOutputReq>();
+    req.user = UserInfo{(**root).uid, (**root).gid, (**root).token};
+    req.identity = identity;
+    return req;
+  }
+  Result<QueryEcFileOutputRsp> observeFileOutput(const EcObjectRef &object,
+                                                const Uuid &parent,
+                                                const Uuid &child,
+                                                EcFileOutputOwner kind) {
+    EcFileOutputIdentity identity;
+    identity.object = object;
+    identity.owner = {user_.uid, metaClientId_.uuid};
+    identity.parent = parent;
+    identity.child = child;
+    identity.ownerKind = kind;
+    auto req = fileOutputRequest(identity);
+    RETURN_ON_ERROR(req);
+    return blockingWait(metaClient_->queryEcFileOutput(*req));
+  }
+
   bool enableMetaGcAdmin() const override { return true; }
   bool enableExactGc() const override { return true; }
   uint32_t ecAdmissionLimit() const override { return 4; }

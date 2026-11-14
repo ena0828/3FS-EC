@@ -27,6 +27,27 @@ class ReplayModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Budget cannot retain'):
             self.plan(allocation_budget=12 * 11469)
 
+    def test_full_history_fits_fixed_tree_and_command_bounds_before_any_native_dispatch(self):
+        binding, source = model.synthetic()
+        events = []
+        for index in range(128):
+            event = copy.deepcopy(source[0]); event['sequence_decimal'] = str(index)
+            event['clock']['scaled_ns_decimal'] = str(index)
+            events.append(event)
+        binding.update(selected_observations=127, horizon_ns_decimal='128')
+        plan = model.build(binding, events[:127], trace_id='dff02455-143f-43e3-94c4-ecdc9f5687a8',
+                           repair_every=1, allocation_budget=1 << 30)
+        revisions = 1 + plan['summary']['scheduled_repairs']
+        self.assertEqual(revisions, 128)
+        nodes = 16 * (revisions + 1)
+        normal_commands = 2 * nodes + 26 * revisions + 1
+        self.assertEqual(nodes, 2064); self.assertEqual(normal_commands, 7457)
+        self.assertEqual(plan['collector_limits'], {'nodes': nodes, 'commands': 16384})
+        self.assertGreater(plan['collector_limits']['commands'], 2 * normal_commands)
+        binding['selected_observations'] = 128
+        with self.assertRaisesRegex(ValueError, 'published revision limit'):
+            model.build(binding, events, trace_id=plan['trace_id'], repair_every=1, allocation_budget=1 << 30)
+
     def test_expiry_is_inclusive_and_never_wraps_large_time(self):
         binding, events = model.synthetic()
         events = events[:1]

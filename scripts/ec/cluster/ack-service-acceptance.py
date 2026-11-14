@@ -161,7 +161,16 @@ def command(runner,w,argv,*,pass_fds=()):
             require(runner.transport_role=='control' and len(argv)==5 and
                     list(map(str,argv[:4]))==[str(runner.root/'bin/admin_cli'),'--cfg',str(runner.config),'--'],
                     'An inherited collector lease requires the original control CLI and configuration')
+    namespace_control=(runner.transport_role=='file' and argv and
+                       argv[-1] in ('mode4-unlink','mode4-resume-unlink','mode4-inspect-unlink'))
+    if namespace_control and not pass_fds:
+        validate_leased_file_command(runner,argv)
     binding=runner.check_transport()
+    if namespace_control:
+        # This facade sends only the fixed Meta Remove request. A configured
+        # RDMA profile must not turn namespace acknowledgement into data I/O.
+        kind='local_namespace_inspect' if argv[-1]=='mode4-inspect-unlink' else 'namespace_control'
+        return _owned_command(runner,w,argv,None,kind=kind,pass_fds=pass_fds)
     if local_export:
         # Read-only journal export still verifies the prepared profile. It does
         # not send data RPCs or create a transport sidecar for the journal.
@@ -190,6 +199,7 @@ def validate_leased_file_command(runner,argv):
     fields={
         'create':{'file_path','shard_bytes','permission','session_rights'},
         'resume-open':set(), 'close':set(),
+        'unlink':{'session_run_dir','file_path'}, 'resume-unlink':set(), 'inspect-unlink':set(),
         'pwrite':{'session_run_dir','offset_decimal','input_file'}, 'resume':set(), 'query':set(),
         'read':{'session_run_dir','offset_decimal','length_decimal','output_file'},
         'resume-read':{'output_file'}, 'release-read':set(),
@@ -225,17 +235,26 @@ def validate_collector_command(root,argv,*,expected_executable=None):
     executable=sys.executable if expected_executable is None else expected_executable
     require(type(executable) is str and bool(executable) and root.is_absolute() and root==root.resolve(),
             'Invalid fixed collector interpreter/root')
-    require(type(argv) is list and all(type(x) is str for x in argv) and len(argv) in (8,10),
+    require(type(argv) is list and all(type(x) is str for x in argv) and len(argv) in (8,10,14),
             'Invalid collector command shape')
     require(argv[:3]==[executable,'-B',str(root/'scripts/tree-gc-runner.py')] and
             argv[3] in ('start','resume') and argv[4:6]==['--root',str(root)] and argv[6]=='--run-dir',
             'Collector executable/root/operation differs')
-    require((argv[3]=='start' and len(argv)==10 and argv[8]=='--expected') or
+    require((argv[3]=='start' and len(argv) in (10,14) and argv[8]=='--expected') or
             (argv[3]=='resume' and len(argv)==8),'Collector start/resume arguments differ')
-    for raw in (argv[7],*([argv[9]] if len(argv)==10 else [])):
+    limits=None
+    if argv[3]=='start':
+        limits={'nodes':256,'commands':8192}
+        if len(argv)==14:
+            require(argv[10]=='--max-nodes' and argv[12]=='--max-commands','Collector limit fields differ')
+            for field,raw,maximum in (('nodes',argv[11],4096),('commands',argv[13],16384)):
+                require(re.fullmatch('[1-9][0-9]{0,4}',raw) is not None and int(raw)<=maximum,
+                        'Collector limit out of bounds')
+                limits[field]=int(raw)
+    for raw in (argv[7],*([argv[9]] if len(argv)>=10 else [])):
         path=Path(raw)
         require(path.is_absolute() and path==path.resolve(),'Collector paths must be canonical absolute paths')
-    return {'action':argv[3],'run_dir':argv[7], 'expected':argv[9] if len(argv)==10 else None}
+    return {'action':argv[3],'run_dir':argv[7], 'expected':argv[9] if len(argv)>=10 else None, 'limits':limits}
 
 
 def collector_command(runner,w,argv,*,pass_fds):

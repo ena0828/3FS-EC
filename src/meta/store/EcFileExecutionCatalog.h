@@ -2,6 +2,7 @@
 
 #include "EcFileMutationCatalog.h"
 #include "EcTreeSourcePinCatalog.h"
+#include "fbs/meta/EcFileOutput.h"
 #include "storage/ec_rmw/EcRmwComputation.h"
 
 namespace hf3fs::meta::server {
@@ -59,6 +60,9 @@ class EcFileExecutionCatalog {
                                                                 uint8_t workerIndex,
                                                                 EcFileExecutionOwner = EcFileExecutionOwner::Pwrite);
   static CoTryTask<EcFileExecutionObservation> get(Tx &, const EcOwner &, const EcObjectRef &, const Uuid &child);
+  // Read-only, exact-identity projection. Absence is NotFound, never an empty
+  // successful observation or proof that a Storage stage did not materialize.
+  static CoTryTask<EcFileOutputObservation> observeOutput(Tx &, const EcFileOutputIdentity &);
   // Real ECFE increment conflicts with Closing; source ECSP issuance is also
   // incremented in this transaction. Commit MUST succeed before any signing.
   // Repair binds the exact captured immutable descriptors; no caller or worker

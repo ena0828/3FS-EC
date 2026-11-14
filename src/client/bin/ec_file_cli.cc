@@ -15,6 +15,7 @@
 #include "client/ec/EcFilePwriteClient.h"
 #include "client/ec/EcFileRepairClient.h"
 #include "client/ec/EcFileRunFactory.h"
+#include "client/ec/EcNamespaceClient.h"
 #include "client/ec/EcTreeReadJournal.h"
 #include "client/ec/EcTruncateJournal.h"
 #include "client/mgmtd/MgmtdClientForAdmin.h"
@@ -136,6 +137,7 @@ void printProgress(const EcFileRunJournal &j) {
 }
 #include "EcFileMode4Cli.inc"
 #include "EcFileRepairCli.inc"
+#include "EcFileNamespaceCli.inc"
 int execute(int argc, char **argv) {
   if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
     std::cout << "ec_file_cli --cfg=FILE [--config.FIELD=VALUE] COMMAND\n"
@@ -164,6 +166,10 @@ int execute(int argc, char **argv) {
                  "Mode4 truncate: mode4-truncate/resume-truncate/query-truncate/close-truncate-debt.\n"
                  "New truncate: session_run_dir + new run_dir + length_decimal; resume keeps original CAS/IDs.\n"
                  "close-truncate-debt abandons unfinished truncation; it is an explicit cancellation.\n"
+                 "Namespace: mode4-unlink uses session_run_dir + file_path + a new run_dir.\n"
+                 "mode4-resume-unlink replays the original UUID/path/expected inode; Missing is not success.\n"
+                 "mode4-inspect-unlink reads local history only. Namespace calls use Meta TCP, no Storage I/O.\n"
+                 "Acknowledgement does not mean current path absence, final link removal or physical capacity return.\n"
                  "Create: file_path + new run_dir. Open: inode_decimal/incarnation/birth + new run_dir.\n"
                  "Pwrite/read: accepted session_run_dir + new run_dir + offset_decimal + input_file/length_decimal.\n"
                  "Resume/query/close use original run_dir, original namespace and fixed IDs.\n";
@@ -191,8 +197,9 @@ int execute(int argc, char **argv) {
   const std::string command = argv[1];
   // These exact commands inspect local journals and never create a network.
   const bool localOnly = command == "inspect" || command == "mode4-inspect" ||
-                         command == "mode4-export-read-allocations";
-  const bool useRdma = !localOnly && *storageTransport == EcStorageTransportPolicy::RdmaOnly;
+                         command == "mode4-export-read-allocations" || command == "mode4-inspect-unlink";
+  const bool namespaceOnly = isMode4NamespaceCommand(command);
+  const bool useRdma = !localOnly && !namespaceOnly && *storageTransport == EcStorageTransportPolicy::RdmaOnly;
   SCOPE_EXIT {
     if (useRdma) net::IBManager::stop();
   };
@@ -202,6 +209,10 @@ int execute(int argc, char **argv) {
       std::cerr << "cannot initialize requested RDMA devices: " << ibStarted.error().describe() << '\n';
       return 2;
     }
+  }
+  if (namespaceOnly) {
+    std::cerr << "NAMESPACE_CONTROL_TRANSPORT=tcp; namespace acknowledgement is not Storage I/O or physical reclamation\n";
+    return executeMode4Namespace(cfg, command);
   }
   std::cerr << "CLIENT_ORIGINATED_STORAGE_TRANSPORT=" << cfg.storage_transport()
             << "; Meta/Mgmtd control plane remains TCP; Meta-owned data uses independent configuration; "

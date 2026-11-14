@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <limits>
 #include <fcntl.h>
 #include <folly/ScopeGuard.h>
+#include <folly/json.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -87,6 +89,11 @@ Observation prepared(const meta::EcRevisionRetirementReq &req, bool retire) {
   return value;
 }
 
+std::string archiveJson(const auto &value) {
+  if constexpr (requires { value.archiveJson(); }) return value.archiveJson();
+  else return serde::toJsonString(value);
+}
+
 class Journal {
  public:
   explicit Journal(int fd)
@@ -99,7 +106,7 @@ class Journal {
 
   static Result<std::unique_ptr<Journal>> create(const Path &path, const auto &observation) {
     if (path.empty()) return makeError(StatusCode::kInvalidArg);
-    const auto text = serde::toJsonString(observation) + "\n";
+    const auto text = archiveJson(observation) + "\n";
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return makeError(StatusCode::kIOError, "retirement archive must be a new exclusive file");
     SCOPE_EXIT { ::close(fd); };
@@ -119,7 +126,7 @@ class Journal {
     guard.dismiss();
     return Result<std::unique_ptr<Journal>>(std::move(result));
   }
-  Result<Void> append(const auto &value) { return appendFd(fd_, serde::toJsonString(value) + "\n"); }
+  Result<Void> append(const auto &value) { return appendFd(fd_, archiveJson(value) + "\n"); }
 
  private:
   static Result<Void> appendFd(int fd, std::string_view text) {
@@ -135,6 +142,151 @@ class Journal {
   }
   int fd_;
 };
+
+// Reuses the exclusive, file+directory-synced archive writer above. Prepared
+// identity contains no authentication token; every invocation uses a new file.
+struct FileOutputArchive {
+  SERDE_STRUCT_FIELD(schema, uint16_t{1});
+  SERDE_STRUCT_FIELD(action, std::string{"observe_file_output"});
+  SERDE_STRUCT_FIELD(phase, std::string{"prepared"});
+  SERDE_STRUCT_FIELD(outcome, std::string{"not_observed"});
+  SERDE_STRUCT_FIELD(client_namespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(request_id, Uuid::zero());
+  SERDE_STRUCT_FIELD(identity, meta::EcFileOutputIdentity{});
+  SERDE_STRUCT_FIELD(observation, (std::optional<meta::EcFileOutputObservation>{}));
+  SERDE_STRUCT_FIELD(metadata_observation_only, true);
+  SERDE_STRUCT_FIELD(physical_reclamation_confirmed, false);
+  SERDE_STRUCT_FIELD(status_code, uint32_t{});
+
+ public:
+  std::string archiveJson() const {
+    // Generic readable serde casts uint64 to int64. Replace EVERY uint64 in
+    // this closed DTO from its original typed value before writing any JSON.
+    // The binary RPC encoding is unchanged; small integers retain JSON numbers.
+    auto value = folly::parseJson(serde::toJsonString(*this));
+    value["uint64_encoding"] = "unsigned_decimal_strings";
+    value["identity"]["object"]["inode"] = std::to_string(identity.object.inode.u64());
+    if (!observation) return folly::toJson(value);
+    const auto &o = *observation;
+    auto &j = value["observation"];
+    j["identity"]["object"]["inode"] = std::to_string(o.identity.object.inode.u64());
+    j["stripe"] = std::to_string(o.stripe);
+    j["generation"] = std::to_string(o.generation);
+    j["revision"] = std::to_string(o.revision);
+    j["logicalLength"] = std::to_string(o.logicalLength);
+    j["issuanceSequence"] = std::to_string(o.issuanceSequence);
+    auto fragment = [](folly::dynamic &json, const storage::EcFragmentIdentity &id) {
+      json["stripe"] = std::to_string(id.stripe);
+      json["generation"] = std::to_string(id.generation);
+    };
+    auto placement = [](folly::dynamic &json, const meta::EcPlacement &p) {
+      json["target"] = std::to_string(p.target.toUnderType());
+    };
+    auto endpoints = [&](folly::dynamic &json, const meta::EcV2OperationEndpoints &set) {
+      for (size_t n = 0; n < set.endpoints.size(); ++n)
+        placement(json["endpoints"][n]["placement"], set.endpoints[n].placement);
+    };
+    endpoints(j["endpoints"], o.endpoints);
+    for (size_t n = 0; n < o.candidates.size(); ++n) {
+      fragment(j["candidates"][n]["identity"], o.candidates[n].identity);
+      placement(j["candidates"][n]["endpoint"]["placement"], o.candidates[n].endpoint.placement);
+      if (o.allocations) {
+        const auto &a = (*o.allocations)[n];
+        auto &b = j["allocations"][n];
+        b["object"]["inode"] = std::to_string(a.object.inode.u64());
+        fragment(b["fragment"]["identity"], a.fragment.identity);
+        placement(b["fragment"]["placement"], a.fragment.placement);
+      }
+    }
+    if (o.drain) {
+      const auto &d = o.drain->identity;
+      auto &json = j["drain"]["identity"];
+      json["object"]["inode"] = std::to_string(d.object.inode.u64());
+      json["objectEpoch"] = std::to_string(d.objectEpoch);
+      json["generation"] = std::to_string(d.generation);
+      json["revision"] = std::to_string(d.revision);
+      endpoints(json["endpoints"], d.endpoints);
+    }
+    return folly::toJson(value);
+  }
+};
+auto fileOutputParser() {
+  argparse::ArgumentParser parser("ec-observe-file-output");
+  for (const auto *option : {"--inode", "--object-incarnation", "--owner-uid", "--owner-client", "--parent",
+                             "--child", "--owner-kind", "--client-namespace", "--request-id", "--output"})
+    parser.add_argument(option).required();
+  return parser;
+}
+CoTryTask<Dispatcher::OutputTable> handleFileOutput(IEnv &ienv,
+                                                   const argparse::ArgumentParser &parser,
+                                                   const Dispatcher::Args &args) {
+  auto &env = dynamic_cast<AdminEnv &>(ienv);
+  ENSURE_USAGE(args.empty());
+  if (!env.userInfo.isRoot() || env.userInfo.token.empty())
+    co_return makeError(StatusCode::kAuthenticationFail, "output observation requires root credentials");
+  auto inode = unsignedDecimal(parser.get<std::string>("--inode"));
+  auto uid = unsignedDecimal(parser.get<std::string>("--owner-uid"));
+  auto object = parseAdminNonNilUuid(parser.get<std::string>("--object-incarnation"));
+  auto owner = parseAdminNonNilUuid(parser.get<std::string>("--owner-client"));
+  auto parent = parseAdminNonNilUuid(parser.get<std::string>("--parent"));
+  auto child = parseAdminNonNilUuid(parser.get<std::string>("--child"));
+  auto clientId = parseAdminNonNilUuid(parser.get<std::string>("--client-namespace"));
+  auto requestId = parseAdminNonNilUuid(parser.get<std::string>("--request-id"));
+  CO_RETURN_ON_ERROR(inode);
+  CO_RETURN_ON_ERROR(uid);
+  CO_RETURN_ON_ERROR(object);
+  CO_RETURN_ON_ERROR(owner);
+  CO_RETURN_ON_ERROR(parent);
+  CO_RETURN_ON_ERROR(child);
+  CO_RETURN_ON_ERROR(clientId);
+  CO_RETURN_ON_ERROR(requestId);
+  if (*uid > std::numeric_limits<uint32_t>::max()) co_return makeError(StatusCode::kInvalidArg);
+  meta::QueryEcFileOutputReq req;
+  req.user = env.userInfo;
+  req.client = ClientId(*clientId);
+  req.uuid = *requestId;
+  req.identity.object = {meta::InodeId(*inode), *object};
+  req.identity.owner = {flat::Uid(static_cast<uint32_t>(*uid)), *owner};
+  req.identity.parent = *parent;
+  req.identity.child = *child;
+  const auto kind = parser.get<std::string>("--owner-kind");
+  if (kind == "pwrite") req.identity.ownerKind = meta::EcFileOutputOwner::Pwrite;
+  else if (kind == "truncate-tail") req.identity.ownerKind = meta::EcFileOutputOwner::TruncateTail;
+  else if (kind == "repair") req.identity.ownerKind = meta::EcFileOutputOwner::Repair;
+  else co_return makeError(StatusCode::kInvalidArg, "owner-kind requires pwrite, truncate-tail or repair");
+  CO_RETURN_ON_ERROR(req.valid());
+  FileOutputArchive archive;
+  archive.client_namespace = req.client.uuid;
+  archive.request_id = req.uuid;
+  archive.identity = req.identity;
+  auto journal = Journal::create(Path(parser.get<std::string>("--output")), archive);
+  CO_RETURN_ON_ERROR(journal);
+  try {
+    auto client = env.metaClientGetter();
+    if (!client || client->clientId().uuid != req.client.uuid)
+      co_return makeError(StatusCode::kInvalidArg, "set config.client_uuid to the persisted client-namespace");
+    auto result = co_await folly::coro::co_withCancellation({}, client->queryEcFileOutput(req));
+    if (result && (result->requestId != req.uuid || result->clientNamespace != req.client.uuid ||
+                   serde::serialize(result->observation.identity) != serde::serialize(req.identity) ||
+                   result->observation.version != 1 || result->observation.physicalReclamationConfirmed ||
+                   result->observation.recordDigest == storage::EcSha256{}))
+      result = makeError(StorageClientCode::kProtocolMismatch);
+    archive.phase = "result";
+    if (result) {
+      archive.outcome = "observed";
+      archive.observation = std::move(result->observation);
+    } else {
+      archive.status_code = result.error().code();
+    }
+    CO_RETURN_ON_ERROR((*journal)->append(archive));
+    if (!result) co_return makeError(result.error().code(), "output not observed; no reclamation is confirmed");
+    co_return Dispatcher::OutputTable{{archive.archiveJson()}};
+  } catch (...) {
+    // A failed query never changes the original operation or makes an absence
+    // claim. Retain this prepared archive and query the exact identity again.
+    co_return makeError(StatusCode::kIOError, "output observation unavailable; archive retained");
+  }
+}
 
 CoTryTask<Dispatcher::OutputTable> handle(IEnv &ienv,
                                           const argparse::ArgumentParser &parser,
@@ -332,6 +484,9 @@ CoTryTask<Dispatcher::OutputTable> handleTree(IEnv &ienv,
 }  // namespace
 
 CoTryTask<void> registerEcRevisionRetirementHandlers(Dispatcher &dispatcher) {
+  CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
+      [] { return fileOutputParser(); },
+      [](IEnv &env, const auto &p, const auto &a) { return handleFileOutput(env, p, a); }));
   CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
       [] { return treeParser(); },
       [](IEnv &env, const auto &p, const auto &a) { return handleTree(env, p, a); }));

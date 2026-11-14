@@ -20,8 +20,8 @@ PROFILE = "native-gc-local-14-storage-14-targets"
 BUNDLE_SCRIPTS = {
     "native_managed_domain.py": "5e8a91992d6bf8f2f54f30089d2145a100465885b8d356f70f89d69911527128",
     "experiment-runner.py": "974894b54d1c4690477fdde963efc61090972baa32cc1130fb1ac749f6eb509c",
-    "ack-service-acceptance.py": "6afe67cef029c17b9a93e9f9198601207bceb5918b35e5d68b08f1fef5b0d5bd",
-    "file-command.py": "f76dce6289d128ab9e2896761b0b2591c34441a3febfa97d0369a2701eaced02",
+    "ack-service-acceptance.py": "f4b14a46da73779c1b58dc5c0d485aba7f8805f430433a9161c4070f82f461fb",
+    "file-command.py": "d5abb3991c75fb0c0660b1f7f21033523cf5f103dc83c191238aa42c5cc30728",
     "native-v2.py": "facd989833b438ecd1daf1bc7a5a50eeef80091831d35a89ef40f960bad8cd4c",
     "native_v2_config.py": "ceb82357531234c07901cedaa34d7755f7957a368837e1414b3b78b9bdf23a30",
     "native_fault_control.py": "b409e69d65283f2cf75d0305940b5850968047b3758eec99430a229d7590cf87",

@@ -4,6 +4,7 @@
 #include <limits>
 #include <set>
 #include <utility>
+#include <openssl/evp.h>
 
 #include "EcCatalog.h"
 #include "EcFileRepairCatalog.h"
@@ -18,6 +19,15 @@ using namespace ec_file_mutation_detail;
 namespace life = ec_v2_lifecycle;
 using Tx = EcFileTreeTxnBudget;
 using State = EcFileExecutionState;
+static_assert(uint8_t(State::Reserved) == uint8_t(EcFileOutputState::Reserved) &&
+              uint8_t(State::Bound) == uint8_t(EcFileOutputState::Bound) &&
+              uint8_t(State::Closing) == uint8_t(EcFileOutputState::Closing) &&
+              uint8_t(State::Drained) == uint8_t(EcFileOutputState::Drained) &&
+              uint8_t(State::Published) == uint8_t(EcFileOutputState::Published) &&
+              uint8_t(State::Aborted) == uint8_t(EcFileOutputState::Aborted));
+static_assert(uint8_t(EcFileExecutionOwner::Pwrite) == uint8_t(EcFileOutputOwner::Pwrite) &&
+              uint8_t(EcFileExecutionOwner::TruncateTail) == uint8_t(EcFileOutputOwner::TruncateTail) &&
+              uint8_t(EcFileExecutionOwner::Repair) == uint8_t(EcFileOutputOwner::Repair));
 using kv::KeyPrefix;
 CoTryTask<EcFileChildRecord> loadChild(Tx &txn,
                                        const EcOwner &owner,
@@ -196,6 +206,66 @@ CoTryTask<Void> admissible(Tx &txn, const EcFileExecutionObservation &o) {
   co_return Void{};
 }
 }  // namespace
+
+CoTryTask<EcFileOutputObservation> EcFileExecutionCatalog::observeOutput(Tx &txn,
+                                                                        const EcFileOutputIdentity &identity) {
+  CO_RETURN_ON_ERROR(identity.valid());
+  // Keep this read in the same transaction as get(), including all candidate,
+  // binding, typed-owner and historical retirement-reference checks.
+  auto raw = co_await txn.get(key(identity.object, identity.child));
+  CO_RETURN_ON_ERROR(raw);
+  if (!*raw) co_return makeError(MetaCode::kNotFound, "file output execution has not been observed");
+  auto observed = co_await get(txn, identity.owner, identity.object, identity.child);
+  CO_RETURN_ON_ERROR(observed);
+  const auto &r = observed->record;
+  if (r.child.intent.parent != identity.parent ||
+      static_cast<uint8_t>(r.ownerKind) != static_cast<uint8_t>(identity.ownerKind))
+    co_return makeError(StatusCode::kTokenMismatch, "file output parent or owner kind changed");
+  auto digest = [](std::string_view bytes) -> Result<storage::EcSha256> {
+    storage::EcSha256 result{};
+    unsigned int size = 0;
+    if (EVP_Digest(bytes.data(), bytes.size(), result.data(), &size, EVP_sha256(), nullptr) != 1 ||
+        size != result.size())
+      return makeError(StatusCode::kIOError, "file output observation digest failed");
+    return result;
+  };
+  auto recordDigest = digest(**raw);
+  CO_RETURN_ON_ERROR(recordDigest);
+  EcFileOutputObservation out;
+  out.identity = identity;
+  out.state = static_cast<EcFileOutputState>(r.state);
+  out.birth = r.child.birth;
+  out.session = r.child.session;
+  out.plan = r.child.intent.plan;
+  out.sourcePin = r.child.intent.sourcePin;
+  out.stripe = r.child.stripe;
+  out.generation = r.child.targetGeneration;
+  out.revision = r.child.targetRevision;
+  out.logicalLength = r.child.targetLogicalLength;
+  out.planDigest = r.planDigest;
+  out.issuanceSequence = r.issuanceSequence;
+  out.candidates = r.candidates;
+  out.allocations = r.allocations;
+  out.endpoints = r.endpoints;
+  out.contentSha256 = r.contentSha256;
+  out.recordDigest = *recordDigest;
+  out.outputT2Confirmed = r.state == State::Drained || r.state == State::Published || r.state == State::Aborted;
+  if (r.drain) {
+    EcFileOutputDrain d;
+    d.version = r.drain->version;
+    d.identity = r.drain->identity;
+    d.state = r.drain->state;
+    d.terminalUse = r.drain->terminalUse;
+    d.retirements = r.drain->retirements;
+    for (size_t n = 0; n < r.endpoints.count; ++n)
+      if (r.drain->observations[n]) d.ackMask |= uint32_t{1} << n;
+    auto sha = digest(serde::serialize(*r.drain));
+    CO_RETURN_ON_ERROR(sha);
+    d.recordDigest = *sha;
+    out.drain = std::move(d);
+  }
+  co_return out;
+}
 
 CoTryTask<EcFileExecutionObservation> EcFileExecutionCatalog::get(Tx &txn,
                                                                   const EcOwner &owner,

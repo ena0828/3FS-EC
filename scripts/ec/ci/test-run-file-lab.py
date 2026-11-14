@@ -76,25 +76,27 @@ class FileLabGates(unittest.TestCase):
                 choices = {'put': ['create', 'pwrite', 'read', 'release-read', 'export-read-allocations'],
                            'get': ['read', 'release-read'],
                            'repair': ['repair', 'close-repair-debt', 'read', 'release-read', 'export-read-allocations'],
-                           'evict': ['truncate', 'close-truncate-debt', 'read', 'release-read', 'close', 'collector']}[spec['kind']]
+                           'evict': ['truncate', 'close-truncate-debt', 'read', 'release-read', 'close', 'unlink', 'collector']}[spec['kind']]
                 files, command_paths = {}, []
                 for index, action in enumerate(choices):
                     phase_name = {'create': 'session', 'pwrite': 'write', 'read': 'read', 'release-read': 'release',
                                   'export-read-allocations': 'export', 'repair': 'repair',
                                   'close-repair-debt': 'repair-debt', 'truncate': 'truncate',
-                                  'close-truncate-debt': 'truncate-debt', 'close': 'close', 'collector': 'collector'}[action]
+                                  'close-truncate-debt': 'truncate-debt', 'close': 'close', 'unlink': 'unlink', 'collector': 'collector'}[action]
                     if spec['kind'] == 'evict' and action in ('read', 'release-read'):
                         phase_name = 'empty/' + phase_name
                     attempt = folder / phase_name / 'attempts/0000'
                     if action == 'collector':
                         argv = ['/usr/bin/python3', '-B', str(scripts / 'tree-gc-runner.py'), 'start', '--root', str(root),
-                                '--run-dir', str(folder / 'collector-run'), '--expected', str(folder / 'expected.json')]
+                                '--run-dir', str(folder / 'collector-run'), '--expected', str(folder / 'expected.json'),
+                                '--max-nodes', '2064', '--max-commands', '16384']
                         kind = 'tree_gc_collector'
                     else:
                         if action == 'create': native_run = folder / 'session-run'
                         elif action == 'pwrite': native_run = folder / 'write-run'
                         elif action in ('repair', 'close-repair-debt'): native_run = folder / 'repair-run'
                         elif action in ('truncate', 'close-truncate-debt'): native_run = folder / 'truncate-run'
+                        elif action == 'unlink': native_run = folder / 'unlink-run'
                         elif action == 'close': native_run = session
                         else: native_run = folder / ('empty/read-run' if spec['kind'] == 'evict' else 'read-run')
                         native_run.mkdir(parents=True, exist_ok=True)
@@ -106,12 +108,15 @@ class FileLabGates(unittest.TestCase):
                         if action == 'repair': options.update(session_run_dir=str(session), repair_stripe_decimal='0', repair_mask_decimal='3',
                             repair_source_order=','.join(map(str, range(2,12))), repair_mode='helper', repair_window_decimal='1', repair_delivery='direct')
                         if action == 'truncate': options.update(session_run_dir=str(session), length_decimal='0')
+                        if action == 'unlink': options.update(session_run_dir=str(session),
+                            file_path='/ec-lab/kv-' + plan['trace_id'] + '-' + spec['instance'])
                         if action == 'export-read-allocations':
                             output = folder / 'export/allocations-0000.json'; save(output, {'synthetic': True})
                             options['output_file'] = str(output)
                         argv = [str(root / 'bin/ec_file_cli'), '--cfg=' + str(root / 'client/file-client.toml'),
                                 *['--config.' + key + '=' + value for key, value in options.items()], 'mode4-' + action]
-                        kind = 'local_read_export' if action == 'export-read-allocations' else None
+                        kind = ('local_read_export' if action == 'export-read-allocations' else
+                                'namespace_control' if action == 'unlink' else None)
                     command = {'argv': argv, 'process_started': True, 'process_exited': True, 'returncode': 0,
                                'inherited_collector_lease': True}
                     if kind: command['kind'] = kind
@@ -127,8 +132,16 @@ class FileLabGates(unittest.TestCase):
                          'namespace_deleted': False, 'physical_capacity_returned': False, 'performance_validated': False,
                          'historical_unconfirmed_attempts': 0, 'historical_join_proven': True,
                          'snapshot_exports': [{'synthetic': True}] if spec['kind'] in ('put', 'repair') else [],
-                         'gc': None, 'files': files, 'owned_commands': commands}
+                         'gc': None, 'files': files, 'owned_commands': commands, 'namespace_unlink': None}
                 if spec['kind'] == 'evict':
+                    obj = {'client_namespace': '00000000-0000-0000-0000-000000000001', 'inode_decimal': '42',
+                           'incarnation': '00000000-0000-0000-0000-000000000002', 'birth': '00000000-0000-0000-0000-000000000003'}
+                    value['object'] = obj
+                    value['namespace_unlink'] = obj | {'schema': 1, 'kind': 'ec_file_namespace_unlink',
+                        'namespace_unlink_acknowledged': True, 'revalidated': True, 'network_io_performed': True,
+                        'physical_capacity_returned': False, 'namespace_deleted': False, 'failure': None,
+                        'path': '/ec-lab/kv-' + plan['trace_id'] + '-' + spec['instance'],
+                        'request': '00000000-0000-0000-0000-000000000004'}
                     cost = step['model']['required_confirmed_gc_allocation_bytes_decimal']
                     value['gc'] = {'confirmed_allocation_model_bytes_decimal': cost, 'completion': {'state': 'confirmed',
                         'completion_scope': 'exact_expected_published_revisions_and_allocations', 'capacity_returned': False,
@@ -189,6 +202,11 @@ class FileLabGates(unittest.TestCase):
                 lab.kv_replay_command_gate(root, run, step, commands, {'mode': 'rdma'})
             step = next(row for row in plan['steps'] if row['spec']['kind'] == 'evict')
             commands = copy.deepcopy(next(row for row in values if row['name'] == step['name'])['owned_commands'])
+            unlink = next(row for row in commands if row.get('kind') == 'namespace_control')
+            unlink['transport'] = {'mode': 'rdma'}
+            with self.assertRaisesRegex(lab.GateError, 'data authority'):
+                lab.kv_replay_command_gate(root, run, step, commands, None)
+            del unlink['transport']
             collector = next(row for row in commands if row.get('kind') == 'tree_gc_collector')
             collector['argv'][7] = str(run / 'other-collector')
             with self.assertRaisesRegex(lab.GateError, 'original run'):
@@ -232,13 +250,13 @@ class FileLabGates(unittest.TestCase):
             with self.subTest(check_changes=changes), self.assertRaises(lab.GateError):
                 lab.require_flat_direct_result(bad, root)
 
-    def test_core_gate_accepts_current_exact_28_and_rejects_stale_failed_or_incomplete_evidence(self):
+    def test_core_gate_accepts_current_exact_29_and_rejects_stale_failed_or_incomplete_evidence(self):
         # Synthetic private receipts/files exercise the actual parsers and
         # validators. No ELF, FDB process or acceptance workload is executed.
         source = Path(__file__).resolve().parents[3]
         core = lab.module(source / 'scripts/ec/ci/run-core-tests.py', 'core_gate_fixture')
         common = lab.module(source / 'scripts/ec/test-native-fragments.py', 'core_gate_common_fixture')
-        self.assertEqual((len(core.META_CASES), len(core.FUSE_CASES)), (13, 15))
+        self.assertEqual((len(core.META_CASES), len(core.FUSE_CASES)), (14, 15))
         with tempfile.TemporaryDirectory() as temp:
             parent = Path(temp).resolve()
             build, fdb, output = parent / 'build', parent / 'fdb', parent / 'acceptance'
@@ -268,7 +286,7 @@ class FileLabGates(unittest.TestCase):
                     lines.append('  ' + method)
                 path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
-            record = {'status': 'passed', 'exitcode': 0, 'passed_tests': 28, 'failures': [], 'signals': [],
+            record = {'status': 'passed', 'exitcode': 0, 'passed_tests': 29, 'failures': [], 'signals': [],
                       'source': str(source), 'build': str(build), 'work': str(output),
                       'runner_sha256': lab.sha(source / 'scripts/ec/ci/run-core-tests.py'),
                       'helpers_sha256': {name: lab.sha(source / 'scripts/ec' / name)
@@ -304,7 +322,7 @@ class FileLabGates(unittest.TestCase):
                 return lab.core_gate(source, build, fdb, path)
 
             accepted = check(record)
-            self.assertEqual(accepted['passed_tests'], 28)
+            self.assertEqual(accepted['passed_tests'], 29)
             self.assertEqual(accepted['binaries']['test_meta'], lab.sha(build / 'tests/test_meta'))
             for update in ({'passed_tests': 21}, {'passed_tests': 26}, {'status': 'failed'}, {'exitcode': 1}, {'failures': ['synthetic']}):
                 with self.subTest(update=update), self.assertRaises(ValueError):

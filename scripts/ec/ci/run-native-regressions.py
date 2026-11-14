@@ -47,6 +47,19 @@ CLIENT_MANDATORY = {
         "QueryErrorsNeverPrepareAndDirectClientRejectsNilRequestIds",
     )
 }
+CLIENT_MANDATORY |= {
+    'TestEcNamespaceJournal.' + name for name in (
+        'AcceptedAndClosedSessionBindDurableIdentityWithoutChangingOriginal',
+        'RejectsUnacceptedSessionPathDriftAndNoncanonicalCodec',
+        'ResumeRejectsMissingLockGapsAndLinkedDirectory',
+    )
+} | {
+    'TestEcNamespaceClient.' + name for name in (
+        'LostReplyResumesOriginalRequestAndDoesNotRemoveRecreatedPath',
+        'PersistenceFailureAfterReplyRequiresExplicitSameJournalResume',
+        'MissingReplacementAndPreDispatchCancellationNeverAcknowledge',
+    )
+}
 
 MANDATORY |= {
     "TestEcHelperDirectAuthorization." + name for name in (
@@ -80,6 +93,7 @@ CLIENT_MANDATORY |= {
     )
 }
 CLIENT_MANDATORY |= {
+    'TestEcRevisionRetirementCommands.OutputObservationArchivesMissingAndChecksFixedIdentity',
     "TestEcStripeRead.ReplacementAndSelfMoveRetainOutputChargeAcrossLateCleanupAndClose",
     "TestEcStripeClient.InvalidRepairDeliveryIsRejectedBeforeAnyMetadataCall",
     "TestEcStripeRunRecord.HelperDirectV3PersistsSelectionAndRejectsDowngradedJson",

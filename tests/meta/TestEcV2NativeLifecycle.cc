@@ -1401,6 +1401,7 @@ class TestEcV2NativeHelperPlan : public TestEcV2NativeLifecycle {
 // clang-format off
 // The following fragments require TestEcFileNativeWrite to be defined first.
 #include "EcFileNativeWriteTests.inc"
+#include "EcFileOutputNativeTests.inc"
 #include "EcFileRepairNativeTests.inc"
 #include "EcFileHelperDirectNativeTests.inc"
 #include "EcFileRepairPendingNativeTests.inc"

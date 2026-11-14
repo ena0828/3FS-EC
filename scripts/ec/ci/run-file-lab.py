@@ -1165,6 +1165,8 @@ def kv_replay_command_gate(lab, run, step, commands, selection):
             require(fixed['run_dir'] == str(folder / 'collector-run') and
                     (fixed['expected'] is None or fixed['expected'] == str(folder / 'expected.json')),
                     'replay collector changed its original run or expected set')
+            require(fixed['limits'] is None or same_transport_value(fixed['limits'], read_json(run / 'plan.json')['collector_limits']),
+                    'replay collector budget differs from prevalidated plan')
             local.append(row); actions.add('collector'); continue
         exported = ack.validate_leased_file_command(shape, argv)
         raw_run = next(arg.split('=', 1)[1] for arg in argv if arg.startswith('--config.run_dir='))
@@ -1175,6 +1177,7 @@ def kv_replay_command_gate(lab, run, step, commands, selection):
         elif action in ('pwrite', 'resume'): expected_run = folder / 'write-run'
         elif action in ('repair', 'resume-repair', 'close-repair-debt'): expected_run = folder / 'repair-run'
         elif action in ('truncate', 'resume-truncate', 'close-truncate-debt'): expected_run = folder / 'truncate-run'
+        elif action in ('unlink', 'resume-unlink'): expected_run = folder / 'unlink-run'
         elif action == 'close': expected_run = run / 'native/actions' / step['spec']['instance'] / 'session-run'
         else: expected_run = folder / ('empty/read-run' if step['spec']['kind'] == 'evict' else 'read-run')
         require(raw_run == str(expected_run), 'replay command changed the original phase journal')
@@ -1185,6 +1188,16 @@ def kv_replay_command_gate(lab, run, step, commands, selection):
             require(canonical(output).is_relative_to(run / 'native/actions' / step['name'] / 'export'),
                     'read export output escaped its action')
             local.append(row); actions.add('export'); continue
+        if action in ('unlink', 'resume-unlink'):
+            require(kind == 'namespace_control' and step['spec']['kind'] == 'evict' and row['returncode'] == 0
+                    and 'transport' not in row, 'namespace acknowledgement acquired data authority or is not an eviction')
+            if action == 'unlink':
+                original_session = run / 'native/actions' / step['spec']['instance'] / 'session-run'
+                require('--config.session_run_dir=' + str(original_session) in argv, 'unlink changed original session')
+                plan = read_json(run / 'plan.json')
+                path = '/ec-lab/kv-' + plan['trace_id'] + '-' + step['spec']['instance']
+                require('--config.file_path=' + path in argv, 'unlink changed original namespace path')
+            local.append(row); actions.add('unlink'); continue
         require(kind is None and action in allowed[step['spec']['kind']], 'unexpected replay data command')
         require(row['returncode'] == 0 or action in ('truncate', 'resume-truncate'), 'failed replay data command')
         data.append(row); actions.add(action)
@@ -1192,7 +1205,7 @@ def kv_replay_command_gate(lab, run, step, commands, selection):
                 'get': ({'read', 'resume-read'}, {'release-read'}),
                 'repair': ({'repair', 'resume-repair'}, {'close-repair-debt'}, {'read', 'resume-read'}, {'release-read'}, {'export'}),
                 'evict': ({'truncate', 'resume-truncate'}, {'close-truncate-debt'}, {'read', 'resume-read'},
-                          {'release-read'}, {'close'}, {'collector'})}[step['spec']['kind']]
+                          {'release-read'}, {'close'}, {'unlink'}, {'collector'})}[step['spec']['kind']]
     require(all(actions & alternatives for alternatives in required), 'replay action omitted a mandatory native phase')
     validate_command_transports(lab, selection, data)
     return len(data), len(local)

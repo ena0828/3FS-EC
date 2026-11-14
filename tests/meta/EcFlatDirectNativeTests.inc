@@ -1,5 +1,13 @@
 // Included by the real FDB + TCP Storage/Meta fixture, not a mock Meta service.
-TEST_F(TestEcV2NativeHelperPlan, FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery) {
+// Four live block actors each await one source Read or target Query/Append.
+// Those data permits are released before forwarding to the next helper; the
+// upstream helper/scope permits are separate. Only this W4 fixture requests
+// four data slots. Existing two-slot admission/rejection fixtures stay intact.
+class TestEcV2NativeHelperDirect : public TestEcV2NativeHelperPlan {
+ protected:
+  uint32_t ecAdmissionLimit() const override { return 4; }
+};
+TEST_F(TestEcV2NativeHelperDirect, FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery) {
   using namespace hf3fs::client::ec;
   folly::CPUThreadPoolExecutor pool(4);
   auto borrowedMeta = std::shared_ptr<meta::client::MetaClient>(metaClient_.get(), [](auto *) {});
@@ -28,6 +36,7 @@ TEST_F(TestEcV2NativeHelperPlan, FlatDirectSingleAndDoubleTargetsKeepPermanentDe
   auto previous = written.observation->record.candidate;
   for (uint16_t mask : {uint16_t{1}, uint16_t{3}}) {
     for (uint8_t window : {uint8_t{1}, uint8_t{2}, uint8_t{4}}) {
+      SCOPED_TRACE(fmt::format("flat_direct mask={} window={}", mask, unsigned(window)));
       EcStripeRepair repair;
       repair.object = object;
       repair.expectedRevision = previous.revision;
@@ -176,6 +185,7 @@ TEST_F(TestEcV2NativeHelperPlan, FlatDirectSingleAndDoubleTargetsKeepPermanentDe
   blockingWait(manager->close());
   EXPECT_EQ(manager->snapshot().activeOperations, 0);
   EXPECT_EQ(manager->snapshot().reservedApplicationBytes, 0);
+  RecordProperty("flat_direct_data_admission", 4);
   RecordProperty("flat_direct_targets_windows", "1,2 targets x 1,2,4 blocks in flight; four blocks per shard");
   RecordProperty("flat_direct_metrics", "default off plus first-hop-only frames; no client Append or validated output bytes");
   RecordProperty("authority", "Meta71 committed ECRP2/ECVI; independent Append and Query; Storage50 TCP");

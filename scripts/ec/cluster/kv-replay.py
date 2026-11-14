@@ -142,6 +142,18 @@ def validate_receipt(step, plan, receipt):
     kv.require(type(receipt['snapshot_exports']) is list and len(receipt['snapshot_exports']) ==
                (1 if spec['kind'] in ('put', 'repair') else 0), 'Published snapshot inventory differs')
     if spec['kind'] == 'evict':
+        unlink = receipt['namespace_unlink']
+        for key, expected in {'schema': 1, 'kind': 'ec_file_namespace_unlink',
+                              'namespace_unlink_acknowledged': True, 'revalidated': True,
+                              'network_io_performed': True, 'physical_capacity_returned': False,
+                              'namespace_deleted': False, 'failure': None,
+                              'path': '/ec-lab/kv-' + plan['trace_id'] + '-' + spec['instance']}.items():
+            kv.require(type(unlink.get(key)) is type(expected) and unlink[key] == expected,
+                       'Unconfirmed identity-bound namespace unlink: ' + key)
+        for key in ('client_namespace', 'inode_decimal', 'incarnation', 'birth'):
+            kv.require(unlink[key] == receipt['object'][key], 'Unlink object identity differs: ' + key)
+        kv.require(type(unlink['request']) is str and str(uuid.UUID(unlink['request'])) == unlink['request'] and
+                   uuid.UUID(unlink['request']).int != 0, 'Invalid fixed namespace request')
         gc = receipt['gc']
         kv.require(type(gc) is dict and gc['confirmed_allocation_model_bytes_decimal'] ==
                    step['model']['required_confirmed_gc_allocation_bytes_decimal'], 'GC does not settle model reservation')
@@ -154,6 +166,7 @@ def validate_receipt(step, plan, receipt):
                    completion['allocations_confirmed'] * plan['shard_bytes'] ==
                    int(step['model']['required_confirmed_gc_allocation_bytes_decimal']), 'Allocation count differs from budget')
     else:
+        kv.require(receipt['namespace_unlink'] is None, 'Unexpected unlink on live cache action')
         kv.require(receipt['gc'] is None, 'Unexpected GC on live cache action')
 
 

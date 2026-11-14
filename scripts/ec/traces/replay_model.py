@@ -8,6 +8,13 @@ import uuid
 
 import kv_trace as kv
 
+MAX_PUBLISHED_REVISIONS = 128
+# One changed stripe copies sixteen radix nodes. The initial root is nil;
+# truncate(0) adds one empty path which unlink detaches. Each node needs
+# inspect+reclaim and each
+# published revision needs two retire and twenty-four allocation commands.
+# The remaining command budget is finite headroom for explicit recovery.
+COLLECTOR_LIMITS = {'nodes': 16 * (MAX_PUBLISHED_REVISIONS + 1), 'commands': 16384}
 
 def repair_options(strategy='helper', delivery='direct', window=1, targets=(0, 1)):
     kv.require(strategy in ('central', 'pipeline', 'helper') and delivery in ('return', 'direct')
@@ -127,7 +134,8 @@ def build(binding, events, *, trace_id, shard_bytes=11469, slots=2, logical_budg
         peak_logical, peak_slots = max(peak_logical, used_logical), max(peak_slots, len(resident))
         peak_allocations = max(peak_allocations, used_allocations)
         if repair_every and (order + 1) % repair_every == 0:
-            kv.require(item['revisions'] < 256, 'Per-instance published revision limit reached; shorten replay or reduce repairs')
+            kv.require(item['revisions'] < MAX_PUBLISHED_REVISIONS,
+                       'Per-instance published revision limit reached; shorten replay or reduce repairs')
             while used_allocations + allocation_cost > allocation_budget:
                 evict(victim(exclude=key), now, 'repair_reservation', str(sequence), region)
             step = action('repair', item, now, 'configured_repair_period', str(sequence), region)
@@ -140,16 +148,17 @@ def build(binding, events, *, trace_id, shard_bytes=11469, slots=2, logical_budg
     kv.require(len(steps) <= 16384 and used_logical == used_allocations == 0, 'Invalid bounded final accounting')
     return {'schema': 1, 'kind': 'bounded_serial_native_kv_replay', 'trace_id': trace_id, 'namespace': '/ec-lab',
             'source_binding': binding, 'selected_observations_sha256': kv.sha(kv.canonical(events)),
-            'shard_bytes': shard_bytes, 'repair': repair,
+            'shard_bytes': shard_bytes, 'repair': repair, 'collector_limits': dict(COLLECTOR_LIMITS),
             'model': {'slots': slots, 'logical_budget_decimal': str(logical_budget),
                       'allocation_budget_decimal': str(allocation_budget), 'ttl_ns_decimal': str(ttl_ns),
                       'repair_every': repair_every, 'eviction_policy': 'source-time-inactivity-ttl-then-lru',
                       'arrival_pacing': False, 'execution': 'serial_closed_loop',
                       'allocation_cost_per_revision_decimal': str(allocation_cost),
                       'allocation_credit_requires': 'exact_confirmed_published_allocation_gc',
+                      'eviction_namespace_operation': 'identity_bound_single_entry_unlink_before_gc',
                       'namespace_metadata_in_budget': False, 'unpublished_unknown_outputs_credit': False},
             'bounds': {'observations': len(events), 'actions': len(steps), 'instances': misses,
-                       'max_revisions_per_instance': 256, 'max_actions': 16384},
+                       'max_revisions_per_instance': MAX_PUBLISHED_REVISIONS, 'max_actions': 16384},
             'summary': {'observation_regions': 'warmup_and_measurement_combined',
                         'model_hits': hits, 'model_misses': misses, 'scheduled_repairs': repairs,
                         'peak_resident_objects': peak_slots, 'peak_logical_bytes_decimal': str(peak_logical),

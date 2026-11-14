@@ -20,8 +20,15 @@ class FakeBackend:
         self.calls.append(name)
         if name == self.fail_at: raise ValueError('synthetic unknown native attempt')
         step = next(s for s in self.plan['steps'] if s['name'] == name)
-        gc = None
+        gc, unlink = None, None
+        obj = {'client_namespace': '00000000-0000-0000-0000-000000000001', 'inode_decimal': '42',
+               'incarnation': '00000000-0000-0000-0000-000000000002', 'birth': '00000000-0000-0000-0000-000000000003'}
         if spec['kind'] == 'evict':
+            unlink = obj | {'schema': 1, 'kind': 'ec_file_namespace_unlink', 'namespace_unlink_acknowledged': True,
+                'revalidated': True, 'network_io_performed': True, 'physical_capacity_returned': False,
+                'namespace_deleted': False, 'failure': None,
+                'path': '/ec-lab/kv-' + self.plan['trace_id'] + '-' + spec['instance'],
+                'request': '00000000-0000-0000-0000-000000000004'}
             count = int(step['model']['required_confirmed_gc_allocation_bytes_decimal']) // self.plan['shard_bytes']
             gc = {'confirmed_allocation_model_bytes_decimal': '0' if self.corrupt_gc else str(count * self.plan['shard_bytes']),
                   'completion': {'state': 'confirmed', 'completion_scope': 'exact_expected_published_revisions_and_allocations',
@@ -31,6 +38,7 @@ class FakeBackend:
                 'key_sha256': spec['key_sha256'], 'logical_bytes_decimal': spec['logical_bytes_decimal'],
                 'plan_sha256': entry.digest(self.plan), 'spec_sha256': entry.digest(spec),
                 'snapshot_exports': [{}] if spec['kind'] in ('put', 'repair') else [], 'gc': gc,
+                'object': obj, 'namespace_unlink': unlink,
                 'historical_unconfirmed_attempts': 1, 'historical_join_proven': False,
                 'current_owner_children_joined': True, 'namespace_deleted': False,
                 'physical_capacity_returned': False, 'performance_validated': False}
@@ -84,6 +92,17 @@ class ReplayEntryTests(unittest.TestCase):
                 self.run_quietly(plan, run, FakeBackend(plan), invalid)
             self.assertEqual(len(list((run / 'confirmed').iterdir())), len(plan['steps']))
             self.assertFalse((run / 'completion.json').exists())
+
+    def test_eviction_requires_remote_original_namespace_ack_not_missing_or_local_inspection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, plan = self.fixture(temporary)
+            step = next(s for s in plan['steps'] if s['spec']['kind'] == 'evict')
+            good = FakeBackend(plan).perform(step['name'], step['spec'])
+            for key, value in (('namespace_unlink_acknowledged', False), ('revalidated', False),
+                               ('network_io_performed', False), ('incarnation', 'replacement'),
+                               ('path', '/replacement'), ('request', '00000000-0000-0000-0000-000000000000')):
+                altered = copy.deepcopy(good); altered['namespace_unlink'][key] = value
+                with self.subTest(key=key), self.assertRaises(ValueError): entry.validate_receipt(step, plan, altered)
 
     def test_rejects_receipt_identity_join_capacity_and_boolean_overclaims(self):
         with tempfile.TemporaryDirectory() as temporary:

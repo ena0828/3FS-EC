@@ -569,6 +569,13 @@ CoTryTask<EcGcAdminRsp> MetaClient::queryEcFragmentGcV2(QueryEcFragmentGcV2Req r
   once.set_retry_init_wait(0_ms);
   co_return co_await retry(&IMetaServiceStub::queryEcFragmentGcV2, req, std::move(once));
 }
+CoTryTask<QueryEcFileOutputRsp> MetaClient::queryEcFileOutput(QueryEcFileOutputReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "fixed output query UUID is required");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcFileOutput, req, std::move(once));
+}
+
 CoTryTask<EcTargetRetirementRsp> MetaClient::prepareEcTargetRetirement(PrepareEcTargetRetirementReq req) {
   if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "retirement requires an explicit request UUID");
   auto once = config_.retry_default();

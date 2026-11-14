@@ -10,6 +10,7 @@ import sys
 
 
 RIGHTS = {"read": 1, "write": 2, "read-write": 3}
+NAMESPACE_COMMANDS = {"unlink", "resume-unlink", "inspect-unlink"}
 
 
 def transport_module():
@@ -42,13 +43,14 @@ def parser():
     for name in ("create", "open", "resume-open", "pwrite", "resume", "query", "seal", "close",
                  "read", "resume-read", "release-read", "export-read-allocations", "truncate", "resume-truncate", "query-truncate",
                  "close-truncate-debt", "append", "resume-append", "query-append", "seal-append",
-                 "fsync", "resume-fsync", "repair", "resume-repair", "query-repair", "close-repair-debt"):
+                 "fsync", "resume-fsync", "repair", "resume-repair", "query-repair", "close-repair-debt",
+                 "unlink", "resume-unlink", "inspect-unlink"):
         item = sub.add_parser(name)
         item.add_argument("--run-dir", type=Path, required=True, help="该操作的固定日志目录；新操作必须使用新目录")
         if name in ("repair", "resume-repair", "query-repair", "close-repair-debt"):
             item.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
                               help="显式开启/关闭本次原生修复计量；默认沿用配置（默认关闭），开启有计量开销")
-        if name in ("pwrite", "read", "truncate", "append", "fsync", "repair"):
+        if name in ("pwrite", "read", "truncate", "append", "fsync", "repair", "unlink"):
             item.add_argument("--session", type=Path, required=True, help="已接受会话的原日志目录")
         if name in ("pwrite", "read"):
             item.add_argument("--offset", type=decimal, required=True, help="字节偏移")
@@ -76,6 +78,8 @@ def parser():
             item.add_argument("--path", required=True, help="3FS 中的绝对文件路径")
             item.add_argument("--shard-bytes", type=decimal, default="1048576")
             item.add_argument("--permission", type=decimal, default="384", help="权限的十进制值，384 对应 0600")
+        if name == "unlink":
+            item.add_argument("--path", required=True, help="待删除的单个3FS绝对路径；以原会话对象身份约束，禁止递归")
         if name == "open":
             item.add_argument("--inode", type=decimal, required=True)
             item.add_argument("--incarnation", required=True)
@@ -127,7 +131,7 @@ def command(args):
         options["repair_metrics"] = "true" if args.metrics else "false"
     if transport is not None:
         options["storage_transport"] = "rdma"
-    if args.action == "create" and not args.path.startswith("/"):
+    if args.action in ("create", "unlink") and not args.path.startswith("/"):
         raise ValueError("--path 必须为 3FS 绝对路径")
     return [str(root / "bin/ec_file_cli"), f"--cfg={root / 'client/file-client.toml'}",
             *[f"--config.{key}={value}" for key, value in options.items()], "mode4-" + args.action]
@@ -146,7 +150,7 @@ def main():
         return 0
     if sys.platform != "linux":
         raise ValueError("实际运行须在 Linux/WSL 中进行")
-    if args.action != "export-read-allocations":
+    if args.action != "export-read-allocations" and args.action not in NAMESPACE_COMMANDS:
         module = transport_module()
         binding = module.prepared_transport(args.root, args.root / "client/file-client.toml", file_api=True)
         module.bind_transport_run(args.root, args.run_dir, binding, [argv[0]])

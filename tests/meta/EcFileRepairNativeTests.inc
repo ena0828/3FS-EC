@@ -121,6 +121,15 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
     EXPECT_EQ(completed.progress.record->state, EcFileRepairState::Published);
     EXPECT_TRUE(completed.progress.outputDrained);
     EXPECT_FALSE(completed.progress.sourceReleased);
+    auto output = observeFileOutput(run->intent.object, run->intent.operation, run->intent.child,
+                                    EcFileOutputOwner::Repair);
+    ASSERT_OK(output);
+    EXPECT_EQ(output->observation.state, EcFileOutputState::Published);
+    EXPECT_TRUE(output->observation.outputT2Confirmed);
+    EXPECT_FALSE(output->observation.physicalReclamationConfirmed);
+    ASSERT_TRUE(output->observation.allocations);
+    EXPECT_EQ(output->observation.allocations->size(), 12);
+    EXPECT_EQ(output->observation.identity.ownerKind, EcFileOutputOwner::Repair);
     const auto &metrics = completed.metrics;
     ASSERT_TRUE(metrics.available);
     EXPECT_FALSE(metrics.overflow);

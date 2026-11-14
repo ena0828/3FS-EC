@@ -30,6 +30,7 @@ using folly::coro::blockingWait;
 struct Calls {
   std::atomic<size_t> retires{0};
   std::atomic<size_t> queries{0};
+  std::atomic<size_t> outputQueries{0};
   std::atomic<int> mismatch{0};
   std::atomic<bool> missing{false};
   std::atomic<bool> maybeCommitted{false};
@@ -51,6 +52,23 @@ class RetirementService : public meta::MockMetaService {
  public:
   explicit RetirementService(std::shared_ptr<Calls> calls)
       : calls_(std::move(calls)) {}
+  CoTryTask<meta::QueryEcFileOutputRsp> queryEcFileOutput(serde::CallContext &,
+                                                         const meta::QueryEcFileOutputReq &req) override {
+    ++calls_->outputQueries;
+    if (calls_->missing) co_return makeError(MetaCode::kNotFound);
+    // Command/archive seam only. The real authorization and durable candidate
+    // states are covered separately by TestEcFileNativeWrite over Meta/FDB.
+    meta::QueryEcFileOutputRsp rsp;
+    rsp.clientNamespace = req.client.uuid;
+    rsp.requestId = req.uuid;
+    rsp.observation.identity = req.identity;
+    rsp.observation.recordDigest.fill(17);
+    rsp.observation.generation = std::numeric_limits<uint64_t>::max();
+    rsp.observation.candidates[0].identity.generation = std::numeric_limits<uint64_t>::max();
+    rsp.observation.candidates[0].endpoint.placement.target = storage::TargetId(std::numeric_limits<uint64_t>::max());
+    if (calls_->mismatch) rsp.observation.identity.parent = Uuid::random();
+    co_return rsp;
+  }
   CoTryTask<meta::EcRevisionRetirementRsp> retireEcRevisionV2(serde::CallContext &,
                                                               const meta::RetireEcRevisionV2Req &req) override {
     calls_->record(req);
@@ -178,6 +196,62 @@ class TestEcRevisionRetirementCommands : public ::testing::Test {
   size_t getters_ = 0;
   Uuid namespace_ = Uuid::random(), object_ = Uuid::random(), request_ = Uuid::random();
 };
+
+TEST_F(TestEcRevisionRetirementCommands, OutputObservationArchivesMissingAndChecksFixedIdentity) {
+  const auto owner = Uuid::random(), parent = Uuid::random(), child = Uuid::random();
+  auto command = [&](const std::string &output) -> Dispatcher::Args {
+    return {"ec-observe-file-output", "--inode", std::to_string(meta::InodeId::normalMax().u64()),
+            "--object-incarnation", object_.toHexString(), "--owner-uid", "702", "--owner-client", owner.toHexString(),
+            "--parent", parent.toHexString(), "--child", child.toHexString(), "--owner-kind", "pwrite",
+            "--client-namespace", namespace_.toHexString(), "--request-id", request_.toHexString(), "--output", output};
+  };
+  calls_->missing = true;
+  const auto missingPath = path("missing-output.jsonl");
+  ASSERT_ERROR(blockingWait(dispatcher_.run(env_, command(missingPath))), MetaCode::kNotFound);
+  EXPECT_EQ(calls_->outputQueries.load(), 1);
+  const auto absent = read(missingPath);
+  ASSERT_EQ(absent.size(), 2);
+  EXPECT_EQ(absent[0]["phase"].asString(), "prepared");
+  EXPECT_EQ(absent[1]["outcome"].asString(), "not_observed");
+  EXPECT_TRUE(absent[1]["observation"].isNull());
+  EXPECT_FALSE(absent[1]["physical_reclamation_confirmed"].asBool());
+  EXPECT_EQ(absent[1]["identity"]["owner"]["client"].asString(), owner.toHexString());
+  EXPECT_EQ(absent[1]["identity"]["parent"].asString(), parent.toHexString());
+  EXPECT_EQ(absent[1]["identity"]["child"].asString(), child.toHexString());
+  const auto before = read(missingPath);
+  ASSERT_ERROR(blockingWait(dispatcher_.run(env_, command(missingPath))), StatusCode::kIOError);
+  EXPECT_EQ(calls_->outputQueries.load(), 1);
+  EXPECT_EQ(read(missingPath), before);
+  calls_->missing = false;
+  calls_->mismatch = 1;
+  ASSERT_ERROR(blockingWait(dispatcher_.run(env_, command(path("changed-output.jsonl")))),
+               StorageClientCode::kProtocolMismatch);
+  calls_->mismatch = 0;
+  const auto observedPath = path("observed-output.jsonl");
+  ASSERT_OK(blockingWait(dispatcher_.run(env_, command(observedPath))));
+  const auto observed = read(observedPath);
+  ASSERT_EQ(observed.size(), 2);
+  EXPECT_EQ(observed[1]["outcome"].asString(), "observed");
+  EXPECT_TRUE(observed[1]["metadata_observation_only"].asBool());
+  EXPECT_EQ(observed[1]["identity"]["object"]["inode"].asString(), std::to_string(meta::InodeId::normalMax().u64()));
+  EXPECT_EQ(observed[1]["observation"]["generation"].asString(), "18446744073709551615");
+  EXPECT_EQ(observed[1]["observation"]["candidates"][0]["identity"]["generation"].asString(), "18446744073709551615");
+  EXPECT_EQ(observed[1]["observation"]["candidates"][0]["endpoint"]["placement"]["target"].asString(), "18446744073709551615");
+  EXPECT_FALSE(observed[1]["observation"]["outputT2Confirmed"].asBool());
+  EXPECT_FALSE(observed[1]["observation"]["physicalReclamationConfirmed"].asBool());
+  struct stat info {};
+  ASSERT_EQ(::stat(observedPath.c_str(), &info), 0);
+  EXPECT_EQ(info.st_mode & 0777, 0600);
+  std::ifstream raw(observedPath);
+  const std::string text((std::istreambuf_iterator<char>(raw)), std::istreambuf_iterator<char>());
+  EXPECT_EQ(text.find(env_.userInfo.token), std::string::npos);
+  auto invalid = command(path("invalid-output.jsonl"));
+  replace(invalid, "--owner-uid", "4294967296");
+  const auto calls = calls_->outputQueries.load();
+  ASSERT_ERROR(blockingWait(dispatcher_.run(env_, invalid)), StatusCode::kInvalidArg);
+  EXPECT_EQ(calls_->outputQueries.load(), calls);
+  EXPECT_FALSE(std::filesystem::exists(path("invalid-output.jsonl")));
+}
 
 TEST_F(TestEcRevisionRetirementCommands, UnknownHasOneCallAndReconstructedClientQueriesOriginalIdentity) {
   const auto retiredPath = path("retire.jsonl");

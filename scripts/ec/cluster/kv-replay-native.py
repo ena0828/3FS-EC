@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Serial, same-journal native mode4 adapter for a bounded observation replay.
 
-No service lifecycle, PID adoption, timeout-based reclamation or namespace
-deletion. The caller owns one trace flock, inherited by each backend-owned child.
+No service lifecycle, PID adoption or timeout-based reclamation. Eviction
+acknowledges one identity-bound namespace unlink before allocation collection.
+The caller owns one trace flock, inherited by each backend-owned child.
 Collector admin grandchildren instead retain the collector's object lease;
 an unfinished eviction cannot advance or return its model slot before recovery.
 Receipts distinguish current real joins from interrupted historical attempts.
@@ -149,6 +150,9 @@ class NativeBackend:
         names = [name_checked(step['name']) for step in plan['steps']]
         require(len(set(names)) == len(names), 'Repeated fixed action name')
         self.plan = json.loads(encoded(plan)); self.plan_sha = digest(plan)
+        require(encoded(plan.get('collector_limits')) == encoded({'nodes': 2064, 'commands': 16384}) and
+                plan.get('bounds', {}).get('max_revisions_per_instance') == 128,
+                'Replay collector limits must be fixed before native I/O')
         self.manifest = self.w.load_json(self.root / 'cluster.json')
         require(self.manifest.get('file_api') is True and self.manifest.get('root') == str(self.root), 'Not a file API bundle')
         self.folder = self.directory(self.run_dir / 'native')
@@ -463,7 +467,7 @@ class NativeBackend:
 
     def collect(self, folder, fixed, history):
         exports = [entry for receipt in history for entry in receipt['snapshot_exports']]
-        require(1 <= len(exports) <= self.gc.MAX_REVISIONS, 'Missing/unbounded published revision history')
+        require(1 <= len(exports) <= min(128, self.gc.MAX_REVISIONS), 'Missing/unbounded published revision history')
         revisions, seen, allocations = [], set(), set()
         for entry in exports:
             require(self.sha(entry['path']) == entry['sha256'], 'Captured export changed')
@@ -485,6 +489,7 @@ class NativeBackend:
                   'empty_read': self.load(folder / 'empty/read/done.json'),
                   'empty_release': self.load(folder / 'empty/release/done.json'),
                   'session_close': self.load(folder / 'close/done.json'),
+                  'namespace_unlink': self.load(folder / 'unlink/done.json'),
                   'scope': 'all completed mutations of this exclusive replay instance; no unknown unpublished outputs'}
         self.seal(ledger, values)
         expect = self.gc.expected({'schema': 1,
@@ -496,16 +501,19 @@ class NativeBackend:
         intent = phase / 'intent.json'
         first = not intent.exists()
         if first: require(not run.exists(), 'Fresh collector run exists')
-        self.seal(intent, {'run': str(run), 'expected_sha256': self.sha(expected_path)})
+        limits = self.plan['collector_limits']
+        self.seal(intent, {'run': str(run), 'expected_sha256': self.sha(expected_path), 'limits': limits})
         attempted = (phase / 'attempts').exists() and any((phase / 'attempts').iterdir())
         if attempted:
             require((run / 'plan.json').is_file(), 'Collector started without intact plan; do not replace its identity')
         else:
             require(not run.exists(), 'Unstarted collector path unexpectedly exists')
         self.command(phase, 'resume' if attempted else 'start', run,
-                     () if attempted else ['--expected', expected_path], collector=True)
+                     () if attempted else ['--expected', expected_path, '--max-nodes', limits['nodes'],
+                                           '--max-commands', limits['commands']], collector=True)
         plan = self.load(run / 'plan.json'); self.gc.validate_plan(plan)
-        require(encoded(plan['expected']) == encoded(expect) and plan['root'] == str(self.root), 'Collector plan differs')
+        require(encoded(plan['expected']) == encoded(expect) and plan['root'] == str(self.root) and
+                encoded(plan['limits']) == encoded(limits), 'Collector plan differs')
         completion = self.load(run / 'completion.json')
         for key, want in (('schema', 1), ('state', 'confirmed'),
                           ('completion_scope', 'exact_expected_published_revisions_and_allocations'),
@@ -555,7 +563,7 @@ class NativeBackend:
             fixed = put['object']; instance_folder = self.actions / instance
             session_run = instance_folder / 'session-run'
         payload, data = self.payload(instance_folder, spec)
-        exports, collection = [], None
+        exports, collection, namespace_unlink = [], None, None
         if spec['kind'] == 'put':
             def written(result):
                 require(result['returncode'] == 0 and len(result['business']) == 2, 'Pwrite journal/outcome missing')
@@ -572,7 +580,7 @@ class NativeBackend:
             self.phase(folder, 'write', folder / 'write-run', 'pwrite', 'resume',
                        ['--session', session_run, '--offset', 0, '--input', payload], written, new_run=True)
         elif spec['kind'] == 'repair':
-            require(sum(len(value['snapshot_exports']) for value in history) < self.gc.MAX_REVISIONS,
+            require(sum(len(value['snapshot_exports']) for value in history) < min(128, self.gc.MAX_REVISIONS),
                     'Published revision capacity exhausted before starting another mutation')
             options = ['--session', session_run, '--stripe', 0, '--targets', ','.join(map(str, spec['targets'])),
                        '--sources', ','.join(map(str, spec['sources'])), '--strategy', spec['strategy'], '--window', spec['window']]
@@ -602,6 +610,22 @@ class NativeBackend:
             self.readback(self.directory(folder / 'empty'), session_run, fixed, b'')
             self.phase(folder, 'close', session_run, 'close', 'close', (),
                        lambda r: self.session_check(r, closed=True, fixed=fixed))
+            path = '/ec-lab/kv-' + self.plan['trace_id'] + '-' + instance
+            def unlinked(result):
+                value = self.one(result)
+                for key, want in (('schema', 1), ('kind', 'ec_file_namespace_unlink'),
+                                  ('cluster', self.manifest['cluster_id']), ('path', path),
+                                  ('namespace_unlink_acknowledged', True), ('revalidated', True),
+                                  ('network_io_performed', True), ('physical_capacity_returned', False),
+                                  ('namespace_deleted', False), ('failure', None)):
+                    exact(value, key, want)
+                for key in ('client_namespace', 'inode_decimal', 'incarnation', 'birth'):
+                    require(value[key] == fixed[key], 'Unlink changed original object/owner/birth')
+                require(value['command'] in ('mode4-unlink', 'mode4-resume-unlink'), 'Unlink was not remotely acknowledged')
+                self.gc.uid(value['request'])
+                return value
+            namespace_unlink = self.phase(folder, 'unlink', folder / 'unlink-run', 'unlink', 'resume-unlink',
+                ['--session', session_run, '--path', path], unlinked, new_run=True)
             collection = self.collect(folder, fixed, history)
         self.guard()
         files, commands, unknown = {}, [], 0
@@ -610,7 +634,7 @@ class NativeBackend:
         # with joined.json; its historical unknowns remain in GC completion.
         owned_attempts = {folder / phase / 'attempts' for phase in (
             'session', 'write', 'read', 'release', 'export', 'repair', 'repair-debt',
-            'truncate', 'truncate-debt', 'close', 'collector', 'empty/read', 'empty/release')}
+            'truncate', 'truncate-debt', 'close', 'unlink', 'collector', 'empty/read', 'empty/release')}
         for path in sorted(folder.rglob('*')):
             direct_attempt = path.parent.parent in owned_attempts and re.fullmatch('[0-9]{4}', path.parent.name) is not None
             collector_join = (collection is not None and path.name == 'joined.json' and
@@ -634,7 +658,7 @@ class NativeBackend:
         value = {'schema': 1, 'state': 'confirmed', 'kind': spec['kind'], 'name': name, 'instance': instance,
                  'plan_sha256': self.plan_sha, 'spec_sha256': digest(spec), 'key_sha256': spec['key_sha256'],
                  'logical_bytes_decimal': spec['logical_bytes_decimal'], 'object': fixed, 'files': files,
-                 'snapshot_exports': exports, 'gc': collection, 'owned_commands': commands,
+                 'snapshot_exports': exports, 'gc': collection, 'namespace_unlink': namespace_unlink, 'owned_commands': commands,
                  'historical_unconfirmed_attempts': unknown, 'historical_join_proven': unknown == 0,
                  'current_owner_children_joined': True, 'namespace_deleted': False,
                  'physical_capacity_returned': False, 'performance_validated': False,

@@ -160,6 +160,31 @@ class OwnedLeaseTests(unittest.TestCase):
                 ACK.command(runner, WRAPPER, original, pass_fds=(9876,))
             popen.assert_not_called()
 
+    def test_namespace_lease_is_control_only_and_resume_forbids_replacement_identity(self):
+        runner = self.runner(); runner.transport_role = 'file'
+        runner.config = self.root / 'client/file-client.toml'
+        runner.check_transport = Mock(return_value={'mode': 'rdma'})
+        for action in ('unlink', 'resume-unlink', 'inspect-unlink'):
+            argv = self.file_argv(action)
+            if action == 'unlink':
+                argv[2:2] = ['--config.session_run_dir=' + str(self.root / 'original-session'),
+                             '--config.file_path=/ec-lab/fixed-instance']
+            with self.subTest(action=action), patch.object(ACK, '_owned_command', return_value='observed') as owned, \
+                 patch.object(WRAPPER, 'bind_transport_run') as bind:
+                self.assertEqual(ACK.command(runner, WRAPPER, argv, pass_fds=(9876,)), 'observed')
+                self.assertIsNone(owned.call_args.args[3])
+                self.assertEqual(owned.call_args.kwargs['pass_fds'], (9876,))
+                self.assertEqual(owned.call_args.kwargs['kind'],
+                                 'local_namespace_inspect' if action == 'inspect-unlink' else 'namespace_control')
+                bind.assert_not_called()
+                if action != 'unlink':
+                    with self.assertRaisesRegex(RuntimeError, 'argument set'):
+                        ACK.command(runner, WRAPPER, argv[:-1] + ['--config.file_path=/replacement', argv[-1]],
+                                    pass_fds=(9876,))
+            with patch.object(ACK, '_owned_command') as owned, self.assertRaisesRegex(RuntimeError, 'executable/config'):
+                ACK.command(runner, WRAPPER, ['other-program', *argv[1:]])
+            owned.assert_not_called()
+
     def test_collector_trace_lease_only_allows_fixed_start_and_resume(self):
         base = [sys.executable, '-B', str(self.root / 'scripts/tree-gc-runner.py'), 'start',
                 '--root', str(self.root), '--run-dir', str(self.root / 'client/collector'),
@@ -168,6 +193,12 @@ class OwnedLeaseTests(unittest.TestCase):
         recorded = ['/usr/bin/python3', *base[1:]]
         self.assertEqual(ACK.validate_collector_command(self.root, recorded,
                          expected_executable='/usr/bin/python3')['action'], 'start')
+        bounded = base + ['--max-nodes', '2064', '--max-commands', '16384']
+        self.assertEqual(ACK.validate_collector_command(self.root, bounded)['limits'], {'nodes': 2064, 'commands': 16384})
+        for limits in (['--max-nodes', '0', '--max-commands', '16384'],
+                       ['--max-nodes', '2064', '--max-commands', '16385'],
+                       ['--max-nodes', '02064', '--max-commands', '16384']):
+            with self.assertRaises(RuntimeError): ACK.validate_collector_command(self.root, base + limits)
         with patch.object(ACK.sys, 'executable', '/different/reader/python3'), \
              patch.object(ACK.subprocess, 'Popen') as forbidden:
             with self.assertRaisesRegex(RuntimeError, 'executable/root'):

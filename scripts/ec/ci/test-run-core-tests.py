@@ -59,10 +59,10 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                 bad[field]["cleanup"]["leader_reaped"] = False
             with self.subTest(field=field), self.assertRaises(ValueError):
                 RUNNER.check_meta_receipt(bad, binary, output, cases, test_filter)
-        self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 28)
+        self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 29)
         combined, combined_filter, combined_fuse = RUNNER.selection("service-contracts")
         self.assertEqual(combined, expected + (
-            "TestMetaServiceReflection.RegistersAll71IncludingBeyondDefaultFieldRank",))
+            "TestMetaServiceReflection.RegistersAll72IncludingBeyondDefaultFieldRank",))
         self.assertEqual(combined_filter, ":".join(combined))
         self.assertEqual(combined_fuse, ())
         RUNNER.check_meta_receipt(receipt(binary, output, combined, combined_filter), binary, output,
@@ -200,7 +200,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
             "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
             "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
             "TestEcFileNativeRepair.HelperDirectCommittedIssuanceLostReplyAndFreshTwelvePublication",
-            "TestEcV2NativeHelperPlan.FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery",
+            "TestEcV2NativeHelperDirect.FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery",
             "TestEcV2NativeHelperPlan.FlatDirectCommittedReplyLossAndClosingOnlyObserve",
             "TestEcV2RepairPlanCatalog.DirectDeliveryVersionsOnlyPermanentRecord",
             "TestEcV2NativeHelperPlan.StripeManagerRunsAllExplicitRepairStrategiesThroughMetaIssuedPlan",
@@ -219,7 +219,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
         # A successful summary cannot hide either missing/failed XML case.
         for name in (
                 "TestEcV2NativeHelperPlan.StripeManagerRunsAllExplicitRepairStrategiesThroughMetaIssuedPlan",
-                "TestEcV2NativeHelperPlan.FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery"):
+                "TestEcV2NativeHelperDirect.FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery"):
             for broken in ("missing", "failed"):
                 invalid = copy.deepcopy(sample)
                 if broken == "missing":
@@ -246,7 +246,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                 RUNNER.check_meta_receipt(invalid, binary, output, cases, test_filter)
 
     def test_fixed_sets_and_required_cli(self):
-        self.assertEqual(len(set(RUNNER.META_CASES)), 13)
+        self.assertEqual(len(set(RUNNER.META_CASES)), 14)
         self.assertEqual(len(set(RUNNER.FUSE_CASES)), 15)
         parsed = RUNNER.parser().parse_args(["--source", "/source", "--build", "/build",
                                             "--fdb-bin-dir", "/fdb", "--work", "/private/new"])

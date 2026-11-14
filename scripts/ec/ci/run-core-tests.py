@@ -27,6 +27,7 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
     "RenameMovesReplacesAndKeepsOpenObjectsWithPermanentReplay",
     "TruncateTailLostReplyAndExtensionDoNotResurrectBytes",
     "TruncatePublicationSurvivesClosingLastUnlinkedSession",
+    "OutputObservationAuthenticatesExactOwnerAndRetainsCandidateDebt",
 )) + tuple("TestEcMountedTruncateRecovery." + name for name in (
     "BeginConflictReplaysOriginalIntent",
     "PublishedConflictAfterDataTailReplaysOriginalIntent",
@@ -40,7 +41,7 @@ REPAIR_CASES = (
     "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
     "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
     "TestEcFileNativeRepair.HelperDirectCommittedIssuanceLostReplyAndFreshTwelvePublication",
-    "TestEcV2NativeHelperPlan.FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery",
+    "TestEcV2NativeHelperDirect.FlatDirectSingleAndDoubleTargetsKeepPermanentDelivery",
     "TestEcV2NativeHelperPlan.FlatDirectCommittedReplyLossAndClosingOnlyObserve",
     "TestEcV2RepairPlanCatalog.DirectDeliveryVersionsOnlyPermanentRecord",
     "TestEcV2NativeHelperPlan.StripeManagerRunsAllExplicitRepairStrategiesThroughMetaIssuedPlan",
@@ -49,7 +50,7 @@ REPAIR_CASES = (
 AUTH_USER_CASES = tuple(f"TestAuth/{backend}.{case}" for backend in (0, 1)
                         for case in ("Basic", "ExplicitPrimaryGroup"))
 SERVICE_CONTRACT_CASES = AUTH_USER_CASES + (
-    "TestMetaServiceReflection.RegistersAll71IncludingBeyondDefaultFieldRank",
+    "TestMetaServiceReflection.RegistersAll72IncludingBeyondDefaultFieldRank",
 )
 TARGET_META_CASES = (
     "TestEcTargetRetirementCatalog.RealFdbImmutableIntentAndRequestIdentity",
@@ -90,7 +91,7 @@ def parser():
     for name in ("source", "build", "fdb-bin-dir", "work"):
         result.add_argument("--" + name, required=True, type=Path)
     result.add_argument("--profile", choices=("core", "repair", "target-meta", "auth-user", "service-contracts"), default="core",
-                        help="core: 13 Meta + 15 FUSE; repair: file and flat repair, Direct delivery and recovery fixtures; "
+                        help="core: 14 Meta + 15 FUSE; repair: file and flat repair, Direct delivery and recovery fixtures; "
                              "target-meta: 9 retirement catalogue, RPC and evidence cases; "
                              "auth-user: default and explicit primary GID with MemKV and FDB; "
                              "service-contracts: auth-user plus all Meta dispatch IDs")

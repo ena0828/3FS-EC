@@ -21,6 +21,7 @@
 #include "fbs/meta/Common.h"
 #include "fbs/meta/Ec.h"
 #include "fbs/meta/EcFileAppend.h"
+#include "fbs/meta/EcFileOutput.h"
 #include "fbs/meta/EcFileRange.h"
 #include "fbs/meta/EcFileRepairRpc.h"
 #include "fbs/meta/EcFileRpc.h"
@@ -888,6 +889,23 @@ struct EcGcAdminRsp : RspBase {
   SERDE_STRUCT_FIELD(terminalRevision, uint64_t{});
 };
 
+// Authenticated root observes an exact original owner; its own client namespace
+// is independent from the owner whose immutable output is being inspected.
+struct QueryEcFileOutputReq : ReqBase {
+  SERDE_STRUCT_FIELD(identity, EcFileOutputIdentity{});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(checkUuid());
+    return identity.valid();
+  }
+};
+struct QueryEcFileOutputRsp : RspBase {
+  SERDE_STRUCT_FIELD(clientNamespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(observation, EcFileOutputObservation{});
+};
+
 // An explicit administrative metadata operation. The same client namespace
 // and request UUID bind one exact historical revision permanently.
 struct EcRevisionRetirementReq : ReqBase {
@@ -1387,6 +1405,7 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(queryEcTargetRetirement, 69, QueryEcTargetRetirementReq, EcTargetRetirementRsp);
   META_SERVICE_METHOD(prepareEcFileRepairDirect, 70, PrepareEcFileRepairDirectReq, EcFileRepairDirectRsp);
   META_SERVICE_METHOD(prepareEcRepairDirectV2, 71, PrepareEcRepairDirectV2Req, PrepareEcRepairDirectV2Rsp);
+  META_SERVICE_METHOD(queryEcFileOutput, 72, QueryEcFileOutputReq, QueryEcFileOutputRsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
   META_SERVICE_METHOD(bindEcRmwOutput, 52, BindEcRmwOutputReq, BindEcRmwOutputRsp);

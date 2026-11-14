@@ -30,6 +30,34 @@ spec.loader.exec_module(file_command)
 
 
 class PortableExperiments(unittest.TestCase):
+    def test_unlink_wrapper_preserves_fixed_inputs_and_never_creates_data_transport_evidence(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent).resolve(); run = root / 'fixed unlink'; session = root / 'closed session'
+            (root / 'cluster.json').write_text(json.dumps({'root': str(root), 'file_api': True,
+                'data_transport': {'schema': 1, 'mode': 'rdma', 'interface': 'eth0',
+                                   'ipv4': '192.0.2.1', 'ib_device': 'mlx5_0'}}))
+            for action in ('unlink', 'resume-unlink', 'inspect-unlink'):
+                args = ['file-command.py', '--root', str(root), action, '--run-dir', str(run)]
+                if action == 'unlink': args += ['--session', str(session), '--path', '/ec-lab/original']
+                module = mock.Mock()
+                with self.subTest(action=action), mock.patch.object(file_command.sys, 'argv', args), \
+                     mock.patch.object(file_command.sys, 'platform', 'linux'), \
+                     mock.patch.object(file_command, 'transport_module', return_value=module), \
+                     mock.patch.object(file_command.os, 'execve', side_effect=RuntimeError('captured exec'), create=True) as execute, \
+                     contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'captured exec'):
+                    file_command.main()
+                argv = execute.call_args.args[1]
+                self.assertEqual(argv[-1], 'mode4-' + action)
+                self.assertIn('--config.run_dir=' + str(run), argv)
+                self.assertEqual('--config.session_run_dir=' + str(session) in argv, action == 'unlink')
+                module.bind_transport_run.assert_not_called()
+                module.prepared_transport.assert_called_once_with(root, root / 'client/file-client.toml',
+                                                                 file_api=True, require_initialized=False)
+                self.assertFalse(run.exists()); self.assertFalse(session.exists())
+                if action != 'unlink':
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        file_command.parser().parse_args(args[1:] + ['--path', '/replacement'])
+
     def test_read_allocation_export_forwards_only_local_paths_without_creating_output(self):
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent).resolve()
