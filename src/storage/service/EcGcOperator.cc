@@ -29,11 +29,16 @@ Result<Void> StorageOperator::initEcGc() {
                EcGcExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_, [this] {
                  return config_.read_only();
                }));
-  CHECK_RESULT(absentExecutor,
-               EcGcAbsentExecutor::create(shared, authority, components_.appInfo.nodeId, ecAuthorizationNow_, [this] {
-                 return config_.read_only();
-               }));
-  ecGcAbsent_ = std::move(absentExecutor);
+  // Ordinary GC does not require a C role. Absence additionally needs the
+  // independently loaded local C authority, never one supplied by a request.
+  if (config_.enable_ec_scope_control()) {
+    if (!ecScopeControl_) return makeError(StatusCode::kInvalidConfig, "absence requires a loaded C role");
+    CHECK_RESULT(controlAuthority, Uuid::fromHexString(config_.ec_scope_control_authority()));
+    CHECK_RESULT(absentExecutor,
+                 EcGcAbsentExecutor::create(shared, authority, controlAuthority, components_.appInfo.nodeId,
+                                           ecAuthorizationNow_, [this] { return config_.read_only(); }));
+    ecGcAbsent_ = std::move(absentExecutor);
+  }
   ecGc_ = std::move(executor);
   ecGcKeyFileIdentity_ = EcKeyFileIdentity{loadedIdentity.device, loadedIdentity.inode};
   return Void{};

@@ -588,6 +588,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
   virtual bool enableHelperIssuance() const { return false; }
   virtual bool enableExactGc() const { return false; }
   virtual bool enableMetaGcAdmin() const { return false; }
+  virtual const Uuid &gcAuthority() const { return authority_; }
   virtual bool enableTargetRetirement() const { return false; }
   virtual bool enableFileRmw() const { return false; }
   virtual bool enableMountedTruncateFault() const { return false; }
@@ -881,7 +882,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
       storage.set_enable_ec_gc(true);
       storage.set_ec_gc_key_file(gcKeyPath_);
       storage.set_ec_gc_key_id(gcKeyId_.toHexString());
-      storage.set_ec_gc_authority(authority_.toHexString());
+      storage.set_ec_gc_authority(gcAuthority().toHexString());
     }
     if (enableHelperIssuance()) {
       storage.set_enable_ec_helpers(true);
@@ -995,7 +996,7 @@ class TestEcV2NativeLifecycle : public hf3fs::testing::SetupFDB {
       metaConfig_.set_enable_ec_exact_gc(true);
       metaConfig_.set_ec_gc_key_file(gcKeyPath_);
       metaConfig_.set_ec_gc_key_id(gcKeyId_.toHexString());
-      metaConfig_.set_ec_gc_authority(authority_.toHexString());
+      metaConfig_.set_ec_gc_authority(gcAuthority().toHexString());
     }
     if (enableHelperIssuance()) metaConfig_.set_ec_v2_helper_key_file(helperKeyPath_);
     metaConfig_.set_ec_v2_control_key_file(controlKeyPath_);

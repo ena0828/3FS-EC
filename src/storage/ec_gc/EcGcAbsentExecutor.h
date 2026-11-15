@@ -35,6 +35,7 @@ class EcGcAbsentExecutor final {
   static Result<std::unique_ptr<EcGcAbsentExecutor>> create(
       std::shared_ptr<const EcGcKey>,
       Uuid authority,
+      Uuid controlAuthority,
       NodeId actualLocalNode,
       Clock,
       ReadOnly readOnly = [] { return false; });
@@ -52,11 +53,12 @@ class EcGcAbsentExecutor final {
 
  private:
   struct Job;
-  EcGcAbsentExecutor(std::shared_ptr<const EcGcKey>, Uuid, NodeId, Clock, ReadOnly);
+  EcGcAbsentExecutor(std::shared_ptr<const EcGcKey>, Uuid, Uuid, NodeId, Clock, ReadOnly);
   Result<EcGcAbsentAck> process(const Job &);
   void run() noexcept;
   std::shared_ptr<const EcGcKey> key_;
   Uuid authority_;
+  Uuid controlAuthority_;
   NodeId node_;
   Clock clock_;
   ReadOnly readOnly_;

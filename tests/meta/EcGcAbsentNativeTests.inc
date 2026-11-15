@@ -2,6 +2,8 @@
 // by the existing repair issuer; only the selected subset is ever materialized.
 class TestEcFileNativeAbsent : public TestEcFileNativeRepair {
  protected:
+  const Uuid &gcAuthority() const override { return absentGcAuthority_; }
+  const Uuid absentGcAuthority_ = Uuid::random();
   struct CandidateRun {
     OpenEcFileSessionRsp opened;
     hf3fs::client::ec::EcTreeRepairRun run;
@@ -9,6 +11,14 @@ class TestEcFileNativeAbsent : public TestEcFileNativeRepair {
     UserInfo root;
   };
   void prepareCandidates(CandidateRun &out, uint16_t materialized, std::string name) {
+    ASSERT_FALSE(gcAuthority().is_nil());
+    ASSERT_NE(gcAuthority(), authority_);
+    ASSERT_EQ(metaConfig_.ec_gc_authority(), gcAuthority().toHexString());
+    ASSERT_EQ(metaConfig_.ec_v2_control_authority(), authority_.toHexString());
+    struct stat controlFile{}, gcFile{};
+    ASSERT_EQ(::stat(controlKeyPath_.c_str(), &controlFile), 0);
+    ASSERT_EQ(::stat(gcKeyPath_.c_str(), &gcFile), 0);
+    ASSERT_TRUE(controlFile.st_dev != gcFile.st_dev || controlFile.st_ino != gcFile.st_ino);
     auto open = request<OpenEcFileSessionReq>();
     open.createNew = true;
     open.path = PathAt(parent_, name);
@@ -102,6 +112,27 @@ class TestEcFileNativeAbsent : public TestEcFileNativeRepair {
     ASSERT_GT(late.grant.claims.expiresAtSeconds, now);
     ASSERT_ERROR(blockingWait(storageClient_->beginEcStageV2Controlled(late, control())), StatusCode::kTokenStale);
   }
+  void queryRejectsWrongAuthority(const QueryEcFragmentAbsentReq &query) {
+    auto key = ec_tree_detail::allocationKey(kv::KeyPrefix::EcGcAbsentCompletion, query.identity);
+    ASSERT_OK(key);
+    // Rebuild only Meta with one wrong role identity at a time. The original
+    // Storage instance, two key files, T2 witness and G2 claim remain fixed.
+    for (bool wrongControl : {true, false}) {
+      SCOPED_TRACE(wrongControl ? "wrong C authority" : "wrong G authority");
+      metaConfig_.set_ec_v2_control_authority((wrongControl ? gcAuthority() : authority_).toHexString());
+      metaConfig_.set_ec_gc_authority((wrongControl ? gcAuthority() : authority_).toHexString());
+      ASSERT_NO_FATAL_FAILURE(restartCoordinator());
+      auto rejected = blockingWait(metaClient_->queryEcFragmentAbsent(query));
+      ASSERT_ERROR(rejected, wrongControl ? StatusCode::kTokenMismatch : StatusCode::kAuthenticationFail);
+      auto tx = kv_->createReadWriteTransaction();
+      auto saved = blockingWait(tx->get(*key));
+      ASSERT_OK(saved);
+      ASSERT_FALSE(*saved); // A failed read-only Query cannot publish ECGB.
+    }
+    metaConfig_.set_ec_v2_control_authority(authority_.toHexString());
+    metaConfig_.set_ec_gc_authority(gcAuthority().toHexString());
+    ASSERT_NO_FATAL_FAILURE(restartCoordinator());
+  }
 };
 
 TEST_F(TestEcFileNativeAbsent, MixedBoundCandidatesRequireDistinctCollectedOrAbsentFacts) {
@@ -133,6 +164,7 @@ TEST_F(TestEcFileNativeAbsent, MixedBoundCandidatesRequireDistinctCollectedOrAbs
       ASSERT_FALSE(blockingWait(metaClient_->queryEcFragmentAbsent(query)));
       // Original G2 still refuses Missing; no semantic upgrade to Collected.
       ASSERT_FALSE(blockingWait(metaClient_->collectEcFragmentV2(collect)));
+      if (n == 1) ASSERT_NO_FATAL_FAILURE(queryRejectsWrongAuthority(query));
       auto done = blockingWait(metaClient_->confirmEcFragmentAbsent(confirm));
       ASSERT_OK(done);
       ASSERT_OK(done->valid());
@@ -165,6 +197,7 @@ TEST_F(TestEcFileNativeAbsent, MixedBoundCandidatesRequireDistinctCollectedOrAbs
   EXPECT_EQ(absent, 8);
   EXPECT_EQ(collected, 4);
   RecordProperty("absence_scope", "12 bound candidates; 4 actual sealed fragments and 8 never-Begun allocations");
+  RecordProperty("authorities", "distinct C/G authorities and key files; wrong-role Queries reject without ECGB; original claim then succeeds");
   RecordProperty("capacity", "AbsentAfterClose permits only candidate reservation classification; no reclaimed bytes claim");
 }
 
@@ -219,6 +252,9 @@ TEST_F(TestEcFileNativeAbsent, LostAbsentReplyReopensAndQueryRecordsTheOriginalF
   ASSERT_OK(saved);
   ASSERT_TRUE(*saved);
   EXPECT_EQ((**saved).request.claims.action, storage::EcGcAbsentAction::QueryAbsent);
+  EXPECT_EQ((**saved).request.claims.authority, gcAuthority());
+  ASSERT_TRUE((**saved).request.claims.closure.scopeRequest);
+  EXPECT_EQ((**saved).request.claims.closure.scopeRequest->claims.clusterAuthority, authority_);
   EXPECT_EQ((**saved).ack.claims.ledgerSha256, acknowledged.claims.ledgerSha256);
   auto changed = query;
   changed.claimId = Uuid::random();

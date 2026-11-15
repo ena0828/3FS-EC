@@ -12,7 +12,10 @@ class EcGcAbsentTransport {
 };
 class EcGcAbsentCoordinator {
  public:
-  using Config = EcGcCoordinator::Config;
+  struct Config : EcGcCoordinator::Config {
+    // Independently loaded C role; authority above remains the G role.
+    Uuid controlAuthority = Uuid::zero();
+  };
   static Result<std::unique_ptr<EcGcAbsentCoordinator>> create(Config, std::shared_ptr<kv::IKVEngine>,
       std::shared_ptr<const storage::EcScopeControlKey>, std::shared_ptr<const storage::EcGcKey>,
       std::shared_ptr<EcGcAbsentTransport>);

@@ -8,6 +8,7 @@
 #include <sys/vfs.h>
 
 #include "client/storage/StorageClient.h"
+#include "fbs/storage/EcGcAbsentDiscovery.h"
 #include "common/net/Server.h"
 #include "storage/service/Components.h"
 #include "storage/service/StorageService.h"
@@ -244,6 +245,18 @@ TEST_F(TestEcGcDiscoveryService, RealTcpReturnsActualInstanceAndCurrentReadOnlyM
   EXPECT_EQ(observed->claims.gcProtocol, kEcGcSupportedProtocol);
   EXPECT_EQ(observed->claims.capabilities, kEcGcDiscoveryCollectQuery);
   EXPECT_FALSE(observed->claims.bootNonce.is_nil());
+  // This fixture intentionally configures G without C. Ordinary GC discovery
+  // remains usable; it must not advertise or execute absence without a loaded C role.
+  ASSERT_FALSE(config.storage().enable_ec_scope_control());
+  EcGcAbsentDiscoveryClaims absence;
+  absence.keyId=keyId;absence.authority=authority;absence.nodeId=nodeId;
+  absence.chainId=chainId;absence.targetId=targetId;absence.nonce=Uuid::random();
+  absence.issuedAtSeconds=now();absence.expiresAtSeconds=absence.issuedAtSeconds+30;
+  auto absentRequest=signEcGcAbsentDiscovery(*key,absence,now());ASSERT_OK(absentRequest);
+  ASSERT_ERROR(blockingWait(storageClient->getEcGcAbsentCapabilityControlled(*absentRequest,key,control())),
+               StatusCode::kAuthenticationFail);
+  auto noC=blockingWait(components->storageOperator.exchangeEcGcAbsent(EcGcAbsentRequest{}));ASSERT_OK(noC);
+  ASSERT_ERROR(noC->result,StatusCode::kAuthenticationFail);
   config.storage().set_read_only(true);
   auto next = signEcGcDiscovery(*key, claims(), now());
   ASSERT_OK(next);

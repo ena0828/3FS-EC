@@ -5,7 +5,7 @@ class TestEcGcAbsentExecutor : public TestEcGcExecutor {
   void SetUp() override {
     TestEcGcExecutor::SetUp();
     if (HasFatalFailure()) return;
-    auto started=EcGcAbsentExecutor::create(key,authority,node,[]{return 1000;},[this]{return readOnly;});
+    auto started=EcGcAbsentExecutor::create(key,authority,controlAuthority,node,[]{return 1000;},[this]{return readOnly;});
     ASSERT_OK(started);
     absent=std::move(*started);
   }
@@ -41,7 +41,7 @@ class TestEcGcAbsentExecutor : public TestEcGcExecutor {
     w.originDrainEvidence=c.certificate.originDrainEvidence;
     w.scopeRequest.emplace();w.scopeAck.emplace();
     auto &r=w.scopeRequest->claims;const auto &e=c.certificate.endpoint;
-    r.clusterAuthority=authority;r.nodeId=e.nodeId;r.chainId=e.chainId;r.targetId=e.targetId;
+    r.clusterAuthority=controlAuthority;r.nodeId=e.nodeId;r.chainId=e.chainId;r.targetId=e.targetId;
     r.engineUuid=e.engineUuid;r.targetIncarnation=e.targetIncarnation;r.object=request.identity.object;
     r.scopeKind=w.scopeKind;r.scopeId=w.scopeId;r.ownerUid=w.ownerUid;r.clientNamespace=w.clientNamespace;
     r.endpointSetDigest=w.endpointSetDigest;r.revocationId=w.revocationId;
@@ -51,6 +51,11 @@ class TestEcGcAbsentExecutor : public TestEcGcExecutor {
     w.scopeAck->claims.requestDigest.fill(41);w.scopeAck->claims.revocationDigest.fill(42);
     w.scopeAck->claims.bootNonce=Uuid::from(903,904);w.scopeAck->claims.observedAtSeconds=950;
     w.scopeAck->claims.state=EcScopeControlState::Drained;w.scopeAck->claims.durable=true;
+    return remac(c);
+  }
+  // A real fixture G MAC, independent of the verifier under test. C/T2 here
+  // remains synthetic; the Meta fixture supplies real distributed C evidence.
+  EcGcAbsentRequest remac(const EcGcAbsentRequestClaims &c) const {
     const auto body=ec_gc_absent_detail::Codec::encode(c);
     EcSha256 mac{};unsigned size=0;
     if (!HMAC(EVP_sha256(),keyBytes.data(),keyBytes.size(),reinterpret_cast<const uint8_t *>(body.data()),body.size(),mac.data(),&size)||size!=32)
@@ -63,6 +68,7 @@ class TestEcGcAbsentExecutor : public TestEcGcExecutor {
     return folly::coro::blockingWait(absent->execute(action,token(action),target));
   }
   std::unique_ptr<EcGcAbsentExecutor> absent;
+  const Uuid controlAuthority=Uuid::from(801,802);
   bool readOnly=false;
 };
 
@@ -74,25 +80,57 @@ TEST_F(TestEcGcAbsentExecutor, MissingRequiresOriginalDurableCloseAndQueryNeverC
   EXPECT_FALSE(exchange(EcGcAbsentAction::QueryAbsent));
   EXPECT_EQ(used(),before);
   auto issued=token(EcGcAbsentAction::ConfirmAbsent);
+  ASSERT_NE(authority,controlAuthority);
+  using AbsentCodec=ec_gc_absent_detail::Codec;
+  EcGcLocalTarget local{issued.claims.certificate.endpoint,2,3,2,true};
+  ASSERT_OK(AbsentCodec::verifyRequest(*key,issued,authority,controlAuthority,local,1000));
+  EXPECT_FALSE(EcGcAbsentExecutor::create(key,authority,Uuid::zero(),node,[]{return 1000;}));
+  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,issued,authority,Uuid::zero(),local,1000));
+  auto wrongC=issued.claims;
+  wrongC.closure.scopeRequest->claims.clusterAuthority=Uuid::from(811,812);
+  ASSERT_ERROR(folly::coro::blockingWait(absent->execute(EcGcAbsentAction::ConfirmAbsent,remac(wrongC),target)),
+               StatusCode::kTokenMismatch);
+  auto wrongG=issued.claims;wrongG.authority=Uuid::from(813,814);
+  ASSERT_ERROR(folly::coro::blockingWait(absent->execute(EcGcAbsentAction::ConfirmAbsent,remac(wrongG),target)),
+               StatusCode::kAuthenticationFail);
+  // The second original-witness variant must check C independently too.
+  auto retired=issued.claims;auto &w=retired.closure;const auto &e=retired.certificate.endpoint;
+  w.kind=EcGcClosureKind::TargetRetirement;w.scopeRequest.reset();w.scopeAck.reset();
+  w.retirementRequest.emplace();w.retirementObservation.emplace();
+  auto &r=w.retirementRequest->claims;
+  r.clusterAuthority=controlAuthority;r.nodeId=e.nodeId;r.chainId=e.chainId;r.targetId=e.targetId;
+  r.engineUuid=e.engineUuid;r.targetIncarnation=e.targetIncarnation;
+  r.retirementId=Uuid::from(815,816);r.nonce=Uuid::from(817,818);r.issuedAtSeconds=900;r.expiresAtSeconds=1100;
+  auto &a=w.retirementObservation->claims;
+  a.requestDigest.fill(43);a.retirementDigest.fill(44);a.bootNonce=Uuid::from(819,820);a.observedAtSeconds=950;
+  a.state=EcTargetRetirementState::LocalDataDrained;a.durable=true;
+  ASSERT_OK(AbsentCodec::verifyRequest(*key,remac(retired),authority,controlAuthority,local,1000));
+  r.clusterAuthority=Uuid::from(821,822);
+  ASSERT_ERROR(folly::coro::blockingWait(absent->execute(EcGcAbsentAction::ConfirmAbsent,remac(retired),target)),
+               StatusCode::kTokenMismatch);
+  ASSERT_ERROR(exchange(EcGcAbsentAction::QueryAbsent), StorageCode::kChunkMetadataNotFound);
+  EXPECT_EQ(used(),before);
+  // No new global inequality rule: correctly configured historical equal
+  // UUIDs still verify, without changing this executor's distinct C role.
+  auto sameRoleIds=issued.claims;sameRoleIds.closure.scopeRequest->claims.clusterAuthority=authority;
+  ASSERT_OK(AbsentCodec::verifyRequest(*key,remac(sameRoleIds),authority,authority,local,1000));
   auto confirmed=folly::coro::blockingWait(absent->execute(EcGcAbsentAction::ConfirmAbsent,issued,target));ASSERT_OK(confirmed);
   EXPECT_EQ(confirmed->claims.state,EcGcAbsentState::AbsentAfterClose);
   EXPECT_EQ(confirmed->claims.recordRevision,1u);
-  using AbsentCodec=ec_gc_absent_detail::Codec;
   ASSERT_OK(AbsentCodec::verifyAck(*key,*confirmed,issued));
   // Actual G verification and independent old-protocol rejection. Mutation of
   // any original closure/claim/action never selects Collect as a fallback.
-  EcGcLocalTarget local{issued.claims.certificate.endpoint,2,3,2,true};
   auto changed=issued;changed.claims.authority=Uuid::random();
-  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,changed,authority,local,1000));
+  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,changed,authority,controlAuthority,local,1000));
   changed=issued;changed.claims.closure.revocationId=Uuid::random();
-  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,changed,authority,local,1000));
+  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,changed,authority,controlAuthority,local,1000));
   changed=issued;changed.claims.action=static_cast<EcGcAbsentAction>(3);
-  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,changed,authority,local,1000));
+  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,changed,authority,controlAuthority,local,1000));
   changed=issued;changed.claims.expiresAtSeconds=1301;
-  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,changed,authority,local,1000));
-  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,issued,authority,local,1100));
+  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,changed,authority,controlAuthority,local,1000));
+  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,issued,authority,controlAuthority,local,1100));
   local.enabled=false;
-  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,issued,authority,local,1000));
+  EXPECT_FALSE(AbsentCodec::verifyRequest(*key,issued,authority,controlAuthority,local,1000));
   local.enabled=true;
   EXPECT_FALSE(AbsentCodec::verifyAck(*key,*confirmed,token(EcGcAbsentAction::QueryAbsent)));
   const auto legacy=Codec::encode(claims(EcGcAction::Collect));
@@ -100,7 +138,7 @@ TEST_F(TestEcGcAbsentExecutor, MissingRequiresOriginalDurableCloseAndQueryNeverC
   std::array<uint8_t,32> otherBytes{};otherBytes.fill(0x73);
   writeFile(directory.path()/"other-g.key",{reinterpret_cast<const char *>(otherBytes.data()),otherBytes.size()});
   auto otherKey=EcGcKey::loadFile(std::filesystem::path((directory.path()/"other-g.key").string()),keyId,{});ASSERT_OK(otherKey);
-  EXPECT_FALSE(AbsentCodec::verifyRequest(**otherKey,issued,authority,local,1000));
+  EXPECT_FALSE(AbsentCodec::verifyRequest(**otherKey,issued,authority,controlAuthority,local,1000));
   EXPECT_FALSE(AbsentCodec::verifyAck(**otherKey,*confirmed,issued));
   // Re-MAC a structurally valid ACK with the fixture oracle. The verifier must
   // compare identities/digests in addition to authenticating the envelope.
@@ -132,7 +170,7 @@ TEST_F(TestEcGcAbsentExecutor, MissingRequiresOriginalDurableCloseAndQueryNeverC
   ASSERT_OK(executor->stopAndJoin());executor.reset();
   scope=makeError(StatusCode::kInvalidArg);target.reset();engine.reset();
   ASSERT_NO_FATAL_FAILURE(open(false));
-  auto started=EcGcAbsentExecutor::create(key,authority,node,[]{return 1000;});ASSERT_OK(started);
+  auto started=EcGcAbsentExecutor::create(key,authority,controlAuthority,node,[]{return 1000;});ASSERT_OK(started);
   absent=std::move(*started);
   auto reopened=exchange(EcGcAbsentAction::QueryAbsent);ASSERT_OK(reopened);
   EXPECT_EQ(reopened->claims.ledgerSha256,confirmed->claims.ledgerSha256);

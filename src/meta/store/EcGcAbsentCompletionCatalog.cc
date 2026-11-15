@@ -18,9 +18,10 @@ CoTryTask<Void> noCollected(kv::IReadWriteTransaction &tx, const storage::EcFrag
   co_return Void{};
 }
 Result<Void> checkExchange(const EcGcBoundClosure &bound, const storage::EcGcAbsentRequest &request,
-                           const storage::EcGcAbsentAck &ack, const storage::EcGcKey &key, const Uuid &authority) {
+                           const storage::EcGcAbsentAck &ack, const storage::EcGcKey &key, const Uuid &authority,
+                           const Uuid &controlAuthority) {
   if (authority.is_nil() || request.claims.authority != authority || request.claims.keyId != key.keyId() ||
-      bound.drain.identity.clusterAuthority != authority)
+      controlAuthority.is_nil() || bound.drain.identity.clusterAuthority != controlAuthority)
     return makeError(StatusCode::kTokenMismatch, "absence authority differs from original closure");
   CHECK_RESULT(certificate, EcGcCompletionCatalog::project(bound.claim));
   CHECK_RESULT(closure, EcGcAbsentCompletionCatalog::project(bound));
@@ -36,7 +37,9 @@ Result<Void> checkExchange(const EcGcBoundClosure &bound, const storage::EcGcAbs
   return Void{};
 }
 CoTryTask<std::optional<EcGcAbsentCompletion>> getWithClosure(kv::IReadWriteTransaction &tx,
-    const EcGcBoundClosure &bound, const storage::EcGcKey &key, const Uuid &authority) {
+    const EcGcBoundClosure &bound, const storage::EcGcKey &key, const Uuid &authority, const Uuid &controlAuthority) {
+  if (controlAuthority.is_nil() || bound.drain.identity.clusterAuthority != controlAuthority)
+    co_return makeError(StatusCode::kTokenMismatch, "absence original C authority differs from configuration");
   const auto &claim = bound.claim;
   CO_RETURN_ON_ERROR(co_await noCollected(tx, claim.allocation.fragment.identity));
   auto k = allocationKey(kv::KeyPrefix::EcGcAbsentCompletion, claim.allocation.fragment.identity);
@@ -48,7 +51,7 @@ CoTryTask<std::optional<EcGcAbsentCompletion>> getWithClosure(kv::IReadWriteTran
     if (r.version != 1 || r.object != claim.enrollment.object || r.claimId != claim.claimId ||
         !same(r.identity, claim.allocation.fragment.identity))
       co_return makeError(StatusCode::kDataCorruption, "absence completion identity differs");
-    CO_RETURN_ON_ERROR(checkExchange(bound, r.request, r.ack, key, authority));
+    CO_RETURN_ON_ERROR(checkExchange(bound, r.request, r.ack, key, authority, controlAuthority));
     if (r.claimDigest != r.ack.claims.claimDigest || r.closureDigest != r.ack.claims.closureDigest)
       co_return makeError(StatusCode::kDataCorruption, "absence completion commitment differs");
   }
@@ -94,23 +97,25 @@ Result<storage::EcGcLocalClosureWitness> EcGcAbsentCompletionCatalog::project(co
 }
 CoTryTask<std::optional<EcGcAbsentCompletion>> EcGcAbsentCompletionCatalog::get(Transaction &raw,
     const EcObjectRef &object, const storage::EcFragmentIdentity &identity, const Uuid &claimId,
-    const storage::EcScopeControlKey &control, const storage::EcGcKey &key, const Uuid &authority) {
+    const storage::EcScopeControlKey &control, const storage::EcGcKey &key, const Uuid &authority,
+    const Uuid &controlAuthority) {
   EcGcTxnScope scope(raw);
   auto &tx = scope.transaction();
   auto bound = co_await EcTreeGcCatalog::closureForClaim(tx, object, identity, claimId, control);
   CO_RETURN_ON_ERROR(bound);
-  co_return co_await getWithClosure(tx, *bound, key, authority);
+  co_return co_await getWithClosure(tx, *bound, key, authority, controlAuthority);
 }
 CoTryTask<EcGcAbsentCompletion> EcGcAbsentCompletionCatalog::record(Transaction &raw,
     const EcObjectRef &object, const storage::EcFragmentIdentity &identity, const Uuid &claimId,
     const storage::EcGcAbsentRequest &request, const storage::EcGcAbsentAck &ack,
-    const storage::EcScopeControlKey &control, const storage::EcGcKey &key, const Uuid &authority) {
+    const storage::EcScopeControlKey &control, const storage::EcGcKey &key, const Uuid &authority,
+    const Uuid &controlAuthority) {
   EcGcTxnScope scope(raw);
   auto &tx = scope.transaction();
   auto bound = co_await EcTreeGcCatalog::closureForClaim(tx, object, identity, claimId, control);
   CO_RETURN_ON_ERROR(bound);
-  CO_RETURN_ON_ERROR(checkExchange(*bound, request, ack, key, authority));
-  auto prior = co_await getWithClosure(tx, *bound, key, authority);
+  CO_RETURN_ON_ERROR(checkExchange(*bound, request, ack, key, authority, controlAuthority));
+  auto prior = co_await getWithClosure(tx, *bound, key, authority, controlAuthority);
   CO_RETURN_ON_ERROR(prior);
   if (*prior) {
     const auto &first = (**prior).ack.claims;

@@ -55,7 +55,8 @@ struct EcGcAbsentCoordinator::State {
 Result<std::unique_ptr<EcGcAbsentCoordinator>> EcGcAbsentCoordinator::create(Config config,
     std::shared_ptr<kv::IKVEngine> engine, std::shared_ptr<const storage::EcScopeControlKey> control,
     std::shared_ptr<const storage::EcGcKey> key, std::shared_ptr<EcGcAbsentTransport> transport) {
-  if (!engine || !control || !key || !transport || config.authority.is_nil() || !config.requestTtlSeconds ||
+  if (!engine || !control || !key || !transport || config.authority.is_nil() || config.controlAuthority.is_nil() ||
+      !config.requestTtlSeconds ||
       config.requestTtlSeconds > storage::kEcGcMaxTtlSeconds || !config.maxConcurrent || config.maxConcurrent > 64 ||
       config.targets.empty() || config.targets.size() > 1024)
     return makeError(StatusCode::kInvalidConfig);
@@ -111,7 +112,8 @@ CoTryTask<EcGcAbsentCompletion> EcGcAbsentCoordinator::executeOwned(std::shared_
       if (!raw) co_return makeError(StatusCode::kKVStoreNotFound);
       EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Gc);
       auto prior = co_await EcGcAbsentCompletionCatalog::get(tx, object, identity, claimId,
-                                                            *s->control, *s->key, s->config.authority);
+                                                            *s->control, *s->key, s->config.authority,
+                                                            s->config.controlAuthority);
       if (!prior) diagnose("prior_completion", prior.error().code());
       CO_RETURN_ON_ERROR(prior);
       if (*prior) co_return **prior;
@@ -122,7 +124,7 @@ CoTryTask<EcGcAbsentCompletion> EcGcAbsentCoordinator::executeOwned(std::shared_
     auto closure = EcGcAbsentCompletionCatalog::project(bound);
     if (!closure) diagnose("project_closure", closure.error().code());
     CO_RETURN_ON_ERROR(closure);
-    if (bound.drain.identity.clusterAuthority != s->config.authority ||
+    if (bound.drain.identity.clusterAuthority != s->config.controlAuthority ||
         std::none_of(s->config.targets.begin(), s->config.targets.end(), [&](const auto &t) {
           return sameEndpoint(t.endpoint, certificate->endpoint);
         })) {
@@ -142,7 +144,7 @@ CoTryTask<EcGcAbsentCompletion> EcGcAbsentCoordinator::executeOwned(std::shared_
     claims.expiresAtSeconds = now + s->config.requestTtlSeconds;
     claims.certificate = *certificate;
     claims.closure = std::move(*closure);
-    auto request = storage::ec_gc_absent_detail::RequestSigner::sign(*s->key, claims, now);
+    auto request = storage::ec_gc_absent_detail::RequestSigner::sign(*s->key, claims, s->config.controlAuthority, now);
     if (!request) diagnose("sign", request.error().code());
     CO_RETURN_ON_ERROR(request);
     CO_RETURN_ON_ERROR(ready(control));
@@ -158,7 +160,8 @@ CoTryTask<EcGcAbsentCompletion> EcGcAbsentCoordinator::executeOwned(std::shared_
     if (!raw) co_return makeError(StorageCode::kEcSealOutcomeUnknown);
     EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Gc);
     auto stored = co_await EcGcAbsentCompletionCatalog::record(tx, object, identity, claimId, *request, *response,
-                                                             *s->control, *s->key, s->config.authority);
+                                                             *s->control, *s->key, s->config.authority,
+                                                             s->config.controlAuthority);
     if (!stored) {
       diagnose("record_completion", stored.error().code());
       co_return makeError(unknown(std::move(stored.error())));

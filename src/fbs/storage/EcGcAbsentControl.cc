@@ -81,7 +81,7 @@ Result<Void> validate(const EcGcAbsentRequestClaims &v) {
       return makeError(StatusCode::kInvalidArg, "absence requires one complete local witness");
     const auto &r = w.scopeRequest->claims;
     const auto &a = w.scopeAck->claims;
-    if (!endpoint(r, c.endpoint) || r.clusterAuthority != v.authority || r.object != c.objectIncarnation ||
+    if (!endpoint(r, c.endpoint) || r.clusterAuthority.is_nil() || r.object != c.objectIncarnation ||
         r.scopeKind != w.scopeKind || r.scopeId != w.scopeId || r.ownerUid != w.ownerUid ||
         r.clientNamespace != w.clientNamespace || r.revocationId != w.revocationId ||
         r.endpointSetDigest != w.endpointSetDigest || a.state != EcScopeControlState::Drained || !a.durable || a.inflight != 0)
@@ -92,10 +92,21 @@ Result<Void> validate(const EcGcAbsentRequestClaims &v) {
       return makeError(StatusCode::kInvalidArg, "retirement cannot replace publication evidence");
     const auto &r = w.retirementRequest->claims;
     const auto &a = w.retirementObservation->claims;
-    if (!endpoint(r, c.endpoint) || r.clusterAuthority != v.authority || r.retirementId.is_nil() ||
+    if (!endpoint(r, c.endpoint) || r.clusterAuthority.is_nil() || r.retirementId.is_nil() ||
         a.state != EcTargetRetirementState::LocalDataDrained || !a.durable || a.inflight != 0)
       return makeError(StatusCode::kTokenMismatch, "absence original retirement witness differs");
   } else return makeError(StatusCode::kInvalidArg, "unknown absence closure kind");
+  return Void{};
+}
+// Called only after structural validation selected one complete original C
+// witness. Its authority is independent of the enclosing G signing role.
+Result<Void> controlAuthorityMatches(const EcGcAbsentRequestClaims &v, const Uuid &controlAuthority) {
+  if (controlAuthority.is_nil()) return makeError(StatusCode::kInvalidConfig);
+  const auto &w = v.closure;
+  const auto &actual = w.kind == EcGcClosureKind::ScopeRevocation
+      ? w.scopeRequest->claims.clusterAuthority : w.retirementRequest->claims.clusterAuthority;
+  if (actual != controlAuthority)
+    return makeError(StatusCode::kTokenMismatch, "absence original C authority differs from configuration");
   return Void{};
 }
 Result<Void> validate(const EcGcAbsentAckClaims &v) {
@@ -158,8 +169,10 @@ Result<EcGcAbsentAck> Codec::decodeAck(std::string_view body, std::string_view m
 Result<EcSha256> Codec::closureDigest(const EcGcLocalClosureWitness &w) {
   return digest(std::string(closureDomain) + serde::serialize(w));
 }
-Result<EcGcAbsentRequest> Codec::signRequest(const EcGcKey &key, const EcGcAbsentRequestClaims &v, uint64_t now) {
+Result<EcGcAbsentRequest> Codec::signRequest(const EcGcKey &key, const EcGcAbsentRequestClaims &v,
+    const Uuid &controlAuthority, uint64_t now) {
   RETURN_ON_ERROR(validate(v));
+  RETURN_ON_ERROR(controlAuthorityMatches(v, controlAuthority));
   if (v.keyId != key.keyId() || now < v.issuedAtSeconds || now >= v.expiresAtSeconds)
     return makeError(StatusCode::kAuthenticationFail);
   const auto body = encode(v);
@@ -168,7 +181,7 @@ Result<EcGcAbsentRequest> Codec::signRequest(const EcGcKey &key, const EcGcAbsen
   EcGcAbsentRequest r; r.claims=v; r.signature_=mac; return r;
 }
 Result<VerifiedEcGcAbsentRequest> Codec::verifyRequest(const EcGcKey &key, const EcGcAbsentRequest &r,
-    const Uuid &authority, const EcGcLocalTarget &t, uint64_t now) {
+    const Uuid &authority, const Uuid &controlAuthority, const EcGcLocalTarget &t, uint64_t now) {
   RETURN_ON_ERROR(validate(r.claims));
   CHECK_RESULT(mac, Crypto::authenticate(*key.key_, bytes(encode(r.claims))));
   if (!Crypto::constantTimeEqual(mac, r.signature_) || r.claims.keyId != key.keyId() ||
@@ -177,6 +190,7 @@ Result<VerifiedEcGcAbsentRequest> Codec::verifyRequest(const EcGcKey &key, const
     return makeError(StatusCode::kAuthenticationFail);
   if (!t.enabled || t.dataProtocol != 2 || t.diskFormat != 3 || t.gcProtocol != 2)
     return makeError(StatusCode::kInvalidConfig);
+  RETURN_ON_ERROR(controlAuthorityMatches(r.claims, controlAuthority));
   CHECK_RESULT(c, ec_gc_control_detail::Codec::claimDigest(r.claims.certificate));
   CHECK_RESULT(w, closureDigest(r.claims.closure));
   return VerifiedEcGcAbsentRequest(r,c,w);
@@ -197,12 +211,12 @@ Result<Void> Codec::verifyAck(const EcGcKey &key, const EcGcAbsentAck &a, const 
   return Void{};
 }
 Result<EcGcAbsentAck> Codec::signConfirmed(const EcGcKey &key, const VerifiedEcGcAbsentRequest &verified,
-    Result<EcGcAbsentLedgerReceipt> receipt, const EcGcLocalTarget &t, const Uuid &authority,
+    Result<EcGcAbsentLedgerReceipt> receipt, const EcGcLocalTarget &t, const Uuid &authority, const Uuid &controlAuthority,
     const Uuid &boot, uint64_t now) {
   if (!receipt) return makeError(std::move(receipt.error()));
   try {
     const auto &r=verified.request();
-    if (!verifyRequest(key,r,authority,t,now) || receipt->claimId!=verified.certificate().claimId ||
+    if (!verifyRequest(key,r,authority,controlAuthority,t,now) || receipt->claimId!=verified.certificate().claimId ||
         receipt->recordRevision!=1 || receipt->ledgerSha256==EcSha256{} || boot.is_nil())
       return makeError(StorageCode::kEcSealOutcomeUnknown);
     EcGcAbsentAck a;

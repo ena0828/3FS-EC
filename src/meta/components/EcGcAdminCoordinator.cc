@@ -56,6 +56,7 @@ struct EcGcAdminCoordinator::State {
   std::shared_ptr<NativeEcGcTransport> transport;
   std::shared_ptr<NativeEcGcAbsentTransport> absentTransport;
   Uuid authority = Uuid::zero();
+  Uuid controlAuthority = Uuid::zero();
   std::atomic<bool> closing{false};
   std::atomic<uint32_t> active{0};
 
@@ -110,6 +111,8 @@ EcGcAdminCoordinator::EcGcAdminCoordinator(const Config &config,
     state->client = std::move(client);
     state->controlKey = v2.sharedControlKey();
     if (!state->controlKey) return makeError(StatusCode::kInvalidConfig);
+    state->controlAuthority = v2.authority();
+    if (state->controlAuthority.is_nil()) return makeError(StatusCode::kInvalidConfig);
     state->key = std::shared_ptr<const storage::EcGcKey>(std::move(*key));
     state->authority = *authority;
     auto transport = NativeEcGcTransport::create(state->client, state->key);
@@ -228,7 +231,7 @@ CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::executeAbsentOwned(std::shared
       if (!raw) co_return makeError(StatusCode::kKVStoreNotFound);
       EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Gc);
       auto prior = co_await EcGcAbsentCompletionCatalog::get(tx, req.object, req.identity, req.claimId,
-          *state->controlKey, *state->key, state->authority);
+          *state->controlKey, *state->key, state->authority, state->controlAuthority);
       if (!prior) diagnose("prior_completion", prior.error().code());
       CO_RETURN_ON_ERROR(prior);
       if (*prior) co_return respond(**prior);
@@ -236,7 +239,7 @@ CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::executeAbsentOwned(std::shared
     auto certificate = EcGcCompletionCatalog::project(bound.claim);
     if (!certificate) diagnose("project_certificate", certificate.error().code());
     CO_RETURN_ON_ERROR(certificate);
-    if (bound.drain.identity.clusterAuthority != state->authority) {
+    if (bound.drain.identity.clusterAuthority != state->controlAuthority) {
       diagnose("closure_authority", StatusCode::kTokenMismatch);
       co_return makeError(StatusCode::kTokenMismatch, "absence authority differs from original T2");
     }
@@ -278,6 +281,7 @@ CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::executeAbsentOwned(std::shared
       co_return makeError(StatusCode::kNotImplemented, "target does not admit this explicit absence action");
     EcGcAbsentCoordinator::Config config;
     config.authority = state->authority;
+    config.controlAuthority = state->controlAuthority;
     config.requestTtlSeconds = state->config.ec_gc_request_ttl_seconds();
     config.maxConcurrent = 1;
     config.targets.push_back({actual.endpoint, actual.dataProtocol, actual.diskFormat, actual.gcProtocol, true});

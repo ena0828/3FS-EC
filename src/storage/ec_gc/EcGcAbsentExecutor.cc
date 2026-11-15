@@ -38,11 +38,13 @@ struct EcGcAbsentExecutor::Job {
 
 EcGcAbsentExecutor::EcGcAbsentExecutor(std::shared_ptr<const EcGcKey> key,
                            Uuid authority,
+                           Uuid controlAuthority,
                            NodeId node,
                            Clock clock,
                            ReadOnly readOnly)
     : key_(std::move(key)),
       authority_(authority),
+      controlAuthority_(controlAuthority),
       node_(node),
       clock_(std::move(clock)),
       readOnly_(std::move(readOnly)),
@@ -51,14 +53,15 @@ EcGcAbsentExecutor::EcGcAbsentExecutor(std::shared_ptr<const EcGcKey> key,
 
 Result<std::unique_ptr<EcGcAbsentExecutor>> EcGcAbsentExecutor::create(std::shared_ptr<const EcGcKey> key,
                                                            Uuid authority,
+                                                           Uuid controlAuthority,
                                                            NodeId node,
                                                            Clock clock,
                                                            ReadOnly readOnly) {
-  if (!key || authority.is_nil() || node == NodeId{} || !clock || !readOnly) {
-    return makeError(StatusCode::kInvalidConfig, "GC executor requires explicit G key, authority, node and clock");
+  if (!key || authority.is_nil() || controlAuthority.is_nil() || node == NodeId{} || !clock || !readOnly) {
+    return makeError(StatusCode::kInvalidConfig, "absence executor requires explicit G key, G/C authorities, node and clock");
   }
   return std::unique_ptr<EcGcAbsentExecutor>(
-      new EcGcAbsentExecutor(std::move(key), authority, node, std::move(clock), std::move(readOnly)));
+      new EcGcAbsentExecutor(std::move(key), authority, controlAuthority, node, std::move(clock), std::move(readOnly)));
 }
 
 EcGcAbsentExecutor::~EcGcAbsentExecutor() {
@@ -159,7 +162,7 @@ CoTryTask<EcGcAbsentAck> EcGcAbsentExecutor::execute(EcGcAbsentAction action,
   auto local = target->gcLocalTarget(node_);
   if (!local) co_return makeError(local.error());
   if (action != request.claims.action) co_return makeError(StatusCode::kInvalidArg);
-  auto admitted = ec_gc_absent_detail::Codec::verifyRequest(*key_, request, authority_, *local, clock_());
+  auto admitted = ec_gc_absent_detail::Codec::verifyRequest(*key_, request, authority_, controlAuthority_, *local, clock_());
   if (!admitted) co_return makeError(admitted.error());
   if (action == EcGcAbsentAction::ConfirmAbsent && readOnly_()) co_return makeError(StatusCode::kReadOnlyMode);
   Job job{action, std::move(request), std::move(target)};
@@ -190,7 +193,7 @@ CoTryTask<EcGcAbsentAck> EcGcAbsentExecutor::execute(EcGcAbsentAction action,
 Result<EcGcAbsentAck> EcGcAbsentExecutor::process(const Job &job) {
   CHECK_RESULT(local, job.target->gcLocalTarget(node_));
   CHECK_RESULT(verified,
-               ec_gc_absent_detail::Codec::verifyRequest(*key_, job.request, authority_, local, clock_()));
+               ec_gc_absent_detail::Codec::verifyRequest(*key_, job.request, authority_, controlAuthority_, local, clock_()));
   // No independent key, allocator position, bool "authorized", or synthetic
   // receipt crosses this boundary. Query selects the dedicated WAL-confirming
   // Rust query; it cannot execute ConfirmAbsent as a fallback when a ledger is absent.
@@ -208,6 +211,7 @@ Result<EcGcAbsentAck> EcGcAbsentExecutor::process(const Job &job) {
                                                std::move(receipt),
                                                *after,
                                                authority_,
+                                               controlAuthority_,
                                                bootNonce_,
                                                clock_());
 }

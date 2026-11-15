@@ -108,21 +108,24 @@ class Codec {
   static Result<EcGcAbsentAck> decodeAck(std::string_view, std::string_view);
   static Result<EcSha256> closureDigest(const EcGcLocalClosureWitness &);
   static Result<VerifiedEcGcAbsentRequest> verifyRequest(const EcGcKey &, const EcGcAbsentRequest &,
-      const Uuid &authority, const EcGcLocalTarget &, uint64_t now);
+      const Uuid &authority, const Uuid &controlAuthority, const EcGcLocalTarget &, uint64_t now);
   static Result<Void> verifyAck(const EcGcKey &, const EcGcAbsentAck &, const EcGcAbsentRequest &);
  private:
   friend class RequestSigner;
   friend class AckSigner;
-  static Result<EcGcAbsentRequest> signRequest(const EcGcKey &, const EcGcAbsentRequestClaims &, uint64_t);
+  static Result<EcGcAbsentRequest> signRequest(const EcGcKey &, const EcGcAbsentRequestClaims &,
+      const Uuid &controlAuthority, uint64_t);
   static Result<EcGcAbsentAck> signConfirmed(const EcGcKey &, const VerifiedEcGcAbsentRequest &,
-      Result<EcGcAbsentLedgerReceipt>, const EcGcLocalTarget &, const Uuid &, const Uuid &, uint64_t);
+      Result<EcGcAbsentLedgerReceipt>, const EcGcLocalTarget &, const Uuid &, const Uuid &controlAuthority,
+      const Uuid &, uint64_t);
 };
 class RequestSigner final {
  private:
   friend class ::hf3fs::meta::server::EcGcAbsentCoordinator;
   friend class ::hf3fs::storage::EcGcAbsentTestAccess;
-  static Result<EcGcAbsentRequest> sign(const EcGcKey &key, const EcGcAbsentRequestClaims &c, uint64_t now) {
-    return Codec::signRequest(key, c, now);
+  static Result<EcGcAbsentRequest> sign(const EcGcKey &key, const EcGcAbsentRequestClaims &c,
+      const Uuid &controlAuthority, uint64_t now) {
+    return Codec::signRequest(key, c, controlAuthority, now);
   }
 };
 class AckSigner final {
@@ -130,8 +133,9 @@ class AckSigner final {
   friend class ::hf3fs::storage::EcGcAbsentExecutor;
   friend class ::hf3fs::storage::EcGcAbsentTestAccess;
   static Result<EcGcAbsentAck> sign(const EcGcKey &key, const VerifiedEcGcAbsentRequest &r,
-      Result<EcGcAbsentLedgerReceipt> receipt, const EcGcLocalTarget &t, const Uuid &a, const Uuid &b, uint64_t now) {
-    return Codec::signConfirmed(key, r, std::move(receipt), t, a, b, now);
+      Result<EcGcAbsentLedgerReceipt> receipt, const EcGcLocalTarget &t, const Uuid &a,
+      const Uuid &controlAuthority, const Uuid &b, uint64_t now) {
+    return Codec::signConfirmed(key, r, std::move(receipt), t, a, controlAuthority, b, now);
   }
 };
 }
