@@ -16,6 +16,7 @@ struct EcHostFenceBinding {
   SERDE_STRUCT_FIELD(resourceGeneration, Uuid::zero());
   SERDE_STRUCT_FIELD(bindingDigest, storage::EcSha256{});
  public:
+  bool operator==(const EcHostFenceBinding &) const = default;
   bool valid() const;
 };
 struct EcHostFenceSummary {
@@ -27,6 +28,7 @@ struct EcHostFenceSummary {
   SERDE_STRUCT_FIELD(proofDigest, storage::EcSha256{});
   SERDE_STRUCT_FIELD(sequence, uint64_t(0));
  public:
+  bool operator==(const EcHostFenceSummary &) const = default;
   bool valid() const;
 };
 
