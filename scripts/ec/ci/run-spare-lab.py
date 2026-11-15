@@ -17,6 +17,8 @@ import sys
 import time
 import uuid
 
+# The isolated runtime imports this sibling before main; keep its sealed tree unchanged.
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('spare_shared_file_lab', Path(__file__).with_name('run-file-lab.py'))
 shared = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shared)
@@ -626,7 +628,6 @@ def main():
     require(sys.version_info >= (3, 11), 'Python 3.11 or newer required')
     require(sys.platform == 'linux', 'Linux only; no WSL/VM launcher')
     os.umask(0o077)
-    sys.dont_write_bytecode = True
     os.environ.pop('LD_PRELOAD', None)
     if args.handoff or args.run_owned:
         shared.lab_transport_selection(args, None)  # Internal ownership transitions cannot override the sealed profile.

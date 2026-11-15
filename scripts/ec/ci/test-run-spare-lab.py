@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pure receipt/resource/identity gates; no processes, sockets, chown or services."""
+"""Receipt/resource/identity gates and isolated Python import; no services or chown."""
 import copy
 import contextlib
 import hashlib
@@ -7,6 +7,8 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -75,6 +77,25 @@ def stopped(completed, fdb=-15):
 
 
 class SpareLabGates(unittest.TestCase):
+    def test_isolated_runtime_import_keeps_sealed_tree_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('run-spare-lab.py', 'run-file-lab.py'):
+                (root / name).write_bytes(Path(__file__).with_name(name).read_bytes())
+
+            def snapshot():
+                return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None
+                        for p in root.rglob('*')}
+
+            before = snapshot()
+            # Match the exec'ed runtime's -I without inheriting this test's -B.
+            # --help exercises the real top-level shared import without services.
+            result = subprocess.run([sys.executable, '-I', str(root / 'run-spare-lab.py'), '--help'],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('--local-work', result.stdout)
+            self.assertEqual(snapshot(), before)
+
     def test_prepare_command_preserves_tcp_and_forwards_only_normalized_rdma_selection(self):
         source = Path(__file__).resolve().parents[3]
         args = SimpleNamespace(transport=None, rdma_interface=None, rdma_address=None, rdma_device=None,

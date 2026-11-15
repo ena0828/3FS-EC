@@ -75,7 +75,7 @@ jobs:
               "cluster/test-prepare-fuse-file.py": 8,
               "ci/test-run-file-lab.py": 41,
               "ci/test-run-core-tests.py": 16,
-              "ci/test-run-spare-lab.py": 14,
+              "ci/test-run-spare-lab.py": 15,
               "ci/test-run-fault-matrix.py": 10,
               "ci/test-system-entrypoints.py": 18,
               "ci/test-rpc-frame-entrypoints.py": 13,
