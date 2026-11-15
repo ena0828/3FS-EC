@@ -141,11 +141,20 @@ class ReplayEntryTests(unittest.TestCase):
     def test_settle_is_separate_explicit_authority_and_never_an_implicit_resume_flag(self):
         args = entry.parser().parse_args(['settle', '--run-dir', '/run', '--action', 'a000002'])
         self.assertFalse(args.authorize_absence_confirmation)
+        self.assertFalse(args.authorize_collection_retry)
         args = entry.parser().parse_args(['settle', '--run-dir', '/run', '--action', 'a000002',
                                          '--authorize-absence-confirmation'])
         self.assertTrue(args.authorize_absence_confirmation)
+        args = entry.parser().parse_args(['settle', '--run-dir', '/run', '--action', 'a000002',
+                                         '--authorize-collection-retry'])
+        self.assertTrue(args.authorize_collection_retry)
+        self.assertFalse(args.authorize_absence_confirmation)
+        for flag in ('--authorize-absence-confirmation', '--authorize-collection-retry'):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                entry.parser().parse_args(['resume', '--run-dir', '/run', flag])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            entry.parser().parse_args(['resume', '--run-dir', '/run', '--authorize-absence-confirmation'])
+            entry.parser().parse_args(['settle', '--run-dir', '/run', '--action', 'a000002',
+                                      '--authorize-absence-confirmation', '--authorize-collection-retry'])
 
     def test_settlement_cannot_replace_business_completion_or_partial_credit(self):
         with tempfile.TemporaryDirectory() as temporary:

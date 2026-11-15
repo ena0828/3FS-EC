@@ -224,7 +224,9 @@ class Reservations:
         self.b.seal(path, saved)
         return saved | {'cleanup_result': cleanup, 'classification': result}
 
-    def settle(self, authorize_absence=False):
+    def settle(self, authorize_absence=False, *, authorize_collection_retry=False):
+        require(type(authorize_absence) is bool and type(authorize_collection_retry) is bool and
+                not (authorize_absence and authorize_collection_retry), 'Conflicting or invalid recovery authorization')
         plans = self.plans()
         require(plans, 'No reserved original mutation exists; normal resume must start it first')
         value = plans[-1]; path = self.root / f"{value['index']:04d}"
@@ -232,18 +234,21 @@ class Reservations:
         self.b.seal(path / 'settle-intent.json', {'schema': 1, 'reservation_plan_sha256': self.b.sha(path / 'plan.json'),
             'scope': 'explicit_original_close_and_candidate_classification_not_business_success'})
         target = path / 'classification'
+        require(not authorize_collection_retry or (target / 'plan.json').exists(),
+                'Collection retry requires the original classifier run')
         if not (path / 'settlement.json').exists():
             authorizations = self.b.directory(path / 'authorizations')
             number = len(list(authorizations.iterdir()))
             require(number < 256, 'Explicit settlement invocation bound exhausted')
             self.b.seal(authorizations / f'{number:04d}.json', {'schema': 1,
                 'authorize_absence_confirmation': authorize_absence,
+                'authorize_collection_retry': authorize_collection_retry,
                 'reservation_plan_sha256': self.b.sha(path / 'plan.json')})
             action = 'resume' if (target / 'plan.json').exists() else 'start'
             require(not target.exists() or action == 'resume', 'Partial classifier plan; preserve original Unknown')
             self.b.run_classifier(SimpleNamespace(action=action, root=self.b.root, run_dir=target,
                 source_run=Path(value['source_run']), kind=self.kind, max_commands=4096,
-                authorize_absence_confirmation=authorize_absence))
+                authorize_absence_confirmation=authorize_absence, authorize_collection_retry=authorize_collection_retry))
             result, _, released = self.classification(value)
             self.b.seal(path / 'settlement.json', {'schema': 1, 'state': 'released' if released else 'published_retained',
                 'classification_sha256': self.b.sha(target / 'completion.json'),

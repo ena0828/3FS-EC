@@ -30,6 +30,17 @@ namespace hf3fs::storage::client {
 namespace {
 using EcTransportPolicy = EcRequestControl::TransportPolicy;
 
+void logGcTransportFailure(const char *protocol, const char *phase, const EcGcCertificate &certificate,
+                           unsigned action, status_code_t code) noexcept {
+  try {
+    XLOGF(WARN, "EC_GC_DIAG layer=client protocol={} action={} phase={} code={} claim={} alloc={} child={}",
+          protocol, action, phase, code, certificate.claimId.toHexString(), certificate.fragment.allocation.toHexString(),
+          certificate.fragmentOperation.toHexString());
+  } catch (...) {
+    // Diagnostics must never replace the original transport outcome.
+  }
+}
+
 EcRpcMethod observedEcMethod(StorageClient::MethodType method) noexcept {
   using Method = StorageClient::MethodType;
   switch (method) {
@@ -3376,17 +3387,23 @@ CoTryTask<EcGcAbsentAck> StorageClientImpl::exchangeEcGcAbsentControlled(EcGcAbs
                 control.transport == EcTransportPolicy::TcpOnly, nullptr,
                 control.transport == EcTransportPolicy::RdmaOnly));
     if (!response) {
+      logGcTransportFailure("absent", "rpc", request.claims.certificate,
+                            static_cast<unsigned>(request.claims.action), response.error().code());
       if (collect && dispatched) co_return makeError(unknown(std::move(response.error())));
       if (response.error().code() == RPCCode::kTimeout)
         co_return makeError(response.error().convert(StorageClientCode::kTimeout));
       co_return makeError(std::move(response.error()));
     }
     if (!response->result) {
+      logGcTransportFailure("absent", "response", request.claims.certificate,
+                            static_cast<unsigned>(request.claims.action), response->result.error().code());
       if (collect && dispatched) co_return makeError(unknown(std::move(response->result.error())));
       co_return makeError(std::move(response->result.error()));
     }
     auto verified = ec_gc_absent_detail::Codec::verifyAck(*key, *response->result, request);
     if (!verified) {
+      logGcTransportFailure("absent", "ack", request.claims.certificate,
+                            static_cast<unsigned>(request.claims.action), verified.error().code());
       if (collect && dispatched) co_return makeError(unknown(std::move(verified.error())));
       co_return makeError(std::move(verified.error()));
     }
@@ -3507,17 +3524,23 @@ CoTryTask<EcGcAck> StorageClientImpl::exchangeEcGcControlled(EcGcRequest request
                 control.transport == EcTransportPolicy::TcpOnly, nullptr,
                 control.transport == EcTransportPolicy::RdmaOnly));
     if (!response) {
+      logGcTransportFailure("gc", "rpc", request.claims.certificate,
+                            static_cast<unsigned>(request.claims.action), response.error().code());
       if (collect && dispatched) co_return makeError(unknown(std::move(response.error())));
       if (response.error().code() == RPCCode::kTimeout)
         co_return makeError(response.error().convert(StorageClientCode::kTimeout));
       co_return makeError(std::move(response.error()));
     }
     if (!response->result) {
+      logGcTransportFailure("gc", "response", request.claims.certificate,
+                            static_cast<unsigned>(request.claims.action), response->result.error().code());
       if (collect && dispatched) co_return makeError(unknown(std::move(response->result.error())));
       co_return makeError(std::move(response->result.error()));
     }
     auto verified = ec_gc_control_detail::Codec::verifyAck(*key, *response->result, request);
     if (!verified) {
+      logGcTransportFailure("gc", "ack", request.claims.certificate,
+                            static_cast<unsigned>(request.claims.action), verified.error().code());
       if (collect && dispatched) co_return makeError(unknown(std::move(verified.error())));
       co_return makeError(std::move(verified.error()));
     }

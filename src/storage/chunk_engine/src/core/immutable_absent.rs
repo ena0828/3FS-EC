@@ -61,11 +61,18 @@ impl ImmutableStagingEngine {
         self.require_gc(&c.gc)?;
         if c.scope.binding.target!=c.gc.target || c.scope.binding.scope!=c.gc.spec.stage_id ||
             c.scope.binding.kind!=crate::ec_scope::EcScopeKind::WriteOperation {
+            let equal=u16::from(c.scope.binding.target==c.gc.target)
+                | (u16::from(c.scope.binding.scope==c.gc.spec.stage_id)<<1)
+                | (u16::from(c.scope.binding.kind==crate::ec_scope::EcScopeKind::WriteOperation)<<2);
+            Self::log_gc_rejection(&c.gc,"absent.scope_binding",64,0,0,equal);
             return Err(ImmutableStageError::Conflict);
         }
         let _permit=self.permit()?;
         self.scopes().confirm_closed_for_absence(c.scope,c.retirement)
-            .map_err(|e|ImmutableStageError::OutcomeUnknown(format!("absence closure: {e}")))?;
+            .map_err(|e| {
+                Self::log_gc_rejection(&c.gc,"absent.fresh_closure",4085,0,0,0);
+                ImmutableStageError::OutcomeUnknown(format!("absence closure: {e}"))
+            })?;
         let expected=EcStageAbsentRecord::new(key,&c.gc,c.closure_digest)?;
         // Install/find the very same per-key serialization used by Begin and
         // old GC. No registry lock is held while reading or syncing RocksDB.
@@ -80,15 +87,50 @@ impl ImmutableStagingEngine {
         let mut slot=slot.lock().unwrap();
         let engine=&self.0.engine;
         let prior=engine.meta_store.stage_absent_record(key)?;
-        if let Some(r)=&prior {if r!=&expected {return Err(ImmutableStageError::Conflict);}}
-        if slot.record.is_some() || slot.chunk.is_some() || slot.gc_pending.is_some() ||
-            engine.meta_store.stage_record(key)?.is_some() || engine.meta_store.stage_gc_record(key)?.is_some() ||
-            engine.meta_store.get_chunk_meta(key)?.is_some() {return Err(ImmutableStageError::Conflict);}
-        if prior.is_none() && slot.unknown {return Err(ImmutableStageError::OutcomeUnknown("absence write unconfirmed".into()));}
-        if prior.is_none() && query {return Err(ImmutableStageError::Missing);}
+        if let Some(r)=&prior {if r!=&expected {
+            Self::log_gc_rejection(&c.gc,"absent.prior_mismatch",64,0,0,0);
+            return Err(ImmutableStageError::Conflict);
+        }}
+        // Presence bits: cached record/chunk/pending, disk stage/GC/chunk.
+        // Keep the original short-circuit DB read order. Unknown bits are not
+        // read merely for diagnostics and must not be interpreted as absent.
+        let held=u16::from(slot.record.is_some()) | (u16::from(slot.chunk.is_some())<<1)
+            | (u16::from(slot.gc_pending.is_some())<<2);
+        if held!=0 {
+            Self::log_gc_rejection(&c.gc,"absent.local_presence",64,7,held,0);
+            return Err(ImmutableStageError::Conflict);
+        }
+        if engine.meta_store.stage_record(key)?.is_some() {
+            Self::log_gc_rejection(&c.gc,"absent.disk_stage",64,15,8,0);
+            return Err(ImmutableStageError::Conflict);
+        }
+        if engine.meta_store.stage_gc_record(key)?.is_some() {
+            Self::log_gc_rejection(&c.gc,"absent.disk_gc",64,31,16,0);
+            return Err(ImmutableStageError::Conflict);
+        }
+        if engine.meta_store.get_chunk_meta(key)?.is_some() {
+            Self::log_gc_rejection(&c.gc,"absent.disk_chunk",64,63,32,0);
+            return Err(ImmutableStageError::Conflict);
+        }
+        if prior.is_none() && slot.unknown {
+            Self::log_gc_rejection(&c.gc,"absent.unconfirmed",4085,63,0,0);
+            return Err(ImmutableStageError::OutcomeUnknown("absence write unconfirmed".into()));
+        }
+        if prior.is_none() && query {
+            Self::log_gc_rejection(&c.gc,"absent.no_ledger",4001,63,0,0);
+            return Err(ImmutableStageError::Missing);
+        }
         let mut entry=engine.meta_cache.entry_by_ref(key);
-        if entry.get().is_some() {return Err(ImmutableStageError::Conflict);}
-        Self::absent_indexes(engine,key)?;
+        if entry.get().is_some() {
+            Self::log_gc_rejection(&c.gc,"absent.metadata_cache",64,63,0,0);
+            return Err(ImmutableStageError::Conflict);
+        }
+        Self::absent_indexes(engine,key).map_err(|error| {
+            if matches!(&error,ImmutableStageError::Conflict) {
+                Self::log_gc_rejection(&c.gc,"absent.reverse_index",64,63,0,0);
+            }
+            error
+        })?;
         // An unknown write remains non-evictable. Query may confirm an exact
         // cache-visible record only after another real WAL barrier succeeds.
         if prior.is_none() {

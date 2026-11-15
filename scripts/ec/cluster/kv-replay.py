@@ -247,7 +247,10 @@ def parser():
     settle = sub.add_parser('settle', help='Explicit original close/classification; never completes a workload action')
     settle.add_argument('--run-dir', required=True, type=Path)
     settle.add_argument('--action', required=True)
-    settle.add_argument('--authorize-absence-confirmation', action='store_true')
+    authority = settle.add_mutually_exclusive_group()
+    authority.add_argument('--authorize-absence-confirmation', action='store_true')
+    authority.add_argument('--authorize-collection-retry', action='store_true',
+                           help='After both Queries, retry an original Collect once per candidate with the same claim')
     return result
 
 
@@ -300,7 +303,8 @@ def main(argv=None):
             def verify_input():
                 kv.require(encoded(derive(request)) == encoded(plan), 'Replay inputs changed during execution')
             if options.command == 'settle':
-                result = backend.settle(options.action, authorize_absence=options.authorize_absence_confirmation)
+                result = backend.settle(options.action, authorize_absence=options.authorize_absence_confirmation,
+                                        authorize_collection_retry=options.authorize_collection_retry)
                 verify_input()
             else:
                 result = execute(plan, run, backend, verify_input)

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <exception>
 #include <folly/ScopeGuard.h>
+#include <folly/logging/xlog.h>
 #include <limits>
 #include <new>
 
@@ -14,6 +15,17 @@
 
 namespace hf3fs::meta::server {
 namespace {
+void logAdminGcFailure(const char *protocol, const char *phase, const EcGcAdminReq &request,
+                       const Uuid &child, unsigned action, status_code_t code) noexcept {
+  try {
+    XLOGF(WARN, "EC_GC_DIAG layer=meta_admin protocol={} action={} phase={} code={} claim={} alloc={} child={}",
+          protocol, action, phase, code, request.claimId.toHexString(), request.identity.allocation.toHexString(),
+          child.toHexString());
+  } catch (...) {
+    // Do not let diagnostics change the original durable-operation result.
+  }
+}
+
 uint64_t wallSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
@@ -156,6 +168,10 @@ CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::executeAbsentOwned(std::shared
   SCOPE_EXIT { state->active.fetch_sub(1, std::memory_order_release); };
   bool coordinatorInvoked = false;
   bool committingClaim = false;
+  Uuid diagnosticChild = Uuid::zero();
+  const auto diagnose = [&](const char *phase, status_code_t code) noexcept {
+    logAdminGcFailure("absent", phase, req, diagnosticChild, static_cast<unsigned>(action), code);
+  };
   const auto respond = [&](const EcGcAbsentCompletion &c) -> Result<EcAbsentAdminRsp> {
     EcAbsentAdminRsp out;
     out.object = c.object;
@@ -181,10 +197,14 @@ CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::executeAbsentOwned(std::shared
       CO_RETURN_ON_ERROR(tree);
       if (!*tree) co_return makeError(StatusCode::kNotImplemented, "absence requires an original mode4 G2 claim");
       auto claim = co_await EcTreeGcCatalog::claim(tx, req.object, req.identity, req.claimId, *state->controlKey);
+      if (!claim) diagnose("claim", claim.error().code());
       CO_RETURN_ON_ERROR(claim);
+      diagnosticChild = claim->allocation.fragment.operation;
       CO_RETURN_ON_ERROR(state->ready(oldAction, deadline));
       committingClaim = true;
-      CO_RETURN_ON_ERROR(co_await tx.commit());
+      auto committed = co_await tx.commit();
+      if (!committed) diagnose("claim_commit", committed.error().code());
+      CO_RETURN_ON_ERROR(committed);
       committingClaim = false;
     }
     EcGcBoundClosure bound;
@@ -195,8 +215,12 @@ CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::executeAbsentOwned(std::shared
       if (!raw) co_return makeError(StatusCode::kKVStoreNotFound);
       EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Gc);
       auto original = co_await EcTreeGcCatalog::closureForClaim(tx, req.object, req.identity, req.claimId, *state->controlKey);
+      if (!original) diagnose("load_closure", original.error().code());
       CO_RETURN_ON_ERROR(original);
-      CO_RETURN_ON_ERROR(co_await tx.commit());
+      diagnosticChild = original->claim.allocation.fragment.operation;
+      auto committed = co_await tx.commit();
+      if (!committed) diagnose("closure_read_commit", committed.error().code());
+      CO_RETURN_ON_ERROR(committed);
       bound = std::move(*original);
     }
     {
@@ -205,13 +229,17 @@ CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::executeAbsentOwned(std::shared
       EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Gc);
       auto prior = co_await EcGcAbsentCompletionCatalog::get(tx, req.object, req.identity, req.claimId,
           *state->controlKey, *state->key, state->authority);
+      if (!prior) diagnose("prior_completion", prior.error().code());
       CO_RETURN_ON_ERROR(prior);
       if (*prior) co_return respond(**prior);
     }
     auto certificate = EcGcCompletionCatalog::project(bound.claim);
+    if (!certificate) diagnose("project_certificate", certificate.error().code());
     CO_RETURN_ON_ERROR(certificate);
-    if (bound.drain.identity.clusterAuthority != state->authority)
+    if (bound.drain.identity.clusterAuthority != state->authority) {
+      diagnose("closure_authority", StatusCode::kTokenMismatch);
       co_return makeError(StatusCode::kTokenMismatch, "absence authority differs from original T2");
+    }
     CO_RETURN_ON_ERROR(state->ready(oldAction, deadline));
     const auto now = wallSeconds();
     if (now > std::numeric_limits<uint64_t>::max() - storage::kEcGcAbsentDiscoveryMaxTtlSeconds)
@@ -234,12 +262,17 @@ CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::executeAbsentOwned(std::shared
     discoveryControl.deadline = std::min(deadline, SteadyClock::now() + 60_s);
     auto observation = co_await folly::coro::co_withCancellation({}, state->client->getEcGcAbsentCapabilityControlled(
         *request, state->key, discoveryControl));
+    if (!observation) diagnose("discovery", observation.error().code());
     CO_RETURN_ON_ERROR(observation);
-    CO_RETURN_ON_ERROR(storage::verifyEcGcAbsentDiscoveryObservation(*state->key, *observation, *request, wallSeconds()));
+    auto verified = storage::verifyEcGcAbsentDiscoveryObservation(*state->key, *observation, *request, wallSeconds());
+    if (!verified) diagnose("discovery_ack", verified.error().code());
+    CO_RETURN_ON_ERROR(verified);
     const auto &actual = observation->claims;
     const uint16_t required = action == storage::EcGcAbsentAction::ConfirmAbsent ? 1 : 2;
-    if (!sameEndpoint(actual.endpoint, certificate->endpoint))
+    if (!sameEndpoint(actual.endpoint, certificate->endpoint)) {
+      diagnose("discovery_endpoint", StatusCode::kTokenMismatch);
       co_return makeError(StatusCode::kTokenMismatch, "absence discovery cannot replace original target");
+    }
     if (actual.dataProtocol != 2 || actual.diskFormat != 3 || actual.gcProtocol != 2 ||
         (actual.capabilities & required) != required)
       co_return makeError(StatusCode::kNotImplemented, "target does not admit this explicit absence action");
@@ -277,6 +310,10 @@ CoTryTask<EcGcAdminRsp> EcGcAdminCoordinator::executeOwned(std::shared_ptr<State
   if (!state->enter()) co_return makeError(StorageClientCode::kResourceBusy);
   SCOPE_EXIT { state->active.fetch_sub(1, std::memory_order_release); };
   bool coordinatorInvoked = false;
+  Uuid diagnosticChild = Uuid::zero();
+  const auto diagnose = [&](const char *phase, status_code_t code) noexcept {
+    logAdminGcFailure("gc", phase, req, diagnosticChild, static_cast<unsigned>(action), code);
+  };
   try {
     // G0 reads the full permanent ref/protection/drain history. It neither
     // retires a revision nor manufactures a claim for mode2/unbound records.
@@ -284,9 +321,13 @@ CoTryTask<EcGcAdminRsp> EcGcAdminCoordinator::executeOwned(std::shared_ptr<State
       auto txn = state->engine->createReadWriteTransaction();
       if (!txn) co_return makeError(StatusCode::kKVStoreNotFound);
       auto claim = co_await EcExactGcCatalog::claim(*txn, req.object, req.identity, req.claimId, *state->controlKey);
+      if (!claim) diagnose("claim", claim.error().code());
       CO_RETURN_ON_ERROR(claim);
+      diagnosticChild = claim->allocation.fragment.operation;
       CO_RETURN_ON_ERROR(state->ready(action, deadline));
-      CO_RETURN_ON_ERROR(co_await txn->commit());
+      auto committed = co_await txn->commit();
+      if (!committed) diagnose("claim_commit", committed.error().code());
+      CO_RETURN_ON_ERROR(committed);
     }
     EcGcClaim claim;
     {
@@ -294,11 +335,21 @@ CoTryTask<EcGcAdminRsp> EcGcAdminCoordinator::executeOwned(std::shared_ptr<State
       auto txn = state->engine->createReadWriteTransaction();
       if (!txn) co_return makeError(StatusCode::kKVStoreNotFound);
       auto loaded = co_await EcExactGcCatalog::getClaim(*txn, req.object, req.identity);
+      if (!loaded) diagnose("load_claim", loaded.error().code());
       CO_RETURN_ON_ERROR(loaded);
-      if (!*loaded) co_return makeError(StatusCode::kTokenStale, "no committed exact GC claim");
-      if ((**loaded).claimId != req.claimId) co_return makeError(StatusCode::kTokenMismatch);
+      if (!*loaded) {
+        diagnose("claim_missing", StatusCode::kTokenStale);
+        co_return makeError(StatusCode::kTokenStale, "no committed exact GC claim");
+      }
+      diagnosticChild = (**loaded).allocation.fragment.operation;
+      if ((**loaded).claimId != req.claimId) {
+        diagnose("claim_identity", StatusCode::kTokenMismatch);
+        co_return makeError(StatusCode::kTokenMismatch);
+      }
       claim = std::move(**loaded);
-      CO_RETURN_ON_ERROR(co_await txn->commit());
+      auto committed = co_await txn->commit();
+      if (!committed) diagnose("claim_read_commit", committed.error().code());
+      CO_RETURN_ON_ERROR(committed);
     }
     {
       // Immutable ECGD can be replayed while Storage is unavailable. It still
@@ -311,10 +362,12 @@ CoTryTask<EcGcAdminRsp> EcGcAdminCoordinator::executeOwned(std::shared_ptr<State
                                                        req.claimId,
                                                        *state->key,
                                                        state->authority);
+      if (!prior) diagnose("prior_completion", prior.error().code());
       CO_RETURN_ON_ERROR(prior);
       if (*prior) co_return response(**prior);
     }
     auto certificate = EcGcCompletionCatalog::project(claim);
+    if (!certificate) diagnose("project_certificate", certificate.error().code());
     CO_RETURN_ON_ERROR(certificate);
     CO_RETURN_ON_ERROR(state->ready(action, deadline));
     const auto now = wallSeconds();
@@ -339,12 +392,17 @@ CoTryTask<EcGcAdminRsp> EcGcAdminCoordinator::executeOwned(std::shared_ptr<State
     auto observed = co_await folly::coro::co_withCancellation(
         {},
         state->client->getEcGcCapabilityControlled(*request, state->key, discoveryControl));
+    if (!observed) diagnose("discovery", observed.error().code());
     CO_RETURN_ON_ERROR(observed);
-    CO_RETURN_ON_ERROR(storage::verifyEcGcDiscoveryObservation(*state->key, *observed, *request, wallSeconds()));
+    auto verified = storage::verifyEcGcDiscoveryObservation(*state->key, *observed, *request, wallSeconds());
+    if (!verified) diagnose("discovery_ack", verified.error().code());
+    CO_RETURN_ON_ERROR(verified);
     const auto &actual = observed->claims;
     const uint16_t required = action == storage::EcGcAction::Collect ? uint16_t{1} : uint16_t{2};
-    if (!sameEndpoint(actual.endpoint, certificate->endpoint))
+    if (!sameEndpoint(actual.endpoint, certificate->endpoint)) {
+      diagnose("discovery_endpoint", StatusCode::kTokenMismatch);
       co_return makeError(StatusCode::kTokenMismatch, "GC discovery cannot replace the claimed physical instance");
+    }
     if (actual.dataProtocol != 2 || actual.diskFormat != 3 ||
         !storage::ecGcProtocolSupports(actual.gcProtocol, certificate->gcProtocol) ||
         (actual.capabilities & required) != required)

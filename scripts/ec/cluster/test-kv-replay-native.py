@@ -124,7 +124,8 @@ class NativeAdapterTests(unittest.TestCase):
 
         def classify(args):
             b.guard()
-            self.classification_calls.append((args.action, args.authorize_absence_confirmation))
+            self.classification_calls.append((args.action, args.authorize_absence_confirmation,
+                                              args.authorize_collection_retry))
             folder = args.run_dir
             if args.action == 'start':
                 folder.mkdir(mode=0o700)
@@ -150,9 +151,11 @@ class NativeAdapterTests(unittest.TestCase):
                 if self.classification_mode == 'published':
                     adapter.cleanup.update(state='Published', published=True)
                 if self.classification_mode == 'mixed': adapter.present = {0, 3, 7, 11}
+                if self.classification_mode == 'retry-collection': adapter.collect_failures = 1
                 self.classifiers[str(folder)] = adapter
             adapter = self.classifiers[str(folder)]
-            return m.Classifier(folder, adapter.plan, adapter, args.authorize_absence_confirmation).run()
+            return m.Classifier(folder, adapter.plan, adapter, args.authorize_absence_confirmation,
+                                authorize_collection_retry=args.authorize_collection_retry).run()
         b.run_classifier = classify
 
     def snapshot(self, run):
@@ -572,6 +575,42 @@ class NativeAdapterTests(unittest.TestCase):
         (folder / 'write-run/record.json').unlink()
         with self.assertRaisesRegex(ValueError, 'missing/partial'): self.backend.settle('put-0')
         self.assertFalse((folder / 'mutation-attempts').exists())
+
+    def test_explicit_collection_retry_keeps_original_reservation_until_full_classification(self):
+        self.enable_settlement(mode='retry-collection')
+        self.backend.perform('put-0', self.spec('put')); self.backend.perform('get-0', self.spec('get'))
+        self.fail_action = 'repair'
+        with self.assertRaises(RuntimeError): self.backend.perform('repair-0', self.spec('repair'))
+        folder = self.backend.actions / 'repair-0'
+        with self.assertRaises(classification_fixture.m.gc.CheckError): self.backend.settle('repair-0')
+        with self.assertRaises(classification_fixture.m.gc.CheckError): self.backend.settle('repair-0')
+        calls = len(self.classification_calls)
+        authorizations = folder / 'reservations/0000/authorizations'
+        before = sorted(authorizations.iterdir())
+        with self.assertRaisesRegex(ValueError, 'Conflicting or invalid'):
+            self.backend.settle('repair-0', authorize_absence=True, authorize_collection_retry=True)
+        self.assertEqual(len(self.classification_calls), calls)
+        self.assertEqual(sorted(authorizations.iterdir()), before)
+        self.assertFalse((folder / 'reservations/0000/settlement.json').exists())
+        self.assertFalse((folder / 'mutation-attempts').exists())
+        adapter = next(iter(self.classifiers.values()))
+        original = next(c for c in adapter.calls if c['expected'].get('action') == 'collect')
+        settled = self.backend.settle('repair-0', authorize_collection_retry=True)
+        self.assertEqual(self.classification_calls[-1], ('resume', False, True))
+        authorization = gc.load(sorted(authorizations.iterdir())[-1])
+        self.assertTrue(authorization['authorize_collection_retry'])
+        self.assertFalse(authorization['authorize_absence_confirmation'])
+        self.assertEqual(settled['settlement']['released_model_bytes_decimal'], str(12 * 11469))
+        self.assertFalse(settled['business_action_completed']); self.assertFalse(settled['model_advanced'])
+        self.assertFalse((folder / 'completion.json').exists())
+        repeats = [c for c in adapter.calls if c['expected'].get('action') == 'collect' and
+                   c['expected']['claim_id'] == original['expected']['claim_id']]
+        self.assertEqual(repeats, [original] * 2)
+        self.assertFalse(any(c['expected'].get('action') == 'confirm_absent' for c in adapter.calls))
+        result = self.backend.perform('repair-0', self.spec('repair'))
+        self.assertEqual(result['mutation_reservations']['attempts'], 2)
+        self.assertFalse(result['physical_capacity_returned'])
+        self.assertNotIn('close', [action for action, _, _ in self.calls])
 
     def test_classification_tampering_cannot_turn_partial_or_foreign_set_into_credit(self):
         self.enable_settlement()

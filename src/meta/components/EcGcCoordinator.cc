@@ -5,6 +5,7 @@
 #include <chrono>
 #include <exception>
 #include <folly/ScopeGuard.h>
+#include <folly/logging/xlog.h>
 #include <limits>
 #include <new>
 
@@ -13,6 +14,16 @@
 namespace hf3fs::meta::server {
 namespace {
 using Control = storage::client::EcRequestControl;
+
+void logGcFailure(const char *phase, const Uuid &claim, const storage::EcFragmentIdentity &identity,
+                  const Uuid &child, unsigned action, status_code_t code) noexcept {
+  try {
+    XLOGF(WARN, "EC_GC_DIAG layer=meta_gc action={} phase={} code={} claim={} alloc={} child={}",
+          action, phase, code, claim.toHexString(), identity.allocation.toHexString(), child.toHexString());
+  } catch (...) {
+    // Logging cannot change an irreversible or unconfirmed operation.
+  }
+}
 
 bool sameEndpoint(const storage::EcScopeEndpoint &a, const storage::EcScopeEndpoint &b) {
   return a.nodeId == b.nodeId && a.chainId == b.chainId && a.targetId == b.targetId && a.engineUuid == b.engineUuid &&
@@ -124,10 +135,17 @@ CoTryTask<EcGcCompletion> EcGcCoordinator::executeOwned(std::shared_ptr<State> s
   if (!state->enter()) co_return makeError(StorageClientCode::kResourceBusy);
   SCOPE_EXIT { state->active.fetch_sub(1, std::memory_order_release); };
   bool dispatched = false;
+  Uuid diagnosticChild = Uuid::zero();  // Not known until the permanent claim is read.
+  const auto diagnose = [&](const char *phase, status_code_t code) noexcept {
+    logGcFailure(phase, claimId, identity, diagnosticChild, static_cast<unsigned>(action), code);
+  };
   try {
     auto confirmed = co_await loadCommitted(state, object, identity, claimId);
+    if (!confirmed) diagnose("load_claim", confirmed.error().code());
     CO_RETURN_ON_ERROR(confirmed);
+    diagnosticChild = confirmed->certificate().fragmentOperation;
     auto prior = co_await getOwned(state, object, identity, claimId);
+    if (!prior) diagnose("prior_completion", prior.error().code());
     CO_RETURN_ON_ERROR(prior);
     if (*prior) co_return std::move(**prior);
     const auto &certificate = confirmed->certificate();
@@ -154,6 +172,7 @@ CoTryTask<EcGcCompletion> EcGcCoordinator::executeOwned(std::shared_ptr<State> s
     // committed DB read, not a caller-supplied certificate or receipt.
     auto request =
         storage::ec_gc_control_detail::RequestSigner::sign(*state->key, claims, now, storage::kEcGcMaxTtlSeconds);
+    if (!request) diagnose("sign", request.error().code());
     CO_RETURN_ON_ERROR(request);
     CO_RETURN_ON_ERROR(ready(control));
     dispatched = true;
@@ -161,6 +180,7 @@ CoTryTask<EcGcCompletion> EcGcCoordinator::executeOwned(std::shared_ptr<State> s
     // not destroy the owned transport frame before its real RPC settles.
     auto response = co_await folly::coro::co_withCancellation({}, state->transport->exchange(*request, control));
     if (!response) {
+      diagnose("transport", response.error().code());
       if (action == storage::EcGcAction::Collect) co_return makeError(unknown(std::move(response.error())));
       co_return makeError(std::move(response.error()));
     }
@@ -175,9 +195,15 @@ CoTryTask<EcGcCompletion> EcGcCoordinator::executeOwned(std::shared_ptr<State> s
                                                             *response,
                                                             *state->key,
                                                             state->config.authority);
-    if (!completed) co_return makeError(unknown(std::move(completed.error())));
+    if (!completed) {
+      diagnose("record_completion", completed.error().code());
+      co_return makeError(unknown(std::move(completed.error())));
+    }
     auto committed = co_await txn->commit();
-    if (!committed) co_return makeError(unknown(std::move(committed.error())));
+    if (!committed) {
+      diagnose("commit_completion", committed.error().code());
+      co_return makeError(unknown(std::move(committed.error())));
+    }
     co_return std::move(*completed);
   } catch (const std::bad_alloc &) {
     co_return makeError(dispatched ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kNotEnoughMemory);

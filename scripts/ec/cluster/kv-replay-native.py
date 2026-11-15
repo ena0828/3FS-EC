@@ -532,10 +532,11 @@ class NativeBackend:
                 'completion_sha256': self.sha(run / 'completion.json'), 'completion': completion,
                 'confirmed_allocation_model_bytes_decimal': str(len(allocations) * self.plan['shard_bytes'])}
 
-    def settle(self, name, *, authorize_absence=False):
+    def settle(self, name, *, authorize_absence=False, authorize_collection_retry=False):
         """Explicitly close/classify one original mutation, never advance the trace."""
         self.guard()
-        require(type(authorize_absence) is bool, 'Invalid absence authorization')
+        require(type(authorize_absence) is bool and type(authorize_collection_retry) is bool and
+                not (authorize_absence and authorize_collection_retry), 'Conflicting or invalid recovery authorization')
         matches = [s for s in self.plan['steps'] if s['name'] == name]
         require(len(matches) == 1, 'Settlement is outside the original plan')
         step = matches[0]; spec = spec_checked(name, step['spec'], self.plan)
@@ -550,7 +551,7 @@ class NativeBackend:
         session = self.actions / spec['instance'] / 'session/done.json'
         fixed = self.load(session); self.verify_files(fixed)
         ledger = self.reservations_module.Reservations(self, folder, spec, fixed['value'])
-        result = ledger.settle(authorize_absence)
+        result = ledger.settle(authorize_absence, authorize_collection_retry=authorize_collection_retry)
         self.guard()
         return {'schema': 1, 'kind': 'ec_replay_explicit_settlement', 'name': name,
                 'plan_sha256': self.plan_sha, 'settlement': result,

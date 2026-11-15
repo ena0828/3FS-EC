@@ -211,13 +211,16 @@ def positive(operation, result):
 
 
 class Classifier:
-    def __init__(self, folder, plan, adapter, authorize_absence=False):
+    def __init__(self, folder, plan, adapter, authorize_absence=False, *, authorize_collection_retry=False):
+        require(type(authorize_absence) is bool and type(authorize_collection_retry) is bool and
+                not (authorize_absence and authorize_collection_retry), 'Conflicting or invalid recovery authorization')
         self.folder, self.plan, self.adapter = gc.private(folder), plan, adapter
         validate_plan(plan)
         require(same(load(self.folder / 'plan.json'), plan), 'In-memory plan differs from durable plan')
         self.operations, self.attempts = self.folder / 'operations', self.folder / 'attempts'
         self.history, self.records = {}, []
         self.authorize_absence = authorize_absence
+        self.authorize_collection_retry = authorize_collection_retry
         paths = sorted(self.attempts.iterdir())
         require([p.name for p in paths] == [f'{n:06d}' for n in range(len(paths))] and
                 len(paths) <= plan['max_commands'], 'Invalid attempt ledger')
@@ -377,14 +380,23 @@ class Classifier:
             if found: return {**candidate, 'classification': classification, 'eligible': True,
                               'claim_id': claim, 'evidence': evidence_ref(found)}
         if self.history.get(collect['name']) or self.history.get(absent['name']):
-            require(self.authorize_absence, 'Collect unconfirmed; absence confirmation requires explicit authorization')
+            require(self.authorize_absence or self.authorize_collection_retry,
+                    'Collect unconfirmed; collection retry or absence confirmation requires explicit authorization')
+            if self.authorize_collection_retry:
+                require(self.history.get(collect['name']), 'Collection retry requires an original Collect attempt')
+                operation, classification, permission = collect, 'Collected', 'collection-retry'
+                scope = 'explicit_same_claim_collection_retry_not_inferred_from_QueryMissing'
+            else:
+                operation, classification, permission = absent, 'AbsentAfterClose', 'absence'
+                scope = 'explicit_new_absence_confirmation_not_inferred_from_QueryMissing'
             authorization = {'schema': 1, 'plan_sha256': gc.file_sha(self.folder / 'plan.json'),
-                             'candidate': candidate, 'claim_id': claim, 'operation_sha256': sha(absent),
+                             'candidate': candidate, 'claim_id': claim, 'operation_sha256': sha(operation),
                              'attempt': f'{len(self.records):06d}',
-                             'scope': 'explicit_new_absence_confirmation_not_inferred_from_QueryMissing'}
-            self.seal(self.folder / (name + '-absence-authorization-' + authorization['attempt'] + '.json'), authorization)
-            found = self.perform(absent)
-            classification = 'AbsentAfterClose'
+                             'scope': scope}
+            self.seal(self.folder / (name + '-' + permission + '-authorization-' + authorization['attempt'] + '.json'), authorization)
+            # One dispatch for this candidate in this invocation; failures leave
+            # the same operation/claim unconfirmed and retain all prior evidence.
+            found = self.perform(operation)
         else:
             found = self.perform(collect)
             classification = 'Collected'
@@ -573,6 +585,11 @@ def binding(root, source_record, cfg):
 
 def execute(args, *, check_owner=None):
     if check_owner is not None: check_owner()
+    absence = getattr(args, 'authorize_absence_confirmation', False)
+    collection_retry = getattr(args, 'authorize_collection_retry', False)
+    require(type(absence) is bool and type(collection_retry) is bool and not (absence and collection_retry),
+            'Conflicting or invalid recovery authorization')
+    require(not collection_retry or args.action == 'resume', 'Collection retry requires the original classifier run')
     require(sys.platform == 'linux' and os.getuid() == os.geteuid() != 0 and os.getgid() == os.getegid() != 0,
             'Linux ordinary real/effective UID/GID required')
     os.umask(0o077)
@@ -613,7 +630,7 @@ def execute(args, *, check_owner=None):
                    [('experiment-runner.py', 'output_experiment'), ('ack-service-acceptance.py', 'output_ack'),
                     ('run-cluster.py', 'output_launcher'), ('file-command.py', 'output_file_cli')]]
         adapter = NativeAdapter(root, bound, modules, lease, registry / 'lock', plan, check_owner)
-        return Classifier(folder, plan, adapter, getattr(args, 'authorize_absence_confirmation', False)).run()
+        return Classifier(folder, plan, adapter, absence, authorize_collection_retry=collection_retry).run()
 
 
 def parser():
@@ -628,8 +645,11 @@ def parser():
             c.add_argument('--kind', choices=tuple(CLOSE), required=True)
             c.add_argument('--max-commands', type=int, default=4096)
         else:
-            c.add_argument('--authorize-absence-confirmation', action='store_true',
-                           help='Explicit new absence mutation after unconfirmed Collect; never inferred from Missing')
+            authority = c.add_mutually_exclusive_group()
+            authority.add_argument('--authorize-absence-confirmation', action='store_true',
+                                   help='Explicit new absence mutation after unconfirmed Collect; never inferred from Missing')
+            authority.add_argument('--authorize-collection-retry', action='store_true',
+                                   help='After both Queries, retry an original Collect once per candidate with the same claim')
     return p
 
 

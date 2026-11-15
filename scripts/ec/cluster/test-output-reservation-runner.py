@@ -65,6 +65,7 @@ class Adapter:
         self.drift = False; self.lease = True; self.corrupt = None; self.owner_error = False
         self.final_drift = False; self.prepared_only = None; self.torn_result = None; self.incomplete_close = False
         self.confirm_failure = False
+        self.collect_failures = 0
         self.cleanup = {'observed': True, 'state': 'Aborted', 'published': False, 'output_drained': True,
                         'source_released': True, 'all_cleanup_complete': True, 'revalidated': True, 'failure': None}
 
@@ -112,6 +113,9 @@ class Adapter:
             return {**row, 'resolution': copy.deepcopy(self.resolutions[rid]),
                     'candidate_reservations_release_eligible': True, 'metadata_resolution_only': True}
         claim = f['claim_id']
+        if action == 'collect' and self.collect_failures:
+            self.collect_failures -= 1
+            return {**row, 'status_code': 4085, 'outcome': 'unknown'}
         if action == 'collect' and f['shard'] in self.present:
             m.require(claim not in self.absent, 'Synthetic service rejects opposite terminal')
             self.collected[claim] = True
@@ -197,8 +201,50 @@ class OutputReservationTests(unittest.TestCase):
 
     def tearDown(self): self.tmp.cleanup()
 
-    def run_classifier(self, authorized=False):
-        return m.Classifier(self.folder, self.plan, self.adapter, authorized).run()
+    def run_classifier(self, authorized=False, *, authorize_collection_retry=False):
+        return m.Classifier(self.folder, self.plan, self.adapter, authorized,
+                            authorize_collection_retry=authorize_collection_retry).run()
+
+    def test_explicit_collection_retry_queries_first_reuses_claim_and_dispatches_once(self):
+        self.adapter.collect_failures = 2
+        with self.assertRaises(m.gc.CheckError): self.run_classifier()
+        original = next(c for c in self.adapter.calls if c['expected'].get('action') == 'collect')
+        first_files = m.inventory(self.folder / 'attempts')
+        for absent, retry in ((True, True), (False, 1)):
+            before = len(self.adapter.calls)
+            with self.assertRaisesRegex(m.gc.CheckError, 'Conflicting or invalid'):
+                self.run_classifier(absent, authorize_collection_retry=retry)
+            self.assertEqual(len(self.adapter.calls), before)
+        before = len(self.adapter.calls)
+        with self.assertRaisesRegex(m.gc.CheckError, 'explicit authorization'): self.run_classifier()
+        self.assertEqual([c['expected']['action'] for c in self.adapter.calls[before:]], ['query', 'query_absent'])
+        before = len(self.adapter.calls)
+        with self.assertRaises(m.gc.CheckError): self.run_classifier(authorize_collection_retry=True)
+        delta = self.adapter.calls[before:]
+        self.assertEqual([c['expected']['action'] for c in delta], ['query', 'query_absent', 'collect'])
+        self.assertEqual(delta[-1], original)
+        self.assertFalse((self.folder / 'completion.json').exists())
+        result = self.run_classifier(authorize_collection_retry=True)
+        self.assertEqual(result['eligible_candidate_count'], 12)
+        self.assertFalse(result['business_action_completed']); self.assertFalse(result['physical_capacity_returned'])
+        repeats = [c for c in self.adapter.calls if c['expected'].get('action') == 'collect' and
+                   c['expected']['claim_id'] == original['expected']['claim_id']]
+        self.assertEqual(repeats, [original] * 3)
+        self.assertFalse(any(c['expected'].get('action') == 'confirm_absent' for c in self.adapter.calls))
+        authorizations = list(self.folder.glob('*-collection-retry-authorization-*.json'))
+        self.assertEqual(len(authorizations), 2)
+        for path in authorizations:
+            auth = m.load(path)
+            self.assertEqual(auth['plan_sha256'], m.gc.file_sha(self.folder / 'plan.json'))
+            self.assertEqual(auth['operation_sha256'], m.sha(original))
+            self.assertEqual(auth['claim_id'], original['expected']['claim_id'])
+            self.assertEqual(auth['candidate']['allocation'], original['expected']['allocation'])
+            self.assertEqual(m.load(self.folder / 'attempts' / auth['attempt'] / 'intent.json')['operation'], original)
+        for relative, digest in first_files.items():
+            self.assertEqual(m.gc.file_sha(self.folder / 'attempts' / relative), digest)
+        before = len(self.adapter.calls)
+        self.assertEqual(self.run_classifier(authorize_collection_retry=True), result)
+        self.assertEqual(len(self.adapter.calls), before, 'A full positive receipt prevents all new dispatch')
 
     def test_complete_bound_set_and_repeat_do_not_dispatch_again(self):
         result = self.run_classifier()
@@ -382,9 +428,19 @@ class OutputReservationTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(m.gc.CheckError): m.positive(op, {**row, key: value})
 
     def test_authorization_is_resume_only_and_completed_record_is_immutable(self):
+        flags = ('--authorize-absence-confirmation', '--authorize-collection-retry')
+        for flag in flags:
+            with self.assertRaises(SystemExit):
+                m.parser().parse_args(['start', '--root', str(self.base), '--run-dir', str(self.folder),
+                    '--source-run', self.plan['source_run'], '--kind', 'repair', flag])
+            args = m.parser().parse_args(['resume', '--root', str(self.base), '--run-dir', str(self.folder), flag])
+            self.assertTrue(getattr(args, flag[2:].replace('-', '_')))
         with self.assertRaises(SystemExit):
-            m.parser().parse_args(['start', '--root', str(self.base), '--run-dir', str(self.folder),
-                '--source-run', self.plan['source_run'], '--kind', 'repair', '--authorize-absence-confirmation'])
+            m.parser().parse_args(['resume', '--root', str(self.base), '--run-dir', str(self.folder), *flags])
+        with self.assertRaisesRegex(m.gc.CheckError, 'Conflicting or invalid'):
+            m.execute(SimpleNamespace(authorize_absence_confirmation=True, authorize_collection_retry=True))
+        with self.assertRaisesRegex(m.gc.CheckError, 'original classifier'):
+            m.execute(SimpleNamespace(action='start', authorize_collection_retry=True))
         self.run_classifier(); result = m.load(self.folder / 'completion.json'); result['eligible_candidate_count'] = 999
         (self.folder / 'completion.json').write_bytes(m.encoded(result))
         with self.assertRaises(m.gc.CheckError): self.run_classifier()

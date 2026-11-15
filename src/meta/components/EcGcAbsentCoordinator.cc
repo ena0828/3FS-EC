@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <folly/ScopeGuard.h>
+#include <folly/logging/xlog.h>
 #include <limits>
 #include <new>
 
@@ -12,6 +13,15 @@
 namespace hf3fs::meta::server {
 namespace {
 using Control = storage::client::EcRequestControl;
+void logAbsentFailure(const char *phase, const Uuid &claim, const storage::EcFragmentIdentity &identity,
+                      const Uuid &child, unsigned action, status_code_t code) noexcept {
+  try {
+    XLOGF(WARN, "EC_GC_DIAG layer=meta_absent action={} phase={} code={} claim={} alloc={} child={}",
+          action, phase, code, claim.toHexString(), identity.allocation.toHexString(), child.toHexString());
+  } catch (...) {
+    // Never replace the original failure with a diagnostic failure.
+  }
+}
 bool sameEndpoint(const storage::EcScopeEndpoint &a, const storage::EcScopeEndpoint &b) {
   return a.nodeId == b.nodeId && a.chainId == b.chainId && a.targetId == b.targetId &&
          a.engineUuid == b.engineUuid && a.targetIncarnation == b.targetIncarnation;
@@ -77,6 +87,10 @@ CoTryTask<EcGcAbsentCompletion> EcGcAbsentCoordinator::executeOwned(std::shared_
   if (!s->enter()) co_return makeError(StorageClientCode::kResourceBusy);
   SCOPE_EXIT { s->active.fetch_sub(1, std::memory_order_release); };
   bool dispatched = false;
+  Uuid diagnosticChild = Uuid::zero();
+  const auto diagnose = [&](const char *phase, status_code_t code) noexcept {
+    logAbsentFailure(phase, claimId, identity, diagnosticChild, static_cast<unsigned>(action), code);
+  };
   try {
     EcGcBoundClosure bound;
     {
@@ -84,8 +98,12 @@ CoTryTask<EcGcAbsentCompletion> EcGcAbsentCoordinator::executeOwned(std::shared_
       if (!raw) co_return makeError(StatusCode::kKVStoreNotFound);
       EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Gc);
       auto read = co_await EcTreeGcCatalog::closureForClaim(tx, object, identity, claimId, *s->control);
+      if (!read) diagnose("load_closure", read.error().code());
       CO_RETURN_ON_ERROR(read);
-      CO_RETURN_ON_ERROR(co_await tx.commit());
+      diagnosticChild = read->claim.allocation.fragment.operation;
+      auto committed = co_await tx.commit();
+      if (!committed) diagnose("closure_read_commit", committed.error().code());
+      CO_RETURN_ON_ERROR(committed);
       bound = std::move(*read);
     }
     {
@@ -94,17 +112,23 @@ CoTryTask<EcGcAbsentCompletion> EcGcAbsentCoordinator::executeOwned(std::shared_
       EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Gc);
       auto prior = co_await EcGcAbsentCompletionCatalog::get(tx, object, identity, claimId,
                                                             *s->control, *s->key, s->config.authority);
+      if (!prior) diagnose("prior_completion", prior.error().code());
       CO_RETURN_ON_ERROR(prior);
       if (*prior) co_return **prior;
     }
     auto certificate = EcGcCompletionCatalog::project(bound.claim);
+    if (!certificate) diagnose("project_certificate", certificate.error().code());
     CO_RETURN_ON_ERROR(certificate);
     auto closure = EcGcAbsentCompletionCatalog::project(bound);
+    if (!closure) diagnose("project_closure", closure.error().code());
     CO_RETURN_ON_ERROR(closure);
     if (bound.drain.identity.clusterAuthority != s->config.authority ||
         std::none_of(s->config.targets.begin(), s->config.targets.end(), [&](const auto &t) {
           return sameEndpoint(t.endpoint, certificate->endpoint);
-        })) co_return makeError(StatusCode::kTokenMismatch);
+        })) {
+      diagnose("authority_target", StatusCode::kTokenMismatch);
+      co_return makeError(StatusCode::kTokenMismatch);
+    }
     CO_RETURN_ON_ERROR(ready(control));
     const auto now = s->config.nowSeconds();
     if (now > std::numeric_limits<uint64_t>::max() - s->config.requestTtlSeconds)
@@ -119,11 +143,13 @@ CoTryTask<EcGcAbsentCompletion> EcGcAbsentCoordinator::executeOwned(std::shared_
     claims.certificate = *certificate;
     claims.closure = std::move(*closure);
     auto request = storage::ec_gc_absent_detail::RequestSigner::sign(*s->key, claims, now);
+    if (!request) diagnose("sign", request.error().code());
     CO_RETURN_ON_ERROR(request);
     CO_RETURN_ON_ERROR(ready(control));
     dispatched = true;
     auto response = co_await folly::coro::co_withCancellation({}, s->transport->exchange(*request, control));
     if (!response) {
+      diagnose("transport", response.error().code());
       if (action == storage::EcGcAbsentAction::ConfirmAbsent)
         co_return makeError(unknown(std::move(response.error())));
       co_return makeError(std::move(response.error()));
@@ -133,9 +159,15 @@ CoTryTask<EcGcAbsentCompletion> EcGcAbsentCoordinator::executeOwned(std::shared_
     EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Gc);
     auto stored = co_await EcGcAbsentCompletionCatalog::record(tx, object, identity, claimId, *request, *response,
                                                              *s->control, *s->key, s->config.authority);
-    if (!stored) co_return makeError(unknown(std::move(stored.error())));
+    if (!stored) {
+      diagnose("record_completion", stored.error().code());
+      co_return makeError(unknown(std::move(stored.error())));
+    }
     auto committed = co_await tx.commit();
-    if (!committed) co_return makeError(unknown(std::move(committed.error())));
+    if (!committed) {
+      diagnose("commit_completion", committed.error().code());
+      co_return makeError(unknown(std::move(committed.error())));
+    }
     co_return *stored;
   } catch (const std::bad_alloc &) {
     co_return makeError(dispatched ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kNotEnoughMemory);

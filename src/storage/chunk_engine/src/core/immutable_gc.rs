@@ -23,6 +23,19 @@ pub(crate) struct EcStageGcReceipt {
 }
 
 impl ImmutableStagingEngine {
+    // Failure-only fixed fields. Native callers need not initialize a Rust
+    // tracing subscriber; stderr already belongs to the original service log.
+    // Neither a failed write nor a diagnostic panic may change the GC result.
+    pub(super) fn log_gc_rejection(claim: &EcStageGcClaim, phase: &'static str, code: u16,
+        known_mask: u16, present_mask: u16, equal_mask: u16) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(),
+                "EC_GC_DIAG layer=rust phase={} code={} claim={:02x?} child={:02x?} known_mask={} present_mask={} equal_mask={}",
+                phase, code, claim.claim_id, claim.spec.stage_id, known_mask, present_mask, equal_mask);
+        }));
+    }
+
     pub(crate) fn actual_disk_format(&self) -> u16 {
         match self.0.format {
             EcStagingFormat::V2 => 2,
@@ -54,6 +67,7 @@ impl ImmutableStagingEngine {
                 ImmutableStageError::OutcomeUnknown(format!("GC target confirmation: {error}"))
             })?;
         if actual != claim.target {
+            Self::log_gc_rejection(claim, "gc.target", 64, 0, 0, 0);
             return Err(ImmutableStageError::Conflict);
         }
         Ok(())
@@ -187,19 +201,27 @@ impl ImmutableStagingEngine {
         self.check_key(key)?;
         self.require_gc(claim)?;
         if self.0.engine.meta_store.stage_absent_record(key)?.is_some() {
+            Self::log_gc_rejection(claim, "gc.absence_ledger", 64, 0, 0, 0);
             return Err(ImmutableStageError::Conflict);
         }
         let _permit = self.permit()?;
-        let handle = self.slot(key)?;
+        let handle = self.slot(key).map_err(|error| {
+            if matches!(&error, ImmutableStageError::Missing) {
+                Self::log_gc_rejection(claim, "gc.slot_missing", 4001, 0, 0, 0);
+            }
+            error
+        })?;
         let mut slot = handle.lock().map_err(|_| ImmutableStageError::Busy)?;
         if let Some(ledger) = self.0.engine.meta_store.stage_gc_record(key)? {
             if !ledger.matches(key, claim) {
+                Self::log_gc_rejection(claim, "gc.ledger_mismatch", 64, 0, 0, 0);
                 return Err(ImmutableStageError::Conflict);
             }
             return self.finish_gc_locked(key, &mut slot, &ledger);
         }
         if let Some(pending) = &slot.gc_pending {
             if !pending.ledger.matches(key, claim) {
+                Self::log_gc_rejection(claim, "gc.pending_mismatch", 64, 4, 4, 0);
                 return Err(ImmutableStageError::Conflict);
             }
             // An uncertain atomic batch either left the complete ledger or
@@ -214,8 +236,27 @@ impl ImmutableStagingEngine {
         } else if slot.unknown {
             self.reconcile_locked(key, &mut slot)?;
         }
-        let before = self.actual(key, &slot)?;
+        let before = self.actual(key, &slot).map_err(|error| {
+            if matches!(&error, ImmutableStageError::Missing) {
+                let present = u16::from(slot.record.is_some()) | (u16::from(slot.chunk.is_some()) << 1)
+                    | (u16::from(slot.gc_pending.is_some()) << 2) | (u16::from(slot.unknown) << 3);
+                Self::log_gc_rejection(claim, "gc.actual_missing", 4001, 15, present, 0);
+            }
+            error
+        })?;
         if before.spec != claim.spec || slot.record.as_ref() != Some(&before) {
+            // Equality bits: stage ID, length, CRC, chain version, request word,
+            // writer low/high, etag, then exact cached record == disk record.
+            let equal = u16::from(before.spec.stage_id == claim.spec.stage_id)
+                | (u16::from(before.spec.length == claim.spec.length) << 1)
+                | (u16::from(before.spec.checksum == claim.spec.checksum) << 2)
+                | (u16::from(before.spec.chain_ver == claim.spec.chain_ver) << 3)
+                | (u16::from(before.spec.last_request_id == claim.spec.last_request_id) << 4)
+                | (u16::from(before.spec.last_client_low == claim.spec.last_client_low) << 5)
+                | (u16::from(before.spec.last_client_high == claim.spec.last_client_high) << 6)
+                | (u16::from(before.spec.etag == claim.spec.etag) << 7)
+                | (u16::from(slot.record.as_ref() == Some(&before)) << 8);
+            Self::log_gc_rejection(claim, "gc.spec_mismatch", 64, 0, 0, equal);
             return Err(ImmutableStageError::Conflict);
         }
         let engine = &self.0.engine;
@@ -233,7 +274,10 @@ impl ImmutableStagingEngine {
                 self.publish_cache(key, &before)?;
                 let chunk = engine
                     .get_immutable(key)?
-                    .ok_or(ImmutableStageError::Missing)?;
+                    .ok_or_else(|| {
+                        Self::log_gc_rejection(claim, "gc.sealed_chunk_missing", 4001, 0, 0, 0);
+                        ImmutableStageError::Missing
+                    })?;
                 if chunk.meta() != &before.metadata() {
                     return Err(ImmutableStageError::Corrupt("GC sealed metadata mismatch"));
                 }
@@ -307,12 +351,22 @@ impl ImmutableStagingEngine {
         self.check_key(key)?;
         self.require_gc(claim)?;
         if self.0.engine.meta_store.stage_absent_record(key)?.is_some() {
+            Self::log_gc_rejection(claim, "gc_query.absence_ledger", 64, 0, 0, 0);
             return Err(ImmutableStageError::Conflict);
         }
         let _permit = self.permit()?;
-        let handle = self.slot(key)?;
+        let handle = self.slot(key).map_err(|error| {
+            if matches!(&error, ImmutableStageError::Missing) {
+                Self::log_gc_rejection(claim, "gc_query.slot_missing", 4001, 0, 0, 0);
+            }
+            error
+        })?;
         let mut slot = handle.lock().map_err(|_| ImmutableStageError::Busy)?;
         let Some(ledger) = self.0.engine.meta_store.stage_gc_record(key)? else {
+            let present = u16::from(slot.record.is_some()) | (u16::from(slot.chunk.is_some()) << 1)
+                | (u16::from(slot.gc_pending.is_some()) << 2) | (u16::from(slot.unknown) << 3);
+            Self::log_gc_rejection(claim, "gc_query.no_ledger",
+                if slot.gc_pending.is_some() { 4085 } else { 4001 }, 15, present, 0);
             return Err(if slot.gc_pending.is_some() {
                 ImmutableStageError::OutcomeUnknown("GC result is not confirmed".into())
             } else {
@@ -320,6 +374,7 @@ impl ImmutableStagingEngine {
             });
         };
         if !ledger.matches(key, claim) {
+            Self::log_gc_rejection(claim, "gc_query.ledger_mismatch", 64, 0, 0, 0);
             return Err(ImmutableStageError::Conflict);
         }
         self.finish_gc_locked(key, &mut slot, &ledger)
