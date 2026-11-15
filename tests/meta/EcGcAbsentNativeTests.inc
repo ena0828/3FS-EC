@@ -120,6 +120,7 @@ class TestEcFileNativeAbsent : public TestEcFileNativeRepair {
     for (bool wrongControl : {true, false}) {
       SCOPED_TRACE(wrongControl ? "wrong C authority" : "wrong G authority");
       metaConfig_.set_ec_v2_control_authority((wrongControl ? gcAuthority() : authority_).toHexString());
+      metaConfig_.set_ec_rmw_authority((wrongControl ? gcAuthority() : authority_).toHexString());
       metaConfig_.set_ec_gc_authority((wrongControl ? gcAuthority() : authority_).toHexString());
       ASSERT_NO_FATAL_FAILURE(restartCoordinator());
       auto rejected = blockingWait(metaClient_->queryEcFragmentAbsent(query));
@@ -130,6 +131,7 @@ class TestEcFileNativeAbsent : public TestEcFileNativeRepair {
       ASSERT_FALSE(*saved); // A failed read-only Query cannot publish ECGB.
     }
     metaConfig_.set_ec_v2_control_authority(authority_.toHexString());
+    metaConfig_.set_ec_rmw_authority(authority_.toHexString());
     metaConfig_.set_ec_gc_authority(gcAuthority().toHexString());
     ASSERT_NO_FATAL_FAILURE(restartCoordinator());
   }
