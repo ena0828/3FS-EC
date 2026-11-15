@@ -1,4 +1,5 @@
 #include "EcTargetRetirementCommands.h"
+#include "EcExternalFenceCommands.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -227,6 +228,7 @@ CoTryTask<void> registerEcTargetRetirementHandlers(Dispatcher &dispatcher) {
   CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
       [] { return parserFor("ec-query-target-retirement"); },
       [](IEnv &env, const auto &parser, const auto &args) { return handle(env, parser, args, false); }));
+  CO_RETURN_ON_ERROR(co_await registerEcExternalFenceHandlers(dispatcher));
   co_return Void{};
 }
 }  // namespace hf3fs::client::cli

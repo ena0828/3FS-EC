@@ -96,6 +96,22 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                 value["server"]["cleanup"]["leader_reaped"] = False
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 RUNNER.check_meta_receipt(value, binary, output, cases, test_filter)
+        external, external_filter, external_fuse = RUNNER.selection("external-host-fence")
+        self.assertEqual(len(external), 2)
+        self.assertEqual(external_filter, ":".join(external))
+        self.assertEqual(external_fuse, ())
+        external_sample = receipt(binary, output, external, external_filter)
+        RUNNER.check_meta_receipt(external_sample, binary, output, external, external_filter)
+        for missing_or_failed in (True, False):
+            bad = copy.deepcopy(external_sample)
+            if missing_or_failed:
+                bad["selected"].pop()
+            else:
+                bad["test_results"]["cases"][1]["failed"] = True
+            with self.assertRaises(ValueError):
+                RUNNER.check_meta_receipt(bad, binary, output, external, external_filter)
+        with self.assertRaises(ValueError):
+            RUNNER.check_meta_receipt(sample, binary, output, external, external_filter)
 
     def test_target_meta_inventory_matches_compiled_fixture_sources(self):
         import re
@@ -113,6 +129,12 @@ class TestCoreAcceptanceContract(unittest.TestCase):
                       (source / "tests/meta/TestEcV2NativeLifecycle.cc").read_text(encoding="utf-8"))
         self.assertIn('#include "TestEcTargetRetirementEvidence.inc"',
                       (source / "tests/meta/store/TestEcFileTree.cc").read_text(encoding="utf-8"))
+        external = (source / "tests/meta/EcHostFenceNativeTests.inc").read_text(encoding="utf-8")
+        external_names = [suite + "." + name for suite, name in re.findall(
+            r"TEST_F\(\s*(\w+)\s*,\s*(\w+)\s*\)", external)]
+        RUNNER.exact_names(external_names, RUNNER.EXTERNAL_HOST_FENCE_CASES)
+        self.assertIn('#include "EcHostFenceNativeTests.inc"',
+                      (source / "tests/meta/TestEcV2NativeLifecycle.cc").read_text(encoding="utf-8"))
 
     def test_failed_meta_keeps_cleanup_evidence_without_accepting_stage(self):
         for cleanup in (None, {"signals": ["SIGTERM"], "leader_reaped": True},

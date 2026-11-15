@@ -13,6 +13,7 @@
 #include <linux/magic.h>
 #include <mutex>
 #include <optional>
+#include <openssl/evp.h>
 #include <bit>
 #include <condition_variable>
 #include <stdexcept>
@@ -4419,6 +4420,7 @@ TEST_F(TestEcV2NativeOwnedMutation, MissingBirthTamperedHistoricalProofAndWrongC
 
 #include "EcFlatDirectNativeTests.inc"
 #include "EcTargetRetirementNativeTests.inc"
+#include "EcHostFenceNativeTests.inc"
 #include "EcFileClientNativeTests.inc"
 #include "EcReadDispatcherNativeTests.inc"
 #include "EcRecoveryWriteNativeTests.inc"

@@ -1015,6 +1015,9 @@ struct EcRevisionRetirementRsp : RspBase {
 struct EcTargetRetirementReq : ReqBase {
   SERDE_STRUCT_FIELD(endpoint, EcV2PhysicalEndpoint{});
   SERDE_STRUCT_FIELD(retirementId, Uuid::zero());
+  SERDE_STRUCT_FIELD(mode, EcTargetRetirementMode::Cooperative);
+  SERDE_STRUCT_FIELD(externalBinding, (std::optional<EcHostFenceBinding>{}));
+  SERDE_STRUCT_FIELD(externalEvidence, String{});
 
  public:
   Result<Void> valid() const {
@@ -1023,6 +1026,13 @@ struct EcTargetRetirementReq : ReqBase {
         endpoint.placement.node == flat::NodeId{} || endpoint.placement.chain == storage::ChainId{} ||
         endpoint.placement.target == storage::TargetId{})
       return INVALID("fixed exact target retirement identity is required");
+    if (mode == EcTargetRetirementMode::Cooperative) {
+      if (externalBinding || !externalEvidence.empty()) return INVALID("cooperative retirement cannot import external evidence");
+    } else if (mode == EcTargetRetirementMode::HostExecutionFence) {
+      if (!externalBinding || !externalBinding->valid() ||
+          (!externalEvidence.empty() && externalEvidence.size() != kEcHostFenceCertificateBytes))
+        return INVALID("external retirement requires a fixed provider binding and canonical evidence");
+    } else return INVALID("invalid retirement mode");
     return VALID;
   }
 };
@@ -1033,6 +1043,9 @@ struct EcTargetRetirementRsp : RspBase {
   SERDE_STRUCT_FIELD(stage, EcTargetRetirementStage::Prepared);
   // All-zero while Prepared; immutable first completion digest when Completed.
   SERDE_STRUCT_FIELD(completionDigest, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(mode, EcTargetRetirementMode::Cooperative);
+  SERDE_STRUCT_FIELD(external, (std::optional<EcHostFenceSummary>{}));
+  SERDE_STRUCT_FIELD(externalBinding, (std::optional<EcHostFenceBinding>{}));
 };
 
 // File metadata/range RPCs deliberately have their own disabled-by-default gate.

@@ -48,6 +48,14 @@ CLIENT_MANDATORY = {
     )
 }
 CLIENT_MANDATORY |= {
+    "TestEcExternalFenceCommands." + name for name in (
+        "PreparedBindingDoesNotClaimFencingOrPhysicalRelease",
+        "LostImportReplyQueriesSameIdentityWithoutHiddenRetry",
+        "InvalidEvidenceAndNamespaceNeverDispatch",
+        "WrongIdentityModeOrIncompleteEvidenceNeverConfirms",
+    )
+}
+CLIENT_MANDATORY |= {
     'TestEcNamespaceJournal.' + name for name in (
         'AcceptedAndClosedSessionBindDurableIdentityWithoutChangingOriginal',
         'RejectsUnacceptedSessionPathDriftAndNoncanonicalCodec',
@@ -380,6 +388,9 @@ def main():
         Path(__file__), source / "scripts/ec/test-native-fragments.py", record_path,
         source / "tests/storage/store/TestEcCodec.cc", source / "tests/storage/store/TestEcRmw.cc",
         source / "tests/client/TestEcTargetRetirementCommands.cc",
+        source / "tests/client/TestEcExternalFenceCommands.cc",
+        source / "src/client/cli/admin/EcExternalFenceCommands.cc",
+        source / "src/fbs/meta/EcHostFence.cc",
         source / "tests/client/TestEcRpcFrameSizes.cc", source / "tests/client/TestEcRepairPipeline.cc",
         source / "tests/storage/service/TestEcStageService.cc",
         source / "tests/storage/service/EcHelperTransportNativeTests.inc",

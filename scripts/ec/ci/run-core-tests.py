@@ -76,6 +76,10 @@ TARGET_META_CASES = (
     "TestEcFileTree.RealFdbEightDataRetirementRangeRevalidatesAndFitsSingleBudget",
     "TestEcFileTree.RealFdbRepairTwentyTwoRetirementsFencePublicationAndRevalidateGc",
 )
+EXTERNAL_HOST_FENCE_CASES = (
+    "TestEcHostFenceNative.ProofIdentityReplayAndRestartRemainImmutable",
+    "TestEcHostFenceNative.ClosedUnavailableTargetsReleaseReadAndAbortButNeverPublish",
+)
 FUSE_CASES = (
     "TestEcFuseRead.FlagsAndCopiedIdentityUseActualAuthentication",
     "TestEcFuseRead.WindowBoundsAndZeroEofPreserveReceiptAndOutputLease",
@@ -103,9 +107,10 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     for name in ("source", "build", "fdb-bin-dir", "work"):
         result.add_argument("--" + name, required=True, type=Path)
-    result.add_argument("--profile", choices=("core", "repair", "target-meta", "auth-user", "service-contracts"), default="core",
+    result.add_argument("--profile", choices=("core", "repair", "target-meta", "external-host-fence", "auth-user", "service-contracts"), default="core",
                         help="core: 23 Meta + 15 FUSE; repair: file and flat repair, Direct delivery and recovery fixtures; "
                              "target-meta: 9 retirement catalogue, RPC and evidence cases; "
+                             "external-host-fence: 2 independent-proof and mixed terminal evidence cases; "
                              "auth-user: default and explicit primary GID with MemKV and FDB; "
                              "service-contracts: auth-user plus all Meta dispatch IDs")
     return result
@@ -118,6 +123,8 @@ def selection(profile):
         return REPAIR_CASES, ":".join(REPAIR_CASES), ()
     if profile == "target-meta":
         return TARGET_META_CASES, ":".join(TARGET_META_CASES), ()
+    if profile == "external-host-fence":
+        return EXTERNAL_HOST_FENCE_CASES, ":".join(EXTERNAL_HOST_FENCE_CASES), ()
     if profile == "auth-user":
         return AUTH_USER_CASES, ":".join(AUTH_USER_CASES), ()
     if profile == "service-contracts":

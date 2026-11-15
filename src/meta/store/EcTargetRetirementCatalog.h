@@ -9,10 +9,23 @@ struct EcTargetRetirementCompletion {
   SERDE_STRUCT_FIELD(observation, storage::EcTargetRetirementObservation{});
   SERDE_STRUCT_FIELD(digest, storage::EcSha256{});
 };
+// Distinct persistent record shape/version. Old cooperative readers reject it.
+// The provider public key is pinned at Prepare, before the independent fence.
+struct EcHostFenceRecord {
+  SERDE_STRUCT_FIELD(version, uint16_t(2));
+  SERDE_STRUCT_FIELD(intent, EcTargetRetirementIntent{});
+  SERDE_STRUCT_FIELD(binding, EcHostFenceBinding{});
+  SERDE_STRUCT_FIELD(publicKey, EcHostFencePublicKey{});
+  SERDE_STRUCT_FIELD(certificate, String{});
+  SERDE_STRUCT_FIELD(digest, storage::EcSha256{});
+};
 struct EcTargetRetirementRecord {
   SERDE_STRUCT_FIELD(version, kEcTargetRetirementCatalogVersion);
   SERDE_STRUCT_FIELD(intent, EcTargetRetirementIntent{});
   SERDE_STRUCT_FIELD(completion, (std::optional<EcTargetRetirementCompletion>{}));
+ public:
+  // Local normalized view only; never appended to the original v1 serialization.
+  std::optional<EcHostFenceRecord> hostFence;
 };
 
 // No network, retry, cache or commit: use the caller's single transaction and
@@ -25,6 +38,11 @@ class EcTargetRetirementCatalog {
   static Result<Void> validIntent(const EcTargetRetirementIntent &);
   static CoTryTask<EcTargetRetirementRecord> prepare(kv::IReadWriteTransaction &, const EcTargetRetirementIntent &);
   static CoTryTask<EcTargetRetirementRecord> get(kv::IReadWriteTransaction &, const EcTargetRetirementIntent &);
+  static CoTryTask<EcTargetRetirementRecord> prepareHostFence(kv::IReadWriteTransaction &,
+      const EcTargetRetirementIntent &, const EcHostFenceBinding &, const EcHostFencePublicKey &);
+  static CoTryTask<EcTargetRetirementRecord> recordHostFence(kv::IReadWriteTransaction &,
+      const EcTargetRetirementIntent &, const EcHostFenceBinding &, std::string_view certificate);
+  static Result<EcHostFenceSummary> hostFenceSummary(const EcTargetRetirementRecord &);
   static CoTryTask<EcTargetRetirementRecord> recordCompletion(kv::IReadWriteTransaction &,
                                                             const EcTargetRetirementIntent &,
                                                             const storage::EcTargetRetirementRequest &,

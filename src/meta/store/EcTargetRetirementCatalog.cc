@@ -1,5 +1,6 @@
 #include "meta/store/EcTargetRetirementCatalog.h"
 
+#include <algorithm>
 #include <openssl/evp.h>
 
 #include "common/kv/KeyPrefix.h"
@@ -50,15 +51,49 @@ CoTryTask<Void> save(Tx &txn, std::string key, const T &value) {
 }
 CoTryTask<std::optional<EcTargetRetirementRecord>> loadTarget(Tx &txn, const EcV2PhysicalEndpoint &ep) {
   CO_RETURN_ON_ERROR(endpointValid(ep));
-  auto value = co_await load<EcTargetRetirementRecord>(txn, targetKey(ep));
-  CO_RETURN_ON_ERROR(value);
-  if (*value) {
-    const auto &record = **value;
-    if (record.version != kEcTargetRetirementCatalogVersion || record.intent.endpoint != ep ||
-        !EcTargetRetirementCatalog::validIntent(record.intent))
-      co_return makeError(StatusCode::kDataCorruption, "target retirement identity or version differs");
+  auto raw = co_await txn.get(targetKey(ep));
+  CO_RETURN_ON_ERROR(raw);
+  if (!*raw) co_return std::nullopt;
+  if ((**raw).size() > EcTargetRetirementCatalog::kMaximumRecordBytes)
+    co_return makeError(StatusCode::kDataCorruption);
+  EcTargetRetirementRecord record;
+  if (serde::deserialize(record, **raw) && serde::serialize(record) == **raw && record.version == 1) {
+    if (record.intent.version != 1) co_return makeError(StatusCode::kDataCorruption);
+  } else {
+    EcHostFenceRecord external;
+    if (!serde::deserialize(external, **raw) || serde::serialize(external) != **raw ||
+        external.version != 2 || external.intent.version != 2 || !external.binding.valid() ||
+        std::all_of(external.publicKey.begin(), external.publicKey.end(), [](auto x) { return x == 0; }) ||
+        (external.certificate.empty() != (external.digest == storage::EcSha256{})))
+      co_return makeError(StatusCode::kDataCorruption, "invalid canonical external retirement record");
+    record = {};
+    record.version = 2;
+    record.intent = external.intent;
+    record.hostFence = std::move(external);
   }
-  co_return value;
+  if (record.intent.endpoint != ep || !EcTargetRetirementCatalog::validIntent(record.intent))
+    co_return makeError(StatusCode::kDataCorruption, "target retirement identity or version differs");
+  co_return std::optional<EcTargetRetirementRecord>(std::move(record));
+}
+Result<storage::EcSha256> hostDigest(const EcHostFenceRecord &r) {
+  RETURN_ON_ERROR(EcHostFence::verify(r.certificate, r.intent, r.binding, r.publicKey));
+  std::string bytes("3FSEHC01");
+  bytes += serde::serialize(r.intent);
+  bytes += serde::serialize(r.binding);
+  bytes += serde::serialize(r.publicKey);
+  bytes += r.certificate;
+  storage::EcSha256 out{};
+  unsigned int size = 0;
+  if (EVP_Digest(bytes.data(), bytes.size(), out.data(), &size, EVP_sha256(), nullptr) != 1 || size != out.size())
+    return makeError(StatusCode::kIOError);
+  return out;
+}
+Result<Void> verifyHost(const EcTargetRetirementRecord &r) {
+  if (r.version != 2 || !r.hostFence || r.completion || r.hostFence->certificate.empty())
+    return makeError(StatusCode::kTokenStale, "external target retirement is not complete");
+  CHECK_RESULT(digest, hostDigest(*r.hostFence));
+  if (digest != r.hostFence->digest) return makeError(StatusCode::kDataCorruption);
+  return Void{};
 }
 Result<storage::EcSha256> checkCompletion(const EcTargetRetirementIntent &intent,
                                          const storage::EcTargetRetirementRequest &request,
@@ -100,6 +135,7 @@ Result<storage::EcSha256> checkCompletion(const EcTargetRetirementIntent &intent
   return digest;
 }
 Result<Void> verifyCompleted(const EcTargetRetirementRecord &record, const storage::EcScopeControlKey &key) {
+  if (record.version == 2) return verifyHost(record);
   if (!record.completion) return makeError(StatusCode::kTokenStale, "target retirement is not complete");
   CHECK_RESULT(digest, checkCompletion(record.intent,
                                       record.completion->request,
@@ -113,7 +149,7 @@ Result<Void> verifyCompleted(const EcTargetRetirementRecord &record, const stora
 
 Result<Void> EcTargetRetirementCatalog::validIntent(const EcTargetRetirementIntent &intent) {
   RETURN_ON_ERROR(endpointValid(intent.endpoint));
-  if (intent.version != kEcTargetRetirementCatalogVersion || intent.authority.is_nil() ||
+  if ((intent.version != 1 && intent.version != 2) || intent.authority.is_nil() ||
       intent.retirementId.is_nil() || intent.owner.client.is_nil() || intent.requestId.is_nil() ||
       intent.owner.uid != flat::Uid(0))
     return makeError(StatusCode::kInvalidArg, "invalid root-owned target retirement intent");
@@ -122,6 +158,7 @@ Result<Void> EcTargetRetirementCatalog::validIntent(const EcTargetRetirementInte
 CoTryTask<EcTargetRetirementRecord> EcTargetRetirementCatalog::prepare(Tx &txn,
                                                                      const EcTargetRetirementIntent &intent) {
   CO_RETURN_ON_ERROR(validIntent(intent));
+  if (intent.version != 1) co_return makeError(StatusCode::kInvalidArg);
   auto index = co_await load<EcTargetRetirementIntent>(txn, requestKey(intent));
   CO_RETURN_ON_ERROR(index);
   if (*index && !sameIntent(**index, intent))
@@ -140,6 +177,61 @@ CoTryTask<EcTargetRetirementRecord> EcTargetRetirementCatalog::prepare(Tx &txn,
   CO_RETURN_ON_ERROR(co_await save(txn, targetKey(intent.endpoint), record));
   CO_RETURN_ON_ERROR(co_await save(txn, requestKey(intent), intent));
   co_return record;
+}
+CoTryTask<EcTargetRetirementRecord> EcTargetRetirementCatalog::prepareHostFence(
+    Tx &txn, const EcTargetRetirementIntent &intent, const EcHostFenceBinding &binding,
+    const EcHostFencePublicKey &publicKey) {
+  CO_RETURN_ON_ERROR(validIntent(intent));
+  if (intent.version != 2 || !binding.valid() ||
+      std::all_of(publicKey.begin(), publicKey.end(), [](auto x) { return x == 0; }))
+    co_return makeError(StatusCode::kInvalidArg);
+  auto index = co_await load<EcTargetRetirementIntent>(txn, requestKey(intent));
+  CO_RETURN_ON_ERROR(index);
+  if (*index && !sameIntent(**index, intent)) co_return makeError(StatusCode::kTokenMismatch);
+  auto old = co_await loadTarget(txn, intent.endpoint);
+  CO_RETURN_ON_ERROR(old);
+  if (*old) {
+    const auto &r = **old;
+    if (!sameIntent(r.intent, intent) || !r.hostFence ||
+        serde::serialize(r.hostFence->binding) != serde::serialize(binding) || r.hostFence->publicKey != publicKey)
+      co_return makeError(StatusCode::kTokenMismatch, "external target is bound to another fixed intent/provider");
+    if (!*index) co_return makeError(StatusCode::kDataCorruption);
+    co_return r;
+  }
+  if (*index) co_return makeError(StatusCode::kDataCorruption);
+  EcHostFenceRecord external;
+  external.intent = intent; external.binding = binding; external.publicKey = publicKey;
+  CO_RETURN_ON_ERROR(co_await save(txn, targetKey(intent.endpoint), external));
+  CO_RETURN_ON_ERROR(co_await save(txn, requestKey(intent), intent));
+  EcTargetRetirementRecord result;
+  result.version = 2; result.intent = intent; result.hostFence = std::move(external);
+  co_return result;
+}
+CoTryTask<EcTargetRetirementRecord> EcTargetRetirementCatalog::recordHostFence(
+    Tx &txn, const EcTargetRetirementIntent &intent, const EcHostFenceBinding &binding,
+    std::string_view certificate) {
+  auto record = co_await get(txn, intent);
+  CO_RETURN_ON_ERROR(record);
+  if (!record->hostFence || serde::serialize(record->hostFence->binding) != serde::serialize(binding))
+    co_return makeError(StatusCode::kTokenMismatch);
+  auto &r = *record->hostFence;
+  CO_RETURN_ON_ERROR(EcHostFence::verify(certificate, intent, binding, r.publicKey));
+  if (!r.certificate.empty()) {
+    CO_RETURN_ON_ERROR(verifyHost(*record));
+    if (r.certificate != certificate) co_return makeError(StatusCode::kTokenMismatch, "first fence evidence is immutable");
+    co_return std::move(*record);
+  }
+  r.certificate = std::string(certificate);
+  auto digest = hostDigest(r);
+  CO_RETURN_ON_ERROR(digest);
+  r.digest = *digest;
+  CO_RETURN_ON_ERROR(co_await save(txn, targetKey(intent.endpoint), r));
+  co_return std::move(*record);
+}
+Result<EcHostFenceSummary> EcTargetRetirementCatalog::hostFenceSummary(const EcTargetRetirementRecord &record) {
+  RETURN_ON_ERROR(verifyHost(record));
+  const auto &r = *record.hostFence;
+  return EcHostFence::verify(r.certificate, r.intent, r.binding, r.publicKey);
 }
 CoTryTask<EcTargetRetirementRecord> EcTargetRetirementCatalog::get(Tx &txn,
                                                                  const EcTargetRetirementIntent &intent) {
@@ -164,6 +256,7 @@ CoTryTask<EcTargetRetirementRecord> EcTargetRetirementCatalog::recordCompletion(
     const storage::EcScopeControlKey &key) {
   auto record = co_await get(txn, intent);
   CO_RETURN_ON_ERROR(record);
+  if (record->version != 1 || record->hostFence) co_return makeError(StatusCode::kTokenMismatch);
   auto digest = checkCompletion(intent, request, observation, &key);
   CO_RETURN_ON_ERROR(digest);
   if (record->completion) {
@@ -191,9 +284,10 @@ CoTryTask<std::optional<EcTargetRetirementRef>> EcTargetRetirementCatalog::findC
   if (!*record) co_return std::nullopt;
   if ((**record).intent.authority != authority)
     co_return makeError(StatusCode::kTokenMismatch, "target retirement authority differs");
-  if (!(**record).completion) co_return std::nullopt;
+  if (!(**record).completion && (!(**record).hostFence || (**record).hostFence->certificate.empty())) co_return std::nullopt;
   CO_RETURN_ON_ERROR(verifyCompleted(**record, key));
-  co_return std::optional<EcTargetRetirementRef>{{(**record).intent.retirementId, (**record).completion->digest}};
+  co_return std::optional<EcTargetRetirementRef>{{(**record).intent.retirementId,
+      (**record).hostFence ? (**record).hostFence->digest : (**record).completion->digest}};
 }
 CoTryTask<Void> EcTargetRetirementCatalog::verifyStoredReference(Tx &txn,
                                                                const EcV2PhysicalEndpoint &endpoint,
@@ -202,11 +296,16 @@ CoTryTask<Void> EcTargetRetirementCatalog::verifyStoredReference(Tx &txn,
   if (authority.is_nil() || reference.retirementId.is_nil()) co_return makeError(StatusCode::kInvalidArg);
   auto record = co_await loadTarget(txn, endpoint);
   CO_RETURN_ON_ERROR(record);
-  if (!*record || !(**record).completion)
+  if (!*record || (!(**record).completion && !(**record).hostFence))
     co_return makeError(StatusCode::kDataCorruption, "referenced target retirement completion is missing");
   const auto &value = **record;
   if (value.intent.authority != authority || value.intent.retirementId != reference.retirementId)
     co_return makeError(StatusCode::kTokenMismatch, "historical retirement identity differs");
+  if (value.hostFence) {
+    CO_RETURN_ON_ERROR(verifyHost(value));
+    if (value.hostFence->digest != reference.completionDigest) co_return makeError(StatusCode::kTokenMismatch);
+    co_return Void{};
+  }
   auto digest = checkCompletion(value.intent, value.completion->request, value.completion->observation, nullptr);
   CO_RETURN_ON_ERROR(digest);
   if (*digest != value.completion->digest || *digest != reference.completionDigest)
@@ -230,6 +329,10 @@ CoTryTask<EcTargetRetirementCompletion> EcTargetRetirementCatalog::getVerifiedCo
     const EcTargetRetirementRef &reference, const storage::EcScopeControlKey &key) {
   auto record = co_await loadTarget(txn, endpoint);
   CO_RETURN_ON_ERROR(record);
+  // A host fence is not a local disk retirement witness. Inaccessible old
+  // allocations cannot use this API to manufacture Collected/Absent receipts.
+  if (*record && (**record).hostFence) co_return makeError(StatusCode::kNotImplemented,
+      "host-fenced inaccessible capacity is not a Storage absence witness");
   if (!*record || !(**record).completion)
     co_return makeError(StatusCode::kDataCorruption, "referenced target retirement completion is missing");
   const auto &r = **record;

@@ -6,6 +6,7 @@
 #include <folly/ScopeGuard.h>
 #include <limits>
 
+#include "common/utils/SerDeser.h"
 #include "meta/store/EcFileTreeTxnBudget.h"
 #include "meta/store/EcTargetRetirementCatalog.h"
 
@@ -14,12 +15,22 @@ namespace {
 uint64_t wallSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
-EcTargetRetirementRsp response(const EcTargetRetirementRecord &record) {
+Result<EcTargetRetirementRsp> response(const EcTargetRetirementRecord &record) {
   EcTargetRetirementRsp out;
   out.intent = record.intent;
   if (record.completion) {
     out.stage = EcTargetRetirementStage::Completed;
     out.completionDigest = record.completion->digest;
+  }
+  if (record.hostFence) {
+    out.mode = EcTargetRetirementMode::HostExecutionFence;
+    out.externalBinding = record.hostFence->binding;
+    if (!record.hostFence->certificate.empty()) {
+      CHECK_RESULT(summary, EcTargetRetirementCatalog::hostFenceSummary(record));
+      out.stage = EcTargetRetirementStage::HostExecutionFenced;
+      out.completionDigest = record.hostFence->digest;
+      out.external = summary;
+    }
   }
   return out;
 }
@@ -31,6 +42,8 @@ struct EcTargetRetirementCoordinator::State {
   std::shared_ptr<storage::client::StorageClient> client;
   std::shared_ptr<const storage::EcScopeControlKey> key;
   Uuid authority;
+  Uuid hostProvider;
+  std::optional<EcHostFencePublicKey> hostPublicKey;
   std::atomic<bool> closing{false};
   std::atomic<uint32_t> active{0};
   bool enter() {
@@ -65,6 +78,13 @@ EcTargetRetirementCoordinator::EcTargetRetirementCoordinator(
     state->key = v2.sharedControlKey();
     state->authority = v2.authority();
     if (!state->key || state->authority.is_nil()) return makeError(StatusCode::kInvalidConfig);
+    if (config.enable_ec_host_fence()) {
+      CHECK_RESULT(provider, Uuid::fromHexString(config.ec_host_fence_provider_id()));
+      if (provider.is_nil()) return makeError(StatusCode::kInvalidConfig);
+      CHECK_RESULT(publicKey, EcHostFence::loadPublicKey(config.ec_host_fence_public_key_file().string()));
+      state->hostProvider = provider;
+      state->hostPublicKey = publicKey;
+    }
     state_ = std::move(state);
     return Void{};
   };
@@ -108,6 +128,45 @@ CoTryTask<EcTargetRetirementRsp> EcTargetRetirementCoordinator::executeOwned(
     intent.authority = state->authority;
     intent.owner = {req.user.uid, req.client.uuid};
     intent.requestId = req.uuid;
+    if (req.mode == EcTargetRetirementMode::HostExecutionFence) {
+      if (!state->config.enable_ec_host_fence() || !state->hostPublicKey)
+        co_return makeError(StatusCode::kNotImplemented, "independent host fencing is not configured");
+      if (!req.externalBinding || req.externalBinding->providerId != state->hostProvider ||
+          (action == storage::EcTargetRetirementAction::Query && !req.externalEvidence.empty()))
+        co_return makeError(StatusCode::kTokenMismatch);
+      intent.version = 2;
+      auto raw = state->engine->createReadWriteTransaction();
+      if (!raw) co_return makeError(StatusCode::kKVStoreNotFound);
+      EcFileTreeTxnBudget txn(*raw);
+      // Query/import cannot silently manufacture the required earlier Prepare.
+      auto record = action == storage::EcTargetRetirementAction::Prepare && req.externalEvidence.empty()
+          ? co_await EcTargetRetirementCatalog::prepareHostFence(txn, intent, *req.externalBinding, *state->hostPublicKey)
+          : co_await EcTargetRetirementCatalog::get(txn, intent);
+      CO_RETURN_ON_ERROR(record);
+      if (!record->hostFence || serde::serialize(record->hostFence->binding) != serde::serialize(*req.externalBinding))
+        co_return makeError(StatusCode::kTokenMismatch);
+      if (!record->hostFence->certificate.empty()) {
+        CO_RETURN_ON_ERROR(EcTargetRetirementCatalog::hostFenceSummary(*record));
+        if (!req.externalEvidence.empty() && req.externalEvidence != record->hostFence->certificate)
+          co_return makeError(StatusCode::kTokenMismatch, "first external completion cannot be replaced");
+        co_return response(*record);
+      }
+      if (action == storage::EcTargetRetirementAction::Query) co_return response(*record);
+      CO_RETURN_ON_ERROR(state->ready(deadline));
+      if (state->config.readonly()) co_return makeError(StatusCode::kReadOnlyMode);
+      if (!req.externalEvidence.empty()) {
+        if (record->hostFence->publicKey != *state->hostPublicKey) co_return makeError(StatusCode::kTokenMismatch);
+        auto completed = co_await EcTargetRetirementCatalog::recordHostFence(
+            txn, intent, *req.externalBinding, req.externalEvidence);
+        CO_RETURN_ON_ERROR(completed);
+        record = std::move(completed);
+      }
+      commitStarted = true;
+      auto committed = co_await txn.commit();
+      CO_RETURN_ON_ERROR(committed);
+      // No Storage call, no synthetic scope ACK, no automatic provider request.
+      co_return response(*record);
+    }
     EcTargetRetirementRecord accepted;
     {
       auto raw = state->engine->createReadWriteTransaction();

@@ -80,6 +80,9 @@ struct Config : ConfigBase<Config> {
   CONFIG_ITEM(enable_ec_exact_gc, false);
   CONFIG_ITEM(enable_ec_revision_retirement, false);
   CONFIG_ITEM(enable_ec_target_retirement, false);
+  CONFIG_ITEM(enable_ec_host_fence, false);
+  CONFIG_ITEM(ec_host_fence_provider_id, std::string{});
+  CONFIG_ITEM(ec_host_fence_public_key_file, Path{});
   // Bounded file-range metadata only; not POSIX file lifecycle support.
   CONFIG_ITEM(enable_ec_file_ranges, false);
   // Independent trusted Storage RMW, disabled unless explicitly configured.

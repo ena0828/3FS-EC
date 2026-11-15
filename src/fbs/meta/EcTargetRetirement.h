@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fbs/meta/EcV2.h"
+#include "fbs/meta/EcHostFence.h"
 #include "fbs/storage/EcTargetRetirementControl.h"
 
 namespace hf3fs::meta {
@@ -24,5 +25,6 @@ struct EcTargetRetirementIntent {
   SERDE_STRUCT_FIELD(requestId, Uuid::zero());
 };
 
-enum class EcTargetRetirementStage : uint8_t { Prepared = 1, Completed = 2 };
+enum class EcTargetRetirementMode : uint8_t { Cooperative = 1, HostExecutionFence = 2 };
+enum class EcTargetRetirementStage : uint8_t { Prepared = 1, Completed = 2, HostExecutionFenced = 3 };
 }  // namespace hf3fs::meta
