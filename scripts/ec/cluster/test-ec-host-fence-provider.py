@@ -251,6 +251,41 @@ class HostFenceProvider(unittest.TestCase):
                     kernel.trusted('/fixed-role', role_uid=23456)
 
     def test_actual_probe_parsers_reject_wrong_process_and_instance(self):
+        # Exercise the real account gate, including the root-run sudo 1.9 response
+        # observed on Ubuntu: returncode 0 with a complete negative permission list.
+        user = SimpleNamespace(pw_name='ecf20111', pw_uid=20111, pw_gid=20111,
+                               pw_shell='/usr/sbin/nologin')
+        group = SimpleNamespace(gr_gid=20111, gr_mem=[])
+        pwd = SimpleNamespace(getpwuid=lambda value: user, getpwall=lambda: [user])
+        grp = SimpleNamespace(getgrall=lambda: [group], getgrgid=lambda value: group)
+        denied = b'User ecf20111 is not allowed to run sudo on 10-60-37-244.\n'
+        kernel = object.__new__(m.Linux)
+        with mock.patch.dict('sys.modules', {'pwd': pwd, 'grp': grp}), \
+             mock.patch.object(m.socket, 'gethostname', return_value='10-60-37-244'), \
+             mock.patch.object(m.subprocess, 'run') as run, \
+             mock.patch.dict(m.os.environ, {'LC_ALL': 'non-C', 'LANG': 'non-C', 'LANGUAGE': 'non-C'}):
+            for code in (0, 1):
+                with self.subTest(no_permissions_returncode=code):
+                    run.reset_mock()
+                    run.return_value = SimpleNamespace(returncode=code, stdout=denied, stderr=b'')
+                    kernel.account(20111, 20111)
+                    run.assert_called_once_with(['/usr/bin/sudo', '-n', '-l', '-U', 'ecf20111'],
+                                                capture_output=True,
+                                                env=dict(m.os.environ, LC_ALL='C', LANG='C', LANGUAGE='C'))
+                    self.assertEqual(m.os.environ['LC_ALL'], 'non-C')
+            permissions = b'User ecf20111 may run the following commands on 10-60-37-244:\n    (ALL) ALL\n'
+            for code, stdout, stderr in [
+                (0, permissions, b''), (1, permissions, b''), (1, b'', b''),
+                (1, b'', b'sudo: policy plugin failed\n'), (2, denied, b''), (-9, denied, b''),
+                (0, denied, b'sudo: warning\n'), (0, b'warning\n' + denied, b''),
+                (0, denied + b'\n', b''), (0, denied + permissions, b''),
+                (0, denied.replace(b'ecf20111', b'another-user'), b''),
+                (0, denied.replace(b'10-60-37-244', b'other-host'), b''),
+                (0, denied.rstrip(b'\n'), b''), (0, denied.replace(b'\n', b'\r\n'), b''),
+            ]:
+                with self.subTest(code=code, stdout=stdout, stderr=stderr), self.assertRaises(ValueError):
+                    run.return_value = SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
+                    kernel.account(20111, 20111)
         line = '10001 STORAGE HEARTBEAT_CONNECTED host-a 42 [] 2026-11-15 1 v1\n'
         self.assertEqual(m.routing_row(line, 10001, 42, 'host-a')[-1], '42')
         for text in (line + line, line.replace(' 42 ', ' 43 '),

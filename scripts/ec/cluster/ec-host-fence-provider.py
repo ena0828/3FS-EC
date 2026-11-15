@@ -223,8 +223,14 @@ class Linux:
                 'Supplementary groups are forbidden')
         require(set(grp.getgrgid(gid).gr_mem) <= {user.pw_name} and
                 all(p.pw_uid == uid for p in pwd.getpwall() if p.pw_gid == gid), 'Group must be exclusive')
-        check = subprocess.run(['/usr/bin/sudo', '-n', '-l', '-U', user.pw_name], capture_output=True)
-        require(check.returncode == 1, 'Account must have no sudo permissions')
+        sudo_env = dict(os.environ, LC_ALL='C', LANG='C', LANGUAGE='C')
+        check = subprocess.run(['/usr/bin/sudo', '-n', '-l', '-U', user.pw_name],
+                               capture_output=True, env=sudo_env)
+        denied = (f'User {user.pw_name} is not allowed to run sudo on {socket.gethostname()}.\n').encode('utf-8')
+        # sudo versions differ on the exit code of a complete negative listing.
+        # Neither a failure code alone nor a denied single command proves this.
+        require(check.returncode in (0, 1) and check.stdout == denied and check.stderr == b'',
+                'Exact complete no-sudo-permissions response required')
 
     def uid_processes(self, uid):
         found = []
