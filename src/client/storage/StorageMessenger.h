@@ -9,6 +9,7 @@
 #include "common/utils/Coroutine.h"
 #include "common/utils/Result.h"
 #include "fbs/storage/Common.h"
+#include "fbs/storage/ECShard.h"
 
 namespace hf3fs::storage::client {
 
@@ -89,6 +90,20 @@ class StorageMessenger {
                                                         const GetAllChunkMetadataReq &request,
                                                         const net::UserRequestOptions *options = nullptr,
                                                         serde::Timestamp *timestamp = nullptr);
+
+  // These calls snapshot address/options and own request data immediately,
+  // before the returned lazy Task starts. Rsp owns its read payload. Check both
+  // Result<Rsp> and rsp.succeeded(): transport success is not EC success.
+  // This Messenger and optional timestamp output must outlive the awaited call.
+  CoTryTask<WriteECShardRsp> writeECShard(const net::Address &address,
+                                          WriteECShardReq request,
+                                          const net::UserRequestOptions *options = nullptr,
+                                          serde::Timestamp *timestamp = nullptr);
+
+  CoTryTask<ReadECShardRsp> readECShard(const net::Address &address,
+                                        ReadECShardReq request,
+                                        const net::UserRequestOptions *options = nullptr,
+                                        serde::Timestamp *timestamp = nullptr);
 
  private:
   hf3fs::net::Client client_;

@@ -80,13 +80,57 @@ StorageTarget::StorageTarget(const Config &config,
       chunkStore_(config_, globalFileStore) {}
 
 StorageTarget::~StorageTarget() {
+  ecClosing_.store(true, std::memory_order_release);
+  std::lock_guard guard(ecLifecycleMutex_);
   if (released_) {
     return;
   }
   auto result = sync();
+  ecShardStore_.reset();
   if (UNLIKELY(!result)) {
     XLOGF(CRITICAL, "storage target sync meta failed {}, error: {}", targetConfig_.path, result.error());
   }
+}
+
+Result<Void> StorageTarget::release() {
+  // Close admission before waiting for an operation already inside the lock.
+  ecClosing_.store(true, std::memory_order_release);
+  std::lock_guard guard(ecLifecycleMutex_);
+  released_ = true;
+  // Preserve the original CRAQ sync result and repeated-release sync behavior.
+  auto result = sync();
+  ecShardStore_.reset();  // Also close when sync returns an error Result.
+  return result;
+}
+
+Result<ec::StoreResult<ec::IdempotentWriteDisposition>> StorageTarget::writeECShard(
+    const erasure::ECShardKey &key, uint64_t dataVersion,
+    uint32_t validBytes, std::span<const uint8_t> payload,
+    uint32_t encodingScheme, uint32_t formatVersion) {
+  if (ecClosing_.load(std::memory_order_acquire))
+    return makeError(StorageCode::kTargetOffline, "EC target is closing");
+  std::lock_guard guard(ecLifecycleMutex_);
+  if (ecClosing_.load(std::memory_order_acquire))
+    return makeError(StorageCode::kTargetOffline, "EC target is closing");
+  if (!ecShardStore_)
+    return makeError(StorageCode::kStorageInitFailed, "EC shard store is unavailable");
+  if (ecOperationHookForTest_) ecOperationHookForTest_();
+  return ecShardStore_->writeIdempotent(key, dataVersion, validBytes, payload, encodingScheme, formatVersion);
+}
+
+Result<ec::StoreResult<ec::ShardRecord>> StorageTarget::readECShard(
+    const erasure::ECShardKey &key, uint64_t dataVersion,
+    uint32_t expectedScheme, uint32_t expectedFormat) {
+  if (ecClosing_.load(std::memory_order_acquire))
+    return makeError(StorageCode::kTargetOffline, "EC target is closing");
+  std::lock_guard guard(ecLifecycleMutex_);
+  if (ecClosing_.load(std::memory_order_acquire))
+    return makeError(StorageCode::kTargetOffline, "EC target is closing");
+  if (!ecShardStore_)
+    return makeError(StorageCode::kStorageInitFailed, "EC shard store is unavailable");
+  if (ecOperationHookForTest_) ecOperationHookForTest_();
+  // ShardRecord owns its payload vector; no database views escape the lock.
+  return ecShardStore_->read(key, dataVersion, expectedScheme, expectedFormat);
 }
 
 Result<Void> StorageTarget::openEC(bool create) {

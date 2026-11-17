@@ -21,10 +21,58 @@
 namespace hf3fs::storage {
 
 using namespace std::chrono_literals;
+namespace {
+
+// Read the persisted identity before selecting EC policy or opening any store.
+// A numeric directory name alone is not an authority for TargetId.
+Result<PhysicalConfig> validatedPhysicalConfig(const Path &path) {
+  PhysicalConfig physical;
+  RETURN_AND_LOG_ON_ERROR(serde::fromTomlFile(physical, path / kPhysicalConfigFileName));
+  if (physical.path != path ||
+      path.filename().string() != std::to_string(physical.target_id)) {
+    return makeError(StorageCode::kStorageInitFailed, "Target physical identity/path mismatch");
+  }
+  return physical;
+}
+
+Result<Void> requireExistingEC(const Path &path, uint64_t targetId) {
+  boost::system::error_code error;
+  const auto db = path / fmt::format("ec_shards_{}", targetId);
+  if (!boost::filesystem::is_directory(db, error) || error)
+    return makeError(StorageCode::kStorageInitFailed, "Existing target has no EC database");
+  return Void{};
+}
+
+// create(...allowExisting...) must load, never create a replacement EC DB.
+Result<Void> preflightExistingEC(const Path &path, uint64_t id, std::optional<uint32_t> fileCount,
+                                 std::optional<uint32_t> chainId = std::nullopt) {
+  if (!boost::filesystem::exists(path / kPhysicalConfigFileName)) {
+    if (boost::filesystem::exists(path) && !boost::filesystem::is_empty(path))
+      return makeError(StorageCode::kStorageInitFailed, "Nonempty target directory lacks physical identity");
+    return Void{};
+  }
+  auto physical = validatedPhysicalConfig(path);
+  RETURN_AND_LOG_ON_ERROR(physical);
+  if (physical->target_id != id || (fileCount && physical->physical_file_count != *fileCount) ||
+      (chainId && physical->chain_id != *chainId))
+    return makeError(StorageCode::kStorageInitFailed, "Existing EC target request/config mismatch");
+  return requireExistingEC(path, id);
+}
+
+}  // namespace
 
 StorageTargets::~StorageTargets() { void(); }
 
+Result<Void> StorageTargets::validateECPolicy() const {
+  const auto &ids = config_.ec_target_ids();
+  const std::set<std::string> current(ids.begin(), ids.end());
+  if (current.contains("0") || current.size() != ids.size() || current != ecTargetIds_)
+    return makeError(StorageCode::kStorageInitFailed, "EC allowlist changed/invalid; restart required");
+  return Void{};
+}
+
 Result<Void> StorageTargets::init(CPUExecutorGroup &executor) {
+  RETURN_AND_LOG_ON_ERROR(validateECPolicy());
   auto diskInfoResult = SysResource::scanDiskInfo();
   RETURN_AND_LOG_ON_ERROR(diskInfoResult);
   std::unordered_map<uint32_t, std::string> deviceIdToManufacturer;
@@ -74,6 +122,11 @@ Result<Void> StorageTargets::init(CPUExecutorGroup &executor) {
 }
 
 Result<Void> StorageTargets::create(const CreateConfig &createConfig) {
+  RETURN_AND_LOG_ON_ERROR(validateECPolicy());
+  const auto &ids = createConfig.target_ids();
+  const std::set<uint64_t> unique(ids.begin(), ids.end());
+  if (unique.size() != ids.size())
+    return makeError(StorageCode::kStorageInitFailed, "Invalid/duplicate target ids");
   CPUExecutorGroup executor(1, "Creator");
   RETURN_AND_LOG_ON_ERROR(init(executor));
   auto targetPaths = config_.target_paths();
@@ -101,10 +154,16 @@ Result<Void> StorageTargets::create(const CreateConfig &createConfig) {
   size_t idx = 0;
   for (auto &targetId : createConfig.target_ids()) {
     auto diskIndex = idx / targetNumPerPath;
+    const bool enableEC = ecTargetIds_.contains(std::to_string(targetId));
+    if (enableEC) {
+      RETURN_AND_LOG_ON_ERROR(preflightExistingEC(targetPaths[diskIndex] / std::to_string(targetId),
+                                                 targetId, createConfig.physical_file_count()));
+    }
     auto storageTarget = StorageTarget::enable_shared_from_this::create(config_.storage_target(),
                                                                         globalFileStore_,
                                                                         diskIndex,
-                                                                        &*engines_[diskIndex]);
+                                                                        &*engines_[diskIndex],
+                                                                        enableEC);
     PhysicalConfig targetConfig;
     targetConfig.path = targetPaths[diskIndex] / std::to_string(targetId);
     targetConfig.target_id = targetId;
@@ -121,6 +180,7 @@ Result<Void> StorageTargets::create(const CreateConfig &createConfig) {
 }
 
 Result<Void> StorageTargets::create(const CreateTargetReq &req) {
+  RETURN_AND_LOG_ON_ERROR(validateECPolicy());
   if (req.diskIndex >= config_.target_paths().size()) {
     auto msg = fmt::format("disk index exceed {} >= {}", req.diskIndex, config_.target_paths().size());
     XLOG(ERR, msg);
@@ -136,6 +196,14 @@ Result<Void> StorageTargets::create(const CreateTargetReq &req) {
   auto lock = targetLocks_.lock(baton, fmt::to_string(req.chainId));
   if (!lock.locked()) {
     folly::coro::blockingWait(lock.lock());
+  }
+  const bool enableEC = ecTargetIds_.contains(std::to_string(req.targetId.toUnderType()));
+  if (enableEC) {
+    RETURN_AND_LOG_ON_ERROR(preflightExistingEC(
+        config_.target_paths()[req.diskIndex] / std::to_string(req.targetId),
+        req.targetId.toUnderType(),
+        req.addChunkSize ? std::nullopt : std::optional<uint32_t>{req.physicalFileCount},
+        req.chainId.toUnderType()));
   }
   if (auto existingTarget = targetMap_.snapshot()->getByChainId(VersionedChainId{req.chainId, {}}, true)) {
     auto existingTargetId = (*existingTarget)->targetId;
@@ -175,7 +243,8 @@ Result<Void> StorageTargets::create(const CreateTargetReq &req) {
   auto storageTarget = StorageTarget::enable_shared_from_this::create(config_.storage_target(),
                                                                       globalFileStore_,
                                                                       req.diskIndex,
-                                                                      &*engines_[req.diskIndex]);
+                                                                      &*engines_[req.diskIndex],
+                                                                      enableEC);
   PhysicalConfig targetConfig;
   auto targetPath = config_.target_paths()[req.diskIndex] / std::to_string(req.targetId);
   targetConfig.path = targetPath;
@@ -222,6 +291,7 @@ Result<Void> StorageTargets::load(CPUExecutorGroup &executor) {
 
 // load a target.
 Result<Void> StorageTargets::loadTarget(const Path &targetPath) {
+  RETURN_AND_LOG_ON_ERROR(validateECPolicy());
   auto diskPath = targetPath.parent_path();
   if (UNLIKELY(!pathToDiskIndex_.contains(diskPath))) {
     auto msg = fmt::format("Target path ({}) not belongs to any of disk paths", targetPath);
@@ -229,14 +299,21 @@ Result<Void> StorageTargets::loadTarget(const Path &targetPath) {
     return makeError(StorageCode::kStorageInitFailed, std::move(msg));
   }
 
-  auto diskIndex = pathToDiskIndex_[diskPath];
+  auto physical = validatedPhysicalConfig(targetPath);
+  RETURN_AND_LOG_ON_ERROR(physical);
+  const bool enableEC = ecTargetIds_.contains(std::to_string(physical->target_id));
+  if (enableEC) RETURN_AND_LOG_ON_ERROR(requireExistingEC(targetPath, physical->target_id));
+  auto diskIndex = pathToDiskIndex_.at(diskPath);
   auto storageTarget = StorageTarget::enable_shared_from_this::create(config_.storage_target(),
                                                                       globalFileStore_,
                                                                       diskIndex,
-                                                                      &*engines_[diskIndex]);
+                                                                      &*engines_[diskIndex],
+                                                                      enableEC);
   RETURN_AND_LOG_ON_ERROR(storageTarget->load(targetPath));
   XLOGF(INFO, "Load storage target {} at {}", storageTarget->targetId(), targetPath.string());
   auto targetId = storageTarget->targetId();
+  if (targetId.toUnderType() != physical->target_id)
+    return makeError(StorageCode::kStorageInitFailed, "Target identity changed while loading");
   if (UNLIKELY(targetPath.filename().string() != fmt::format("{}", targetId.toUnderType()))) {
     auto msg = fmt::format("Target id {} and path {} mismatch!", targetId, targetPath);
     XLOG(ERR, msg);

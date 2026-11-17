@@ -99,6 +99,16 @@ class StorageService : public serde::ServiceWrapper<StorageService, storage::Sto
     return storageOperator_.getAllChunkMetadata(req);
   }
 
+  CoTryTask<WriteECShardRsp> writeECShard(serde::CallContext &ctx, const WriteECShardReq &req) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.writeECShard(req);
+  }
+
+  CoTryTask<ReadECShardRsp> readECShard(serde::CallContext &ctx, const ReadECShardReq &req) {
+    reportDefaultQueueLatency(ctx);
+    return storageOperator_.readECShard(req);
+  }
+
  private:
   void reportReadQueueLatency(serde::CallContext &ctx);
   void reportUpdateQueueLatency(serde::CallContext &ctx);

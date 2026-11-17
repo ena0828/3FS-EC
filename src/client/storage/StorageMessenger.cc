@@ -1,6 +1,7 @@
 #include "StorageMessenger.h"
 
 #include <boost/core/ignore_unused.hpp>
+#include <optional>
 
 #include "common/serde/ClientContext.h"
 #include "common/serde/Service.h"
@@ -217,6 +218,46 @@ CoTryTask<GetAllChunkMetadataRsp> StorageMessenger::getAllChunkMetadata(const hf
       address,
       request,
       options,
+      timestamp);
+}
+
+// Coroutine parameters are values in the lazy Task frame. The public EC
+// entry points below are deliberately ordinary functions, so no references to
+// their address/request/options parameters escape the initial call.
+template <typename Req, typename Rsp, auto rpcMethod>
+CoTryTask<Rsp> callOwnedECShardRpc(net::Client &client,
+                                   net::Address address,
+                                   Req request,
+                                   std::optional<net::UserRequestOptions> options,
+                                   serde::Timestamp *timestamp) {
+  co_return co_await callSerdeRpcMethod<Req, Rsp, rpcMethod>(client,
+                                                             address,
+                                                             request,
+                                                             options ? &*options : nullptr,
+                                                             timestamp);
+}
+
+CoTryTask<WriteECShardRsp> StorageMessenger::writeECShard(const net::Address &address,
+                                                          WriteECShardReq request,
+                                                          const net::UserRequestOptions *options,
+                                                          serde::Timestamp *timestamp) {
+  return callOwnedECShardRpc<WriteECShardReq, WriteECShardRsp, StorageSerde<>::writeECShard<serde::ClientContext>>(
+      client_,
+      address,
+      std::move(request),
+      options ? std::optional<net::UserRequestOptions>(*options) : std::nullopt,
+      timestamp);
+}
+
+CoTryTask<ReadECShardRsp> StorageMessenger::readECShard(const net::Address &address,
+                                                        ReadECShardReq request,
+                                                        const net::UserRequestOptions *options,
+                                                        serde::Timestamp *timestamp) {
+  return callOwnedECShardRpc<ReadECShardReq, ReadECShardRsp, StorageSerde<>::readECShard<serde::ClientContext>>(
+      client_,
+      address,
+      std::move(request),
+      options ? std::optional<net::UserRequestOptions>(*options) : std::nullopt,
       timestamp);
 }
 

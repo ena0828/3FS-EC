@@ -1,6 +1,9 @@
 #pragma once
 
 #include <folly/concurrency/AtomicSharedPtr.h>
+#include <mutex>
+
+#include "storage/ec/ECShardWorker.h"
 
 #include "client/mgmtd/MgmtdClientForServer.h"
 #include "client/storage/StorageMessenger.h"
@@ -20,6 +23,10 @@
 #include "storage/worker/DumpWorker.h"
 #include "storage/worker/PunchHoleWorker.h"
 #include "storage/worker/SyncMetaKvWorker.h"
+
+namespace hf3fs::test {
+struct ComponentsECTestHelper;
+}
 
 namespace hf3fs::storage {
 
@@ -42,6 +49,7 @@ struct Components {
       c.thread_pool().set_num_proc_threads(32);
     });
 
+    CONFIG_ITEM(enable_ec_shard_rpc, false);  // experimental, startup-only; separate from Target allowlist
     CONFIG_OBJ(client, net::Client::Config);
     CONFIG_OBJ(mgmtd, hf3fs::client::MgmtdClientForServer::Config);
     CONFIG_OBJ(targets, StorageTargets::Config);
@@ -66,6 +74,13 @@ struct Components {
   };
 
   Components(const Config &config);
+  ~Components();
+
+  // No check-then-submit API: gate and Worker.enqueue share this critical section.
+  // Rejected Jobs have no completion obligation; accepted Jobs own their data.
+  Result<Void> submitECShard(std::shared_ptr<ec::ECShardJob> job);
+  // beforeStop only: no joins, I/O, or waiting for accepted Jobs here.
+  void closeECShardAdmission();
 
   Result<Void> start(const flat::AppInfo &appInfo, net::ThreadPoolGroup &tpg);
   Result<Void> waitRoutingInfo(const flat::AppInfo &appInfo, folly::CPUThreadPoolExecutor &executor);
@@ -119,6 +134,26 @@ struct Components {
   StorageOperator storageOperator;
   ReliableUpdate reliableUpdate;
   std::atomic<uint32_t> triggerHeartbeatFlag{};
+
+ private:
+  friend struct hf3fs::test::ComponentsECTestHelper;
+  // Optional candidate is private, for controlled startup-failure/test fences.
+  Result<Void> startECShardWorker(std::shared_ptr<ec::ECShardWorker> candidate = {});
+  Result<Void> openECShardAdmission();
+  void stopECShardWorker();
+
+  const bool ecShardRpcEnabled_;
+  // Lock order: lifecycle control -> admission -> Worker queue; submit only
+  // takes admission -> queue. Consumers never take the service locks.
+  std::mutex ecLifecycleMutex_;
+  std::mutex ecAdmissionMutex_;
+  std::shared_ptr<ec::ECShardWorker> ecShardWorker_;
+  bool ecStartAttempted_ = false;
+  bool ecAccepting_ = false;
+  bool ecClosing_ = false;
+  // Serializes full Components teardown, never taken by jobs/continuations.
+  std::mutex stopMutex_;
+  bool stopped_ = false;
 };
 
 }  // namespace hf3fs::storage

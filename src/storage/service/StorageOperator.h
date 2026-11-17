@@ -97,6 +97,9 @@ class StorageOperator {
 
   CoTryTask<GetAllChunkMetadataRsp> getAllChunkMetadata(const GetAllChunkMetadataReq &req);
 
+  CoTryTask<WriteECShardRsp> writeECShard(const WriteECShardReq &req);
+  CoTryTask<ReadECShardRsp> readECShard(const ReadECShardReq &req);
+
  protected:
   using ChunkMetadataProcessor = std::function<CoTryTask<void>(const ChunkId &, const ChunkMetadata &)>;
 

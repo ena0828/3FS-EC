@@ -140,6 +140,42 @@ StoreError ECShardStore::write(const erasure::ECShardKey& key, uint64_t version,
   return StoreError::Ok;
 }
 
+StoreResult<IdempotentWriteDisposition> ECShardStore::writeIdempotent(
+    const erasure::ECShardKey& key, uint64_t version,
+    uint32_t validBytes, std::span<const uint8_t> payload,
+    uint32_t scheme, uint32_t format) {
+  if (erasure::ECLayout::validateKey(key) != erasure::LayoutError::Ok || version == 0 ||
+      scheme != erasure::ECLayout::kEncodingScheme || format != erasure::ECLayout::kFormatVersion ||
+      validBytes > erasure::ECLayout::kChunkSize || payload.size() != erasure::ECLayout::kShardSize ||
+      payload.data() == nullptr)
+    return {StoreError::InvalidArgument, {}};
+
+  // serialize recomputes the payload CRC32C from the supplied bytes on every call.
+  const auto value = serialize(key, version, validBytes, payload, scheme, format);
+  const auto physical = physicalKey(key, version);
+  std::lock_guard guard(mutex_);
+  const auto old = store_->get(physical);
+  if (!old) {
+    if (old.error().code() != StatusCode::kKVStoreNotFound)
+      return {StoreError::BackendError, {}};
+    if (!store_->put(physical, value, true)) return {StoreError::BackendError, {}};
+    return {StoreError::Ok, IdempotentWriteDisposition::Created};
+  }
+
+  const auto parsed = parse(*old, key, version, scheme, format);
+  if (!parsed) return {parsed.error, {}};
+  const auto& record = parsed.value;
+  if (record.encodingScheme != scheme || record.formatVersion != format ||
+      record.validBytes != validBytes || record.payload.size() != payload.size() ||
+      !std::equal(record.payload.begin(), record.payload.end(), payload.begin()))
+    return {StoreError::ContentConflict, {}};
+
+  // Presence alone is not a sync acknowledgement (a previous Put may have failed).
+  // Re-Put the exact validated record, without changing its on-disk representation.
+  if (!store_->put(physical, *old, true)) return {StoreError::BackendError, {}};
+  return {StoreError::Ok, IdempotentWriteDisposition::ExistingVerified};
+}
+
 StoreResult<ShardRecord> ECShardStore::read(const erasure::ECShardKey& key, uint64_t version,
                                            uint32_t scheme, uint32_t format) {
   if (erasure::ECLayout::validateKey(key) != erasure::LayoutError::Ok || version == 0)

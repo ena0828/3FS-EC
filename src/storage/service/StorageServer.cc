@@ -39,6 +39,7 @@ Result<Void> StorageServer::beforeStart() {
 }
 
 Result<Void> StorageServer::beforeStop() {
+  components_.closeECShardAdmission();
   components_.reliableUpdate.beforeStop();
   components_.reliableForwarding.beforeStop();
   return Void{};

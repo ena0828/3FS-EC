@@ -1205,4 +1205,136 @@ CoTryTask<GetAllChunkMetadataRsp> StorageOperator::getAllChunkMetadata(const Get
   co_return Result<GetAllChunkMetadataRsp>(std::move(response));
 }
 
+namespace {
+// Snapshot checks provide local admission only. Wire v1 carries no fencing token.
+std::shared_ptr<StorageTarget> ecRpcTarget(Components &c, TargetId id, bool writing = false) {
+  auto snapshot = c.targetMap.snapshot();
+  if (!snapshot) return {};
+  auto found = snapshot->getTarget(id);
+  if (!found) return {};
+  const auto &t = **found;
+  auto local = t.storageTarget;
+  if (!local || t.diskError || t.unrecoverableOffline() || (writing && t.rejectCreateChunk) ||
+      t.publicState != flat::PublicTargetState::SERVING || !t.upToDate() || t.targetId != id ||
+      local->targetId() != id || t.chainId != local->chainId() || t.vChainId.chainId != local->chainId() ||
+      t.diskIndex != local->diskIndex() || t.diskIndex >= c.storageTargets.targetPaths().size())
+    return {};
+  auto routed = snapshot->getByChainId(t.vChainId, false);
+  if (!routed || *routed != *found) return {};
+  return local;
+}
+ECShardStatus ecRpcError(status_code_t code) {
+  if (code == StatusCode::kQueueFull) return ECShardStatus::QueueFull;
+  if (code == RPCCode::kRequestRefused || code == StorageCode::kTargetOffline) return ECShardStatus::TargetUnavailable;
+  if (code == StorageCode::kStorageInitFailed) return ECShardStatus::BackendError;
+  if (code == StatusCode::kInvalidArg) return ECShardStatus::InvalidRequest;
+  return ECShardStatus::InternalError;
+}
+ECShardStatus ecStoreError(ec::StoreError error) {
+  switch (error) {
+    case ec::StoreError::ContentConflict:
+      return ECShardStatus::ContentConflict;
+    case ec::StoreError::NotFound:
+      return ECShardStatus::NotFound;
+    case ec::StoreError::BackendError:
+      return ECShardStatus::BackendError;
+    case ec::StoreError::CorruptRecord:
+    case ec::StoreError::IdentityMismatch:
+    case ec::StoreError::LengthMismatch:
+    case ec::StoreError::VersionMismatch:
+    case ec::StoreError::SchemeMismatch:
+    case ec::StoreError::FormatMismatch:
+      return ECShardStatus::CorruptRecord;
+    case ec::StoreError::InvalidArgument:
+      return ECShardStatus::InvalidRequest;
+    default:
+      return ECShardStatus::InternalError;
+  }
+}
+erasure::ECShardKey ecKey(const ECShardKeyDTO &k) {
+  return {k.inodeId, k.logicalChunkIndex, k.stripeIndex, k.shardIndex};
+}
+}  // namespace
+
+CoTryTask<WriteECShardRsp> StorageOperator::writeECShard(const WriteECShardReq &req) {
+  WriteECShardRsp rsp;
+  if (!req.valid()) {
+    rsp.status = ECShardStatus::InvalidRequest;
+    co_return rsp;
+  }
+  auto target = ecRpcTarget(components_, req.targetId, true);
+  if (!target || config_.read_only()) {
+    rsp.status = ECShardStatus::TargetUnavailable;
+    co_return rsp;
+  }
+  if (!target->ecEnabled()) {
+    rsp.status = ECShardStatus::ECDisabled;
+    co_return rsp;
+  }
+  const auto &r = req.record;
+  auto job = ec::ECShardJob::write(target, ecKey(r.key), r.version, r.validBytes, r.payload.bytes, r.scheme, r.format);
+  auto submitted = components_.submitECShard(job);
+  if (!submitted) {
+    rsp.status = ecRpcError(submitted.error().code());
+    co_return rsp;
+  }
+  auto completion = co_await ec::ECShardJob::waitAsync(std::move(job));
+  const auto &result = std::get<ec::ECShardJob::WriteResult>(completion);
+  if (!result)
+    rsp.status = ecRpcError(result.error().code());
+  else if (!*result)
+    rsp.status = ecStoreError(result->error);
+  else if (result->value == ec::IdempotentWriteDisposition::Created)
+    rsp.status = ECShardStatus::Created;
+  else if (result->value == ec::IdempotentWriteDisposition::ExistingVerified)
+    rsp.status = ECShardStatus::ExistingVerified;
+  co_return rsp;
+}
+
+CoTryTask<ReadECShardRsp> StorageOperator::readECShard(const ReadECShardReq &req) {
+  ReadECShardRsp rsp;
+  if (!req.valid()) {
+    rsp.status = ECShardStatus::InvalidRequest;
+    co_return rsp;
+  }
+  auto target = ecRpcTarget(components_, req.targetId);
+  if (!target) {
+    rsp.status = ECShardStatus::TargetUnavailable;
+    co_return rsp;
+  }
+  if (!target->ecEnabled()) {
+    rsp.status = ECShardStatus::ECDisabled;
+    co_return rsp;
+  }
+  auto job = ec::ECShardJob::read(target, ecKey(req.key), req.version, req.scheme, req.format);
+  auto submitted = components_.submitECShard(job);
+  if (!submitted) {
+    rsp.status = ecRpcError(submitted.error().code());
+    co_return rsp;
+  }
+  auto completion = co_await ec::ECShardJob::waitAsync(std::move(job));
+  auto &result = std::get<ec::ECShardJob::ReadResult>(completion);
+  if (!result)
+    rsp.status = ecRpcError(result.error().code());
+  else if (!*result)
+    rsp.status = ecStoreError(result->error);
+  else {
+    auto &r = result->value;
+    ECShardRecordDTO record;
+    record.key = {r.key.inodeId, r.key.logicalChunkIndex, r.key.stripeIndex, r.key.shardIndex};
+    record.version = r.dataVersion;
+    record.scheme = r.encodingScheme;
+    record.format = r.formatVersion;
+    record.validBytes = r.validBytes;
+    record.payloadChecksum = r.payloadChecksum;
+    record.payload.bytes = std::move(r.payload);
+    if (record.valid() && r.key == ecKey(req.key) && r.dataVersion == req.version) {
+      rsp.record = std::move(record);
+      rsp.status = ECShardStatus::Ok;
+    } else
+      rsp.status = ECShardStatus::CorruptRecord;
+  }
+  co_return rsp;
+}
+
 }  // namespace hf3fs::storage

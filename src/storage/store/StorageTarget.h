@@ -1,6 +1,9 @@
 #pragma once
 
 #include <folly/Synchronized.h>
+#include <atomic>
+#include <functional>
+#include <mutex>
 #include <unordered_map>
 
 #include "chunk_engine/src/cxx.rs.h"
@@ -15,6 +18,10 @@
 #include "storage/store/ChunkStore.h"
 #include "storage/store/PhysicalConfig.h"
 #include "storage/update/UpdateJob.h"
+
+namespace hf3fs::test {
+struct StorageTargetECTestHelper;
+}
 
 namespace hf3fs::storage {
 
@@ -31,8 +38,25 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
 
   ~StorageTarget();
 
-  // Borrowed handle: EC operations and release/destruction must be serialized.
+  // Legacy serial tests only: the borrowed pointer is NOT safe for concurrent
+  // RPC/worker use or with release/destruction. Use the explicit methods below.
+  bool ecEnabled() const { return enableEC_; }
+
   ec::ECShardStore *ecShardStore() const { return ecShardStore_.get(); }
+
+  // Synchronous, owning results. The outer Result reports lifecycle failures:
+  // kTargetOffline when closing, kStorageInitFailed when EC is unavailable.
+  // On outer success, callers must also inspect the inner StoreResult.
+  // Callers must keep this Target and input bytes alive throughout the call.
+  Result<ec::StoreResult<ec::IdempotentWriteDisposition>> writeECShard(
+      const erasure::ECShardKey &key, uint64_t dataVersion,
+      uint32_t validBytes, std::span<const uint8_t> payload,
+      uint32_t encodingScheme = erasure::ECLayout::kEncodingScheme,
+      uint32_t formatVersion = erasure::ECLayout::kFormatVersion);
+  Result<ec::StoreResult<ec::ShardRecord>> readECShard(
+      const erasure::ECShardKey &key, uint64_t dataVersion,
+      uint32_t expectedScheme = erasure::ECLayout::kEncodingScheme,
+      uint32_t expectedFormat = erasure::ECLayout::kFormatVersion);
 
   // create storage target.
   Result<Void> create(const PhysicalConfig &config);
@@ -158,21 +182,24 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   auto generationId() const { return generationId_; }
 
   // release self.
-  Result<Void> release() {
-    released_ = true;
-    auto result = sync();
-    ecShardStore_.reset();
-    return result;
-  }
+  Result<Void> release();
 
   // check if chunk engine is used.
   inline bool useChunkEngine() const { return targetConfig_.only_chunk_engine; }
 
  private:
+  friend struct hf3fs::test::StorageTargetECTestHelper;
   Result<Void> openEC(bool create);
 
   const Config &config_;
   const bool enableEC_;
+  // create/load are single-use and must finish before publishing the Target.
+  // Runtime lock order: ecLifecycleMutex_ -> ECShardStore's mutex. No co_await.
+  std::mutex ecLifecycleMutex_;
+  std::atomic<bool> ecClosing_{false};
+  // Test-only admission gate, configured by the friend helper before threads
+  // start. Runs under ecLifecycleMutex_; must never re-enter this Target.
+  std::function<void()> ecOperationHookForTest_;
   bool chunkStoreReady_ = false;
   std::unique_ptr<ec::ECShardStore> ecShardStore_;
   std::shared_ptr<bool> alive_ = std::make_shared<bool>();
@@ -194,7 +221,7 @@ class StorageTarget : public enable_shared_from_this<StorageTarget> {
   CoLockManager<> chunkLocks_;
   CoLockManager<> channelLocks_;
   folly::Synchronized<std::set<Size>, std::mutex> chunkSizeList_;
-  bool released_ = false;
+  bool released_ = false;  // All runtime accesses hold ecLifecycleMutex_.
 };
 
 }  // namespace hf3fs::storage

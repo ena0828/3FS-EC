@@ -1,6 +1,8 @@
 #pragma once
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <set>
+#include <charconv>
 
 #include "chunk_engine/src/cxx.rs.h"
 #include "common/utils/CPUExecutorGroup.h"
@@ -23,6 +25,19 @@ class StorageTargets {
   class Config : public ConfigBase<Config> {
     CONFIG_ITEM(target_paths, std::vector<Path>{}, [](auto &vec) { return !vec.empty(); });
     CONFIG_ITEM(target_num_per_path, 0u);
+    // Startup-only authorization, never controlled by a createTarget RPC.
+    // Canonical decimal strings avoid ConfigBase's implicit numeric casts.
+    CONFIG_ITEM(ec_target_ids, std::vector<std::string>{}, [](const auto &ids) {
+      std::set<std::string> unique;
+      for (const auto &text : ids) {
+        uint64_t id = 0;
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), id);
+        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+            id == 0 || std::to_string(id) != text || !unique.insert(text).second)
+          return false;
+      }
+      return true;
+    });
     CONFIG_HOT_UPDATED_ITEM(collect_all_fds, true);
     CONFIG_HOT_UPDATED_ITEM(space_info_cache_timeout, 5_s);
     CONFIG_HOT_UPDATED_ITEM(allow_disk_without_uuid, false);
@@ -41,6 +56,7 @@ class StorageTargets {
 
   StorageTargets(const Config &config, AtomicallyTargetMap &targetMap)
       : config_(config),
+        ecTargetIds_(config.ec_target_ids().begin(), config.ec_target_ids().end()),
         targetMap_(targetMap) {}
   ~StorageTargets();
 
@@ -85,7 +101,10 @@ class StorageTargets {
  private:
   friend struct test::StorageTargetsHelper;
   ConstructLog<"storage::StorageTargets"> constructLog_;
+  Result<Void> validateECPolicy() const;
   const Config &config_;
+  // Immutable for this StorageTargets lifetime. Reconstruct on service restart.
+  const std::set<std::string> ecTargetIds_;
   AtomicallyTargetMap &targetMap_;
   GlobalFileStore globalFileStore_;
 

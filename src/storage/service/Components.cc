@@ -1,6 +1,8 @@
 #include "storage/service/Components.h"
 
 #include <folly/experimental/coro/BlockingWait.h>
+#include <folly/ScopeGuard.h>
+#include <limits>
 
 #include "common/app/ApplicationBase.h"
 #include "common/monitor/Recorder.h"
@@ -34,10 +36,83 @@ Components::Components(const Config &config)
       syncPool(config.coroutines_pool_default(), "SyncPool"),
       defaultPool(config.coroutines_pool_default(), "DefaultPool"),
       storageOperator(config.storage(), *this),
-      reliableUpdate(config.reliable_update(), *this) {}
+      reliableUpdate(config.reliable_update(), *this),
+      ecShardRpcEnabled_(config.enable_ec_shard_rpc()) {}
+
+Components::~Components() { stopECShardWorker(); }
+
+Result<Void> Components::submitECShard(std::shared_ptr<ec::ECShardJob> job) {
+  std::lock_guard gate(ecAdmissionMutex_);
+  if (!ecAccepting_ || !ecShardWorker_)
+    return makeError(RPCCode::kRequestRefused, "EC service admission is closed");
+  return ecShardWorker_->enqueue(std::move(job));
+}
+
+void Components::closeECShardAdmission() {
+  std::lock_guard gate(ecAdmissionMutex_);
+  ecClosing_ = true;  // one-shot, cannot reopen after beforeStop or rollback
+  ecAccepting_ = false;
+}
+
+Result<Void> Components::startECShardWorker(std::shared_ptr<ec::ECShardWorker> candidate) {
+  std::lock_guard control(ecLifecycleMutex_);
+  {
+    std::lock_guard gate(ecAdmissionMutex_);
+    if (ecClosing_ || ecStartAttempted_)
+      return makeError(RPCCode::kRequestRefused, "EC service lifecycle is one-shot");
+    ecStartAttempted_ = true;
+  }
+  if (!ecShardRpcEnabled_) return Void{};  // no Worker allocation or new disk threads
+  const auto disks = storageTargets.targetPaths().size();
+  if (disks > std::numeric_limits<uint32_t>::max())
+    return makeError(StatusCode::kInvalidConfig, "Too many EC worker disks");
+  try {
+    if (!candidate) candidate = std::make_shared<ec::ECShardWorker>();
+    auto started = candidate->start(static_cast<uint32_t>(disks));
+    if (!started) return makeError(started.error());
+  } catch (...) {
+    return makeError(StatusCode::kOSError, "EC worker initialization failed");
+  }
+  {
+    std::lock_guard gate(ecAdmissionMutex_);
+    if (!ecClosing_) {
+      ecShardWorker_ = std::move(candidate);
+      return Void{};  // Ready, but still not accepting until all Components start.
+    }
+  }
+  candidate->stopAndJoin();  // never under admission lock
+  return makeError(RPCCode::kRequestRefused, "EC service stopped during startup");
+}
+
+Result<Void> Components::openECShardAdmission() {
+  std::lock_guard gate(ecAdmissionMutex_);
+  if (ecClosing_ || !ecStartAttempted_ || (ecShardRpcEnabled_ && !ecShardWorker_))
+    return makeError(RPCCode::kRequestRefused, "EC worker is not ready");
+  ecAccepting_ = ecShardRpcEnabled_;
+  return Void{};
+}
+
+void Components::stopECShardWorker() {
+  closeECShardAdmission();
+  std::lock_guard control(ecLifecycleMutex_);
+  std::shared_ptr<ec::ECShardWorker> worker;
+  {
+    std::lock_guard gate(ecAdmissionMutex_);
+    worker = std::move(ecShardWorker_);
+  }
+  if (worker) worker->stopAndJoin();  // drains and joins outside admission lock
+}
 
 Result<Void> Components::start(const flat::AppInfo &appInfo, net::ThreadPoolGroup &tpg) {
+  {
+    std::lock_guard gate(ecAdmissionMutex_);
+    if (ecClosing_ || ecStartAttempted_)
+      return makeError(RPCCode::kRequestRefused, "Components cannot restart after startup/close");
+  }
   this->appInfo = appInfo;
+  // Every early return, including failures after Worker startup, closes/drains
+  // EC resources. Existing CRAQ partial-start cleanup remains in server stop.
+  auto ecRollback = folly::makeGuard([this] { stopECShardWorker(); });
 
   RETURN_ON_ERROR_LOG_WRAPPED(INFO, "Start rdmabufPool", rdmabufPool.init(tpg.procThreadPool()));
 
@@ -49,6 +124,7 @@ Result<Void> Components::start(const flat::AppInfo &appInfo, net::ThreadPoolGrou
   RETURN_ON_ERROR_LOG_WRAPPED(INFO, "Start messenger", messenger.start());
   RETURN_ON_ERROR_LOG_WRAPPED(INFO, "Start reliableForwarding", reliableForwarding.init());
   RETURN_ON_ERROR_LOG_WRAPPED(INFO, "Start storageTargets", storageTargets.load(tpg.procThreadPool()));
+  RETURN_ON_ERROR_LOG_WRAPPED(INFO, "Start ECShardWorker", startECShardWorker());
   RETURN_ON_ERROR_LOG_WRAPPED(INFO,
                               "Start aioReadWorker",
                               aioReadWorker.start(storageTargets.fds(), rdmabufPool.iovecs()));
@@ -65,6 +141,8 @@ Result<Void> Components::start(const flat::AppInfo &appInfo, net::ThreadPoolGrou
                               checkWorker.start(storageTargets.targetPaths(), storageTargets.manufacturers()));
 
   RETURN_ON_ERROR_LOG_WRAPPED(INFO, "Start storageOperator", storageOperator.init(storageTargets.targetPaths().size()));
+  RETURN_AND_LOG_ON_ERROR(openECShardAdmission());
+  ecRollback.dismiss();
   return Void{};
 }
 
@@ -139,6 +217,12 @@ Result<Void> Components::waitRoutingInfo(const flat::AppInfo &appInfo, folly::CP
 Result<Void> Components::refreshRoutingInfo() { return targetMap.updateRouting(mgmtdClient.load()->getRoutingInfo()); }
 
 Result<Void> Components::stopAndJoin(CPUExecutorGroup &executor) {
+  std::lock_guard stopLock(stopMutex_);
+  if (stopped_) return Void{};
+  stopped_ = true;
+  // Called from afterStop, AFTER network Processor drain. Keep the coroutine
+  // pools and Targets alive until accepted EC jobs have finished notification.
+  stopECShardWorker();
   LOG_COMMAND(INFO, "Stop aioReadWorker", aioReadWorker.stopAndJoin());
   LOG_COMMAND(INFO, "Stop syncMetaKvWorker", syncMetaKvWorker.stopAndJoin());
   LOG_COMMAND(INFO, "Stop punchHoleWorker", punchHoleWorker.stopAndJoin());

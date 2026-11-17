@@ -5,11 +5,13 @@
 
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using hf3fs::Path;
@@ -23,6 +25,8 @@ using hf3fs::erasure::MutableShard;
 using hf3fs::erasure::CodecError;
 using hf3fs::storage::ec::ECShardStore;
 using hf3fs::storage::ec::StoreError;
+using hf3fs::storage::ec::IdempotentWriteDisposition;
+using hf3fs::storage::ec::StoreResult;
 using hf3fs::kv::KVStore;
 
 namespace {
@@ -56,6 +60,21 @@ void mutateRaw(const Path& directory, const ECShardKey& key, uint64_t version,
   ASSERT_TRUE(value);
   change(*value);
   ASSERT_TRUE(raw->put(physical, *value, true));
+}
+
+void expectRawRecord(const Path& directory, const ECShardKey& key, uint64_t version,
+                     const std::string& expected) {
+  KVStore::Config config;
+  config.set_type(KVStore::Type::LevelDB);
+  KVStore::Options options;
+  options.type = KVStore::Type::LevelDB;
+  options.path = directory;
+  options.createIfMissing = false;
+  auto raw = KVStore::create(config, options);
+  ASSERT_NE(raw, nullptr);
+  auto value = raw->get(ECShardStore::physicalKey(key, version));
+  ASSERT_TRUE(value);
+  EXPECT_EQ(*value, expected);
 }
 
 TEST(ECShardStore, DataParityIdentityVersionDuplicateAndReopen) {
@@ -156,6 +175,213 @@ TEST(ECShardStore, LengthAndIdentityChecks) {
   reopened = ECShardStore::open(directory, false);
   ASSERT_TRUE(reopened);
   EXPECT_EQ(reopened.value->read(key, 7).error, StoreError::LengthMismatch);
+}
+
+TEST(ECShardStore, IdempotentCreatedRepeatedAndReopened) {
+  const Path directory = newTestDirectory() / "idempotent";
+  const ECShardKey key{321, 5, 0, 10};
+  const auto bytes = payload(12);
+  auto opened = ECShardStore::open(directory, true);
+  ASSERT_TRUE(opened);
+  auto result = opened.value->writeIdempotent(key, 1, 77, bytes);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result.value, IdempotentWriteDisposition::Created);
+  result = opened.value->writeIdempotent(key, 1, 77, bytes);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result.value, IdempotentWriteDisposition::ExistingVerified);
+  // The legacy API keeps its duplicate behavior, including different content.
+  EXPECT_EQ(opened.value->write(key, 1, 78, payload(13)), StoreError::AlreadyExists);
+  opened.value.reset();
+  opened = ECShardStore::open(directory, false);
+  ASSERT_TRUE(opened);
+  result = opened.value->writeIdempotent(key, 1, 77, bytes);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result.value, IdempotentWriteDisposition::ExistingVerified);
+  auto record = opened.value->read(key, 1);
+  ASSERT_TRUE(record);
+  EXPECT_EQ(record.value.payload, bytes);
+  EXPECT_EQ(record.value.validBytes, 77u);
+  EXPECT_EQ(record.value.payloadChecksum, folly::crc32c(bytes.data(), bytes.size(), 0));
+}
+
+TEST(ECShardStore, IdempotentPayloadAndValidBytesConflictsPreserveOriginal) {
+  const ECShardKey key{321, 6, 0, 0};
+  const auto bytes = payload(21);
+  auto opened = ECShardStore::open(newTestDirectory() / "conflicts", true);
+  ASSERT_TRUE(opened);
+  ASSERT_TRUE(opened.value->writeIdempotent(key, 1, 99, bytes));
+  auto different = bytes;
+  different.back() ^= 1;
+  for (const auto result : {opened.value->writeIdempotent(key, 1, 99, different),
+                            opened.value->writeIdempotent(key, 1, 100, bytes)}) {
+    EXPECT_FALSE(result);
+    EXPECT_EQ(result.error, StoreError::ContentConflict);
+    EXPECT_EQ(result.value, IdempotentWriteDisposition::NotWritten);
+  }
+  auto record = opened.value->read(key, 1);
+  ASSERT_TRUE(record);
+  EXPECT_EQ(record.value.payload, bytes);
+  EXPECT_EQ(record.value.validBytes, 99u);
+}
+
+TEST(ECShardStore, IdempotentEqualCRCDifferentPayloadConflicts) {
+  const ECShardKey key{321, 7, 0, 1};
+  const auto bytes = payload(31);
+  auto collision = bytes;
+  // This five-byte XOR mask has zero CRC32C remainder. Following identical
+  // bytes preserve the collision; it defeats checksum-only content comparison.
+  constexpr std::array<uint8_t, 5> mask{1, 3, 131, 107, 242};
+  for (size_t i = 0; i < mask.size(); ++i) collision[i] ^= mask[i];
+  ASSERT_NE(bytes, collision);
+  ASSERT_EQ(folly::crc32c(bytes.data(), bytes.size(), 0),
+            folly::crc32c(collision.data(), collision.size(), 0));
+  auto opened = ECShardStore::open(newTestDirectory() / "crc-collision", true);
+  ASSERT_TRUE(opened);
+  ASSERT_TRUE(opened.value->writeIdempotent(key, 1, 111, bytes));
+  EXPECT_EQ(opened.value->writeIdempotent(key, 1, 111, collision).error, StoreError::ContentConflict);
+  auto record = opened.value->read(key, 1);
+  ASSERT_TRUE(record);
+  EXPECT_EQ(record.value.payload, bytes);
+}
+
+TEST(ECShardStore, IdempotentVersionsAreIndependent) {
+  const Path directory = newTestDirectory() / "versions";
+  const ECShardKey key{321, 8, 0, 11};
+  const auto first = payload(41), second = payload(42);
+  auto opened = ECShardStore::open(directory, true);
+  ASSERT_TRUE(opened);
+  for (const auto result : {opened.value->writeIdempotent(key, 1, 121, first),
+                            opened.value->writeIdempotent(key, 2, 122, second)}) {
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result.value, IdempotentWriteDisposition::Created);
+  }
+  opened.value.reset();
+  opened = ECShardStore::open(directory, false);
+  ASSERT_TRUE(opened);
+  for (uint64_t version : {1, 2}) {
+    auto record = opened.value->read(key, version);
+    ASSERT_TRUE(record);
+    EXPECT_EQ(record.value.dataVersion, version);
+    EXPECT_EQ(record.value.validBytes, version == 1 ? 121u : 122u);
+    EXPECT_EQ(record.value.payload, version == 1 ? first : second);
+  }
+}
+
+TEST(ECShardStore, IdempotentRejectsInvalidArgumentsWithoutWriting) {
+  const ECShardKey key{321, 9, 0, 0};
+  const auto bytes = payload(51);
+  auto tooLong = bytes;
+  tooLong.push_back(0);
+  auto opened = ECShardStore::open(newTestDirectory() / "invalid", true);
+  ASSERT_TRUE(opened);
+  auto& store = *opened.value;
+  const std::array results{
+      store.writeIdempotent({321, 9, 1, 0}, 1, 0, bytes),
+      store.writeIdempotent({321, 9, 0, 12}, 1, 0, bytes),
+      store.writeIdempotent(key, 0, 0, bytes),
+      store.writeIdempotent(key, 1, 0, bytes, 0),
+      store.writeIdempotent(key, 1, 0, bytes, ECLayout::kEncodingScheme, 0),
+      store.writeIdempotent(key, 1, ECLayout::kChunkSize + 1, bytes),
+      store.writeIdempotent(key, 1, 0, {}),
+      store.writeIdempotent(key, 1, 0, std::span(bytes).first(bytes.size() - 1)),
+      store.writeIdempotent(key, 1, 0, tooLong)};
+  for (const auto& result : results) {
+    EXPECT_FALSE(result);
+    EXPECT_EQ(result.error, StoreError::InvalidArgument);
+    EXPECT_EQ(result.value, IdempotentWriteDisposition::NotWritten);
+  }
+  EXPECT_EQ(store.read(key, 1).error, StoreError::NotFound);
+  EXPECT_EQ(store.writeIdempotent(key, 1, 0, bytes).value, IdempotentWriteDisposition::Created);
+  EXPECT_EQ(store.writeIdempotent(key, 2, ECLayout::kChunkSize, bytes).value,
+            IdempotentWriteDisposition::Created);
+}
+
+TEST(ECShardStore, IdempotentConcurrentSameContent) {
+  const ECShardKey key{321, 10, 0, 0};
+  const auto bytes = payload(61);
+  auto opened = ECShardStore::open(newTestDirectory() / "concurrent-same", true);
+  ASSERT_TRUE(opened);
+  constexpr size_t count = 8;
+  std::array<StoreResult<IdempotentWriteDisposition>, count> results;
+  std::barrier start(static_cast<std::ptrdiff_t>(count + 1));
+  std::vector<std::thread> threads;
+  for (size_t i = 0; i < count; ++i) {
+    threads.emplace_back([&, i] {
+      start.arrive_and_wait();
+      results[i] = opened.value->writeIdempotent(key, 1, 131, bytes);
+    });
+  }
+  start.arrive_and_wait();
+  for (auto& thread : threads) thread.join();
+  size_t created = 0, verified = 0;
+  for (const auto& result : results) {
+    ASSERT_TRUE(result);
+    created += result.value == IdempotentWriteDisposition::Created;
+    verified += result.value == IdempotentWriteDisposition::ExistingVerified;
+  }
+  EXPECT_EQ(created, 1u);
+  EXPECT_EQ(verified, count - 1);
+  auto record = opened.value->read(key, 1);
+  ASSERT_TRUE(record);
+  EXPECT_EQ(record.value.payload, bytes);
+}
+
+TEST(ECShardStore, IdempotentConcurrentDifferentContentHasOneWinner) {
+  const ECShardKey key{321, 11, 0, 0};
+  const std::array bytes{payload(71), payload(72)};
+  auto opened = ECShardStore::open(newTestDirectory() / "concurrent-conflict", true);
+  ASSERT_TRUE(opened);
+  std::array<StoreResult<IdempotentWriteDisposition>, 2> results;
+  std::barrier start(3);
+  std::array<std::thread, 2> threads;
+  for (size_t i = 0; i < threads.size(); ++i) {
+    threads[i] = std::thread([&, i] {
+      start.arrive_and_wait();
+      results[i] = opened.value->writeIdempotent(key, 1, 141, bytes[i]);
+    });
+  }
+  start.arrive_and_wait();
+  for (auto& thread : threads) thread.join();
+  ASSERT_NE(bool(results[0]), bool(results[1]));
+  const size_t winner = results[0] ? 0 : 1;
+  EXPECT_EQ(results[winner].value, IdempotentWriteDisposition::Created);
+  EXPECT_EQ(results[1 - winner].error, StoreError::ContentConflict);
+  EXPECT_EQ(results[1 - winner].value, IdempotentWriteDisposition::NotWritten);
+  auto record = opened.value->read(key, 1);
+  ASSERT_TRUE(record);
+  EXPECT_EQ(record.value.payload, bytes[winner]);
+  EXPECT_EQ(opened.value->writeIdempotent(key, 1, 141, bytes[winner]).value,
+            IdempotentWriteDisposition::ExistingVerified);
+}
+
+TEST(ECShardStore, IdempotentRejectsCorruptRecordsWithoutOverwriting) {
+  const ECShardKey key{321, 12, 0, 0};
+  const auto bytes = payload(81);
+  // Payload corruption, header corruption and truncation must all be preserved.
+  const std::array<std::function<void(std::string&)>, 3> changes{
+      [](std::string& value) { value[56] ^= 1; },
+      [](std::string& value) { value[40] ^= 1; },
+      [](std::string& value) { value.resize(20); }};
+  for (const auto& change : changes) {
+    const Path directory = newTestDirectory() / "corrupt-idempotent";
+    auto opened = ECShardStore::open(directory, true);
+    ASSERT_TRUE(opened);
+    ASSERT_TRUE(opened.value->writeIdempotent(key, 1, 151, bytes));
+    opened.value.reset();
+    std::string corrupted;
+    mutateRaw(directory, key, 1, [&](std::string& value) {
+      change(value);
+      corrupted = value;
+    });
+    opened = ECShardStore::open(directory, false);
+    ASSERT_TRUE(opened);
+    auto result = opened.value->writeIdempotent(key, 1, 151, bytes);
+    EXPECT_FALSE(result);
+    EXPECT_EQ(result.error, StoreError::CorruptRecord);
+    EXPECT_EQ(result.value, IdempotentWriteDisposition::NotWritten);
+    opened.value.reset();
+    expectRawRecord(directory, key, 1, corrupted);
+  }
 }
 
 void recoverFromPersisted(ECStripeBuffers stored, const std::vector<uint8_t>& input,
