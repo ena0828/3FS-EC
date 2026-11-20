@@ -10,6 +10,8 @@
 
 namespace hf3fs::storage {
 
+struct EcHelperPacket;
+
 class EcRepairPlan {
  public:
   static Result<std::shared_ptr<const EcRepairPlan>> create(EcRepairPlanInput input);
@@ -53,9 +55,12 @@ class EcRepairBlockCore {
                                        EcRepairBlock incoming,
                                        std::string_view verifiedLocalBlock);
   static Result<Void> validate(const EcRepairPlan &plan, const EcRepairBlock &block, uint8_t expectedNextHelper);
+  static Result<Void> validate(const EcRepairPlan &plan, const EcHelperPacket &packet, uint8_t expectedNextHelper);
   static Result<Void> validateComplete(const EcRepairPlan &plan, const EcRepairBlock &block);
-  // Digest for a future authenticated hop envelope; a digest alone is not a MAC.
+  static Result<Void> validateComplete(const EcRepairPlan &plan, const EcHelperPacket &packet);
+  // The arithmetic and wire representations hash to the same authenticated-hop field.
   static Result<EcSha256> digestPacket(const EcRepairPlan &plan, const EcRepairBlock &block);
+  static Result<EcSha256> digestPacket(const EcRepairPlan &plan, const EcHelperPacket &packet);
 };
 
 }  // namespace hf3fs::storage

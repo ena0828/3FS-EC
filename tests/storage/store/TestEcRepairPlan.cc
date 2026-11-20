@@ -1,4 +1,5 @@
 #include "fbs/storage/EcStageResultV2.h"
+#include "storage/ec_repair/EcHelperAuthorization.h"
 #include "tests/EcRepairTestData.h"
 
 namespace hf3fs::storage {
@@ -40,9 +41,13 @@ TEST(TestEcRepairPlan, FullBlockAndShortTailUseSameFixedPlan) {
       ASSERT_OK(block);
     }
     ASSERT_OK(EcRepairBlockCore::validateComplete(**plan, *block));
+    auto packet = helperPacket(*block);
+    ASSERT_OK(EcRepairBlockCore::validateComplete(**plan, packet));
     for (size_t target = 0; target != 2; ++target) {
       EXPECT_EQ(block->outputs[target], blockBytes(data, data.input.targets[target], index));
     }
+    packet.outputs[1].data[0] ^= 1;
+    ASSERT_ERROR(EcRepairBlockCore::validateComplete(**plan, packet), StatusCode::kDataCorruption);
   }
   ASSERT_ERROR(EcRepairBlockCore::begin(**plan, 2), StatusCode::kInvalidArg);
 }
@@ -143,6 +148,7 @@ TEST(TestEcRepairPlan, PacketHashBindsPayloadAndRejectsOversizedOrNonzeroSeed) {
   ASSERT_OK(block);
   block->outputs[0][0] = 1;
   EXPECT_FALSE(EcRepairBlockCore::digestPacket(**plan, *block));
+  EXPECT_FALSE(EcRepairBlockCore::digestPacket(**plan, helperPacket(*block)));
   block = EcRepairBlockCore::begin(**plan, 0);
   block = EcRepairBlockCore::advance(**plan, 0, *block, blockBytes(data, data.input.sources[0], 0));
   ASSERT_OK(block);
@@ -154,6 +160,61 @@ TEST(TestEcRepairPlan, PacketHashBindsPayloadAndRejectsOversizedOrNonzeroSeed) {
   EXPECT_NE(*first, *changed);
   block->outputs[0].push_back('x');
   EXPECT_FALSE(EcRepairBlockCore::digestPacket(**plan, *block));
+  EXPECT_FALSE(EcRepairBlockCore::digestPacket(**plan, helperPacket(*block)));
+}
+
+TEST(TestEcRepairPlan, ArithmeticAndWireDigestsMatchLegacyCanonicalBytes) {
+  for (const auto &missing : {std::vector<uint16_t>{2}, std::vector<uint16_t>{11, 2}}) {
+    auto data = makeData(kEcIntegrityBlockBytes + 19, missing);
+    auto plan = EcRepairPlan::create(data.input);
+    ASSERT_OK(plan);
+    for (uint32_t index = 0; index < 2; ++index) {
+      auto block = EcRepairBlockCore::begin(**plan, index);
+      ASSERT_OK(block);
+      // Hop nine exercises a nonzero high byte of the prefix mask. Fill the
+      // packet with distinct binary outputs, including NUL and 0xff.
+      block->contributorMask = 0x01ff;
+      block->nextHelper = 9;
+      for (size_t i = 0; i < missing.size(); ++i) {
+        block->outputs[i] = blockBytes(data, data.input.targets[i], index);
+        block->outputs[i][0] = char(0xff);
+        block->outputs[i][1] = '\0';
+        block->outputs[i][2] = char(i);
+      }
+      // Legacy one-shot encodings for a 64 KiB block and its 19-byte tail.
+      // Use literal field bytes independent of production endian conversion.
+      std::string canonical = "3FSERPK1";
+      canonical.append(reinterpret_cast<const char *>((*plan)->digest().data()), 32);
+      canonical.append(index == 0 ? "\x00\x00\x00\x00" : "\x00\x00\x00\x01", 4);
+      canonical.append("\x01\xff\x09", 3);
+      canonical.push_back(char(missing.size()));
+      for (size_t i = 0; i < missing.size(); ++i) {
+        canonical.append(index == 0 ? "\x00\x01\x00\x00" : "\x00\x00\x00\x13", 4);
+        canonical.append(block->outputs[i]);
+      }
+      EcSha256 expected{};
+      unsigned int digestBytes = 0;
+      ASSERT_EQ(EVP_Digest(canonical.data(), canonical.size(), expected.data(), &digestBytes, EVP_sha256(), nullptr),
+                1);
+      ASSERT_EQ(digestBytes, expected.size());
+      auto packet = helperPacket(*block);
+      auto wire = EcRepairBlockCore::digestPacket(**plan, packet);
+      auto arithmetic = EcRepairBlockCore::digestPacket(**plan, *block);
+      ASSERT_OK(wire);
+      ASSERT_OK(arithmetic);
+      EXPECT_EQ(*wire, expected);
+      EXPECT_EQ(*arithmetic, expected);
+      if (missing.size() == 1) {
+        packet.outputs[1].data = "unused";
+        ASSERT_ERROR(EcRepairBlockCore::validate(**plan, packet, 9), StatusCode::kInvalidArg);
+      } else {
+        std::swap(packet.outputs[0].data, packet.outputs[1].data);
+        auto swapped = EcRepairBlockCore::digestPacket(**plan, packet);
+        ASSERT_OK(swapped);
+        EXPECT_NE(*swapped, expected);
+      }
+    }
+  }
 }
 
 }  // namespace

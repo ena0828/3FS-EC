@@ -1,8 +1,11 @@
 #include "EcRepairPlan.h"
 
 #include <algorithm>
+#include <folly/lang/Bits.h>
 #include <new>
 #include <openssl/evp.h>
+
+#include "fbs/storage/EcHelper.h"
 
 namespace hf3fs::storage {
 namespace {
@@ -147,9 +150,28 @@ Result<EcRepairBlock> EcRepairBlockCore::begin(const EcRepairPlan &plan, uint32_
   }
 }
 
-Result<Void> EcRepairBlockCore::validate(const EcRepairPlan &plan,
-                                         const EcRepairBlock &block,
-                                         uint8_t expectedNextHelper) {
+namespace {
+
+// Used synchronously while the arithmetic block or decoded RPC packet is alive.
+struct BlockView {
+  const EcSha256 &planDigest;
+  uint32_t blockIndex;
+  uint16_t contributorMask;
+  uint8_t nextHelper;
+  uint8_t targetCount;
+  std::array<std::string_view, 2> outputs;
+};
+
+BlockView view(const EcRepairBlock &b) {
+  return {b.planDigest, b.blockIndex, b.contributorMask, b.nextHelper, b.targetCount, {b.outputs[0], b.outputs[1]}};
+}
+
+BlockView view(const EcHelperPacket &p) {
+  return {p.planDigest, p.blockIndex, p.contributorMask, p.nextHelper, p.targetCount,
+          {p.outputs[0].data, p.outputs[1].data}};
+}
+
+Result<Void> validateBlock(const EcRepairPlan &plan, const BlockView &block, uint8_t expectedNextHelper) {
   CHECK_RESULT(length, plan.blockLength(block.blockIndex));
   if (expectedNextHelper > 10 || block.nextHelper != expectedNextHelper || block.planDigest != plan.digest() ||
       block.targetCount != plan.input().targetCount ||
@@ -166,6 +188,65 @@ Result<Void> EcRepairBlockCore::validate(const EcRepairPlan &plan,
     }
   }
   return Void{};
+}
+
+Result<Void> validateCompleteBlock(const EcRepairPlan &plan, const BlockView &block) {
+  RETURN_ON_ERROR(validateBlock(plan, block, 10));
+  for (size_t i = 0; i != block.targetCount; ++i) {
+    const auto &target = plan.input().targets[i];
+    RETURN_ON_ERROR(verifyEcIntegrityBlock(target.identity, target.integrity, block.blockIndex, block.outputs[i]));
+  }
+  return Void{};
+}
+
+Result<EcSha256> packetDigest(const EcRepairPlan &plan, const BlockView &block) {
+  try {
+    RETURN_ON_ERROR(validateBlock(plan, block, block.nextHelper));
+    // 3FSERPK1 is a fixed header followed by (big-endian u32 length, bytes)
+    // for each target in plan order. Feed each extent directly from its owner.
+    std::string header("3FSERPK1", 8);
+    header.reserve(48);
+    hash(header, block.planDigest);
+    integer(header, block.blockIndex, 4);
+    integer(header, block.contributorMask, 2);
+    integer(header, block.nextHelper, 1);
+    integer(header, block.targetCount, 1);
+
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1 ||
+        EVP_DigestUpdate(ctx.get(), header.data(), header.size()) != 1) {
+      return makeError(StatusCode::kIOError, "repair packet SHA-256 failed");
+    }
+    for (size_t i = 0; i != block.targetCount; ++i) {
+      const auto output = block.outputs[i];
+      const auto encodedLength = folly::Endian::big32(static_cast<uint32_t>(output.size()));
+      if (EVP_DigestUpdate(ctx.get(), &encodedLength, sizeof(encodedLength)) != 1 ||
+          EVP_DigestUpdate(ctx.get(), output.data(), output.size()) != 1) {
+        return makeError(StatusCode::kIOError, "repair packet SHA-256 failed");
+      }
+    }
+    EcSha256 result{};
+    unsigned int length = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), result.data(), &length) != 1 || length != result.size())
+      return makeError(StatusCode::kIOError, "repair packet SHA-256 failed");
+    return result;
+  } catch (const std::bad_alloc &) {
+    return makeError(StatusCode::kNotEnoughMemory);
+  }
+}
+
+}  // namespace
+
+Result<Void> EcRepairBlockCore::validate(const EcRepairPlan &plan,
+                                         const EcRepairBlock &block,
+                                         uint8_t expectedNextHelper) {
+  return validateBlock(plan, view(block), expectedNextHelper);
+}
+
+Result<Void> EcRepairBlockCore::validate(const EcRepairPlan &plan,
+                                         const EcHelperPacket &packet,
+                                         uint8_t expectedNextHelper) {
+  return validateBlock(plan, view(packet), expectedNextHelper);
 }
 
 Result<EcRepairBlock> EcRepairBlockCore::advance(const EcRepairPlan &plan,
@@ -195,31 +276,19 @@ Result<EcRepairBlock> EcRepairBlockCore::advance(const EcRepairPlan &plan,
 }
 
 Result<Void> EcRepairBlockCore::validateComplete(const EcRepairPlan &plan, const EcRepairBlock &block) {
-  RETURN_ON_ERROR(validate(plan, block, 10));
-  for (size_t i = 0; i != block.targetCount; ++i) {
-    const auto &target = plan.input().targets[i];
-    RETURN_ON_ERROR(verifyEcIntegrityBlock(target.identity, target.integrity, block.blockIndex, block.outputs[i]));
-  }
-  return Void{};
+  return validateCompleteBlock(plan, view(block));
+}
+
+Result<Void> EcRepairBlockCore::validateComplete(const EcRepairPlan &plan, const EcHelperPacket &packet) {
+  return validateCompleteBlock(plan, view(packet));
 }
 
 Result<EcSha256> EcRepairBlockCore::digestPacket(const EcRepairPlan &plan, const EcRepairBlock &block) {
-  try {
-    RETURN_ON_ERROR(validate(plan, block, block.nextHelper));
-    std::string canonical("3FSERPK1", 8);
-    hash(canonical, block.planDigest);
-    integer(canonical, block.blockIndex, 4);
-    integer(canonical, block.contributorMask, 2);
-    integer(canonical, block.nextHelper, 1);
-    integer(canonical, block.targetCount, 1);
-    for (size_t i = 0; i != block.targetCount; ++i) {
-      integer(canonical, block.outputs[i].size(), 4);
-      canonical.append(block.outputs[i]);
-    }
-    return sha256(canonical);
-  } catch (const std::bad_alloc &) {
-    return makeError(StatusCode::kNotEnoughMemory);
-  }
+  return packetDigest(plan, view(block));
+}
+
+Result<EcSha256> EcRepairBlockCore::digestPacket(const EcRepairPlan &plan, const EcHelperPacket &packet) {
+  return packetDigest(plan, view(packet));
 }
 
 }  // namespace hf3fs::storage

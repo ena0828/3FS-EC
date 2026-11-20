@@ -285,7 +285,7 @@ Result<Void> validateEcHelperDirectRequest(const EcRepairPlan &plan, const EcHel
       r.packet.nextHelper >= 10)
     return makeError(StatusCode::kInvalidArg, "invalid direct request identity, mask or hop");
   RETURN_ON_ERROR(validateEcHelperDirectDelegation(plan, r.delegation, r.packet.blockIndex));
-  RETURN_ON_ERROR(EcRepairBlockCore::validate(plan, repairBlock(r.packet), r.packet.nextHelper));
+  RETURN_ON_ERROR(EcRepairBlockCore::validate(plan, r.packet, r.packet.nextHelper));
   for (size_t i = 0; i != 10; ++i) {
     if (r.sourceRouteVersions[i] == ChainVer{})
       return makeError(StatusCode::kInvalidArg, "direct source route is missing");
@@ -331,7 +331,7 @@ Result<Void> verifyEcHelperDirectPredecessor(const EcHelperKey &key,
     return makeError(StatusCode::kAuthenticationFail, "direct predecessor position or lifetime mismatch");
   RETURN_ON_ERROR(time(s.issuedAtSeconds, s.expiresAtSeconds, now));
   CHECK_RESULT(context, digestEcHelperDirectContext(plan, r));
-  CHECK_RESULT(packet, EcRepairBlockCore::digestPacket(plan, repairBlock(r.packet)));
+  CHECK_RESULT(packet, EcRepairBlockCore::digestPacket(plan, r.packet));
   if (s.contextDigest != context || s.valueDigest != packet)
     return makeError(StatusCode::kAuthenticationFail, "direct predecessor context or packet mismatch");
   CHECK_RESULT(signature, ec_helper_direct_detail::Access::mac(key, canonical(s, "3FSECDP1")));
@@ -381,10 +381,10 @@ Result<EcHelperDirectStamp> stamp(const EcHelperKey &key,
   if (request.packet.nextHelper >= 9 || computed.nextHelper != request.packet.nextHelper + 1 ||
       computed.blockIndex != request.packet.blockIndex)
     return makeError(StatusCode::kInvalidArg, "direct predecessor must advance exactly one non-final helper");
-  RETURN_ON_ERROR(EcRepairBlockCore::validate(plan, repairBlock(computed), computed.nextHelper));
+  RETURN_ON_ERROR(EcRepairBlockCore::validate(plan, computed, computed.nextHelper));
   EcHelperDirectStamp result;
   CHECK_RESULT(context, digestEcHelperDirectContext(plan, request));
-  CHECK_RESULT(value, EcRepairBlockCore::digestPacket(plan, repairBlock(computed)));
+  CHECK_RESULT(value, EcRepairBlockCore::digestPacket(plan, computed));
   result.contextDigest = context;
   result.valueDigest = value;
   result.senderPosition = request.packet.nextHelper;
@@ -405,7 +405,7 @@ Result<EcHelperDirectHopResult> finish(const EcHelperKey &key,
   RETURN_ON_ERROR(verifyEcHelperDirectPredecessor(key, plan, request, now));
   if (request.packet.nextHelper != 9 || complete.blockIndex != request.packet.blockIndex)
     return makeError(StatusCode::kInvalidArg, "only the last direct helper may finish the requested block");
-  RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(plan, repairBlock(complete)));
+  RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(plan, complete));
   EcHelperDirectHopResult result;
   result.planDigest = plan.digest();
   CHECK_RESULT(context, digestEcHelperDirectContext(plan, request));

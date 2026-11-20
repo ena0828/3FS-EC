@@ -3812,7 +3812,7 @@ CoTryTask<EcHelperHopResult> StorageClientImpl::executeEcHelper(EcHelperHopReq r
   CO_RETURN_ON_ERROR(plan);
   const auto position = request.packet.nextHelper;
   if (position >= 10) co_return makeError(StatusCode::kInvalidArg);
-  CO_RETURN_ON_ERROR(EcRepairBlockCore::validate(**plan, repairBlock(request.packet), position));
+  CO_RETURN_ON_ERROR(EcRepairBlockCore::validate(**plan, request.packet, position));
   if (!ecHelperConcurrency_.try_wait()) co_return makeError(StorageClientCode::kResourceBusy);
   auto release = folly::makeGuard([this] { ecHelperConcurrency_.signal(); });
   const auto &source = (*plan)->input().sources[position];
@@ -3837,7 +3837,7 @@ CoTryTask<EcHelperHopResult> StorageClientImpl::executeEcHelper(EcHelperHopReq r
   CO_RETURN_ON_ERROR(check());
   if (response->result->packet.blockIndex != request.packet.blockIndex)
     co_return makeError(StatusCode::kDataCorruption);
-  CO_RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(**plan, repairBlock(response->result->packet)));
+  CO_RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(**plan, response->result->packet));
   // Caller has no helper key. The next Storage hop verifies predecessor MAC;
   // clients verify the final target block hashes and require Meta publication.
   co_return std::move(*response->result);

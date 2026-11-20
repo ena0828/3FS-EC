@@ -228,7 +228,7 @@ CoTryTask<EcHelperDirectHopResult> StorageOperator::executeEcHelperDirectOwned(
       CO_RETURN_ON_ERROR(response->result);
       result = std::move(*response->result);
     } else {
-      CO_RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(*plan, repairBlock(packet)));
+      CO_RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(*plan, packet));
       const auto start = uint64_t(block) * kEcIntegrityBlockBytes;
       bool ready = false;
       // Query is only a hint for ordering. Every selected target still receives

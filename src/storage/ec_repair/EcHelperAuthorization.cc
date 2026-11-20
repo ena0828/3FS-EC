@@ -178,7 +178,7 @@ Result<EcHelperStamp> stamp(const EcHelperKey &key,
                             uint64_t expires) {
   RETURN_ON_ERROR(time(now, expires, now));
   if (packet.nextHelper == 0 || packet.nextHelper > 10) return makeError(StatusCode::kInvalidArg);
-  CHECK_RESULT(digest, EcRepairBlockCore::digestPacket(plan, repairBlock(packet)));
+  CHECK_RESULT(digest, EcRepairBlockCore::digestPacket(plan, packet));
   EcHelperStamp result;
   result.packetDigest = digest;
   result.senderPosition = packet.nextHelper - 1;
@@ -197,7 +197,7 @@ Result<Void> verifyEcHelperPredecessor(const EcHelperKey &key,
                                        const EcHelperStamp &stamp,
                                        uint8_t recipient,
                                        uint64_t now) {
-  RETURN_ON_ERROR(EcRepairBlockCore::validate(plan, repairBlock(packet), recipient));
+  RETURN_ON_ERROR(EcRepairBlockCore::validate(plan, packet, recipient));
   if (recipient == 0) {
     if (!ec_helper_detail::Access::empty(stamp))
       return makeError(StatusCode::kAuthenticationFail, "first helper stamp must be empty");
@@ -207,7 +207,7 @@ Result<Void> verifyEcHelperPredecessor(const EcHelperKey &key,
       stamp.recipientPosition != recipient)
     return makeError(StatusCode::kAuthenticationFail, "helper predecessor position mismatch");
   RETURN_ON_ERROR(time(stamp.issuedAtSeconds, stamp.expiresAtSeconds, now));
-  CHECK_RESULT(digest, EcRepairBlockCore::digestPacket(plan, repairBlock(packet)));
+  CHECK_RESULT(digest, EcRepairBlockCore::digestPacket(plan, packet));
   if (stamp.packetDigest != digest)
     return makeError(StatusCode::kAuthenticationFail, "helper packet differs from predecessor stamp");
   CHECK_RESULT(signature, ec_helper_detail::Access::mac(key, canonical(stamp, plan)));
@@ -220,13 +220,13 @@ Result<Void> verifyEcHelperFinal(const EcHelperKey &key,
                                  const EcRepairPlan &plan,
                                  const EcHelperHopResult &result,
                                  uint64_t now) {
-  RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(plan, repairBlock(result.packet)));
+  RETURN_ON_ERROR(EcRepairBlockCore::validateComplete(plan, result.packet));
   const auto &stamp = result.finalStamp;
   if (stamp.version != kEcHelperVersion || stamp.senderPosition != 9 || stamp.recipientPosition != 255) {
     return makeError(StatusCode::kAuthenticationFail, "helper final stamp has wrong endpoints");
   }
   RETURN_ON_ERROR(time(stamp.issuedAtSeconds, stamp.expiresAtSeconds, now));
-  CHECK_RESULT(digest, EcRepairBlockCore::digestPacket(plan, repairBlock(result.packet)));
+  CHECK_RESULT(digest, EcRepairBlockCore::digestPacket(plan, result.packet));
   if (stamp.packetDigest != digest)
     return makeError(StatusCode::kAuthenticationFail, "helper final packet digest mismatch");
   CHECK_RESULT(signature, ec_helper_detail::Access::mac(key, canonical(stamp, plan)));
