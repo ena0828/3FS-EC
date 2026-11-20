@@ -367,6 +367,8 @@ auto MetaClient::retry(Func &&func, Req &&req, RetryConfig retryConfig, std::fun
                 std::is_same_v<std::remove_cvref_t<Req>, PrepareEcRepairDirectV2Req> ||
                 std::is_same_v<std::remove_cvref_t<Req>, ConfirmEcFileOutputResolutionReq> ||
                 std::is_same_v<std::remove_cvref_t<Req>, QueryEcFileOutputResolutionReq> ||
+                std::is_same_v<std::remove_cvref_t<Req>, ConfirmEcUnreservedRepairReq> ||
+                std::is_same_v<std::remove_cvref_t<Req>, QueryEcUnreservedRepairReq> ||
                 std::is_same_v<std::remove_cvref_t<Req>, ConfirmEcFragmentAbsentReq> ||
                 std::is_same_v<std::remove_cvref_t<Req>, QueryEcFragmentAbsentReq>) {
     // Disable the network sender's own retransmission as well as the explicit
@@ -590,6 +592,18 @@ CoTryTask<QueryEcFileOutputResolutionRsp> MetaClient::queryEcFileOutputResolutio
   auto once = config_.retry_default();
   once.set_retry_init_wait(0_ms);
   co_return co_await retry(&IMetaServiceStub::queryEcFileOutputResolution, req, std::move(once));
+}
+CoTryTask<EcUnreservedRepairRsp> MetaClient::confirmEcUnreservedRepair(ConfirmEcUnreservedRepairReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "fixed output resolution request UUID is required");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::confirmEcUnreservedRepair, req, std::move(once));
+}
+CoTryTask<EcUnreservedRepairRsp> MetaClient::queryEcUnreservedRepair(QueryEcUnreservedRepairReq req) {
+  if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "fixed output resolution request UUID is required");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::queryEcUnreservedRepair, req, std::move(once));
 }
 CoTryTask<EcAbsentAdminRsp> MetaClient::confirmEcFragmentAbsent(ConfirmEcFragmentAbsentReq req) {
   if (req.uuid.is_nil()) co_return makeError(StatusCode::kInvalidArg, "fixed absence request UUID is required");

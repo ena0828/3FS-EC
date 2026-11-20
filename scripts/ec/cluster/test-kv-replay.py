@@ -135,6 +135,10 @@ class ReplayEntryTests(unittest.TestCase):
         for strategy in ('central', 'pipeline', 'helper'):
             args = entry.parser().parse_args(['start', '--root', '/lab', '--run-dir', '/run', '--synthetic', '--strategy', strategy])
             self.assertEqual(args.strategy, strategy)
+            self.assertFalse(args.confirm_unreserved_repair)
+        args = entry.parser().parse_args(['start', '--root', '/lab', '--run-dir', '/run', '--synthetic',
+                                         '--confirm-unreserved-repair'])
+        self.assertTrue(args.confirm_unreserved_repair)
         args = entry.parser().parse_args(['resume', '--run-dir', '/run'])
         self.assertEqual(vars(args), {'command': 'resume', 'run_dir': Path('/run')})
 
@@ -149,7 +153,7 @@ class ReplayEntryTests(unittest.TestCase):
                                          '--authorize-collection-retry'])
         self.assertTrue(args.authorize_collection_retry)
         self.assertFalse(args.authorize_absence_confirmation)
-        for flag in ('--authorize-absence-confirmation', '--authorize-collection-retry'):
+        for flag in ('--authorize-absence-confirmation', '--authorize-collection-retry', '--confirm-unreserved-repair'):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 entry.parser().parse_args(['resume', '--run-dir', '/run', flag])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

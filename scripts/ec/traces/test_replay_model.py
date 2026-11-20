@@ -98,6 +98,11 @@ class ReplayModelTests(unittest.TestCase):
         self.assertFalse(last['model']['unpublished_unknown_outputs_credit'])
         self.assertEqual(last['recovery'], {'schema': 1, 'max_mutation_attempts': 4,
                                            'policy': 'explicit_settle_original_candidates'})
+        opted = self.plan(max_mutation_attempts=4, confirm_unreserved_repair=True)
+        self.assertEqual(opted['recovery'], {**last['recovery'], 'confirm_unreserved_repair': True})
+        self.assertEqual(opted['steps'], last['steps'])
+        self.assertEqual(opted['model'], last['model'])
+        with self.assertRaises(ValueError): self.plan(confirm_unreserved_repair=1)
         for value in (0, 5, True):
             with self.assertRaises(ValueError): self.plan(max_mutation_attempts=value)
 

@@ -16,5 +16,11 @@ class EcFileOutputResolutionCatalog {
   // original closures and both permanent indexes; caller namespace is not rebound.
   static CoTryTask<EcFileOutputResolution> query(Tx &, const EcFileOutputIdentity &, const Uuid &resolutionId,
                                                 const storage::EcScopeControlKey &);
+  static CoTryTask<EcUnreservedRepair> confirmUnreservedRepair(Tx &, const EcFileOutputIdentity &,
+                                                                const Uuid &resolutionId, const Uuid &client,
+                                                                const storage::EcScopeControlKey &);
+  static CoTryTask<EcUnreservedRepair> queryUnreservedRepair(Tx &, const EcFileOutputIdentity &,
+                                                              const Uuid &resolutionId,
+                                                              const storage::EcScopeControlKey &);
 };
 }  // namespace hf3fs::meta::server

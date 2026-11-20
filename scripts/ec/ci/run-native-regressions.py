@@ -112,6 +112,8 @@ CLIENT_MANDATORY |= {
     'TestEcRevisionRetirementCommands.ResolutionUnknownRetainsOriginalIdsAndQueryNeverConfirmsMissing',
     'TestEcRevisionRetirementCommands.ResolutionChecksCompleteDtoAndArchivesBothKindsWithoutCollectionClaim',
     'TestEcRevisionRetirementCommands.ResolutionUsageAndExclusiveArchiveFailuresDoNotDispatch',
+    'TestEcRevisionRetirementCommands.UnreservedRepairUnknownCanBeQueriedWithoutInventingCandidates',
+    'TestEcRevisionRetirementCommands.UnreservedRepairRejectsForeignProofAndNonRepairIdentity',
     "TestEcStripeRead.ReplacementAndSelfMoveRetainOutputChargeAcrossLateCleanupAndClose",
     "TestEcStripeClient.InvalidRepairDeliveryIsRejectedBeforeAnyMetadataCall",
     "TestEcStripeRunRecord.HelperDirectV3PersistsSelectionAndRejectsDowngradedJson",

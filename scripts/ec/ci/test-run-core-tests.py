@@ -62,7 +62,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
         self.assertEqual(len(RUNNER.selection("core")[0]) + len(RUNNER.selection("core")[2]), 38)
         combined, combined_filter, combined_fuse = RUNNER.selection("service-contracts")
         self.assertEqual(combined, expected + (
-            "TestMetaServiceReflection.RegistersAll76IncludingBeyondDefaultFieldRank",))
+            "TestMetaServiceReflection.RegistersAllMethodsIncludingBeyondDefaultFieldRank",))
         self.assertEqual(combined_filter, ":".join(combined))
         self.assertEqual(combined_fuse, ())
         RUNNER.check_meta_receipt(receipt(binary, output, combined, combined_filter), binary, output,

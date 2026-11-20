@@ -51,6 +51,7 @@
 #include "meta/store/EcCatalog.h"
 #include "meta/store/EcFileExecutionCatalog.h"
 #include "meta/store/EcFileOutputResolutionCatalog.h"
+#include "meta/store/EcFileRepairCatalog.h"
 #include "meta/store/EcFileTruncateCatalog.h"
 #include "meta/store/EcGcAbsentCompletionCatalog.h"
 #include "meta/store/EcNamespaceGuard.h"

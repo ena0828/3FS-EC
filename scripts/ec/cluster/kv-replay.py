@@ -149,7 +149,9 @@ def validate_receipt(step, plan, receipt):
         for key, expected in {'schema': 1, 'max_attempts': plan['recovery']['max_mutation_attempts'],
              'released_model_bytes_decimal': str((attempts - 1) * 12 * plan['shard_bytes']),
              'retained_model_bytes_decimal': str(12 * plan['shard_bytes']),
-             'physical_capacity_returned': False, 'scope': 'exact_original_candidate_reservations_only'}.items():
+             'physical_capacity_returned': False, 'scope': ('original_mutation_model_reservations_only'
+                 if spec['kind'] == 'repair' and plan['recovery'].get('confirm_unreserved_repair') else
+                 'exact_original_candidate_reservations_only')}.items():
             kv.require(type(reservation.get(key)) is type(expected) and reservation[key] == expected,
                        'Reservation completion differs: ' + key)
         kv.require(type(reservation['settlement_sha256']) is list and len(reservation['settlement_sha256']) == attempts - 1 and
@@ -241,6 +243,8 @@ def parser():
     start.add_argument('--targets', default='0,1', help='One or two distinct shard indices')
     start.add_argument('--max-mutation-attempts', type=int, default=2,
                        help='Fixed 1..4 attempts; each replacement requires explicit complete settlement')
+    start.add_argument('--confirm-unreserved-repair', action='store_true',
+                       help='Allow settlement with a permanent Meta proof that the closed repair never reserved output')
     for command in ('resume', 'status'):
         child = sub.add_parser(command)
         child.add_argument('--run-dir', required=True, type=Path)
@@ -286,6 +290,8 @@ def main(argv=None):
                     'repair': replay_model.repair_options(options.strategy,
                          options.delivery or ('direct' if options.strategy == 'helper' else 'return'),
                          options.window, [int(x) for x in options.targets.split(',')])}}
+        if options.confirm_unreserved_repair:
+            request['policy']['confirm_unreserved_repair'] = True
         plan = derive(request)  # Validate entire source and policy before creating any remote identity.
         run.mkdir(mode=0o700); sync_parent(run)
     with lease(run, options.command == 'start') as fd:

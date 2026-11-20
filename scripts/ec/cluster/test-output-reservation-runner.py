@@ -94,6 +94,21 @@ class Adapter:
             value = self.observations.get(f['identity']['child'])
             if value is None: return {**row, 'status_code': m.META_NOT_FOUND, 'outcome': 'not_observed', 'observation': None}
             return {**row, 'observation': copy.deepcopy(value)}
+        if action in ('confirm_unreserved_repair', 'query_unreserved_repair'):
+            rid = f['resolution_id']
+            row.update(metadata_resolution_only=True, collected=False, physical_reclamation_confirmed=False,
+                       candidate_reservations_release_eligible=False, uint64_encoding='unsigned_decimal_strings')
+            if action == 'confirm_unreserved_repair':
+                self.resolutions[rid] = {'version': 1, 'identity': copy.deepcopy(row['identity']),
+                    'resolutionId': rid, 'confirmingClientNamespace': self.namespace,
+                    'birth': self.cleanup['birth'], 'childEpoch': self.cleanup['captured_epoch_decimal'],
+                    'sourcePin': self.cleanup['source_pin'], 'repairDigest': '5' * 64, 'sourceClosureDigest': '6' * 64}
+            if rid not in self.resolutions:
+                return {**row, 'status_code': m.META_NOT_FOUND, 'outcome': 'not_observed', 'resolution': None,
+                        'actual_candidate_count': None, 'logical_reservation_release_eligible': False}
+            return {**row, 'outcome': 'observed' if action.startswith('query') else 'confirmed',
+                    'resolution': copy.deepcopy(self.resolutions[rid]),
+                    'actual_candidate_count': 0, 'logical_reservation_release_eligible': True}
         if 'file_output_resolution' in action:
             row.update(uint64_encoding='unsigned_decimal_strings', physical_reclamation_confirmed=False,
                        collected=False, metadata_resolution_only=True)
@@ -200,6 +215,26 @@ class OutputReservationTests(unittest.TestCase):
         self.adapter.exported = self.identities
 
     def tearDown(self): self.tmp.cleanup()
+
+    def test_unreserved_repair_requires_affirmative_fact_after_lost_confirm(self):
+        original = self.identities[0]
+        self.plan['confirm_unreserved_repair'] = True
+        (self.folder / 'plan.json').write_bytes(m.encoded(self.plan))
+        self.adapter.observations.clear()
+        self.adapter.cleanup.update(birth=uid(3), source_pin=uid(33), captured_epoch_decimal='7',
+                                    child=original['child'], operation=original['parent'], inode_decimal=original['inode_decimal'],
+                                    incarnation=original['object_incarnation'], client_namespace=original['owner_client'])
+        self.adapter.loss = 'confirm_unreserved_repair'
+        with self.assertRaises(LostOwner):
+            self.run_classifier()
+        self.assertFalse((self.folder / 'completion.json').exists())
+        self.adapter.corrupt = lambda op, row: (
+            {**row, 'resolution': {**row['resolution'], 'sourcePin': uid(900)}}
+            if row.get('resolution') is not None else row)
+        with self.assertRaises(m.gc.CheckError):
+            self.run_classifier()
+        self.assertFalse((self.folder / 'completion.json').exists())
+        self.assertEqual(sum(op['expected'].get('action') == 'confirm_unreserved_repair' for op in self.adapter.calls), 1)
 
     def run_classifier(self, authorized=False, *, authorize_collection_retry=False):
         return m.Classifier(self.folder, self.plan, self.adapter, authorized,

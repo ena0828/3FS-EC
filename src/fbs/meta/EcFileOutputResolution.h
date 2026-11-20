@@ -40,6 +40,30 @@ struct EcFileOutputResolution {
   Result<Void> valid() const;
 };
 
+// The precise repair was accepted and then closed without ever reserving an
+// output execution. There are no Storage candidates in this qualification.
+struct EcUnreservedRepair {
+  SERDE_STRUCT_FIELD(version, uint16_t{1});
+  SERDE_STRUCT_FIELD(identity, EcFileOutputIdentity{});
+  SERDE_STRUCT_FIELD(resolutionId, Uuid::zero());
+  SERDE_STRUCT_FIELD(confirmingClientNamespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(birth, Uuid::zero());
+  SERDE_STRUCT_FIELD(childEpoch, uint64_t{});
+  SERDE_STRUCT_FIELD(sourcePin, Uuid::zero());
+  SERDE_STRUCT_FIELD(repairDigest, storage::EcSha256{});
+  SERDE_STRUCT_FIELD(sourceClosureDigest, storage::EcSha256{});
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(identity.valid());
+    if (version != 1 || identity.ownerKind != EcFileOutputOwner::Repair || resolutionId.is_nil() ||
+        confirmingClientNamespace.is_nil() || birth.is_nil() || !childEpoch || sourcePin.is_nil() ||
+        repairDigest == storage::EcSha256{} || sourceClosureDigest == storage::EcSha256{})
+      return makeError(StatusCode::kDataCorruption, "invalid unreserved repair qualification");
+    return Void{};
+  }
+};
+
 // Canonical, domain-separated digests; no signature or bearer authority.
 Result<storage::EcSha256> ecFileOutputResolutionDigest(std::string_view domain, std::string_view bytes);
 Result<storage::EcSha256> ecFileOutputCandidateDigest(const std::array<EcV2ReservedAllocation, 12> &);

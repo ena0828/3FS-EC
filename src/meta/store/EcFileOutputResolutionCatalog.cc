@@ -11,11 +11,8 @@ namespace {
 using namespace ec_file_mutation_detail;
 using Tx = EcFileTreeTxnBudget;
 using kv::KeyPrefix;
-std::string primaryKey(const EcFileOutputIdentity &identity) {
-  return idKey(KeyPrefix::EcFileOutputResolution, identity.object, identity.child);
-}
-std::string requestKey(const Uuid &client, const Uuid &id) {
-  std::string key(kv::toStr(KeyPrefix::EcFileOutputResolutionRequest));
+std::string requestKey(KeyPrefix prefix, const Uuid &client, const Uuid &id) {
+  std::string key(kv::toStr(prefix));
   key.append(client.asStringView());
   key.append(id.asStringView());
   return key;
@@ -134,53 +131,122 @@ CoTryTask<EcFileOutputResolution> qualify(Tx &tx, const EcFileOutputIdentity &id
   CO_RETURN_ON_ERROR(out.valid());
   co_return out;
 }
-CoTryTask<EcFileOutputResolution> revalidate(Tx &tx, const EcFileOutputResolution &prior,
-                                            const EcFileOutputIdentity &identity, const Uuid &id,
-                                            const storage::EcScopeControlKey &control) {
+CoTryTask<EcUnreservedRepair> qualifyUnreservedRepair(Tx &tx, const EcFileOutputIdentity &identity,
+                                                      const Uuid &id, const Uuid &client,
+                                                      const storage::EcScopeControlKey &control) {
+  if (identity.ownerKind != EcFileOutputOwner::Repair)
+    co_return makeError(StatusCode::kInvalidArg, "unreserved output proof is limited to repair");
+  auto repair = co_await EcFileRepairCatalog::byChild(tx, identity.owner, identity.object, identity.child);
+  CO_RETURN_ON_ERROR(repair);
+  if (repair->intent.operation != identity.parent)
+    co_return makeError(StatusCode::kTokenMismatch, "repair parent differs");
+  if (repair->state != EcFileRepairState::Aborted || repair->child.state != EcFileChildState::Fenced)
+    co_return makeError(StatusCode::kTokenStale, "original repair remains executable or published");
+
+  // reserveExecution checks this same typed parent and atomically stores its
+  // twelve allocation indexes with the execution. This conflict read shares
+  // the confirmation transaction. Aborted is irreversible for this repair ID.
+  auto execution = co_await tx.get(idKey(KeyPrefix::EcFileExecution, identity.object, identity.child));
+  CO_RETURN_ON_ERROR(execution);
+  if (*execution) co_return makeError(StatusCode::kTokenStale, "repair has an output execution");
+  auto source = co_await EcTreeSourcePinCatalog::query(tx, sourceIntent(repair->child));
+  CO_RETURN_ON_ERROR(source);
+  if (source->issuanceSequence || source->state != EcTreeSourcePinState::Released || !source->drain ||
+      source->drain->state != EcV2DrainState::ReadReleased)
+    co_return makeError(StatusCode::kTokenStale, "original repair source was issued or lacks terminal release");
+  CO_RETURN_ON_ERROR(co_await verifyEcTerminalEvidence(tx, *source->drain, control, EcTerminalPurpose::ReadRelease));
+
+  EcUnreservedRepair out;
+  out.identity = identity;
+  out.resolutionId = id;
+  out.confirmingClientNamespace = client;
+  out.birth = repair->child.birth;
+  out.childEpoch = repair->child.epoch;
+  out.sourcePin = repair->intent.sourcePin;
+  auto parentDigest = ecFileOutputResolutionDigest("hf3fs.ec.unreserved-repair.parent.v1", serde::serialize(*repair));
+  CO_RETURN_ON_ERROR(parentDigest);
+  out.repairDigest = *parentDigest;
+  auto sourceDigest = ecFileOutputResolutionDigest("hf3fs.ec.file-output.closure.v1", serde::serialize(*source->drain));
+  CO_RETURN_ON_ERROR(sourceDigest);
+  out.sourceClosureDigest = *sourceDigest;
+  CO_RETURN_ON_ERROR(out.valid());
+  co_return out;
+}
+
+template <class T, class Qualifier>
+CoTryTask<T> revalidate(Tx &tx, const T &prior, const EcFileOutputIdentity &identity, const Uuid &id,
+                        const storage::EcScopeControlKey &control, KeyPrefix reversePrefix, Qualifier qualifier) {
   CO_RETURN_ON_ERROR(prior.valid());
   if (!same(prior.identity, identity) || prior.resolutionId != id)
     co_return makeError(StatusCode::kTokenMismatch, "resolution identity is permanently bound");
-  auto reverse = co_await require<EcFileOutputResolution>(tx, requestKey(prior.confirmingClientNamespace, id));
+  auto reverse = co_await require<T>(tx, requestKey(reversePrefix, prior.confirmingClientNamespace, id));
   CO_RETURN_ON_ERROR(reverse);
   if (!same(*reverse, prior)) co_return makeError(StatusCode::kDataCorruption, "resolution indexes disagree");
-  auto current = co_await qualify(tx, identity, id, prior.confirmingClientNamespace, control);
+  auto current = co_await qualifier(tx, identity, id, prior.confirmingClientNamespace, control);
   CO_RETURN_ON_ERROR(current);
   if (!same(*current, prior)) co_return makeError(StatusCode::kDataCorruption, "resolution original closure changed");
   co_return prior;
 }
-}  // namespace
-CoTryTask<EcFileOutputResolution> EcFileOutputResolutionCatalog::confirm(
+template <class T, class Qualifier>
+CoTryTask<T> confirmResolution(
     Tx &tx, const EcFileOutputIdentity &identity, const Uuid &id, const Uuid &client,
-    const storage::EcScopeControlKey &control) {
+    const storage::EcScopeControlKey &control, KeyPrefix primaryPrefix, KeyPrefix reversePrefix, Qualifier qualifier) {
   CO_RETURN_ON_ERROR(identity.valid());
   if (id.is_nil() || client.is_nil()) co_return makeError(StatusCode::kInvalidArg);
-  auto prior = co_await load<EcFileOutputResolution>(tx, primaryKey(identity));
+  auto prior = co_await load<T>(tx, idKey(primaryPrefix, identity.object, identity.child));
   CO_RETURN_ON_ERROR(prior);
   if (*prior) {
     if ((**prior).confirmingClientNamespace != client)
       co_return makeError(StatusCode::kTokenMismatch, "confirmation namespace is permanently bound");
-    co_return co_await revalidate(tx, **prior, identity, id, control);
+    co_return co_await revalidate(tx, **prior, identity, id, control, reversePrefix, qualifier);
   }
-  auto reverse = co_await load<EcFileOutputResolution>(tx, requestKey(client, id));
+  auto reverse = co_await load<T>(tx, requestKey(reversePrefix, client, id));
   CO_RETURN_ON_ERROR(reverse);
   if (*reverse) {
     if (same((**reverse).identity, identity))
       co_return makeError(StatusCode::kDataCorruption, "resolution primary index missing");
     co_return makeError(StatusCode::kTokenMismatch, "resolution ID belongs to another child");
   }
-  auto out = co_await qualify(tx, identity, id, client, control);
+  auto out = co_await qualifier(tx, identity, id, client, control);
   CO_RETURN_ON_ERROR(out);
-  CO_RETURN_ON_ERROR(co_await store(tx, primaryKey(identity), *out));
-  CO_RETURN_ON_ERROR(co_await store(tx, requestKey(client, id), *out));
+  CO_RETURN_ON_ERROR(co_await store(tx, idKey(primaryPrefix, identity.object, identity.child), *out));
+  CO_RETURN_ON_ERROR(co_await store(tx, requestKey(reversePrefix, client, id), *out));
   co_return out;
 }
-CoTryTask<EcFileOutputResolution> EcFileOutputResolutionCatalog::query(
-    Tx &tx, const EcFileOutputIdentity &identity, const Uuid &id, const storage::EcScopeControlKey &control) {
+template <class T, class Qualifier>
+CoTryTask<T> queryResolution(
+    Tx &tx, const EcFileOutputIdentity &identity, const Uuid &id, const storage::EcScopeControlKey &control,
+    KeyPrefix primaryPrefix, KeyPrefix reversePrefix, Qualifier qualifier) {
   CO_RETURN_ON_ERROR(identity.valid());
   if (id.is_nil()) co_return makeError(StatusCode::kInvalidArg);
-  auto prior = co_await load<EcFileOutputResolution>(tx, primaryKey(identity));
+  auto prior = co_await load<T>(tx, idKey(primaryPrefix, identity.object, identity.child));
   CO_RETURN_ON_ERROR(prior);
   if (!*prior) co_return makeError(MetaCode::kNotFound, "output resolution has not been confirmed");
-  co_return co_await revalidate(tx, **prior, identity, id, control);
+  co_return co_await revalidate(tx, **prior, identity, id, control, reversePrefix, qualifier);
+}
+}  // namespace
+CoTryTask<EcFileOutputResolution> EcFileOutputResolutionCatalog::confirm(
+    Tx &tx, const EcFileOutputIdentity &identity, const Uuid &id, const Uuid &client,
+    const storage::EcScopeControlKey &control) {
+  co_return co_await confirmResolution<EcFileOutputResolution>(tx, identity, id, client, control,
+      KeyPrefix::EcFileOutputResolution, KeyPrefix::EcFileOutputResolutionRequest, qualify);
+}
+CoTryTask<EcFileOutputResolution> EcFileOutputResolutionCatalog::query(
+    Tx &tx, const EcFileOutputIdentity &identity, const Uuid &id,
+    const storage::EcScopeControlKey &control) {
+  co_return co_await queryResolution<EcFileOutputResolution>(tx, identity, id, control,
+      KeyPrefix::EcFileOutputResolution, KeyPrefix::EcFileOutputResolutionRequest, qualify);
+}
+CoTryTask<EcUnreservedRepair> EcFileOutputResolutionCatalog::confirmUnreservedRepair(
+    Tx &tx, const EcFileOutputIdentity &identity, const Uuid &id, const Uuid &client,
+    const storage::EcScopeControlKey &control) {
+  co_return co_await confirmResolution<EcUnreservedRepair>(tx, identity, id, client, control,
+      KeyPrefix::EcUnreservedRepair, KeyPrefix::EcUnreservedRepairRequest, qualifyUnreservedRepair);
+}
+CoTryTask<EcUnreservedRepair> EcFileOutputResolutionCatalog::queryUnreservedRepair(
+    Tx &tx, const EcFileOutputIdentity &identity, const Uuid &id,
+    const storage::EcScopeControlKey &control) {
+  co_return co_await queryResolution<EcUnreservedRepair>(tx, identity, id, control,
+      KeyPrefix::EcUnreservedRepair, KeyPrefix::EcUnreservedRepairRequest, qualifyUnreservedRepair);
 }
 }  // namespace hf3fs::meta::server

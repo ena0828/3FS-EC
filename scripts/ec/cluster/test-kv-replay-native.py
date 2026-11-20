@@ -95,6 +95,8 @@ class NativeAdapterTests(unittest.TestCase):
         """Actual reservation/Classifier algorithms, explicitly simulated services."""
         b = self.backend
         b.plan['recovery'] = {'schema': 1, 'max_mutation_attempts': limit, 'policy': reservations.POLICY}
+        if mode == 'unreserved-repair':
+            b.plan['recovery']['confirm_unreserved_repair'] = True
         b.plan['model'] = {'allocation_budget_decimal': str(8 * 12 * 11469)}
         for step in b.plan['steps']:
             step['model']['before'] = {'allocation_reservation_bytes_decimal':
@@ -138,16 +140,18 @@ class NativeAdapterTests(unittest.TestCase):
                         'policy': 'collect_first_absence_requires_explicit_resume_authorization',
                         'binding': {'cluster': 'test-cluster', 'client_namespace': Adapter.namespace,
                                     'files': {str(record): sha(record)}}}
+                if args.confirm_unreserved_repair:
+                    plan['confirm_unreserved_repair'] = True
                 self.save(folder / 'plan.json', plan)
                 i = {'inode_decimal': '42', 'object_incarnation': uid(2), 'owner_uid': 1000,
                      'owner_client': uid(4), 'parent': uid(6 if args.kind == 'pwrite' else 30),
                      'child': uid(7 if args.kind == 'pwrite' else 31), 'owner_kind': args.kind}
                 observation = classification_fixture.observation(i, 'Published' if self.classification_mode == 'published' else 'Aborted',
                                                                  bound=self.classification_mode != 'released')
-                adapter = Adapter(plan, {} if self.classification_mode == 'missing' else {i['child']: observation})
+                adapter = Adapter(plan, {} if self.classification_mode in ('missing', 'unreserved-repair') else {i['child']: observation})
                 adapter.exported = [i]
                 adapter.cleanup.update(self.session | {'operation': i['parent'], 'child': i['child'],
-                    'plan': uid(32), 'source_pin': uid(33)})
+                    'plan': uid(32), 'source_pin': uid(33), 'captured_epoch_decimal': '7'})
                 if self.classification_mode == 'published':
                     adapter.cleanup.update(state='Published', published=True)
                 if self.classification_mode == 'mixed': adapter.present = {0, 3, 7, 11}
@@ -561,6 +565,34 @@ class NativeAdapterTests(unittest.TestCase):
         result = self.backend.perform('repair-0', self.spec('repair'))
         self.assertEqual(result['mutation_reservations']['attempts'], 2)
         self.assertFalse(result['physical_capacity_returned'])
+
+    def test_unreserved_repair_settles_model_once_then_replaces_original_attempt(self):
+        self.enable_settlement(mode='unreserved-repair')
+        self.backend.perform('put-0', self.spec('put'))
+        self.backend.perform('get-0', self.spec('get'))
+        self.fail_action = 'repair'
+        with self.assertRaises(RuntimeError): self.backend.perform('repair-0', self.spec('repair'))
+        result = self.backend.settle('repair-0')
+        self.assertEqual(result['settlement']['released_model_bytes_decimal'], str(12 * 11469))
+        self.assertFalse(result['model_advanced'])
+        self.assertFalse(result['settlement']['physical_capacity_returned'])
+        self.assertEqual(result, self.backend.settle('repair-0'))
+        classification = self.backend.actions / 'repair-0/reservations/0000/classification'
+        receipt = self.backend.load(classification / 'completion.json')
+        self.assertEqual(receipt['children'][0]['candidates'], [])
+        self.assertTrue(receipt['unreserved_repair_confirmed'])
+        self.assertFalse(receipt['candidate_set_classified'])
+        seen = set()
+        reservations.Reservations.record_credit(receipt['children'][0], seen)
+        with self.assertRaisesRegex(ValueError, 'more than once'):
+            reservations.Reservations.record_credit(receipt['children'][0], seen)
+        adapter = self.classifiers[str(classification)]
+        calls = len(adapter.calls)
+        self.assertEqual(receipt, classification_fixture.m.Classifier(classification, adapter.plan, adapter).run())
+        self.assertEqual(len(adapter.calls), calls)
+        completed = self.backend.perform('repair-0', self.spec('repair'))
+        self.assertEqual(completed['mutation_reservations']['attempts'], 2)
+        self.assertEqual(completed['mutation_reservations']['scope'], 'original_mutation_model_reservations_only')
 
     def test_exhausted_attempt_budget_and_missing_original_record_never_generate_replacement(self):
         self.enable_settlement(limit=1)

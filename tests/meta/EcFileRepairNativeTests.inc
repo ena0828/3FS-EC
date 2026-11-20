@@ -355,3 +355,133 @@ TEST_F(TestEcFileNativeRepair, ThreeStrategiesPublishFreshTwelveAndKeepSourceDeb
       "scope",
       "three real repair strategies; one process TCP fixture; controlled mask, not a machine-loss experiment");
 }
+
+TEST_F(TestEcFileNativeRepair, UnreservedRepairRequiresAbortedParentReleasedSourceAndMissingExecution) {
+  using namespace hf3fs::client::ec;
+  auto open = request<OpenEcFileSessionReq>();
+  open.createNew = true;
+  open.path = PathAt(parent_, "unreserved-repair");
+  open.shardBytes = kShardBytes;
+  open.session = Uuid::random();
+  open.rights = 3;
+  open.perm = Permission{0600};
+  auto opened = blockingWait(metaClient_->openEcFileSession(open));
+  ASSERT_OK(opened);
+  AdvanceEcFilePwriteReq write;
+  ASSERT_NO_FATAL_FAILURE(writePatch(*opened, 0, bytes(kShardBytes + 7, 92), false, write));
+
+  std::optional<EcUnreservedRepair> original;
+  QueryEcUnreservedRepairReq historical;
+  for (bool reserved : {false, true}) {
+    SCOPED_TRACE(reserved ? "bound output" : "never reserved");
+    opened = blockingWait(metaClient_->openEcFileSession(open));
+    ASSERT_OK(opened);
+    const std::array<uint8_t, 10> sources{2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    auto run = prepareEcTreeRepair(opened->session, opened->root, "unreserved-repair", 0, 3,
+                                   EcFileRepairMode::CentralSerial, sources);
+    ASSERT_OK(run);
+    const auto &i = run->intent;
+    auto begin = request<BeginEcFileRepairReq>();
+    begin.intent = i;
+    begin.uuid = i.request;
+    ASSERT_OK(blockingWait(metaClient_->beginEcFileRepair(begin)));
+
+    EcFileOutputIdentity identity;
+    identity.object = i.object;
+    identity.owner = i.owner;
+    identity.parent = i.operation;
+    identity.child = i.child;
+    identity.ownerKind = EcFileOutputOwner::Repair;
+    auto observer = fileOutputRequest(identity);
+    ASSERT_OK(observer);
+    ConfirmEcUnreservedRepairReq confirm;
+    static_cast<ReqBase &>(confirm) = static_cast<const ReqBase &>(*observer);
+    confirm.identity = identity;
+    confirm.resolutionId = Uuid::random();
+    auto query = request<QueryEcUnreservedRepairReq>();
+    query.user = confirm.user;
+    query.identity = identity;
+    query.resolutionId = confirm.resolutionId;
+    ASSERT_ERROR(blockingWait(metaClient_->queryEcUnreservedRepair(query)), MetaCode::kNotFound);
+    ASSERT_ERROR(blockingWait(metaClient_->confirmEcUnreservedRepair(confirm)), StatusCode::kTokenStale);
+
+    auto prepare = request<AdvanceEcFileRepairReq>();
+    prepare.intent = i;
+    prepare.uuid = run->prepareRequest;
+    prepare.action = EcFileRepairAdvance::Prepare;
+    if (reserved) {
+      auto prepared = blockingWait(metaClient_->advanceEcFileRepair(prepare));
+      ASSERT_OK(prepared);
+      ASSERT_TRUE(prepared->access);
+    } else {
+      // Interrupt closing at the real parent-fence transaction. The accepted
+      // child is terminal, but its source pin still needs authenticated release.
+      auto raw = kv_->createReadWriteTransaction();
+      EcFileTreeTxnBudget tx(*raw, EcFileTreeTxnBudget::Profile::Repair);
+      ASSERT_OK(blockingWait(EcFileRepairCatalog::abort(tx, i.owner, i.object, i.operation)));
+      ASSERT_OK(blockingWait(tx.commit()));
+      ASSERT_ERROR(blockingWait(metaClient_->confirmEcUnreservedRepair(confirm)), StatusCode::kTokenStale);
+      ASSERT_ERROR(blockingWait(metaClient_->advanceEcFileRepair(prepare)), StatusCode::kTokenStale);
+    }
+    auto close = request<CloseEcFileRepairDebtReq>();
+    close.intent = i;
+    close.outputRevocation = run->outputRevocation;
+    close.sourceRevocation = run->sourceRevocation;
+    auto closed = blockingWait(metaClient_->closeEcFileRepairDebt(close));
+    ASSERT_OK(closed);
+    ASSERT_TRUE(closed->progress.sourceReleased);
+    ASSERT_TRUE(closed->progress.outputDrained);
+    if (reserved) {
+      ASSERT_ERROR(blockingWait(metaClient_->confirmEcUnreservedRepair(confirm)), StatusCode::kTokenStale);
+      auto reused = confirm;
+      reused.resolutionId = original->resolutionId;
+      ASSERT_ERROR(blockingWait(metaClient_->confirmEcUnreservedRepair(reused)), StatusCode::kTokenMismatch);
+      ASSERT_ERROR(blockingWait(metaClient_->queryEcUnreservedRepair(query)), MetaCode::kNotFound);
+      continue;
+    }
+    auto mismatch = confirm;
+    mismatch.identity.parent = Uuid::random();
+    ASSERT_ERROR(blockingWait(metaClient_->confirmEcUnreservedRepair(mismatch)), StatusCode::kTokenMismatch);
+    mismatch = confirm;
+    mismatch.identity.owner.client = Uuid::random();
+    ASSERT_ERROR(blockingWait(metaClient_->confirmEcUnreservedRepair(mismatch)), MetaCode::kNoPermission);
+    mismatch = confirm;
+    mismatch.user = user_;
+    ASSERT_ERROR(blockingWait(metaClient_->confirmEcUnreservedRepair(mismatch)), MetaCode::kNoPermission);
+
+    auto result = blockingWait(metaClient_->confirmEcUnreservedRepair(confirm));
+    ASSERT_OK(result);
+    original = result->resolution;
+    ASSERT_OK(original->valid());
+    EXPECT_EQ(serde::serialize(original->identity), serde::serialize(identity));
+    EXPECT_EQ(original->confirmingClientNamespace, metaClientId_.uuid);
+    EXPECT_EQ(original->resolutionId, confirm.resolutionId);
+    EXPECT_EQ(original->sourcePin, i.sourcePin);
+    auto replay = blockingWait(metaClient_->confirmEcUnreservedRepair(confirm));
+    ASSERT_OK(replay);
+    EXPECT_EQ(serde::serialize(replay->resolution), serde::serialize(*original));
+    ASSERT_ERROR(blockingWait(metaClient_->queryEcFileOutput(*observer)), MetaCode::kNotFound);
+    ASSERT_ERROR(blockingWait(metaClient_->advanceEcFileRepair(prepare)), StatusCode::kTokenStale);
+    {
+      const ClientId otherId(Uuid::random());
+      auto factory = std::make_unique<meta::client::MetaClient::StubFactory>(
+          [this](net::Address address) { return metaNet_->serdeCtx(address); });
+      meta::client::MetaClient other(otherId, metaClientConfig_, std::move(factory), mgmtd_, storageClient_, false);
+      SCOPE_EXIT { other.stop(); };
+      ASSERT_ERROR(blockingWait(other.confirmEcUnreservedRepair(confirm)), StatusCode::kTokenMismatch);
+      auto read = blockingWait(other.queryEcUnreservedRepair(query));
+      ASSERT_OK(read);
+      EXPECT_EQ(read->clientNamespace, otherId.uuid);
+      EXPECT_EQ(serde::serialize(read->resolution), serde::serialize(*original));
+    }
+    historical = query;
+  }
+  auto close = request<CloseEcFileSessionReq>();
+  close.object = opened->object.object;
+  close.session = open.session;
+  ASSERT_OK(blockingWait(metaClient_->closeEcFileSession(close)));
+  ASSERT_NO_FATAL_FAILURE(restartCoordinator());
+  auto past = blockingWait(metaClient_->queryEcUnreservedRepair(historical));
+  ASSERT_OK(past);
+  EXPECT_EQ(serde::serialize(past->resolution), serde::serialize(*original));
+}

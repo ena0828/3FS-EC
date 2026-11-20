@@ -6,6 +6,7 @@ the logical action. A retained publication must still pass normal readback.
 """
 from pathlib import Path
 from types import SimpleNamespace
+import uuid
 
 
 POLICY = 'explicit_settle_original_candidates'
@@ -18,7 +19,9 @@ def require(ok, text):
 
 def policy(plan):
     value = plan.get('recovery')
-    require(type(value) is dict and set(value) == {'schema', 'max_mutation_attempts', 'policy'} and
+    keys = {'schema', 'max_mutation_attempts', 'policy'}
+    require(type(value) is dict and (set(value) == keys or
+            set(value) == keys | {'confirm_unreserved_repair'} and value['confirm_unreserved_repair'] is True) and
             type(value['schema']) is int and value['schema'] == 1 and value['policy'] == POLICY and
             type(value['max_mutation_attempts']) is int and 1 <= value['max_mutation_attempts'] <= 4,
             'Invalid fixed explicit settlement policy')
@@ -31,6 +34,7 @@ class Reservations:
         self.limit = policy(backend.plan)['max_mutation_attempts']
         require(spec['kind'] in ('put', 'repair'), 'Only fixed one-stripe mutation reservations are supported')
         self.kind = 'pwrite' if spec['kind'] == 'put' else 'repair'
+        self.confirm_unreserved = self.kind == 'repair' and backend.plan['recovery'].get('confirm_unreserved_repair', False)
         self.phase = 'write' if spec['kind'] == 'put' else 'repair'
         self.cost = 12 * backend.plan['shard_bytes']
         self.root = backend.directory(folder / 'reservations')
@@ -54,7 +58,8 @@ class Reservations:
         return {'schema': 1, 'index': index, 'plan_sha256': self.b.plan_sha,
                 'spec': self.spec, 'object': self.fixed, 'kind': self.kind,
                 'work': str(work), 'source_run': str(work / (self.phase + '-run')),
-                'reservation_bytes_decimal': str(self.cost), 'candidate_count': 12}
+                'reservation_bytes_decimal': str(self.cost),
+                ('reservation_slot_count' if self.confirm_unreserved else 'candidate_count'): 12}
 
     def reserve(self, index):
         require(index < self.limit, 'Fixed mutation attempt limit exhausted; no new identity permitted')
@@ -69,9 +74,7 @@ class Reservations:
             result = self.settlement(value)
             require(value['index'] < index and result['state'] == 'released',
                     'An original reservation is still retained/unknown')
-            for row in result['classification']['children'][0]['candidates']:
-                require(row['allocation'] not in credited, 'Candidate credited more than once')
-                credited.add(row['allocation'])
+            self.record_credit(result['classification']['children'][0], credited)
         path = self.b.directory(self.root / f'{index:04d}')
         value = self.b.seal(path / 'plan.json', self.plan(index))
         if index:
@@ -110,17 +113,21 @@ class Reservations:
         record = Path(value['source_run']) / ('record.json' if self.kind == 'pwrite' else 'record.data')
         require(plan['root'] == str(b.root) and plan['source_run'] == value['source_run'] and
                 plan['source_record'] == str(record) and plan['output_kind'] == self.kind and
-                plan['source_record_sha256'] == b.sha(record), 'Classifier changed original journal')
+                plan['source_record_sha256'] == b.sha(record) and
+                plan.get('confirm_unreserved_repair', False) is self.confirm_unreserved,
+                'Classifier changed original journal or recovery policy')
         for raw, sha in plan['binding']['files'].items():
             require(b.sha(raw) == sha, 'Classifier provider/config/source changed')
         result = b.load(folder / 'completion.json')
+        unreserved = result.get('unreserved_repair_confirmed') is True
+        require(not unreserved or self.confirm_unreserved, 'Original plan did not permit unreserved confirmation')
         for key, want in {'schema': 1, 'kind': 'ec_output_reservation_classification', 'root': str(b.root),
                 'source_run': value['source_run'], 'output_kind': self.kind, 'cluster': b.manifest['cluster_id'],
                 'plan_sha256': b.sha(folder / 'plan.json'), 'source_record_sha256': b.sha(record),
                 'provider_binding_sha256': runner.sha(plan['binding']), 'source_cleanup_confirmed': True,
-                'candidate_set_classified': True, 'business_action_completed': False,
+                'candidate_set_classified': not unreserved, 'business_action_completed': False,
                 'physical_capacity_returned': False, 'session_closed_by_runner': False,
-                'scope': 'exact_original_output_children_only', 'candidate_count': 12}.items():
+                'scope': 'exact_original_output_children_only', 'candidate_count': 0 if unreserved else 12}.items():
             require(type(result.get(key)) is type(want) and result[key] == want, 'Classifier result differs: ' + key)
         inventory = folder / 'final-evidence.json'
         require(result['evidence_inventory']['path'] == str(inventory) and
@@ -161,6 +168,36 @@ class Reservations:
                 identity['inode_decimal'] == self.fixed['inode_decimal'] and
                 identity['object_incarnation'] == self.fixed['incarnation'] and
                 identity['owner_client'] == self.fixed['client_namespace'], 'Original output ownership differs')
+        rows = b.json_objects(b.w.regular_bytes(Path(cleanup['attempt']) / 'command.log', 1024**2).decode())
+        cleanup_result = {'returncode': 0, 'business': rows, 'files': {str(folder / raw): sha for raw, sha in files.items()}}
+        if unreserved:
+            require(child.get('state') == 'UnreservedRepair' and child.get('candidates') == [] and
+                    type(result['eligible_candidate_count']) is int and result['eligible_candidate_count'] == 0,
+                    'Unreserved resolution cannot classify candidate allocations')
+            ns = uuid.UUID(plan['id_namespace'])
+            rid = str(uuid.uuid5(ns, 'child-00-unreserved'))
+            missing = child['negative_observation']
+            path = Path(missing['attempt'])
+            require(path.parent == folder / 'attempts', 'Negative observation escaped its original run')
+            observe = b.load(folder / 'operations/child-00-observe.json')
+            expected = {'action': 'observe_file_output', 'identity': runner.dto_identity(identity),
+                        'client_namespace': plan['binding']['client_namespace'],
+                        'request_id': str(uuid.uuid5(ns, 'child-00-observe'))}
+            intent = b.load(path / 'intent.json'); joined = b.load(path / 'joined.json')
+            require(b.same(intent['operation'], observe) and b.same(observe['expected'], expected),
+                    'Negative observation identity changed')
+            checker.check_join(path, intent, joined)
+            checker.history = {observe['name']: [(path, joined)]}
+            require(b.same(checker.original_missing(observe), missing), 'Negative observation changed')
+            proof = evidence(child['resolution'])['value']
+            require(proof['action'] in runner.UNRESERVED_ACTIONS and proof['resolution_id'] == child['resolution_id'] == rid and
+                    proof['client_namespace'] == plan['binding']['client_namespace'] and
+                    proof['request_id'] == str(uuid.uuid5(ns, 'child-00-unreserved-' + proof['action'].split('_')[0])),
+                    'Unreserved repair evidence came from a different logical operation')
+            resolution = runner.validate_unreserved(proof, identity, cleanup['value'], rid, proof['client_namespace'])
+            require(resolution['birth'] == self.fixed['birth'] and rows[0]['session'] == self.fixed['session'],
+                    'Original replay session or object birth differs')
+            return result, cleanup_result, True
         observation = evidence(child['observation'])['value']['observation']
         original = runner.candidates(observation, identity)
         require(child['candidate_set_sha256'] == runner.sha(observation['candidates']) and
@@ -200,15 +237,26 @@ class Reservations:
         require(all(eligible) or not any(eligible), 'Partial candidate eligibility cannot release a twelve-slot reservation')
         require(type(result['eligible_candidate_count']) is int and result['eligible_candidate_count'] == sum(eligible),
                 'Eligibility count differs')
-        rows = b.json_objects(b.w.regular_bytes(Path(cleanup['attempt']) / 'command.log', 1024**2).decode())
         parent = rows[0].get('operation')
         require(parent == identity['parent'], 'Cleanup changed original parent identity')
         if all(eligible):
             require(child['state'] != 'Published_retained' and
                     (rows[1]['logical_complete'] is False if self.kind == 'pwrite' else rows[0]['published'] is False),
                     'Published workload cannot be replaced after a reservation release')
-        return result, {'returncode': 0, 'business': rows,
-                        'files': {str(folder / raw): sha for raw, sha in files.items()}}, all(eligible)
+        return result, cleanup_result, all(eligible)
+
+    @staticmethod
+    def record_credit(child, seen):
+        if child['state'] == 'UnreservedRepair':
+            # The reservation has no allocation IDs. Its original logical child
+            # must still never release more than one attempt's model budget.
+            for key in (('repair-child', child['identity']['child']), ('repair-parent', child['identity']['parent']),
+                        ('unreserved-resolution', child['resolution_id'])):
+                require(key not in seen, 'Unreserved repair credited more than once')
+                seen.add(key)
+        for row in child['candidates']:
+            require(row['allocation'] not in seen, 'Candidate credited more than once')
+            seen.add(row['allocation'])
 
     def settlement(self, value):
         path = self.root / f"{value['index']:04d}" / 'settlement.json'
@@ -232,7 +280,8 @@ class Reservations:
         value = plans[-1]; path = self.root / f"{value['index']:04d}"
         self.b.records(Path(value['source_run']))  # Missing/partial cannot authorize a new journal.
         self.b.seal(path / 'settle-intent.json', {'schema': 1, 'reservation_plan_sha256': self.b.sha(path / 'plan.json'),
-            'scope': 'explicit_original_close_and_candidate_classification_not_business_success'})
+            'scope': ('explicit_original_close_and_logical_model_resolution_only' if self.confirm_unreserved
+                      else 'explicit_original_close_and_candidate_classification_not_business_success')})
         target = path / 'classification'
         require(not authorize_collection_retry or (target / 'plan.json').exists(),
                 'Collection retry requires the original classifier run')
@@ -248,6 +297,7 @@ class Reservations:
             require(not target.exists() or action == 'resume', 'Partial classifier plan; preserve original Unknown')
             self.b.run_classifier(SimpleNamespace(action=action, root=self.b.root, run_dir=target,
                 source_run=Path(value['source_run']), kind=self.kind, max_commands=4096,
+                confirm_unreserved_repair=self.confirm_unreserved,
                 authorize_absence_confirmation=authorize_absence, authorize_collection_retry=authorize_collection_retry))
             result, _, released = self.classification(value)
             self.b.seal(path / 'settlement.json', {'schema': 1, 'state': 'released' if released else 'published_retained',
@@ -266,9 +316,7 @@ class Reservations:
         for value in values[:-1]:
             result = self.settlement(value)
             require(result['state'] == 'released', 'Earlier mutation reservation not settled')
-            for row in result['classification']['children'][0]['candidates']:
-                require(row['allocation'] not in seen, 'Candidate credited more than once')
-                seen.add(row['allocation'])
+            self.record_credit(result['classification']['children'][0], seen)
             released.append(self.b.sha(self.root / f"{value['index']:04d}" / 'settlement.json'))
         require(len(exports) == 1 and not seen.intersection(
             row['allocation'] for row in exports[0]['revision']['allocations']),
@@ -276,4 +324,5 @@ class Reservations:
         return {'schema': 1, 'attempts': len(values), 'max_attempts': self.limit,
                 'released_model_bytes_decimal': str(len(released) * self.cost),
                 'retained_model_bytes_decimal': str(self.cost), 'settlement_sha256': released,
-                'physical_capacity_returned': False, 'scope': 'exact_original_candidate_reservations_only'}
+                'physical_capacity_returned': False,
+                'scope': 'original_mutation_model_reservations_only' if self.confirm_unreserved else 'exact_original_candidate_reservations_only'}

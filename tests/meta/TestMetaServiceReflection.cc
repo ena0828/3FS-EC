@@ -13,10 +13,10 @@ namespace {
 using VoidMethods = refl::Helper::FieldInfoList<MetaSerde<>>;
 using BoundMethods = refl::Helper::FieldInfoList<MetaSerde<server::MetaSerdeService>>;
 using WrappedMethods = refl::Helper::FieldInfoList<server::MetaSerdeService>;
-static_assert(std::tuple_size_v<VoidMethods> == 76);
-static_assert(std::tuple_size_v<BoundMethods> == 76);
+static_assert(std::tuple_size_v<VoidMethods> == 78);
+static_assert(std::tuple_size_v<BoundMethods> == 78);
 static_assert(std::is_same_v<BoundMethods, WrappedMethods>);
-static_assert(serde::MaxMethodId<VoidMethods> == 76);
+static_assert(serde::MaxMethodId<VoidMethods> == 78);
 static_assert(MetaSerde<>::testRpcMethodId == 50);
 static_assert(MetaSerde<>::bindEcRmwOutputMethodId == 52);
 static_assert(MetaSerde<>::closeEcFileRepairDebtMethodId == 67);
@@ -30,9 +30,11 @@ static_assert(MetaSerde<>::confirmEcFileOutputResolutionMethodId == 73);
 static_assert(MetaSerde<>::queryEcFileOutputResolutionMethodId == 74);
 static_assert(MetaSerde<>::confirmEcFragmentAbsentMethodId == 75);
 static_assert(MetaSerde<>::queryEcFragmentAbsentMethodId == 76);
+static_assert(MetaSerde<>::confirmEcUnreservedRepairMethodId == 77);
+static_assert(MetaSerde<>::queryEcUnreservedRepairMethodId == 78);
 
-// Expected wire mapping, preserving IDs 1..74 independently of declaration order.
-constexpr std::array<std::string_view, 76> kNamesByWireId{
+// Expected wire mapping, independent of declaration order.
+constexpr std::array<std::string_view, 78> kNamesByWireId{
     "statFs",                       // 1
     "stat",                         // 2
     "create",                       // 3
@@ -109,10 +111,12 @@ constexpr std::array<std::string_view, 76> kNamesByWireId{
     "queryEcFileOutputResolution",   // 74
     "confirmEcFragmentAbsent",       // 75
     "queryEcFragmentAbsent",         // 76
+    "confirmEcUnreservedRepair",     // 77
+    "queryEcUnreservedRepair",       // 78
 };
 template <class... M>
 consteval bool exactWireMap(std::tuple<M...> *) {
-  std::array<bool, 77> seen{};
+  std::array<bool, kNamesByWireId.size() + 1> seen{};
   bool valid = true;
   const auto add = [&](uint16_t id, std::string_view name) {
     if (id == 0 || id >= seen.size() || seen[id]) {
@@ -145,17 +149,17 @@ struct DispatchProbe {
     return Info::id;
   }
 };
-TEST(TestMetaServiceReflection, RegistersAll76IncludingBeyondDefaultFieldRank) {
+TEST(TestMetaServiceReflection, RegistersAllMethodsIncludingBeyondDefaultFieldRank) {
   // Instantiate the same ID extraction used by real service dispatch, rather
   // than only counting sender constants or source declaration lines.
   using Extractor = serde::MethodExtractor<server::MetaSerdeService, DispatchProbe>;
-  for (uint16_t id = 1; id <= 76; ++id) {
+  for (uint16_t id = 1; id <= kNamesByWireId.size(); ++id) {
     const auto method = Extractor::get(id);
     ASSERT_NE(method, nullptr) << id;
     EXPECT_EQ(method(), id);
   }
   EXPECT_EQ(Extractor::get(0), nullptr);
-  EXPECT_EQ(Extractor::get(77), nullptr);
+  EXPECT_EQ(Extractor::get(kNamesByWireId.size() + 1), nullptr);
   EXPECT_EQ(Extractor::get(65535), nullptr);
   EXPECT_EQ(MetaSerde<>::getRpcName(TestRpcReq{}), "testRpc");
   EXPECT_EQ(MetaSerde<>::getRpcName(BindEcRmwOutputReq{}), "bindEcRmwOutput");
@@ -169,6 +173,8 @@ TEST(TestMetaServiceReflection, RegistersAll76IncludingBeyondDefaultFieldRank) {
   EXPECT_EQ(MetaSerde<>::getRpcName(QueryEcFileOutputResolutionReq{}), "queryEcFileOutputResolution");
   EXPECT_EQ(MetaSerde<>::getRpcName(ConfirmEcFragmentAbsentReq{}), "confirmEcFragmentAbsent");
   EXPECT_EQ(MetaSerde<>::getRpcName(QueryEcFragmentAbsentReq{}), "queryEcFragmentAbsent");
+  EXPECT_EQ(MetaSerde<>::getRpcName(ConfirmEcUnreservedRepairReq{}), "confirmEcUnreservedRepair");
+  EXPECT_EQ(MetaSerde<>::getRpcName(QueryEcUnreservedRepairReq{}), "queryEcUnreservedRepair");
 }
 }  // namespace
 }  // namespace hf3fs::meta

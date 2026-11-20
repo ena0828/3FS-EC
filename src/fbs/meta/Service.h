@@ -982,6 +982,23 @@ struct QueryEcFileOutputResolutionRsp : RspBase {
   SERDE_STRUCT_FIELD(resolution, EcFileOutputResolution{});
 };
 
+// Separate methods preserve the original twelve-candidate resolution wire format.
+struct EcUnreservedRepairReq : ConfirmEcFileOutputResolutionReq {
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(ConfirmEcFileOutputResolutionReq::valid());
+    if (identity.ownerKind != EcFileOutputOwner::Repair)
+      return makeError(StatusCode::kInvalidArg, "unreserved output qualification requires a repair");
+    return Void{};
+  }
+};
+struct ConfirmEcUnreservedRepairReq : EcUnreservedRepairReq {};
+struct QueryEcUnreservedRepairReq : EcUnreservedRepairReq {};
+struct EcUnreservedRepairRsp : RspBase {
+  SERDE_STRUCT_FIELD(clientNamespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(resolution, EcUnreservedRepair{});
+};
+
 // An explicit administrative metadata operation. The same client namespace
 // and request UUID bind one exact historical revision permanently.
 struct EcRevisionRetirementReq : ReqBase {
@@ -1499,6 +1516,8 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(queryEcFileOutputResolution, 74, QueryEcFileOutputResolutionReq, QueryEcFileOutputResolutionRsp);
   META_SERVICE_METHOD(confirmEcFragmentAbsent, 75, ConfirmEcFragmentAbsentReq, EcAbsentAdminRsp);
   META_SERVICE_METHOD(queryEcFragmentAbsent, 76, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
+  META_SERVICE_METHOD(confirmEcUnreservedRepair, 77, ConfirmEcUnreservedRepairReq, EcUnreservedRepairRsp);
+  META_SERVICE_METHOD(queryEcUnreservedRepair, 78, QueryEcUnreservedRepairReq, EcUnreservedRepairRsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
   META_SERVICE_METHOD(bindEcRmwOutput, 52, BindEcRmwOutputReq, BindEcRmwOutputRsp);

@@ -88,6 +88,8 @@ class MetaServiceStub : public IMetaServiceStub {
   META_STUB_METHOD(queryEcFileOutput, QueryEcFileOutputReq, QueryEcFileOutputRsp);
   META_STUB_METHOD(confirmEcFileOutputResolution, ConfirmEcFileOutputResolutionReq, ConfirmEcFileOutputResolutionRsp);
   META_STUB_METHOD(queryEcFileOutputResolution, QueryEcFileOutputResolutionReq, QueryEcFileOutputResolutionRsp);
+  META_STUB_METHOD(confirmEcUnreservedRepair, ConfirmEcUnreservedRepairReq, EcUnreservedRepairRsp);
+  META_STUB_METHOD(queryEcUnreservedRepair, QueryEcUnreservedRepairReq, EcUnreservedRepairRsp);
   META_STUB_METHOD(confirmEcFragmentAbsent, ConfirmEcFragmentAbsentReq, EcAbsentAdminRsp);
   META_STUB_METHOD(queryEcFragmentAbsent, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
   META_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);

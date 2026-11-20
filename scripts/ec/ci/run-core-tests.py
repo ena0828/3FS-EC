@@ -51,6 +51,7 @@ META_CASES = tuple("TestEcFileNativeWrite." + name for name in (
 # The two flat manager cases also verify opt-in repair metrics, joined failure
 # scopes and history/default-off isolation against real Meta/FDB + Storage.
 REPAIR_CASES = (
+    "TestEcFileNativeRepair.UnreservedRepairRequiresAbortedParentReleasedSourceAndMissingExecution",
     "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
     "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
     "TestEcFileNativeRepair.HelperDirectCommittedIssuanceLostReplyAndFreshTwelvePublication",
@@ -63,7 +64,7 @@ REPAIR_CASES = (
 AUTH_USER_CASES = tuple(f"TestAuth/{backend}.{case}" for backend in (0, 1)
                         for case in ("Basic", "ExplicitPrimaryGroup"))
 SERVICE_CONTRACT_CASES = AUTH_USER_CASES + (
-    "TestMetaServiceReflection.RegistersAll76IncludingBeyondDefaultFieldRank",
+    "TestMetaServiceReflection.RegistersAllMethodsIncludingBeyondDefaultFieldRank",
 )
 TARGET_META_CASES = (
     "TestEcTargetRetirementCatalog.RealFdbImmutableIntentAndRequestIdentity",

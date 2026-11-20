@@ -292,6 +292,7 @@ CoTryTask<Dispatcher::OutputTable> handleFileOutput(IEnv &ienv,
 
 // These are metadata-resolution archives, never a Storage GC acknowledgement.
 // The original business identity and resolutionId are durable before Confirm.
+template <class Proof>
 struct FileOutputResolutionArchive {
   SERDE_STRUCT_FIELD(schema, uint16_t{1});
   SERDE_STRUCT_FIELD(action, std::string{});
@@ -301,7 +302,7 @@ struct FileOutputResolutionArchive {
   SERDE_STRUCT_FIELD(request_id, Uuid::zero());
   SERDE_STRUCT_FIELD(resolution_id, Uuid::zero());
   SERDE_STRUCT_FIELD(identity, meta::EcFileOutputIdentity{});
-  SERDE_STRUCT_FIELD(resolution, (std::optional<meta::EcFileOutputResolution>{}));
+  SERDE_STRUCT_FIELD(resolution, (std::optional<Proof>{}));
   SERDE_STRUCT_FIELD(metadata_resolution_only, true);
   SERDE_STRUCT_FIELD(candidate_reservations_release_eligible, false);
   SERDE_STRUCT_FIELD(collected, false);
@@ -313,32 +314,38 @@ struct FileOutputResolutionArchive {
     auto value = folly::parseJson(serde::toJsonString(*this));
     value["uint64_encoding"] = "unsigned_decimal_strings";
     value["identity"]["object"]["inode"] = std::to_string(identity.object.inode.u64());
+    if constexpr (std::is_same_v<Proof, meta::EcUnreservedRepair>) {
+      value["logical_reservation_release_eligible"] = resolution.has_value();
+      value["actual_candidate_count"] = resolution ? folly::dynamic(0) : folly::dynamic(nullptr);
+    }
     if (resolution) {
       const auto &r = *resolution;
       auto &j = value["resolution"];
       j["identity"]["object"]["inode"] = std::to_string(r.identity.object.inode.u64());
       j["childEpoch"] = std::to_string(r.childEpoch);
-      j["issuanceSequence"] = std::to_string(r.issuanceSequence);
-      for (size_t n = 0; n < r.candidates.size(); ++n) {
-        const auto &candidate = r.candidates[n];
-        auto &json = j["candidates"][n];
-        json["identity"]["stripe"] = std::to_string(candidate.identity.stripe);
-        json["identity"]["generation"] = std::to_string(candidate.identity.generation);
-        json["endpoint"]["placement"]["target"] = std::to_string(candidate.endpoint.placement.target.toUnderType());
+      if constexpr (std::is_same_v<Proof, meta::EcFileOutputResolution>) {
+        j["issuanceSequence"] = std::to_string(r.issuanceSequence);
+        for (size_t n = 0; n < r.candidates.size(); ++n) {
+          const auto &candidate = r.candidates[n];
+          auto &json = j["candidates"][n];
+          json["identity"]["stripe"] = std::to_string(candidate.identity.stripe);
+          json["identity"]["generation"] = std::to_string(candidate.identity.generation);
+          json["endpoint"]["placement"]["target"] = std::to_string(candidate.endpoint.placement.target.toUnderType());
+        }
+        auto closure = [](folly::dynamic &json, const meta::EcFileOutputDrain &closed) {
+          const auto &i = closed.identity;
+          auto &id = json["identity"];
+          id["object"]["inode"] = std::to_string(i.object.inode.u64());
+          id["objectEpoch"] = std::to_string(i.objectEpoch);
+          id["generation"] = std::to_string(i.generation);
+          id["revision"] = std::to_string(i.revision);
+          for (size_t n = 0; n < i.endpoints.endpoints.size(); ++n)
+            id["endpoints"]["endpoints"][n]["placement"]["target"] =
+                std::to_string(i.endpoints.endpoints[n].placement.target.toUnderType());
+        };
+        closure(j["outputClosure"], r.outputClosure);
+        if (r.sourceClosure) closure(j["sourceClosure"], *r.sourceClosure);
       }
-      auto closure = [](folly::dynamic &json, const meta::EcFileOutputDrain &closed) {
-        const auto &i = closed.identity;
-        auto &id = json["identity"];
-        id["object"]["inode"] = std::to_string(i.object.inode.u64());
-        id["objectEpoch"] = std::to_string(i.objectEpoch);
-        id["generation"] = std::to_string(i.generation);
-        id["revision"] = std::to_string(i.revision);
-        for (size_t n = 0; n < i.endpoints.endpoints.size(); ++n)
-          id["endpoints"]["endpoints"][n]["placement"]["target"] =
-              std::to_string(i.endpoints.endpoints[n].placement.target.toUnderType());
-      };
-      closure(j["outputClosure"], r.outputClosure);
-      if (r.sourceClosure) closure(j["sourceClosure"], *r.sourceClosure);
     }
     return folly::toJson(value);
   }
@@ -384,19 +391,24 @@ Result<Request> fileOutputResolutionRequest(const argparse::ArgumentParser &pars
   RETURN_ON_ERROR(req.valid());
   return req;
 }
-template <bool Confirm>
+template <typename Request, auto Rpc>
 CoTryTask<Dispatcher::OutputTable> handleFileOutputResolution(IEnv &ienv,
                                                               const argparse::ArgumentParser &parser,
                                                               const Dispatcher::Args &args) {
   auto &env = dynamic_cast<AdminEnv &>(ienv);
   ENSURE_USAGE(args.empty());
-  using Request = std::conditional_t<Confirm, meta::ConfirmEcFileOutputResolutionReq, meta::QueryEcFileOutputResolutionReq>;
-  using Response = std::conditional_t<Confirm, meta::ConfirmEcFileOutputResolutionRsp, meta::QueryEcFileOutputResolutionRsp>;
+  constexpr bool Confirm = std::is_same_v<Request, meta::ConfirmEcFileOutputResolutionReq> ||
+                           std::is_same_v<Request, meta::ConfirmEcUnreservedRepairReq>;
+  constexpr bool Unreserved = std::is_same_v<Request, meta::ConfirmEcUnreservedRepairReq> ||
+                              std::is_same_v<Request, meta::QueryEcUnreservedRepairReq>;
   auto request = fileOutputResolutionRequest<Request>(parser, env.userInfo);
   CO_RETURN_ON_ERROR(request);
   const auto &req = *request;
-  FileOutputResolutionArchive archive;
-  archive.action = Confirm ? "confirm_file_output_resolution" : "query_file_output_resolution";
+  FileOutputResolutionArchive<std::conditional_t<Unreserved, meta::EcUnreservedRepair, meta::EcFileOutputResolution>> archive;
+  if constexpr (Unreserved)
+    archive.action = Confirm ? "confirm_unreserved_repair" : "query_unreserved_repair";
+  else
+    archive.action = Confirm ? "confirm_file_output_resolution" : "query_file_output_resolution";
   archive.client_namespace = req.client.uuid;
   archive.request_id = req.uuid;
   archive.resolution_id = req.resolutionId;
@@ -409,11 +421,7 @@ CoTryTask<Dispatcher::OutputTable> handleFileOutputResolution(IEnv &ienv,
     if (!client || client->clientId().uuid != req.client.uuid)
       co_return makeError(StatusCode::kInvalidArg, "set config.client_uuid to the persisted client-namespace");
     invoked = true;
-    Result<Response> result = makeError(StatusCode::kNotImplemented);
-    if constexpr (Confirm)
-      result = co_await folly::coro::co_withCancellation({}, client->confirmEcFileOutputResolution(req));
-    else
-      result = co_await folly::coro::co_withCancellation({}, client->queryEcFileOutputResolution(req));
+    auto result = co_await folly::coro::co_withCancellation({}, ((*client).*Rpc)(req));
     if (result) {
       const auto &r = result->resolution;
       auto valid = r.valid();
@@ -425,7 +433,8 @@ CoTryTask<Dispatcher::OutputTable> handleFileOutputResolution(IEnv &ienv,
     archive.phase = "result";
     if (result) {
       archive.outcome = Confirm ? "confirmed" : "observed";
-      archive.candidate_reservations_release_eligible = result->resolution.candidateReservationsReleaseEligible;
+      if constexpr (!Unreserved)
+        archive.candidate_reservations_release_eligible = result->resolution.candidateReservationsReleaseEligible;
       archive.resolution = std::move(result->resolution);
     } else {
       // Confirm may have committed before a failed/mismatching reply. Never
@@ -639,12 +648,19 @@ CoTryTask<Dispatcher::OutputTable> handleTree(IEnv &ienv,
 }  // namespace
 
 CoTryTask<void> registerEcRevisionRetirementHandlers(Dispatcher &dispatcher) {
+  using Client = meta::client::MetaClient;
   CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
       [] { return fileOutputResolutionParser("ec-confirm-file-output-resolution"); },
-      [](IEnv &env, const auto &p, const auto &a) { return handleFileOutputResolution<true>(env, p, a); }));
+      handleFileOutputResolution<meta::ConfirmEcFileOutputResolutionReq, &Client::confirmEcFileOutputResolution>));
   CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
       [] { return fileOutputResolutionParser("ec-query-file-output-resolution"); },
-      [](IEnv &env, const auto &p, const auto &a) { return handleFileOutputResolution<false>(env, p, a); }));
+      handleFileOutputResolution<meta::QueryEcFileOutputResolutionReq, &Client::queryEcFileOutputResolution>));
+  CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
+      [] { return fileOutputResolutionParser("ec-confirm-unreserved-repair"); },
+      handleFileOutputResolution<meta::ConfirmEcUnreservedRepairReq, &Client::confirmEcUnreservedRepair>));
+  CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
+      [] { return fileOutputResolutionParser("ec-query-unreserved-repair"); },
+      handleFileOutputResolution<meta::QueryEcUnreservedRepairReq, &Client::queryEcUnreservedRepair>));
   CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
       [] { return fileOutputParser(); },
       [](IEnv &env, const auto &p, const auto &a) { return handleFileOutput(env, p, a); }));

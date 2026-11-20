@@ -130,6 +130,8 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<QueryEcFileOutputRsp> queryEcFileOutput(QueryEcFileOutputReq req);
   CoTryTask<ConfirmEcFileOutputResolutionRsp> confirmEcFileOutputResolution(ConfirmEcFileOutputResolutionReq req);
   CoTryTask<QueryEcFileOutputResolutionRsp> queryEcFileOutputResolution(QueryEcFileOutputResolutionReq req);
+  CoTryTask<EcUnreservedRepairRsp> confirmEcUnreservedRepair(ConfirmEcUnreservedRepairReq req);
+  CoTryTask<EcUnreservedRepairRsp> queryEcUnreservedRepair(QueryEcUnreservedRepairReq req);
   CoTryTask<EcAbsentAdminRsp> confirmEcFragmentAbsent(ConfirmEcFragmentAbsentReq req);
   CoTryTask<EcAbsentAdminRsp> queryEcFragmentAbsent(QueryEcFragmentAbsentReq req);
   CoTryTask<EcFileRepairRsp> closeEcFileRepairDebt(CloseEcFileRepairDebtReq req);
@@ -165,6 +167,9 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<BatchStatByPathRsp> batchStatByPath(BatchStatByPathReq req);
 
  private:
+  template <bool Confirm, class Rsp, class Req, class Resolve>
+  CoTryTask<Rsp> resolveOutput(Req req, Resolve resolve);
+
   // Both authenticated Prepare methods share the same committed issuance path.
   CoTryTask<EcFileRepairDirectRsp> prepareEcFileRepair(const EcFileRepairReq &req);
   friend class MockMeta;

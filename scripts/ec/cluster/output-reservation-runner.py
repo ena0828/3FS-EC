@@ -181,11 +181,39 @@ def admin_archive(path, operation, *, allow_incomplete=False):
     return rows[1] if len(rows) == 2 else None
 
 
+UNRESERVED_ACTIONS = ('confirm_unreserved_repair', 'query_unreserved_repair')
+
+
+def require_closed_repair(identity, cleanup):
+    require(cleanup is not None and cleanup['state'] == 'Aborted' and not cleanup['published'] and cleanup['source_released'] and
+            cleanup['all_cleanup_complete'] and cleanup['output_drained'] and cleanup['revalidated'] and
+            cleanup['failure'] is None and cleanup['child'] == identity['child'] and cleanup['operation'] == identity['parent'] and
+            cleanup['client_namespace'] == identity['owner_client'] and cleanup['inode_decimal'] == identity['inode_decimal'] and
+            cleanup['incarnation'] == identity['object_incarnation'], 'Original repair closure identity differs')
+    gc.uid(cleanup['source_pin']); gc.decimal(cleanup['captured_epoch_decimal'], True)
+
+
+def validate_unreserved(proof, identity, cleanup, resolution_id, namespace):
+    """Bind a positive Meta resolution to the accepted, closed repair."""
+    r = proof.get('resolution')
+    require(type(r) is dict and type(r.get('version')) is int and r['version'] == 1 and
+            same(r.get('identity'), dto_identity(identity)) and identity['owner_kind'] == 'repair' and
+            r.get('resolutionId') == resolution_id and r.get('confirmingClientNamespace') == namespace,
+            'Unreserved repair resolution identity differs')
+    gc.uid(r.get('birth')); gc.uid(r.get('sourcePin')); gc.decimal(r.get('childEpoch'), True)
+    nonzero_digest(r.get('repairDigest')); nonzero_digest(r.get('sourceClosureDigest'))
+    require_closed_repair(identity, cleanup)
+    require(cleanup['source_pin'] == r['sourcePin'] and cleanup['captured_epoch_decimal'] == r['childEpoch'],
+            'Resolution does not describe the original aborted repair')
+    return r
+
+
 def positive(operation, result):
     action = operation['expected']['action']
     if result['status_code'] != 0:
         return False
-    outcome = 'observed' if action in ('observe_file_output', 'query_file_output_resolution', 'query_absent') else 'confirmed'
+    outcome = 'observed' if action in ('observe_file_output', 'query_file_output_resolution',
+                                       'query_unreserved_repair', 'query_absent') else 'confirmed'
     require(result.get('outcome') == outcome, 'Inconsistent successful Admin result')
     if action in ('observe_file_output', 'confirm_file_output_resolution', 'query_file_output_resolution'):
         require(result.get('uint64_encoding') == 'unsigned_decimal_strings' and
@@ -195,6 +223,12 @@ def positive(operation, result):
         else:
             require(result.get('metadata_resolution_only') is True and result.get('collected') is False,
                     'Not a candidate reservation resolution')
+    elif action in UNRESERVED_ACTIONS:
+        require(result.get('uint64_encoding') == 'unsigned_decimal_strings' and result.get('metadata_resolution_only') is True and
+                result.get('logical_reservation_release_eligible') is True and type(result.get('actual_candidate_count')) is int and
+                result['actual_candidate_count'] == 0 and result.get('candidate_reservations_release_eligible') is False and
+                result.get('physical_reclamation_confirmed') is False and result.get('collected') is False,
+                'Expected affirmative logical-only unreserved repair proof')
     elif action in ('collect', 'query'):
         nonzero_digest(result.get('claim_sha256')); nonzero_digest(result.get('ledger_sha256'))
         gc.decimal(result.get('terminal_revision_decimal'), True)
@@ -324,7 +358,7 @@ class Classifier:
 
     def admin(self, name, action, identity, **extras):
         fixed = {'action': action, 'request_id': self.fixed_id(name), **extras}
-        if action in ('observe_file_output', 'confirm_file_output_resolution', 'query_file_output_resolution'):
+        if action in ('observe_file_output', 'confirm_file_output_resolution', 'query_file_output_resolution', *UNRESERVED_ACTIONS):
             fixed.update(identity=dto_identity(identity), client_namespace=self.adapter.namespace)
         else:
             fixed.update(identity)
@@ -403,10 +437,46 @@ class Classifier:
         return {**candidate, 'classification': classification, 'eligible': True, 'claim_id': claim,
                 'evidence': evidence_ref(found)}
 
-    def child(self, n, identity):
+    def original_missing(self, observe):
+        history = self.history.get(observe['name'], [])
+        if not history:
+            return None
+        path, joined = history[-1]
+        if joined is None or joined['returncode'] == 0:
+            return None
+        missing = admin_archive(path / 'archive.jsonl', observe, allow_incomplete=True)
+        if (missing is None or missing['status_code'] != META_NOT_FOUND or missing.get('outcome') != 'not_observed' or
+                'observation' not in missing or missing['observation'] is not None or
+                missing.get('metadata_observation_only') is not True or missing.get('physical_reclamation_confirmed') is not False):
+            return None
+        return {'attempt': str(path), 'archive_sha256': joined['archive_sha256'],
+                'joined_sha256': gc.file_sha(path / 'joined.json')}
+
+    def unreserved_repair(self, name, identity, cleanup, missing):
+        require_closed_repair(identity, cleanup)
+        rid = self.fixed_id(name + '-unreserved')
+        query = self.admin(name + '-unreserved-query', 'query_unreserved_repair', identity, resolution_id=rid)
+        confirm = self.admin(name + '-unreserved-confirm', 'confirm_unreserved_repair', identity, resolution_id=rid)
+        result = self.prior(confirm) or self.perform(query, failure_ok=True)
+        if result is None:
+            self.require_missing_resolution_query(query)
+            result = self.perform(confirm)
+        validate_unreserved(result['value'], identity, cleanup, rid, self.adapter.namespace)
+        return {'identity': identity, 'state': 'UnreservedRepair', 'resolution_id': rid,
+                'negative_observation': missing, 'resolution': evidence_ref(result), 'candidates': []}
+
+    def child(self, n, identity, cleanup=None):
         name = f'child-{n:02d}'
         op = self.admin(name + '-observe', 'observe_file_output', identity)
-        observation = self.perform(op)
+        enabled = self.plan.get('confirm_unreserved_repair', False)
+        missing = self.original_missing(op) if enabled else None
+        if missing:
+            return self.unreserved_repair(name, identity, cleanup, missing)
+        observation = self.perform(op, failure_ok=enabled)
+        if observation is None:
+            missing = self.original_missing(op)
+            require(missing is not None, 'Unconfirmed output observation')
+            return self.unreserved_repair(name, identity, cleanup, missing)
         value = observation['value'].get('observation')
         require(type(value) is dict, 'Missing ECFE is not a resolution')
         rows = candidates(value, identity)
@@ -457,7 +527,10 @@ class Classifier:
         self.adapter.check()
         cleanup = self.cleanup()
         exported = self.exported()
-        children = [self.child(n, value) for n, value in enumerate(exported['value']['identities'])]
+        identities = exported['value']['identities']
+        if self.plan.get('confirm_unreserved_repair'):
+            require(len(identities) == 1, 'Expected one accepted repair operation')
+        children = [self.child(n, value, cleanup['value']) for n, value in enumerate(identities)]
         allocations = [row for child in children for row in child['candidates']]
         require(len({row['allocation'] for row in allocations}) == len(allocations), 'Allocation repeated across children')
         result = {'schema': 1, 'kind': 'ec_output_reservation_classification', 'root': self.plan['root'],
@@ -471,6 +544,8 @@ class Classifier:
                   'business_action_completed': False, 'physical_capacity_returned': False,
                   'session_closed_by_runner': False, 'scope': 'exact_original_output_children_only',
                   'historical_join_proven': all(joined is not None for _, _, joined in self.records)}
+        if len(children) == 1 and children[0]['state'] == 'UnreservedRepair':
+            result.update(candidate_set_classified=False, unreserved_repair_confirmed=True)
         files = inventory(self.folder, ('completion.json', 'final-evidence.json'))
         evidence_path = self.folder / 'final-evidence.json'
         if evidence_path.exists():
@@ -492,6 +567,9 @@ def validate_plan(plan):
     require(type(plan.get('max_commands')) is int and 1 <= plan['max_commands'] <= MAX_COMMANDS,
             'Invalid cumulative command bound')
     require(plan.get('policy') == 'collect_first_absence_requires_explicit_resume_authorization', 'Unknown classification policy')
+    if 'confirm_unreserved_repair' in plan:
+        require(plan['confirm_unreserved_repair'] is True and plan['output_kind'] == 'repair',
+                'Unreserved confirmation is limited to explicitly authorized new repair plans')
 
 
 class NativeAdapter(gc.NativeAdapter):
@@ -531,6 +609,8 @@ class NativeAdapter(gc.NativeAdapter):
         names = {'observe_file_output': 'ec-observe-file-output',
                  'confirm_file_output_resolution': 'ec-confirm-file-output-resolution',
                  'query_file_output_resolution': 'ec-query-file-output-resolution',
+                 'confirm_unreserved_repair': 'ec-confirm-unreserved-repair',
+                 'query_unreserved_repair': 'ec-query-unreserved-repair',
                  'collect': 'ec-gc-collect', 'query': 'ec-gc-query',
                  'confirm_absent': 'ec-gc-confirm-absent', 'query_absent': 'ec-gc-query-absent'}
         if 'identity' in f:
@@ -620,6 +700,8 @@ def execute(args, *, check_owner=None):
                     'output_kind': args.kind, 'id_namespace': str(uuid.uuid4()), 'binding': bound,
                     'max_commands': args.max_commands,
                     'policy': 'collect_first_absence_requires_explicit_resume_authorization'}
+            if getattr(args, 'confirm_unreserved_repair', False):
+                plan['confirm_unreserved_repair'] = True
             validate_plan(plan); save(folder / 'plan.json', plan)
             for name in ('operations', 'attempts'): gc.private(folder / name, create=True)
             save(locator, {'run': str(folder), 'plan_sha256': gc.file_sha(folder / 'plan.json')})
@@ -644,6 +726,8 @@ def parser():
             c.add_argument('--source-run', type=Path, required=True)
             c.add_argument('--kind', choices=tuple(CLOSE), required=True)
             c.add_argument('--max-commands', type=int, default=4096)
+            c.add_argument('--confirm-unreserved-repair', action='store_true',
+                           help='Permit Meta to confirm an explicitly closed repair never reserved output')
         else:
             authority = c.add_mutually_exclusive_group()
             authority.add_argument('--authorize-absence-confirmation', action='store_true',

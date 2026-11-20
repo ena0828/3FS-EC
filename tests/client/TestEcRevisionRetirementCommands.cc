@@ -115,6 +115,41 @@ struct Calls {
     if (!resolution || resolutionMissing) return makeError(MetaCode::kNotFound);
     return *resolution;
   }
+  // Model a persistent Meta response across client reconstruction. Server/FDB
+  // tests separately verify the transactional prerequisites for this proof.
+  template <class Request>
+  Result<meta::EcUnreservedRepairRsp> unreservedReply(const Request &req, bool confirm) {
+    std::lock_guard lock(mutex);
+    if (confirm && !unreserved) {
+      meta::EcUnreservedRepair proof;
+      proof.identity = req.identity;
+      proof.resolutionId = req.resolutionId;
+      proof.confirmingClientNamespace = req.client.uuid;
+      proof.birth = Uuid::random();
+      proof.childEpoch = std::numeric_limits<uint64_t>::max();
+      proof.sourcePin = Uuid::random();
+      proof.repairDigest.fill(19);
+      proof.sourceClosureDigest.fill(23);
+      RETURN_ON_ERROR(proof.valid());
+      unreserved = std::move(proof);
+    }
+    if (!unreserved) return makeError(MetaCode::kNotFound);
+    if (confirm && resolutionUnknown) return makeError(TransactionCode::kMaybeCommitted);
+    meta::EcUnreservedRepairRsp rsp;
+    rsp.clientNamespace = req.client.uuid;
+    rsp.requestId = req.uuid;
+    rsp.resolution = *unreserved;
+    switch (resolutionMismatch.load()) {
+      case 1: rsp.resolution.confirmingClientNamespace = Uuid::random(); break;
+      case 2: rsp.resolution.resolutionId = Uuid::random(); break;
+      case 3: rsp.resolution.identity.child = Uuid::random(); break;
+      case 4: rsp.resolution.sourceClosureDigest.fill(0); break;
+      case 5: rsp.resolution.repairDigest.fill(0); break;
+      case 6: rsp.requestId = Uuid::random(); break;
+      case 7: rsp.clientNamespace = Uuid::random(); break;
+    }
+    return rsp;
+  }
   void clearResolution() { std::lock_guard lock(mutex); resolution.reset(); }
   std::atomic<int> mismatch{0};
   std::atomic<bool> missing{false};
@@ -132,6 +167,7 @@ struct Calls {
   std::mutex mutex;
   std::optional<meta::EcRevisionRetirementReq> last;
   std::optional<meta::EcFileOutputResolution> resolution;
+  std::optional<meta::EcUnreservedRepair> unreserved;
 };
 
 class RetirementService : public meta::MockMetaService {
@@ -152,6 +188,16 @@ class RetirementService : public meta::MockMetaService {
     auto value = calls_->resolve(req.identity, req.resolutionId, req.client.uuid, false);
     CO_RETURN_ON_ERROR(value);
     co_return resolutionReply<meta::QueryEcFileOutputResolutionRsp>(req, *value);
+  }
+  CoTryTask<meta::EcUnreservedRepairRsp> confirmEcUnreservedRepair(
+      serde::CallContext &, const meta::ConfirmEcUnreservedRepairReq &req) override {
+    ++calls_->resolutionConfirms;
+    co_return calls_->unreservedReply(req, true);
+  }
+  CoTryTask<meta::EcUnreservedRepairRsp> queryEcUnreservedRepair(
+      serde::CallContext &, const meta::QueryEcUnreservedRepairReq &req) override {
+    ++calls_->resolutionQueries;
+    co_return calls_->unreservedReply(req, false);
   }
   CoTryTask<meta::QueryEcFileOutputRsp> queryEcFileOutput(serde::CallContext &,
                                                          const meta::QueryEcFileOutputReq &req) override {
@@ -312,6 +358,12 @@ class TestEcRevisionRetirementCommands : public ::testing::Test {
             "--resolution-id", resolutionId_.toHexString(), "--client-namespace", namespace_.toHexString(),
             "--request-id", request_.toHexString(), "--output", file};
   }
+  Dispatcher::Args unreservedArgs(bool confirm, const std::string &output) const {
+    auto args = resolutionArgs(confirm, output);
+    args.front() = confirm ? "ec-confirm-unreserved-repair" : "ec-query-unreserved-repair";
+    replace(args, "--owner-kind", "repair");
+    return args;
+  }
   static void replace(Dispatcher::Args &arguments, std::string_view key, std::string value) {
     auto found = std::find(arguments.begin(), arguments.end(), key);
     ASSERT_NE(found, arguments.end());
@@ -337,6 +389,93 @@ class TestEcRevisionRetirementCommands : public ::testing::Test {
   Uuid resolutionOwner_ = Uuid::random(), resolutionParent_ = Uuid::random(),
        resolutionChild_ = Uuid::random(), resolutionId_ = Uuid::random();
 };
+
+TEST_F(TestEcRevisionRetirementCommands, UnreservedRepairUnknownCanBeQueriedWithoutInventingCandidates) {
+  const auto missingPath = path("missing.jsonl");
+  ASSERT_ERROR(blockingWait(dispatcher_.run(env_, unreservedArgs(false, missingPath))), MetaCode::kNotFound);
+  const auto missing = read(missingPath);
+  ASSERT_EQ(missing.size(), 2);
+  EXPECT_EQ(missing[1]["outcome"], "not_observed");
+  EXPECT_TRUE(missing[1]["actual_candidate_count"].isNull());
+  EXPECT_FALSE(missing[1]["logical_reservation_release_eligible"].asBool());
+  EXPECT_EQ(calls_->resolutionConfirms.load(), 0);
+
+  calls_->resolutionUnknown = true;
+  const auto unknownPath = path("unknown.jsonl");
+  ASSERT_ERROR(blockingWait(dispatcher_.run(env_, unreservedArgs(true, unknownPath))), TransactionCode::kMaybeCommitted);
+  const auto unknown = read(unknownPath);
+  ASSERT_EQ(unknown.size(), 2);
+  EXPECT_EQ(unknown[0]["resolution_id"], resolutionId_.toHexString());
+  EXPECT_EQ(unknown[1]["outcome"], "unknown");
+  EXPECT_TRUE(unknown[1]["resolution"].isNull());
+  EXPECT_FALSE(unknown[1]["logical_reservation_release_eligible"].asBool());
+
+  client_ = newClient(namespace_);
+  const auto queryPath = path("query.jsonl");
+  auto query = unreservedArgs(false, queryPath);
+  replace(query, "--request-id", Uuid::random().toHexString());
+  ASSERT_OK(blockingWait(dispatcher_.run(env_, query)));
+  const auto observed = read(queryPath);
+  ASSERT_EQ(observed.size(), 2);
+  EXPECT_EQ(observed[1]["outcome"], "observed");
+  EXPECT_EQ(observed[1]["actual_candidate_count"].asInt(), 0);
+  EXPECT_TRUE(observed[1]["logical_reservation_release_eligible"].asBool());
+  EXPECT_FALSE(observed[1]["candidate_reservations_release_eligible"].asBool());
+  EXPECT_FALSE(observed[1]["physical_reclamation_confirmed"].asBool());
+  EXPECT_FALSE(observed[1]["collected"].asBool());
+  EXPECT_EQ(observed[1]["resolution"]["identity"], unknown[0]["identity"]);
+  EXPECT_EQ(observed[1]["resolution"]["childEpoch"], "18446744073709551615");
+  EXPECT_EQ(observed[1]["resolution"]["resolutionId"], resolutionId_.toHexString());
+  EXPECT_EQ(observed[1]["resolution"]["confirmingClientNamespace"], namespace_.toHexString());
+  EXPECT_EQ(calls_->resolutionConfirms.load(), 1);
+  EXPECT_EQ(calls_->resolutionQueries.load(), 2);
+
+  calls_->resolutionUnknown = false;
+  const auto replayPath = path("replayed-confirm.jsonl");
+  ASSERT_OK(blockingWait(dispatcher_.run(env_, unreservedArgs(true, replayPath))));
+  const auto replay = read(replayPath);
+  ASSERT_EQ(replay.size(), 2);
+  EXPECT_EQ(replay[1]["outcome"], "confirmed");
+  EXPECT_EQ(replay[1]["resolution"], observed[1]["resolution"]);
+
+  const auto reader = Uuid::random();
+  client_ = newClient(reader);
+  const auto readerPath = path("second-reader.jsonl");
+  auto readerQuery = unreservedArgs(false, readerPath);
+  replace(readerQuery, "--client-namespace", reader.toHexString());
+  replace(readerQuery, "--request-id", Uuid::random().toHexString());
+  ASSERT_OK(blockingWait(dispatcher_.run(env_, readerQuery)));
+  const auto readerJournal = read(readerPath);
+  ASSERT_EQ(readerJournal.size(), 2);
+  EXPECT_EQ(readerJournal[1]["client_namespace"], reader.toHexString());
+  EXPECT_EQ(readerJournal[1]["resolution"], replay[1]["resolution"]);
+  EXPECT_EQ(calls_->resolutionConfirms.load(), 2);
+  EXPECT_EQ(calls_->resolutionQueries.load(), 3);
+}
+
+TEST_F(TestEcRevisionRetirementCommands, UnreservedRepairRejectsForeignProofAndNonRepairIdentity) {
+  const auto invalidPath = path("pwrite.jsonl");
+  auto invalid = unreservedArgs(true, invalidPath);
+  replace(invalid, "--owner-kind", "pwrite");
+  ASSERT_ERROR(blockingWait(dispatcher_.run(env_, invalid)), StatusCode::kInvalidArg);
+  EXPECT_FALSE(std::filesystem::exists(invalidPath));
+  EXPECT_EQ(calls_->resolutionConfirms.load(), 0);
+
+  const auto confirmPath = path("confirmed.jsonl");
+  ASSERT_OK(blockingWait(dispatcher_.run(env_, unreservedArgs(true, confirmPath))));
+  for (int fault = 1; fault <= 7; ++fault) {
+    SCOPED_TRACE(fault);
+    calls_->resolutionMismatch = fault;
+    const bool confirm = fault == 1;  // Only Confirm binds the issuer to this caller.
+    const auto output = path("bad-proof-" + std::to_string(fault) + ".jsonl");
+    ASSERT_ERROR(blockingWait(dispatcher_.run(env_, unreservedArgs(confirm, output))), StorageClientCode::kProtocolMismatch);
+    const auto rejected = read(output);
+    ASSERT_EQ(rejected.size(), 2);
+    EXPECT_EQ(rejected[1]["outcome"], confirm ? "unknown" : "not_observed");
+    EXPECT_TRUE(rejected[1]["actual_candidate_count"].isNull());
+    EXPECT_FALSE(rejected[1]["logical_reservation_release_eligible"].asBool());
+  }
+}
 
 TEST_F(TestEcRevisionRetirementCommands, ResolutionUnknownRetainsOriginalIdsAndQueryNeverConfirmsMissing) {
   calls_->resolutionUnknown = true;
