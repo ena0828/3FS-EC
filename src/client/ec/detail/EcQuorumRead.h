@@ -307,10 +307,6 @@ class EcQuorumRead {
         publish(state, makeError(StorageClientCode::kTimeout));
         co_return;
       }
-      // Leave the final interval for the spare reads to return. An already
-      // short deadline admits both up front, as waiting would consume it.
-      if (options.quorumFirst && now >= options.deadline - interval)
-        wanted = inflight + (12 - launched);
       while (inflight < wanted && launched < 12) {
         launch(state, state->options.order[launched++]);
         ++inflight;
@@ -322,14 +318,20 @@ class EcQuorumRead {
       const bool canHedge = launched < 12 && inflight < 12;
       auto hedgeAt = progress + interval;
       if (options.quorumFirst) hedgeAt = std::min(hedgeAt, options.deadline - interval);
-      if (canHedge && now >= hedgeAt) {
-        wanted = inflight + 1;
+      // Several reads can finish together. Drain completed responses before
+      // starting a speculative read or allocating a timer to wait for one.
+      auto index = state->completed.try_dequeue();
+      if (!index && canHedge && now >= hedgeAt) {
+        // Leave the final interval for both remaining spares to return.
+        wanted = inflight + (options.quorumFirst && now >= options.deadline - interval ? 12 - launched : 1);
         progress = now;
         continue;
       }
       const auto wakeAt = canHedge ? std::min(hedgeAt, state->options.deadline) : state->options.deadline;
-      auto index =
-          co_await folly::coro::co_withCancellation(state->stop.getToken(), completion(state, wakeAt - Clock::now()));
+      if (!index) {
+        index = co_await folly::coro::co_withCancellation(state->stop.getToken(),
+                                                          completion(state, wakeAt - Clock::now()));
+      }
       if (!index) continue;
       --inflight;
       Result<Response> response = makeError(StatusCode::kUnknown);
