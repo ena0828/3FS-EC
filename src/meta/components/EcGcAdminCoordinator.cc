@@ -157,6 +157,37 @@ CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::confirmAbsent(EcGcAdminReq req
 CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::queryAbsent(EcGcAdminReq req) const {
   return executeAbsentOwned(state_, std::move(req), storage::EcGcAbsentAction::QueryAbsent);
 }
+CoTryTask<EcRetiredAdminRsp> EcGcAdminCoordinator::resolveRetired(ResolveEcFragmentRetiredReq req) const {
+  return resolveRetiredOwned(state_, std::move(req));
+}
+CoTryTask<EcRetiredAdminRsp> EcGcAdminCoordinator::resolveRetiredOwned(std::shared_ptr<State> state,
+                                                                     ResolveEcFragmentRetiredReq req) {
+  if (!state) co_return makeError(StatusCode::kNotImplemented);
+  CO_RETURN_ON_ERROR(req.valid());
+  const auto action = req.confirm ? storage::EcGcAction::Collect : storage::EcGcAction::Query;
+  const auto deadline = SteadyClock::now() + state->config.ec_gc_timeout();
+  CO_RETURN_ON_ERROR(state->ready(action, deadline));
+  if (!state->enter()) co_return makeError(StorageClientCode::kResourceBusy);
+  SCOPE_EXIT { state->active.fetch_sub(1, std::memory_order_release); };
+  auto txn = state->engine->createReadWriteTransaction();
+  if (!txn) co_return makeError(StatusCode::kKVStoreNotFound);
+  auto retained = co_await EcGcCompletionCatalog::retained(*txn, req.object, req.identity, req.claimId,
+                                                          state->controlAuthority, req.confirm);
+  CO_RETURN_ON_ERROR(retained);
+  if (!*retained) co_return makeError(MetaCode::kNotFound, "retained disposition is not confirmed");
+  CO_RETURN_ON_ERROR((**retained).valid());
+  CO_RETURN_ON_ERROR(state->ready(action, deadline));
+  if (req.confirm) {
+    auto committed = co_await txn->commit();
+    if (!committed) co_return makeError(std::move(committed.error()));
+  }
+  EcRetiredAdminRsp out;
+  out.clientNamespace = req.client.uuid;
+  out.requestId = req.uuid;
+  out.confirm = req.confirm;
+  out.disposition = std::move(**retained);
+  co_return out;
+}
 
 CoTryTask<EcAbsentAdminRsp> EcGcAdminCoordinator::executeAbsentOwned(std::shared_ptr<State> state,
     EcGcAdminReq req, storage::EcGcAbsentAction action) {

@@ -99,6 +99,28 @@ class ReplayEntryTests(unittest.TestCase):
             self.assertEqual(len(list((run / 'confirmed').iterdir())), len(plan['steps']))
             self.assertFalse((run / 'completion.json').exists())
 
+    def test_eviction_keeps_fenced_allocations_distinct_from_collected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, plan = self.fixture(temporary)
+            evict = next(s for s in plan['steps'] if s['spec']['kind'] == 'evict')
+            strict = FakeBackend(plan).perform(evict['name'], evict['spec'])
+            strict['gc']['completion']['allocations_fenced_retained'] = 1
+            with self.assertRaisesRegex(ValueError, 'ordinary allocation collection'):
+                entry.validate_receipt(evict, plan, strict)
+            plan['allow_fenced_retained'] = True
+            receipt = FakeBackend(plan).perform(evict['name'], evict['spec'])
+            completion = receipt['gc']['completion']
+            proof = {'state': 'retired_inaccessible', 'allocation': '10000000-0000-0000-0000-000000000001',
+                     'inode_decimal': receipt['object']['inode_decimal'], 'object_incarnation': receipt['object']['incarnation'],
+                     'collected': False, 'storage_absence_observed': False, 'physical_capacity_returned': False,
+                     'claim_sha256': '1' * 64, 'fence_completion_sha256': '2' * 64, 'fence_proof_sha256': '3' * 64}
+            completion.update(allocations_collected=completion['allocations_confirmed'] - 1,
+                              allocations_fenced_retained=1, fenced_retained_allocations=[proof])
+            entry.validate_receipt(evict, plan, receipt)
+            proof['physical_capacity_returned'] = True
+            with self.assertRaisesRegex(ValueError, 'physical credit'):
+                entry.validate_receipt(evict, plan, receipt)
+
     def test_eviction_requires_remote_original_namespace_ack_not_missing_or_local_inspection(self):
         with tempfile.TemporaryDirectory() as temporary:
             _, plan = self.fixture(temporary)

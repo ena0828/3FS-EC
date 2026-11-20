@@ -38,6 +38,10 @@ class MemoryAdapter:
         self.leaves = copy.deepcopy(leaves)
         self.queue = list(leaves)
         self.permanent_nodes, self.retired, self.collected = {}, {}, {}
+        self.unavailable = set()
+        self.fenced_allocations = set()
+        self.retained_claims = set()
+        self.gc_claims = set()
         self.calls = []
         self.failure = None
         self.lease = True
@@ -80,9 +84,25 @@ class MemoryAdapter:
             if request not in self.retired:
                 return {**out, "status_code": 2002, "outcome": "not_confirmed"}
             out.update(generation_decimal=self.retired[request], references_released=True)
+        elif op["kind"] == "retained":
+            claim = fixed["claim_id"]
+            confirm = fixed["action"] == "confirm_retired"
+            out.update(kind="ec_fragment_retired", collected=False, storage_absence_observed=False,
+                       physical_capacity_returned=False)
+            if confirm and claim in self.gc_claims and fixed["allocation"] in self.fenced_allocations:
+                self.retained_claims.add(claim)
+            if claim not in self.retained_claims:
+                return {**out, "status_code": 3000, "outcome": "unknown" if confirm else "not_observed"}
+            out.update(state="retired_inaccessible", outcome="confirmed" if confirm else "observed",
+                       claim_sha256="1" * 64, fence_completion_sha256="2" * 64, fence_proof_sha256="3" * 64,
+                       retirement_id=uid(501), engine_uuid=uid(502), target_incarnation=uid(503),
+                       node_decimal="10003", chain_decimal="3", target_decimal="4")
         else:
             request = fixed["claim_id"]
             if fixed["action"] == "collect":
+                self.gc_claims.add(request)
+                if fixed["allocation"] in self.unavailable or request in self.retained_claims:
+                    return {**out, "status_code": 2003, "outcome": "not_confirmed"}
                 self.collected[request] = {"claim_sha256": "1" * 64, "ledger_sha256": "2" * 64,
                                            "terminal_revision_decimal": "7"}
             if request not in self.collected:
@@ -109,6 +129,10 @@ class MemoryAdapter:
         if self.corrupt:
             result = self.corrupt(op, result)
         prepared = {"schema": 1, **op["expected"], "phase": "prepared", "status_code": 0, "outcome": "not_confirmed"}
+        if op["kind"] == "retained":
+            prepared.update(kind="ec_fragment_retired", state="not_confirmed",
+                            **{k: "" for k in (*gc.RETAINED_HASHES, *gc.RETAINED_ENDPOINT_IDS)},
+                            **{k: gc.ZERO for k in gc.RETAINED_UUIDS}, **{k: False for k in gc.RETAINED_FLAGS})
         (attempt / "archive.jsonl").write_bytes(gc.encoded(prepared) + gc.encoded(result))
         (attempt / "command.log").write_text("private synthetic adapter log\n", encoding="utf-8")
         if fail and fail[1] == "after-archive":
@@ -169,11 +193,80 @@ class TreeCollectorTests(unittest.TestCase):
         self.assertEqual(result["allocations_confirmed"], 12)
         self.assertEqual(result["completion_scope"], gc.SCOPE)
         self.assertFalse(result["capacity_returned"])
+        self.assertNotIn("allocations_fenced_retained", result)
         self.assertFalse(result["namespace_deleted"])
         self.assertFalse(result["unpublished_outputs_covered"])
         self.assertTrue(result["all_started_commands_joined"])
         self.assertEqual(self.run_collector(), result)
         self.assertEqual(len(self.adapter.calls), 29)  # Completed resume only verifies original evidence.
+
+    def select_fenced_allocation(self, opt_in=True):
+        if opt_in:
+            self.expected["allow_fenced_retained"] = True
+            self.restart_with(self.expected["revisions"])
+        allocation = self.expected["revisions"][0]["allocations"][2]["allocation"]
+        self.adapter.unavailable.add(allocation)
+        self.adapter.fenced_allocations.add(allocation)
+        return allocation
+
+    def test_retained_allocation_is_explicit_and_permanent_across_resume(self):
+        allocation = self.select_fenced_allocation()
+        self.adapter.failure = ("confirm_retired", "after-rpc")
+        with self.assertRaises(LostOwner):
+            self.run_collector()
+        result = self.run_collector()
+        self.assertEqual((result["allocations_confirmed"], result["allocations_collected"], result["allocations_fenced_retained"]),
+                         (12, 11, 1))
+        item, = result["fenced_retained_allocations"]
+        self.assertEqual(item["allocation"], allocation)
+        self.assertFalse(item["collected"])
+        self.assertFalse(item["physical_capacity_returned"])
+        self.assertEqual(result["historical_unjoined_attempts"], 1)
+        ops = [op["expected"] for op in self.adapter.calls if op["expected"].get("allocation") == allocation]
+        self.assertEqual([op["action"] for op in ops], ["collect", "confirm_retired", "query_retired", "query_retired"])
+        self.assertEqual({(op["claim_id"], op["request_id"]) for op in ops}, {(item["claim_id"], item["request_id"])})
+        calls = len(self.adapter.calls)
+        self.assertEqual(self.run_collector(), result)
+        self.assertEqual(len(self.adapter.calls), calls)
+
+    def test_default_stops_even_when_target_has_fence(self):
+        self.select_fenced_allocation(opt_in=False)
+        with self.assertRaises(gc.JoinedCommandFailure):
+            self.run_collector()
+        self.assertFalse(any(op["kind"] == "retained" for op in self.adapter.calls))
+        self.assertFalse((self.folder / "completion.json").exists())
+
+    def test_unreachable_without_fence_stays_pending_then_normal_collect_can_retry(self):
+        self.select_fenced_allocation()
+        self.adapter.fenced_allocations.clear()
+        with self.assertRaises(gc.JoinedCommandFailure):
+            self.run_collector()
+        self.assertFalse((self.folder / "completion.json").exists())
+        self.adapter.unavailable.clear()
+        result = self.run_collector()
+        self.assertEqual(result["allocations_collected"], 12)
+        self.assertEqual(result["fenced_retained_allocations"], [])
+
+    def test_retained_reply_requires_same_fence_and_no_physical_claim(self):
+        for field, changed in (("fence_proof_sha256", "4" * 64), ("claim_sha256", "0" * 64),
+                               ("physical_capacity_returned", True), ("retirement_id", gc.ZERO),
+                               ("target_incarnation", uid(555)), ("shard", 11)):
+            with self.subTest(field=field):
+                self.select_fenced_allocation()
+                self.adapter.corrupt = lambda op, out: ({**out, field: changed}
+                    if op["expected"]["action"] == "query_retired" else out)
+                with self.assertRaises(gc.CheckError):
+                    self.run_collector()
+                self.assertFalse((self.folder / "completion.json").exists())
+
+    def test_failed_ordinary_query_does_not_switch_disposition(self):
+        self.expected["allow_fenced_retained"] = True
+        self.restart_with(self.expected["revisions"])
+        self.adapter.corrupt = lambda op, reply: ({**reply, "status_code": 3000, "outcome": "not_confirmed"}
+            if op["expected"]["action"] == "query" else reply)
+        with self.assertRaises(gc.JoinedCommandFailure):
+            self.run_collector()
+        self.assertFalse(any(op["kind"] == "retained" for op in self.adapter.calls))
 
     def test_shared_identity_dedup_preserves_both_revision_retirements(self):
         first = self.expected["revisions"][0]
@@ -319,6 +412,16 @@ class TreeCollectorTests(unittest.TestCase):
         self.assertEqual(parts[parts.index("--node") + 1], "inspect")
         self.assertEqual(parts[parts.index("--request-id") + 1], op["expected"]["request_id"])
         self.assertEqual(parts[-2:], ["--output", str(output)])
+        reservation = self.plan["allocation_ids"][0]
+        fixed = {**collector.common, **reservation["identity"], "claim_id": reservation["claim_id"],
+                 "request_id": reservation["request_id"], "client_namespace": self.adapter.namespace}
+        for action in ("confirm_retired", "query_retired"):
+            operation = {"kind": "retained", "expected": {**fixed, "action": action}}
+            parts = shlex.split(adapter.argv(operation, output)[4])
+            self.assertEqual(parts[0], "ec-gc-" + action.replace("_", "-"))
+            options = dict(zip(parts[1::2], parts[2::2]))
+            self.assertEqual(options, {**{"--" + k.removesuffix("_decimal").replace("_", "-"): str(v)
+                                          for k, v in fixed.items()}, "--output": str(output)})
 
     def test_resume_parser_refuses_expected_or_limit_override(self):
         with mock.patch("sys.stderr"):

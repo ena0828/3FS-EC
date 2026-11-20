@@ -13,10 +13,10 @@ namespace {
 using VoidMethods = refl::Helper::FieldInfoList<MetaSerde<>>;
 using BoundMethods = refl::Helper::FieldInfoList<MetaSerde<server::MetaSerdeService>>;
 using WrappedMethods = refl::Helper::FieldInfoList<server::MetaSerdeService>;
-static_assert(std::tuple_size_v<VoidMethods> == 78);
-static_assert(std::tuple_size_v<BoundMethods> == 78);
+static_assert(std::tuple_size_v<VoidMethods> == 79);
+static_assert(std::tuple_size_v<BoundMethods> == 79);
 static_assert(std::is_same_v<BoundMethods, WrappedMethods>);
-static_assert(serde::MaxMethodId<VoidMethods> == 78);
+static_assert(serde::MaxMethodId<VoidMethods> == 79);
 static_assert(MetaSerde<>::testRpcMethodId == 50);
 static_assert(MetaSerde<>::bindEcRmwOutputMethodId == 52);
 static_assert(MetaSerde<>::closeEcFileRepairDebtMethodId == 67);
@@ -32,9 +32,10 @@ static_assert(MetaSerde<>::confirmEcFragmentAbsentMethodId == 75);
 static_assert(MetaSerde<>::queryEcFragmentAbsentMethodId == 76);
 static_assert(MetaSerde<>::confirmEcUnreservedRepairMethodId == 77);
 static_assert(MetaSerde<>::queryEcUnreservedRepairMethodId == 78);
+static_assert(MetaSerde<>::resolveEcFragmentRetiredMethodId == 79);
 
 // Expected wire mapping, independent of declaration order.
-constexpr std::array<std::string_view, 78> kNamesByWireId{
+constexpr std::array<std::string_view, 79> kNamesByWireId{
     "statFs",                       // 1
     "stat",                         // 2
     "create",                       // 3
@@ -113,6 +114,7 @@ constexpr std::array<std::string_view, 78> kNamesByWireId{
     "queryEcFragmentAbsent",         // 76
     "confirmEcUnreservedRepair",     // 77
     "queryEcUnreservedRepair",       // 78
+    "resolveEcFragmentRetired",      // 79
 };
 template <class... M>
 consteval bool exactWireMap(std::tuple<M...> *) {
@@ -175,6 +177,7 @@ TEST(TestMetaServiceReflection, RegistersAllMethodsIncludingBeyondDefaultFieldRa
   EXPECT_EQ(MetaSerde<>::getRpcName(QueryEcFragmentAbsentReq{}), "queryEcFragmentAbsent");
   EXPECT_EQ(MetaSerde<>::getRpcName(ConfirmEcUnreservedRepairReq{}), "confirmEcUnreservedRepair");
   EXPECT_EQ(MetaSerde<>::getRpcName(QueryEcUnreservedRepairReq{}), "queryEcUnreservedRepair");
+  EXPECT_EQ(MetaSerde<>::getRpcName(ResolveEcFragmentRetiredReq{}), "resolveEcFragmentRetired");
 }
 }  // namespace
 }  // namespace hf3fs::meta

@@ -27,10 +27,22 @@ MAX_NODES = 4096
 MAX_COMMANDS = 16384
 ZERO = str(uuid.UUID(int=0))
 SCOPE = "exact_expected_published_revisions_and_allocations"
+RETAINED_HASHES = ("claim_sha256", "fence_completion_sha256", "fence_proof_sha256")
+RETAINED_UUIDS = ("retirement_id", "engine_uuid", "target_incarnation")
+RETAINED_ENDPOINT_IDS = ("node_decimal", "chain_decimal", "target_decimal")
+RETAINED_FLAGS = ("collected", "storage_absence_observed", "physical_capacity_returned")
+RETAINED_EVIDENCE = ("state", *RETAINED_HASHES, *RETAINED_UUIDS, *RETAINED_ENDPOINT_IDS, *RETAINED_FLAGS)
 
 
 class CheckError(RuntimeError):
     pass
+
+
+class JoinedCommandFailure(CheckError):
+    """A joined, nonzero administrative command. Other evidence failures are never recoverable here."""
+    def __init__(self, operation):
+        super().__init__("Actual CLI failed; explicit resume retains the same request")
+        self.operation = operation
 
 
 def require(ok, message):
@@ -160,7 +172,11 @@ def key(value):
 
 
 def expected(value):
-    fields(value, "schema object settled_ledger revisions")
+    policy = {}
+    if type(value) is dict and "allow_fenced_retained" in value:
+        require(type(value["allow_fenced_retained"]) is bool, "Retained disposition policy must be boolean")
+        policy["allow_fenced_retained"] = value["allow_fenced_retained"]
+    fields(value, "schema object settled_ledger revisions" + (" allow_fenced_retained" if policy else ""))
     require(type(value["schema"]) is int and value["schema"] == 1, "Unknown expected schema")
     fields(value["object"], "inode_decimal incarnation")
     obj = {"inode_decimal": decimal(value["object"]["inode_decimal"], True),
@@ -184,7 +200,7 @@ def expected(value):
         require(len({x["allocation"] for x in allocations}) == 12, "Repeated allocation in revision")
         revisions.append({"stripe_decimal": stripe, "revision_decimal": revision, "generation_decimal": generation,
                           "allocations": sorted(allocations, key=lambda x: x["shard"])})
-    return {"schema": 1, "object": obj, "settled_ledger": ledger,
+    return {"schema": 1, "object": obj, "settled_ledger": ledger, **policy,
             "revisions": sorted(revisions, key=lambda x: (int(x["stripe_decimal"]), int(x["revision_decimal"])))}
 
 
@@ -247,7 +263,8 @@ def archive(path, operation):
             require(type(actual) is type(value) and actual == value, "Administration identity changed")
         require(type(row.get("status_code")) is int and 0 <= row["status_code"] <= 2**32 - 1, "Invalid status code")
     result = lines[1]
-    require(result["status_code"] == 0 and result.get("outcome") == "confirmed", "Administration result unconfirmed")
+    expected_outcome = "observed" if operation["kind"] == "retained" and fixed["action"] == "query_retired" else "confirmed"
+    require(result["status_code"] == 0 and result.get("outcome") == expected_outcome, "Administration result unconfirmed")
     if operation["kind"] == "tree":
         require(type(result.get("reclaimed")) is bool and result["reclaimed"] == (fixed["node"] != ZERO),
                 "Tree reclaim flag mismatch")
@@ -275,6 +292,20 @@ def archive(path, operation):
     elif operation["kind"] == "retire":
         require(result.get("references_released") is True, "Revision references not released")
         require(decimal(result.get("generation_decimal"), True) == operation["generation"], "Retired generation changed")
+    elif operation["kind"] == "retained":
+        prepared = lines[0]
+        require(all(row.get("kind") == "ec_fragment_retired" and all(row.get(k) is False for k in RETAINED_FLAGS)
+                    for row in lines), "Invalid retained archive kind or physical disposition")
+        require(prepared["status_code"] == 0 and prepared.get("state") == prepared.get("outcome") == "not_confirmed"
+                and all(prepared.get(name) == "" for name in (*RETAINED_HASHES, *RETAINED_ENDPOINT_IDS))
+                and all(prepared.get(name) == ZERO for name in RETAINED_UUIDS), "Unexpected pre-dispatch retained evidence")
+        require(result.get("state") == "retired_inaccessible", "Retained allocation has no terminal fence disposition")
+        for name in RETAINED_HASHES:
+            require(int(digest(result.get(name)), 16) != 0, "Missing retained claim or external fence digest")
+        for name in RETAINED_UUIDS:
+            require(uid(result.get(name)) == result[name], "Missing canonical retired endpoint or retirement UUID")
+        for name in RETAINED_ENDPOINT_IDS:
+            decimal(result.get(name), True)
     else:
         decimal(result.get("terminal_revision_decimal"), True)
         for name in ("claim_sha256", "ledger_sha256"):
@@ -379,13 +410,14 @@ class Collector:
                 else:
                     save(path / "accepted.json", accepted)
                 return result
-        if unknown_after is not None and operation["kind"] in ("retire", "gc") and not operation["name"].startswith("recovery-"):
+        recovery_actions = {"retire": "query_revision_retirement", "gc": "query", "retained": "query_retired"}
+        if unknown_after is not None and operation["kind"] in recovery_actions and not operation["name"].startswith("recovery-"):
             # First explicit recovery queries the same permanent identity. If
             # that query failed with a joined nonzero exit, a later explicit
             # resume may replay the original idempotent mutation. No error code
             # is interpreted as evidence that the original mutation did not run.
             recovery_name = "recovery-" + operation["name"]
-            query_action = "query_revision_retirement" if operation["kind"] == "retire" else "query"
+            query_action = recovery_actions[operation["kind"]]
             query = self.operation(recovery_name, operation["kind"],
                                    {**operation["expected"], "action": query_action}, operation.get("generation"))
             # A successful recovery query is itself the required confirmation.
@@ -416,14 +448,47 @@ class Collector:
         # is lost, recovery requires the inherited object lease to be reacquired.
         joined = self.adapter.execute(argv, path)
         save(path / "joined.json", joined)
-        require(self.verify_join(path, load(path / "intent.json"))["returncode"] == 0,
-                "Actual CLI failed; explicit resume retains the same request")
+        if self.verify_join(path, load(path / "intent.json"))["returncode"] != 0:
+            raise JoinedCommandFailure(operation)
         require(joined.get("owner_error_type") is None, "Owner reported an error; preserve evidence for explicit resume")
         result = archive(path / "archive.jsonl", operation)
         save(path / "accepted.json", {"operation_sha256": file_sha(self.operations / (operation["name"] + ".json")),
                                       "archive_sha256": file_sha(path / "archive.jsonl"),
                                       "joined_sha256": file_sha(path / "joined.json")})
         return result
+
+    def allocation_disposition(self, n, row, allow_retained):
+        fixed = {**self.common, **row["identity"], "request_id": row["request_id"], "claim_id": row["claim_id"]}
+        collect = self.operation("collect-" + str(n), "gc", {**fixed, "action": "collect"})
+        confirm_name = "confirm-retired-" + str(n)
+        previous = self._attempts_by_operation.get(confirm_name, [])
+        # A confirmed or historically unjoined retained disposition must be verified
+        # under that same claim before another physical collect can be considered.
+        last_confirm = self.verify_join(*previous[-1]) if previous else None
+        resume_retained = previous and (last_confirm is None or last_confirm["returncode"] == 0)
+        if resume_retained:
+            attempts = self._attempts_by_operation.get(collect["name"], [])
+            require(any(joined is not None and joined["returncode"] != 0
+                        for joined in (self.verify_join(path, intent) for path, intent in attempts)),
+                    "Retained history has no joined original Collect failure")
+        else:
+            try:
+                collected = self.perform(collect)
+            except JoinedCommandFailure as error:
+                if not allow_retained or error.operation != collect:
+                    raise
+            else:
+                queried = self.perform(self.operation("query-" + str(n), "gc", {**fixed, "action": "query"}))
+                require(all(collected[k] == queried[k] for k in ("claim_sha256", "ledger_sha256", "terminal_revision_decimal")),
+                        "Collect/query permanent GC evidence changed")
+                return None
+        require(allow_retained, "Retained confirmation outside the authorized plan")
+        scoped = {**fixed, "client_namespace": self.adapter.namespace}
+        confirmed = self.perform(self.operation(confirm_name, "retained", {**scoped, "action": "confirm_retired"}))
+        queried = self.perform(self.operation("query-retired-" + str(n), "retained", {**scoped, "action": "query_retired"}))
+        evidence = {k: confirmed[k] for k in RETAINED_EVIDENCE}
+        require(evidence == {k: queried[k] for k in RETAINED_EVIDENCE}, "Confirmed retained allocation changed on query")
+        return {**scoped, **evidence}
 
     def run(self):
         expected_rows = {(x["stripe_decimal"], x["revision_decimal"]): x for x in self.plan["expected"]["revisions"]}
@@ -470,14 +535,12 @@ class Collector:
                      "revision_decimal": row["revision_decimal"]}
             for action in ("retire_revision", "query_revision_retirement"):
                 self.perform(self.operation(action + "-" + str(n), "retire", {**fixed, "action": action}, row["generation_decimal"]))
+        allow_retained = self.plan["expected"].get("allow_fenced_retained") is True
+        retained = []
         for n, row in enumerate(self.plan["allocation_ids"]):
-            fixed = {**self.common, **row["identity"], "request_id": row["request_id"], "claim_id": row["claim_id"]}
-            collected = None
-            for action in ("collect", "query"):
-                result = self.perform(self.operation(action + "-" + str(n), "gc", {**fixed, "action": action}))
-                confirmation = {name: result[name] for name in ("claim_sha256", "ledger_sha256", "terminal_revision_decimal")}
-                require(collected is None or confirmation == collected, "Collect/query permanent GC evidence changed")
-                collected = confirmation
+            proof = self.allocation_disposition(n, row, allow_retained)
+            if proof is not None:
+                retained.append(proof)
         result = {"schema": 1, "collector_id": self.plan["collector_id"], "state": "confirmed",
                   "completion_scope": SCOPE, "plan_sha256": file_sha(self.folder / "plan.json"),
                   "revisions_confirmed": len(expected_rows), "allocations_confirmed": len(self.plan["allocation_ids"]),
@@ -486,6 +549,9 @@ class Collector:
                   "historical_unjoined_attempts": len(self.recovered),
                   "all_started_commands_joined": not self.recovered,
                   "current_owner_commands_joined": True}
+        if allow_retained:
+            result.update(allocations_collected=result["allocations_confirmed"] - len(retained),
+                          allocations_fenced_retained=len(retained), fenced_retained_allocations=retained)
         target = self.folder / "completion.json"
         if target.exists():
             require(load(target) == result, "Completion changed")
@@ -534,6 +600,10 @@ class NativeAdapter:
         elif operation["kind"] == "retire":
             command = "ec-retire-revision" if fixed["action"] == "retire_revision" else "ec-query-revision-retirement"
             options = ("inode_decimal", "object_incarnation", "stripe_decimal", "revision_decimal", "client_namespace", "request_id")
+        elif operation["kind"] == "retained":
+            command = "ec-gc-confirm-retired" if fixed["action"] == "confirm_retired" else "ec-gc-query-retired"
+            options = ("inode_decimal", "object_incarnation", "stripe_decimal", "generation_decimal", "shard",
+                       "allocation", "claim_id", "request_id", "client_namespace")
         else:
             command = "ec-gc-collect" if fixed["action"] == "collect" else "ec-gc-query"
             options = ("inode_decimal", "object_incarnation", "stripe_decimal", "generation_decimal", "shard", "allocation", "claim_id", "request_id")

@@ -92,6 +92,7 @@ IMPL_META_STUB_METHOD(confirmEcUnreservedRepair, ConfirmEcUnreservedRepairReq, E
 IMPL_META_STUB_METHOD(queryEcUnreservedRepair, QueryEcUnreservedRepairReq, EcUnreservedRepairRsp);
 IMPL_META_STUB_METHOD(confirmEcFragmentAbsent, ConfirmEcFragmentAbsentReq, EcAbsentAdminRsp);
 IMPL_META_STUB_METHOD(queryEcFragmentAbsent, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
+IMPL_META_STUB_METHOD(resolveEcFragmentRetired, ResolveEcFragmentRetiredReq, EcRetiredAdminRsp);
 IMPL_META_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 template class MetaServiceStub<serde::ClientContext>;

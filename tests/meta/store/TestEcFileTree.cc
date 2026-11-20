@@ -1249,6 +1249,9 @@ TEST_F(TestEcFileTree, RealFdbRepairTwentyTwoAckClaimAndCompletionUseOneMeasured
   ASSERT_TRUE(*queried);
   measured();
   EXPECT_TRUE(same(**queried, *completion));
+  ASSERT_ERROR(f.runProfile([&](Tx &t) {
+    return EcGcCompletionCatalog::retained(t, intent.object, identity, claimId, authority, true);
+  }), StatusCode::kTokenStale);
   // Completing the fresh output's GC never invents T2 for the old source pin.
   auto source = f.runProfile([&](Tx &t) {
     return require<EcTreeSourcePinRecord>(t, idKey(kv::KeyPrefix::EcTreeSourcePin, intent.object, intent.sourcePin));

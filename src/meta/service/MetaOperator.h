@@ -134,6 +134,7 @@ class MetaOperator : public folly::NonCopyableNonMovable {
   CoTryTask<EcUnreservedRepairRsp> queryEcUnreservedRepair(QueryEcUnreservedRepairReq req);
   CoTryTask<EcAbsentAdminRsp> confirmEcFragmentAbsent(ConfirmEcFragmentAbsentReq req);
   CoTryTask<EcAbsentAdminRsp> queryEcFragmentAbsent(QueryEcFragmentAbsentReq req);
+  CoTryTask<EcRetiredAdminRsp> resolveEcFragmentRetired(ResolveEcFragmentRetiredReq req);
   CoTryTask<EcFileRepairRsp> closeEcFileRepairDebt(CloseEcFileRepairDebtReq req);
 
   CoTryTask<MkdirsRsp> mkdirs(MkdirsReq req);

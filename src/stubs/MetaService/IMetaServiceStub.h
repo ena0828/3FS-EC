@@ -95,6 +95,7 @@ class IMetaServiceStub {
   IMETA_STUB_METHOD(queryEcUnreservedRepair, QueryEcUnreservedRepairReq, EcUnreservedRepairRsp);
   IMETA_STUB_METHOD(confirmEcFragmentAbsent, ConfirmEcFragmentAbsentReq, EcAbsentAdminRsp);
   IMETA_STUB_METHOD(queryEcFragmentAbsent, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
+  IMETA_STUB_METHOD(resolveEcFragmentRetired, ResolveEcFragmentRetiredReq, EcRetiredAdminRsp);
   IMETA_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 #undef IMETA_STUB_METHOD

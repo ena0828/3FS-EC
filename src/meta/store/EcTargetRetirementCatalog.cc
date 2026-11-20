@@ -233,6 +233,24 @@ Result<EcHostFenceSummary> EcTargetRetirementCatalog::hostFenceSummary(const EcT
   const auto &r = *record.hostFence;
   return EcHostFence::verify(r.certificate, r.intent, r.binding, r.publicKey);
 }
+
+CoTryTask<std::optional<EcTargetRetirementCatalog::VerifiedFence>> EcTargetRetirementCatalog::findHostFence(
+    Tx &txn, const EcV2PhysicalEndpoint &endpoint, const Uuid &authority) {
+  if (authority.is_nil()) co_return makeError(StatusCode::kInvalidArg);
+  auto record = co_await loadTarget(txn, endpoint);
+  CO_RETURN_ON_ERROR(record);
+  if (!*record) co_return std::nullopt;
+  const auto &r = **record;
+  if (r.intent.authority != authority) co_return makeError(StatusCode::kTokenMismatch, "host fence authority differs");
+  if (!r.hostFence || r.hostFence->certificate.empty()) co_return std::nullopt;
+  auto index = co_await load<EcTargetRetirementIntent>(txn, requestKey(r.intent));
+  CO_RETURN_ON_ERROR(index);
+  if (!*index || !sameIntent(**index, r.intent))
+    co_return makeError(StatusCode::kDataCorruption, "host fence registration differs");
+  auto summary = hostFenceSummary(r);
+  CO_RETURN_ON_ERROR(summary);
+  co_return VerifiedFence{r.intent.retirementId, r.hostFence->digest, summary->proofDigest};
+}
 CoTryTask<EcTargetRetirementRecord> EcTargetRetirementCatalog::get(Tx &txn,
                                                                  const EcTargetRetirementIntent &intent) {
   CO_RETURN_ON_ERROR(validIntent(intent));

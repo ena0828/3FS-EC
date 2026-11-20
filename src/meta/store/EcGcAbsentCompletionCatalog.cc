@@ -10,6 +10,7 @@ using namespace ec_tree_detail;
 using Codec = storage::ec_gc_absent_detail::Codec;
 using G2 = storage::ec_gc_control_detail::Codec;
 CoTryTask<Void> noCollected(kv::IReadWriteTransaction &tx, const storage::EcFragmentIdentity &identity) {
+  CO_RETURN_ON_ERROR(co_await EcGcCompletionCatalog::requireNoRetainedDisposition(tx, identity));
   auto key = allocationKey(kv::KeyPrefix::EcGcCompletion, identity);
   CO_RETURN_ON_ERROR(key);
   auto old = co_await tx.get(*key);

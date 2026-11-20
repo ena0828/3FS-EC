@@ -21,4 +21,12 @@ CoTryTask<EcGcAdminRsp> MetaOperator::queryEcFragmentGcV2(QueryEcFragmentGcV2Req
   CO_RETURN_ON_ERROR(req.valid());
   co_return co_await folly::coro::co_withCancellation({}, ecGcAdmin_->query(std::move(req)));
 }
+CoTryTask<EcRetiredAdminRsp> MetaOperator::resolveEcFragmentRetired(ResolveEcFragmentRetiredReq req) {
+  CO_RETURN_ON_ERROR(co_await authenticateEcGcAdmin(req));
+  CO_RETURN_ON_ERROR(req.valid());
+  if (!config_.enable_ec_target_retirement() || !config_.enable_ec_host_fence())
+    co_return makeError(StatusCode::kNotImplemented, "external target fencing is disabled");
+  CO_RETURN_ON_ERROR(ecTargetRetirement_->checkEnabled());
+  co_return co_await folly::coro::co_withCancellation({}, ecGcAdmin_->resolveRetired(std::move(req)));
+}
 }  // namespace hf3fs::meta::server

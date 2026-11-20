@@ -43,7 +43,7 @@ def synthetic():
 
 def build(binding, events, *, trace_id, shard_bytes=11469, slots=2, logical_budget=229376,
           allocation_budget=16777216, ttl_ns=259200000000000, repair_every=3, repair=None, max_mutation_attempts=2,
-          confirm_unreserved_repair=False):
+          confirm_unreserved_repair=False, allow_fenced_retained=False):
     kv.require(str(uuid.UUID(trace_id)) == trace_id, 'Require canonical fixed trace UUID')
     kv.require(type(binding) is dict and type(binding.get('schema')) is int and binding.get('schema') == 1 and binding.get('kind') in (
         'verified_public_input_observations', 'synthetic_functional_observations'), 'Unknown observation provenance')
@@ -59,6 +59,7 @@ def build(binding, events, *, trace_id, shard_bytes=11469, slots=2, logical_budg
     kv.integer(repair_every, 'repair period (zero disables)', 0, 4096)
     kv.integer(max_mutation_attempts, 'explicit bounded mutation attempts', 1, 4)
     kv.require(type(confirm_unreserved_repair) is bool, 'Expected a boolean unreserved repair policy')
+    kv.require(type(allow_fenced_retained) is bool, 'Expected a boolean fenced allocation policy')
     if repair is None:
         repair = repair_options()
     kv.require(kv.canonical(repair) == kv.canonical(repair_options(
@@ -155,13 +156,15 @@ def build(binding, events, *, trace_id, shard_bytes=11469, slots=2, logical_budg
     return {'schema': 1, 'kind': 'bounded_serial_native_kv_replay', 'trace_id': trace_id, 'namespace': '/ec-lab',
             'source_binding': binding, 'selected_observations_sha256': kv.sha(kv.canonical(events)),
             'shard_bytes': shard_bytes, 'repair': repair, 'collector_limits': dict(COLLECTOR_LIMITS),
+            **({'allow_fenced_retained': True} if allow_fenced_retained else {}),
             'recovery': recovery,
             'model': {'slots': slots, 'logical_budget_decimal': str(logical_budget),
                       'allocation_budget_decimal': str(allocation_budget), 'ttl_ns_decimal': str(ttl_ns),
                       'repair_every': repair_every, 'eviction_policy': 'source-time-inactivity-ttl-then-lru',
                       'arrival_pacing': False, 'execution': 'serial_closed_loop',
                       'allocation_cost_per_revision_decimal': str(allocation_cost),
-                      'allocation_credit_requires': 'exact_confirmed_published_allocation_gc',
+                      'allocation_credit_requires': ('exact_collection_or_verified_host_fence_disposition'
+                                                     if allow_fenced_retained else 'exact_confirmed_published_allocation_gc'),
                       'eviction_namespace_operation': 'identity_bound_single_entry_unlink_before_gc',
                       'namespace_metadata_in_budget': False, 'unpublished_unknown_outputs_credit': False},
             'bounds': {'observations': len(events), 'actions': len(steps), 'instances': misses,

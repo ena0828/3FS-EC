@@ -370,7 +370,8 @@ auto MetaClient::retry(Func &&func, Req &&req, RetryConfig retryConfig, std::fun
                 std::is_same_v<std::remove_cvref_t<Req>, ConfirmEcUnreservedRepairReq> ||
                 std::is_same_v<std::remove_cvref_t<Req>, QueryEcUnreservedRepairReq> ||
                 std::is_same_v<std::remove_cvref_t<Req>, ConfirmEcFragmentAbsentReq> ||
-                std::is_same_v<std::remove_cvref_t<Req>, QueryEcFragmentAbsentReq>) {
+                std::is_same_v<std::remove_cvref_t<Req>, QueryEcFragmentAbsentReq> ||
+                std::is_same_v<std::remove_cvref_t<Req>, ResolveEcFragmentRetiredReq>) {
     // Disable the network sender's own retransmission as well as the explicit
     // caller's zero-backoff policy. Recovery belongs to the original request ID.
     options.sendRetryTimes = 0;
@@ -616,6 +617,13 @@ CoTryTask<EcAbsentAdminRsp> MetaClient::queryEcFragmentAbsent(QueryEcFragmentAbs
   auto once = config_.retry_default();
   once.set_retry_init_wait(0_ms);
   co_return co_await retry(&IMetaServiceStub::queryEcFragmentAbsent, req, std::move(once));
+}
+CoTryTask<EcRetiredAdminRsp> MetaClient::resolveEcFragmentRetired(ResolveEcFragmentRetiredReq req) {
+  if (req.uuid.is_nil() || req.client.uuid != clientId_.uuid)
+    co_return makeError(StatusCode::kInvalidArg, "fixed retirement-disposition request and client UUIDs required");
+  auto once = config_.retry_default();
+  once.set_retry_init_wait(0_ms);
+  co_return co_await retry(&IMetaServiceStub::resolveEcFragmentRetired, req, std::move(once));
 }
 
 CoTryTask<EcTargetRetirementRsp> MetaClient::prepareEcTargetRetirement(PrepareEcTargetRetirementReq req) {

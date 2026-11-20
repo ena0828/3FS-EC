@@ -476,14 +476,25 @@ class NativeBackend:
         exports = [entry for receipt in history for entry in receipt['snapshot_exports']]
         require(1 <= len(exports) <= min(128, self.gc.MAX_REVISIONS), 'Missing/unbounded published revision history')
         revisions, seen, allocations = [], set(), set()
+        retained_policy = self.plan.get('allow_fenced_retained', False)
+        endpoints = {}
         for entry in exports:
             require(self.sha(entry['path']) == entry['sha256'], 'Captured export changed')
             row = entry['revision']; key = (row['stripe_decimal'], row['revision_decimal'])
             require(key not in seen, 'Repeated published revision; history is not independent mutations')
             seen.add(key)
+            if retained_policy:
+                original, = self.load(entry['path'])['revisions']
+                require(original['revision_decimal'] == row['revision_decimal'] and
+                        original['stripe_decimal'] == row['stripe_decimal'], 'Export revision differs')
             for item in row['allocations']:
                 require(item['allocation'] not in allocations, 'Allocation reused across published revisions')
                 allocations.add(item['allocation'])
+                if retained_policy:
+                    endpoint = original['endpoints'][item['shard']]
+                    exact(endpoint, 'shard', item['shard'])
+                    endpoints[item['allocation']] = {**item, **{key: endpoint[key] for key in
+                        ('node_decimal', 'chain_decimal', 'target_decimal', 'engine_uuid', 'target_incarnation')}}
             revisions.append(row)
         ledger = folder / 'settled-ledger.json'
         values = {'schema': 1, 'instance': fixed, 'published_actions': [
@@ -500,6 +511,7 @@ class NativeBackend:
                   'scope': 'all completed mutations of this exclusive replay instance; no unknown unpublished outputs'}
         self.seal(ledger, values)
         expect = self.gc.expected({'schema': 1,
+            **({'allow_fenced_retained': True} if retained_policy else {}),
             'object': {'inode_decimal': fixed['inode_decimal'], 'incarnation': fixed['incarnation']},
             'settled_ledger': {'path': str(ledger), 'sha256': self.sha(ledger)}, 'revisions': revisions})
         expected_path = folder / 'expected.json'; self.seal(expected_path, expect)
@@ -528,6 +540,11 @@ class NativeBackend:
                           ('allocations_confirmed', len(allocations)), ('current_owner_commands_joined', True),
                           ('capacity_returned', False), ('namespace_deleted', False), ('unpublished_outputs_covered', False)):
             exact(completion, key, want)
+        if retained_policy:
+            for disposition in completion['fenced_retained_allocations']:
+                identity = endpoints.get(disposition['allocation'])
+                require(identity is not None and all(disposition[k] == v for k, v in identity.items()),
+                        'Retired allocation differs from the original published endpoint')
         return {'run': str(run), 'plan_sha256': self.sha(run / 'plan.json'),
                 'completion_sha256': self.sha(run / 'completion.json'), 'completion': completion,
                 'confirmed_allocation_model_bytes_decimal': str(len(allocations) * self.plan['shard_bytes'])}

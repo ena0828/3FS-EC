@@ -43,6 +43,14 @@ class EcTargetRetirementCatalog {
   static CoTryTask<EcTargetRetirementRecord> recordHostFence(kv::IReadWriteTransaction &,
       const EcTargetRetirementIntent &, const EcHostFenceBinding &, std::string_view certificate);
   static Result<EcHostFenceSummary> hostFenceSummary(const EcTargetRetirementRecord &);
+  struct VerifiedFence {
+    Uuid retirementId;
+    storage::EcSha256 completionDigest;
+    storage::EcSha256 proofDigest;
+  };
+  static CoTryTask<std::optional<VerifiedFence>> findHostFence(kv::IReadWriteTransaction &,
+                                                              const EcV2PhysicalEndpoint &,
+                                                              const Uuid &authority);
   static CoTryTask<EcTargetRetirementRecord> recordCompletion(kv::IReadWriteTransaction &,
                                                             const EcTargetRetirementIntent &,
                                                             const storage::EcTargetRetirementRequest &,

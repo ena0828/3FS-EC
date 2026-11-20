@@ -251,9 +251,41 @@ struct AbsenceObservation {
   SERDE_STRUCT_FIELD(physical_reclamation_confirmed, false);
 };
 
-AbsenceObservation preparedAbsence(const meta::EcGcAdminReq &req, bool confirm) {
-  AbsenceObservation value;
-  value.action = confirm ? "confirm_absent" : "query_absent";
+struct RetiredObservation {
+  SERDE_STRUCT_FIELD(schema, uint16_t{1});
+  SERDE_STRUCT_FIELD(kind, std::string{"ec_fragment_retired"});
+  SERDE_STRUCT_FIELD(action, std::string{});
+  SERDE_STRUCT_FIELD(phase, std::string{"prepared"});
+  SERDE_STRUCT_FIELD(outcome, std::string{"not_confirmed"});
+  SERDE_STRUCT_FIELD(state, std::string{"not_confirmed"});
+  SERDE_STRUCT_FIELD(client_namespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(request_id, Uuid::zero());
+  SERDE_STRUCT_FIELD(claim_id, Uuid::zero());
+  SERDE_STRUCT_FIELD(inode_decimal, std::string{});
+  SERDE_STRUCT_FIELD(object_incarnation, Uuid::zero());
+  SERDE_STRUCT_FIELD(stripe_decimal, std::string{});
+  SERDE_STRUCT_FIELD(generation_decimal, std::string{});
+  SERDE_STRUCT_FIELD(shard, uint16_t{});
+  SERDE_STRUCT_FIELD(allocation, Uuid::zero());
+  SERDE_STRUCT_FIELD(status_code, uint32_t{});
+  SERDE_STRUCT_FIELD(claim_sha256, std::string{});
+  SERDE_STRUCT_FIELD(retirement_id, Uuid::zero());
+  SERDE_STRUCT_FIELD(fence_completion_sha256, std::string{});
+  SERDE_STRUCT_FIELD(fence_proof_sha256, std::string{});
+  SERDE_STRUCT_FIELD(node_decimal, std::string{});
+  SERDE_STRUCT_FIELD(chain_decimal, std::string{});
+  SERDE_STRUCT_FIELD(target_decimal, std::string{});
+  SERDE_STRUCT_FIELD(engine_uuid, Uuid::zero());
+  SERDE_STRUCT_FIELD(target_incarnation, Uuid::zero());
+  SERDE_STRUCT_FIELD(collected, false);
+  SERDE_STRUCT_FIELD(storage_absence_observed, false);
+  SERDE_STRUCT_FIELD(physical_capacity_returned, false);
+};
+
+template <typename Record>
+Record preparedDisposition(const meta::EcGcAdminReq &req, std::string action) {
+  Record value;
+  value.action = std::move(action);
   value.client_namespace = req.client.uuid;
   value.request_id = req.uuid;
   value.claim_id = req.claimId;
@@ -274,7 +306,7 @@ CoTryTask<Dispatcher::OutputTable> handleAbsent(IEnv &ienv,
   ENSURE_USAGE(args.empty());
   auto request = requestFor(parser, env.userInfo, true);
   CO_RETURN_ON_ERROR(request);
-  auto observation = preparedAbsence(*request, confirm);
+  auto observation = preparedDisposition<AbsenceObservation>(*request, confirm ? "confirm_absent" : "query_absent");
   auto journal = Journal::create(Path(parser.get<std::string>("--output")), observation);
   CO_RETURN_ON_ERROR(journal);
   bool invoked = false;
@@ -328,6 +360,61 @@ CoTryTask<Dispatcher::OutputTable> handleAbsent(IEnv &ienv,
     co_return makeError(invoked ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kIOError);
   }
 }
+CoTryTask<Dispatcher::OutputTable> handleRetired(IEnv &ienv,
+                                                 const argparse::ArgumentParser &parser,
+                                                 const Dispatcher::Args &args,
+                                                 bool confirm) {
+  auto &env = dynamic_cast<AdminEnv &>(ienv);
+  ENSURE_USAGE(args.empty());
+  auto request = requestFor(parser, env.userInfo, true);
+  CO_RETURN_ON_ERROR(request);
+  auto observation = preparedDisposition<RetiredObservation>(*request, confirm ? "confirm_retired" : "query_retired");
+  auto journal = Journal::create(Path(parser.get<std::string>("--output")), observation);
+  CO_RETURN_ON_ERROR(journal);
+  bool invoked = false;
+  try {
+    auto client = env.metaClientGetter();
+    if (!client || client->clientId().uuid != request->client.uuid)
+      co_return makeError(StatusCode::kInvalidConfig, "actual Meta namespace differs; prepared archive retained");
+    meta::ResolveEcFragmentRetiredReq req;
+    static_cast<meta::EcGcAdminReq &>(req) = *request;
+    req.confirm = confirm;
+    invoked = true;
+    auto result = co_await folly::coro::co_withCancellation({}, client->resolveEcFragmentRetired(std::move(req)));
+    if (result) {
+      const auto &proof = result->disposition;
+      if (!proof.valid() || proof.object != request->object || !serde::equals(proof.identity, request->identity) ||
+          proof.claimId != request->claimId || result->clientNamespace != request->client.uuid ||
+          result->requestId != request->uuid || result->confirm != confirm)
+        result = makeError(StorageClientCode::kProtocolMismatch);
+    }
+    observation.phase = "result";
+    if (result) {
+      const auto &proof = result->disposition;
+      const auto &endpoint = proof.endpoint;
+      observation.outcome = confirm ? "confirmed" : "observed";
+      observation.state = "retired_inaccessible";
+      observation.claim_sha256 = hex(proof.claimDigest);
+      observation.retirement_id = proof.retirementId;
+      observation.fence_completion_sha256 = hex(proof.fenceCompletionDigest);
+      observation.fence_proof_sha256 = hex(proof.fenceProofDigest);
+      observation.node_decimal = std::to_string(endpoint.placement.node.toUnderType());
+      observation.chain_decimal = std::to_string(endpoint.placement.chain.toUnderType());
+      observation.target_decimal = std::to_string(endpoint.placement.target.toUnderType());
+      observation.engine_uuid = endpoint.engineUuid;
+      observation.target_incarnation = endpoint.targetIncarnation;
+    } else {
+      observation.status_code = result.error().code();
+      observation.outcome = confirm ? "unknown" : "not_observed";
+    }
+    auto saved = (*journal)->append(observation);
+    if (!saved) co_return makeError(StorageCode::kEcSealOutcomeUnknown, "retained disposition archive final sync failed");
+    if (!result) co_return makeError(result.error().code(), "retained disposition unavailable; preserve fixed claim");
+    co_return Dispatcher::OutputTable{{serde::toJsonString(observation)}};
+  } catch (...) {
+    co_return makeError(invoked && confirm ? StorageCode::kEcSealOutcomeUnknown : StatusCode::kIOError);
+  }
+}
 }  // namespace
 CoTryTask<void> registerEcGcHandlers(Dispatcher &dispatcher) {
   CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
@@ -342,6 +429,12 @@ CoTryTask<void> registerEcGcHandlers(Dispatcher &dispatcher) {
   CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
       [] { return parserFor("ec-gc-query-absent", true); },
       [](IEnv &env, const auto &parser, const auto &args) { return handleAbsent(env, parser, args, false); }));
+  CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
+      [] { return parserFor("ec-gc-confirm-retired", true); },
+      [](IEnv &env, const auto &parser, const auto &args) { return handleRetired(env, parser, args, true); }));
+  CO_RETURN_ON_ERROR(co_await dispatcher.registerHandler(
+      [] { return parserFor("ec-gc-query-retired", true); },
+      [](IEnv &env, const auto &parser, const auto &args) { return handleRetired(env, parser, args, false); }));
   co_return Void{};
 }
 }  // namespace hf3fs::client::cli

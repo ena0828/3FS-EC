@@ -24,6 +24,7 @@
 #include "fbs/meta/EcFileOutput.h"
 #include "fbs/meta/EcFileOutputResolution.h"
 #include "fbs/meta/EcGcAbsentCompletion.h"
+#include "fbs/meta/EcGcCompletion.h"
 #include "fbs/meta/EcFileRange.h"
 #include "fbs/meta/EcFileRepairRpc.h"
 #include "fbs/meta/EcFileRpc.h"
@@ -904,6 +905,22 @@ struct QueryEcFragmentAbsentReq : EcGcAdminReq {
     return Void{};
   }
 };
+struct ResolveEcFragmentRetiredReq : EcGcAdminReq {
+  SERDE_STRUCT_FIELD(confirm, false);
+
+ public:
+  Result<Void> valid() const {
+    RETURN_ON_ERROR(EcGcAdminReq::valid());
+    if (client.uuid.is_nil()) return makeError(StatusCode::kInvalidArg);
+    return Void{};
+  }
+};
+struct EcRetiredAdminRsp : RspBase {
+  SERDE_STRUCT_FIELD(clientNamespace, Uuid::zero());
+  SERDE_STRUCT_FIELD(requestId, Uuid::zero());
+  SERDE_STRUCT_FIELD(confirm, false);
+  SERDE_STRUCT_FIELD(disposition, EcGcRetainedDisposition{});
+};
 struct EcAbsentAdminRsp : RspBase {
   SERDE_STRUCT_FIELD(object, EcObjectRef{});
   SERDE_STRUCT_FIELD(identity, storage::EcFragmentIdentity{});
@@ -1518,6 +1535,7 @@ SERDE_SERVICE(MetaSerde, 4) {
   META_SERVICE_METHOD(queryEcFragmentAbsent, 76, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
   META_SERVICE_METHOD(confirmEcUnreservedRepair, 77, ConfirmEcUnreservedRepairReq, EcUnreservedRepairRsp);
   META_SERVICE_METHOD(queryEcUnreservedRepair, 78, QueryEcUnreservedRepairReq, EcUnreservedRepairRsp);
+  META_SERVICE_METHOD(resolveEcFragmentRetired, 79, ResolveEcFragmentRetiredReq, EcRetiredAdminRsp);
 
   META_SERVICE_METHOD(testRpc, 50, TestRpcReq, TestRpcRsp);
   META_SERVICE_METHOD(bindEcRmwOutput, 52, BindEcRmwOutputReq, BindEcRmwOutputRsp);

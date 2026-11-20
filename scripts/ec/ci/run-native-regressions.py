@@ -48,6 +48,9 @@ CLIENT_MANDATORY = {
     )
 }
 CLIENT_MANDATORY |= {
+    "TestEcGcCommands.RetiredDispositionRequiresExactClaimAndNeverReportsCollection",
+}
+CLIENT_MANDATORY |= {
     "TestEcExternalFenceCommands." + name for name in (
         "PreparedBindingDoesNotClaimFencingOrPhysicalRelease",
         "LostImportReplyQueriesSameIdentityWithoutHiddenRetry",

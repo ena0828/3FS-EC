@@ -23,6 +23,7 @@ using folly::coro::blockingWait;
 struct Calls {
   std::atomic<size_t> collects{0};
   std::atomic<size_t> queries{0};
+  std::atomic<size_t> retained{0};
   std::atomic<bool> mismatch{false};
   void record(const meta::EcGcAdminReq &req) {
     std::lock_guard lock(mutex);
@@ -56,7 +57,30 @@ class GcService : public meta::MockMetaService {
     co_return rsp;
   }
 
+  CoTryTask<meta::EcRetiredAdminRsp> resolveEcFragmentRetired(serde::CallContext &,
+                                                              const meta::ResolveEcFragmentRetiredReq &req) override {
+    ++calls_->retained;
+    calls_->record(req);
+    meta::EcRetiredAdminRsp rsp;
+    rsp.requestId = req.uuid;
+    rsp.clientNamespace = req.client.uuid;
+    rsp.confirm = req.confirm;
+    auto &proof = rsp.disposition;
+    proof.object = req.object;
+    proof.identity = req.identity;
+    proof.claimId = calls_->mismatch ? Uuid::random() : req.claimId;
+    proof.claimDigest[0] = 3;
+    proof.endpoint.placement = {storage::ChainId{2}, storage::TargetId{4}, flat::NodeId{6}};
+    proof.endpoint.engineUuid = engine_;
+    proof.endpoint.targetIncarnation = target_;
+    proof.retirementId = retirement_;
+    proof.fenceCompletionDigest[0] = 7;
+    proof.fenceProofDigest[0] = 9;
+    co_return rsp;
+  }
+
  private:
+  const Uuid engine_ = Uuid::random(), target_ = Uuid::random(), retirement_ = Uuid::random();
   static meta::EcGcAdminRsp completed(const meta::EcGcAdminReq &req) {
     meta::EcGcAdminRsp rsp;
     rsp.object = req.object;
@@ -216,6 +240,40 @@ TEST_F(TestEcGcCommands, MismatchedSuccessfulResponseIsNotAConfirmation) {
   EXPECT_EQ(records[1]["outcome"].asString(), "not_confirmed");
   EXPECT_EQ(records[1]["claim_id"].asString(), claim_.toHexString());
   EXPECT_TRUE(records[1]["ledger_sha256"].asString().empty());
+}
+
+TEST_F(TestEcGcCommands, RetiredDispositionRequiresExactClaimAndNeverReportsCollection) {
+  for (const bool confirm : {true, false}) {
+    const auto output = path(confirm ? "retired-confirm.jsonl" : "retired-query.jsonl");
+    auto command = args(confirm ? "ec-gc-confirm-retired" : "ec-gc-query-retired", output);
+    command.insert(command.end(), {"--client-namespace", client_->clientId().uuid.toHexString()});
+    ASSERT_OK(blockingWait(dispatcher_.run(env_, command)));
+    const auto records = read(output);
+    ASSERT_EQ(records.size(), 2);
+    EXPECT_EQ(records[0]["claim_sha256"].asString(), "");
+    EXPECT_EQ(records[1]["outcome"].asString(), confirm ? "confirmed" : "observed");
+    EXPECT_EQ(records[1]["state"].asString(), "retired_inaccessible");
+    EXPECT_EQ(records[1]["claim_id"].asString(), claim_.toHexString());
+    EXPECT_EQ(records[1]["request_id"].asString(), request_.toHexString());
+    EXPECT_EQ(records[1]["node_decimal"].asString(), "6");
+    EXPECT_EQ(records[1]["fence_completion_sha256"].asString().size(), 64);
+    EXPECT_EQ(records[1]["fence_proof_sha256"].asString().size(), 64);
+    EXPECT_FALSE(records[1]["collected"].asBool());
+    EXPECT_FALSE(records[1]["storage_absence_observed"].asBool());
+    EXPECT_FALSE(records[1]["physical_capacity_returned"].asBool());
+  }
+  calls_->mismatch = true;
+  const auto output = path("retired-foreign-claim.jsonl");
+  auto command = args("ec-gc-query-retired", output);
+  command.insert(command.end(), {"--client-namespace", client_->clientId().uuid.toHexString()});
+  ASSERT_ERROR(blockingWait(dispatcher_.run(env_, command)), StorageClientCode::kProtocolMismatch);
+  const auto records = read(output);
+  ASSERT_EQ(records.size(), 2);
+  EXPECT_EQ(records[1]["state"].asString(), "not_confirmed");
+  EXPECT_EQ(records[1]["outcome"].asString(), "not_observed");
+  EXPECT_TRUE(records[1]["fence_proof_sha256"].asString().empty());
+  EXPECT_EQ(calls_->retained.load(), 3);
+  EXPECT_EQ(calls_->collects.load() + calls_->queries.load(), 0);
 }
 }  // namespace
 }  // namespace hf3fs::client::cli

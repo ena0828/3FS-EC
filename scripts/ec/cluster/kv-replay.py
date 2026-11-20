@@ -181,6 +181,27 @@ def validate_receipt(step, plan, receipt):
         kv.require(type(completion['allocations_confirmed']) is int and
                    completion['allocations_confirmed'] * plan['shard_bytes'] ==
                    int(step['model']['required_confirmed_gc_allocation_bytes_decimal']), 'Allocation count differs from budget')
+        if plan.get('allow_fenced_retained'):
+            retained = completion['fenced_retained_allocations']
+            collected = completion['allocations_collected']
+            count = completion['allocations_fenced_retained']
+            kv.require(type(retained) is list and type(collected) is int and collected >= 0 and
+                       type(count) is int and count == len(retained) and
+                       collected + count == completion['allocations_confirmed'],
+                       'Collected and retained classifications do not cover the expected allocations')
+            kv.require(len({row['allocation'] for row in retained}) == count, 'Repeated retained allocation')
+            for row in retained:
+                kv.require(row['state'] == 'retired_inaccessible' and
+                           all(row[k] is False for k in ('collected', 'storage_absence_observed', 'physical_capacity_returned')) and
+                           row['inode_decimal'] == receipt['object']['inode_decimal'] and
+                           row['object_incarnation'] == receipt['object']['incarnation'],
+                           'Fenced allocation claimed physical credit or belongs to another object')
+                for field in ('claim_sha256', 'fence_completion_sha256', 'fence_proof_sha256'):
+                    kv.digest(row[field], field)
+                    kv.require(row[field] != '0' * 64, 'Missing retained allocation proof')
+        else:
+            kv.require('fenced_retained_allocations' not in completion and 'allocations_fenced_retained' not in completion,
+                       'Original plan requires ordinary allocation collection')
     else:
         kv.require(receipt['namespace_unlink'] is None, 'Unexpected unlink on live cache action')
         kv.require(receipt['gc'] is None, 'Unexpected GC on live cache action')
@@ -199,9 +220,18 @@ def execute(plan, run, backend, verify_input=None):
     expected = {step['name'] + '.json' for step in plan['steps']}
     kv.require(all(path.name in expected and path.is_file() for path in completed.iterdir()), 'Unexpected completed action')
     rows = []
+    retained_ids = set()
+    collected_count = 0
     for index, step in enumerate(plan['steps']):
         receipt = backend.perform(step['name'], step['spec'])
         validate_receipt(step, plan, receipt)
+        if plan.get('allow_fenced_retained') and step['spec']['kind'] == 'evict':
+            completion = receipt['gc']['completion']
+            for allocation in completion['fenced_retained_allocations']:
+                identity = allocation['allocation']
+                kv.require(identity not in retained_ids, 'One retained allocation was credited by two evictions')
+                retained_ids.add(identity)
+            collected_count += completion['allocations_collected']
         row = {'schema': 1, 'plan_sha256': digest(plan), 'name': step['name'], 'receipt_sha256': digest(receipt),
                'receipt_path': str(run / 'native/actions' / step['name'] / 'completion.json'),
                'model_after': step['model']['after'], 'scope': 'validated native action; logical allocation reservation only'}
@@ -216,6 +246,11 @@ def execute(plan, run, backend, verify_input=None):
               'confirmed_actions_sha256': digest(rows), 'summary': plan['summary'], 'claims': plan['claims'],
               'historical_child_join_claim': 'per-action receipts; recovery does not prove historical exit',
               'scope': 'bounded serial native functional replay; not a performance or physical capacity result'}
+    if plan.get('allow_fenced_retained'):
+        result['gc_accounting'] = {'allocations_collected': collected_count,
+                                   'allocations_fenced_retained': len(retained_ids),
+                                   'fenced_retained_model_bytes_decimal': str(len(retained_ids) * plan['shard_bytes']),
+                                   'physical_capacity_returned': False}
     seal(run / 'completion.json', result)
     return result
 
@@ -245,6 +280,8 @@ def parser():
                        help='Fixed 1..4 attempts; each replacement requires explicit complete settlement')
     start.add_argument('--confirm-unreserved-repair', action='store_true',
                        help='Allow settlement with a permanent Meta proof that the closed repair never reserved output')
+    start.add_argument('--allow-fenced-retained', action='store_true',
+                       help='Allow logical eviction after Meta permanently classifies an allocation on a fenced target')
     for command in ('resume', 'status'):
         child = sub.add_parser(command)
         child.add_argument('--run-dir', required=True, type=Path)
@@ -292,6 +329,8 @@ def main(argv=None):
                          options.window, [int(x) for x in options.targets.split(',')])}}
         if options.confirm_unreserved_repair:
             request['policy']['confirm_unreserved_repair'] = True
+        if options.allow_fenced_retained:
+            request['policy']['allow_fenced_retained'] = True
         plan = derive(request)  # Validate entire source and policy before creating any remote identity.
         run.mkdir(mode=0o700); sync_parent(run)
     with lease(run, options.command == 'start') as fd:

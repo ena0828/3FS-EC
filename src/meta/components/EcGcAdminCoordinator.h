@@ -22,11 +22,13 @@ class EcGcAdminCoordinator {
   CoTryTask<EcGcAdminRsp> query(EcGcAdminReq) const;
   CoTryTask<EcAbsentAdminRsp> confirmAbsent(EcGcAdminReq) const;
   CoTryTask<EcAbsentAdminRsp> queryAbsent(EcGcAdminReq) const;
+  CoTryTask<EcRetiredAdminRsp> resolveRetired(ResolveEcFragmentRetiredReq) const;
 
  private:
   struct State;
   static CoTryTask<EcGcAdminRsp> executeOwned(std::shared_ptr<State>, EcGcAdminReq, storage::EcGcAction);
   static CoTryTask<EcAbsentAdminRsp> executeAbsentOwned(std::shared_ptr<State>, EcGcAdminReq, storage::EcGcAbsentAction);
+  static CoTryTask<EcRetiredAdminRsp> resolveRetiredOwned(std::shared_ptr<State>, ResolveEcFragmentRetiredReq);
   const Config &config_;
   std::optional<Status> initializationError_;
   std::shared_ptr<State> state_;

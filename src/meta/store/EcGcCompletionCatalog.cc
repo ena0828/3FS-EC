@@ -1,6 +1,7 @@
 #include "meta/store/EcGcCompletionCatalog.h"
 
 #include "meta/store/EcExactGcCatalog.h"
+#include "meta/store/EcTargetRetirementCatalog.h"
 #include "meta/store/EcV2LifecycleUtils.h"
 
 namespace hf3fs::meta::server {
@@ -8,9 +9,10 @@ namespace {
 using Codec = storage::ec_gc_control_detail::Codec;
 using namespace ec_v2_lifecycle;
 
-Result<std::string> completionKey(const storage::EcFragmentIdentity &identity) {
+Result<std::string> completionKey(const storage::EcFragmentIdentity &identity,
+                                  kv::KeyPrefix prefix = kv::KeyPrefix::EcGcCompletion) {
   CHECK_RESULT(chunk, identity.chunkId());
-  std::string key(kv::toStr(kv::KeyPrefix::EcGcCompletion));
+  std::string key(kv::toStr(prefix));
   key.append(chunk.data());
   return key;
 }
@@ -60,6 +62,7 @@ CoTryTask<std::optional<EcGcCompletion>> getWithClaim(kv::IReadWriteTransaction 
                                                       const storage::EcGcKey &key,
                                                       const Uuid &authority) {
   if (claim.version == 2) {
+    CO_RETURN_ON_ERROR(co_await EcGcCompletionCatalog::requireNoRetainedDisposition(txn, claim.allocation.fragment.identity));
     auto chunk = claim.allocation.fragment.identity.chunkId();
     CO_RETURN_ON_ERROR(chunk);
     std::string absentKey(kv::toStr(kv::KeyPrefix::EcGcAbsentCompletion));
@@ -76,6 +79,70 @@ CoTryTask<std::optional<EcGcCompletion>> getWithClaim(kv::IReadWriteTransaction 
   co_return value;
 }
 }  // namespace
+
+CoTryTask<Void> EcGcCompletionCatalog::requireNoRetainedDisposition(Transaction &txn,
+                                                                   const storage::EcFragmentIdentity &identity) {
+  auto key = completionKey(identity, kv::KeyPrefix::EcGcRetainedDisposition);
+  CO_RETURN_ON_ERROR(key);
+  auto disposition = co_await txn.get(*key);
+  CO_RETURN_ON_ERROR(disposition);
+  if (*disposition) co_return makeError(StatusCode::kTokenStale, "allocation already classified as RetiredInaccessible");
+  co_return Void{};
+}
+
+CoTryTask<std::optional<EcGcRetainedDisposition>> EcGcCompletionCatalog::retained(
+    Transaction &raw, const EcObjectRef &object, const storage::EcFragmentIdentity &identity,
+    const Uuid &claimId, const Uuid &controlAuthority, bool confirm) {
+  if (controlAuthority.is_nil()) co_return makeError(StatusCode::kInvalidArg, "missing control authority");
+  EcGcTxnScope scope(raw);
+  auto &txn = scope.transaction();
+  auto claim = co_await exactClaim(txn, object, identity, claimId);
+  CO_RETURN_ON_ERROR(claim);
+  if (claim->version != 2) co_return makeError(StatusCode::kNotImplemented, "retained disposition requires mode4");
+
+  auto key = completionKey(identity, kv::KeyPrefix::EcGcRetainedDisposition);
+  CO_RETURN_ON_ERROR(key);
+  auto old = co_await load<EcGcRetainedDisposition>(txn, *key);
+  CO_RETURN_ON_ERROR(old);
+  if (!*old && !confirm) co_return std::nullopt;
+  // Conflict reads in both directions serialize competing terminal writes,
+  // including a late G2 ACK for a Collect issued before the fence.
+  for (auto prefix : {kv::KeyPrefix::EcGcCompletion, kv::KeyPrefix::EcGcAbsentCompletion}) {
+    auto otherKey = completionKey(identity, prefix);
+    CO_RETURN_ON_ERROR(otherKey);
+    auto other = co_await txn.get(*otherKey);
+    CO_RETURN_ON_ERROR(other);
+    if (*other) co_return makeError(*old ? StatusCode::kDataCorruption : StatusCode::kTokenStale,
+                                    "allocation already has a Storage terminal proof");
+  }
+  auto endpoint = claim->allocation.endpoint();
+  auto fence = co_await EcTargetRetirementCatalog::findHostFence(txn, endpoint, controlAuthority);
+  CO_RETURN_ON_ERROR(fence);
+  if (!*fence) {
+    if (*old) co_return makeError(StatusCode::kDataCorruption, "retained disposition lost its verified host fence");
+    co_return std::nullopt;
+  }
+  auto certificate = project(*claim);
+  CO_RETURN_ON_ERROR(certificate);
+  auto digest = Codec::claimDigest(*certificate);
+  CO_RETURN_ON_ERROR(digest);
+  EcGcRetainedDisposition value;
+  value.object = object;
+  value.identity = identity;
+  value.claimId = claimId;
+  value.claimDigest = *digest;
+  value.endpoint = endpoint;
+  value.retirementId = (**fence).retirementId;
+  value.fenceCompletionDigest = (**fence).completionDigest;
+  value.fenceProofDigest = (**fence).proofDigest;
+  CO_RETURN_ON_ERROR(value.valid());
+  if (*old) {
+    if (!serde::equals(**old, value)) co_return makeError(StatusCode::kDataCorruption, "retained disposition changed");
+  } else {
+    CO_RETURN_ON_ERROR(co_await save(txn, *key, value));
+  }
+  co_return value;
+}
 
 Result<storage::EcGcCertificate> EcGcCompletionCatalog::project(const EcGcClaim &claim) {
   const bool flat = claim.version == 1 && claim.enrollment.version == 1;

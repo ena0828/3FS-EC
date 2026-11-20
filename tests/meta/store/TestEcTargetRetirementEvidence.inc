@@ -446,6 +446,19 @@ TEST_F(TestEcFileTree, RealFdbRepairTwentyTwoRetirementsFencePublicationAndReval
   ASSERT_OK(afterSource);
   ASSERT_TRUE(*afterSource);
   EXPECT_EQ(serde::serialize(**afterSource), serde::serialize(*claim));
+  const auto confirmed = f.runProfile([&](Tx &t) {
+    return EcGcCompletionCatalog::retained(t, intent.object, identity, claimId, targets.authority, true);
+  });
+  ASSERT_OK(confirmed);
+  EXPECT_FALSE(*confirmed) << "cooperative retirement has no independent execution-fence certificate";
+  const auto queried = f.runProfile([&](Tx &t) {
+    return EcGcCompletionCatalog::retained(t, intent.object, identity, claimId, targets.authority, false);
+  });
+  ASSERT_OK(queried);
+  EXPECT_FALSE(*queried);
+  ASSERT_ERROR(f.runProfile([&](Tx &t) {
+    return EcGcCompletionCatalog::retained(t, intent.object, identity, Uuid::random(), targets.authority, true);
+  }), StatusCode::kTokenMismatch);
   RecordProperty("retirement_repair_22_max_bytes", std::to_string(maximumBytes));
   RecordProperty("retirement_repair_22_max_operations", std::to_string(maximumKeys));
   RecordProperty("scope", "real FDB and persistent target observations; metadata-only assembled Data; no physical GC");

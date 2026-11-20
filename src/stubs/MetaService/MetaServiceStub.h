@@ -92,6 +92,7 @@ class MetaServiceStub : public IMetaServiceStub {
   META_STUB_METHOD(queryEcUnreservedRepair, QueryEcUnreservedRepairReq, EcUnreservedRepairRsp);
   META_STUB_METHOD(confirmEcFragmentAbsent, ConfirmEcFragmentAbsentReq, EcAbsentAdminRsp);
   META_STUB_METHOD(queryEcFragmentAbsent, QueryEcFragmentAbsentReq, EcAbsentAdminRsp);
+  META_STUB_METHOD(resolveEcFragmentRetired, ResolveEcFragmentRetiredReq, EcRetiredAdminRsp);
   META_STUB_METHOD(closeEcFileRepairDebt, CloseEcFileRepairDebtReq, EcFileRepairRsp);
 
 #undef META_STUB_METHOD
