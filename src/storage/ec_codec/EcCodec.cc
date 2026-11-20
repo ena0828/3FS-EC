@@ -1,6 +1,7 @@
 #include "EcCodec.h"
 
 #include <new>
+#include <utility>
 
 #include "chunk_engine/src/cxx.rs.h"
 
@@ -62,6 +63,30 @@ std::array<chunk_engine::EcCodecInput, 12> rawSources(std::span<const EcCodecSha
   return result;
 }
 
+Result<chunk_engine::EcCodecResult> checkedContribution(std::span<const uint16_t> healthy,
+                                                       std::span<const uint16_t> targets,
+                                                       uint16_t helper,
+                                                       std::string_view slice,
+                                                       const EcCodecFormat &format) {
+  // The Rust plan checks bounds, duplicates, disjointness and helper membership.
+  if (healthy.size() != 10 || targets.empty() || targets.size() > 2 || slice.size() > EcCodec::kMaxShardBytes) {
+    return makeError(StatusCode::kInvalidArg, "invalid EC contribution count or input size");
+  }
+  auto result = chunk_engine::ec_codec_contribute(rawFormat(format),
+                                                  {healthy.data(), healthy.size()},
+                                                  {targets.data(), targets.size()},
+                                                  helper,
+                                                  bytes(slice));
+  RETURN_ON_ERROR(checkResult(result));
+  if (result.shards.size() != targets.size())
+    return makeError(StatusCode::kFoundBug, "EC contribution returned incorrect count");
+  for (size_t i = 0; i != targets.size(); ++i) {
+    if (result.shards[i].index != targets[i] || result.shards[i].data.size() != slice.size())
+      return makeError(StatusCode::kFoundBug, "EC contribution returned incorrect target or size");
+  }
+  return Result<chunk_engine::EcCodecResult>(std::move(result));
+}
+
 }  // namespace
 
 std::string_view EcCodec::backendName() noexcept {
@@ -120,29 +145,39 @@ Result<std::vector<std::string>> EcCodec::contribute(std::span<const uint16_t> h
                                                      std::string_view slice,
                                                      const EcCodecFormat &format) {
   try {
-    // Validate counts before forming Rust slices or allocating output. The Rust
-    // plan validates bounds, duplicates, disjointness and helper membership.
-    if (healthy.size() != 10 || targets.empty() || targets.size() > 2 || slice.size() > kMaxShardBytes) {
-      return makeError(StatusCode::kInvalidArg, "invalid EC contribution count or input size");
-    }
-    auto result = chunk_engine::ec_codec_contribute(rawFormat(format),
-                                                    {healthy.data(), healthy.size()},
-                                                    {targets.data(), targets.size()},
-                                                    helper,
-                                                    bytes(slice));
-    RETURN_ON_ERROR(checkResult(result));
-    if (result.shards.size() != targets.size())
-      return makeError(StatusCode::kFoundBug, "EC contribution returned incorrect count");
+    CHECK_RESULT(result, checkedContribution(healthy, targets, helper, slice, format));
     std::vector<std::string> output;
     output.reserve(targets.size());
-    for (size_t i = 0; i != targets.size(); ++i) {
-      const auto &shard = result.shards[i];
-      if (shard.index != targets[i] || shard.data.size() != slice.size()) {
-        return makeError(StatusCode::kFoundBug, "EC contribution returned incorrect target or size");
-      }
+    for (const auto &shard : result.shards)
       output.emplace_back(reinterpret_cast<const char *>(shard.data.data()), shard.data.size());
-    }
     return output;
+  } catch (const std::bad_alloc &) {
+    return makeError(StatusCode::kNotEnoughMemory);
+  }
+}
+
+Result<Void> EcCodec::accumulateContribution(std::span<const uint16_t> healthy,
+                                            std::span<const uint16_t> targets,
+                                            uint16_t helper,
+                                            std::string_view slice,
+                                            std::span<std::string> accumulators,
+                                            const EcCodecFormat &format) {
+  try {
+    if (accumulators.size() != targets.size())
+      return makeError(StatusCode::kInvalidArg, "EC accumulator count differs from target count");
+    for (const auto &accumulator : accumulators) {
+      if (accumulator.size() != slice.size())
+        return makeError(StatusCode::kInvalidArg, "EC accumulator length differs from source slice");
+    }
+    CHECK_RESULT(result, checkedContribution(healthy, targets, helper, slice, format));
+    // The Rust vectors belong to this result for the entire loop. No resize,
+    // allocation or fallible operation remains once the first byte is changed.
+    for (size_t i = 0; i != accumulators.size(); ++i) {
+      auto *dest = reinterpret_cast<uint8_t *>(accumulators[i].data());
+      const auto *contribution = result.shards[i].data.data();
+      for (size_t j = 0; j != slice.size(); ++j) dest[j] ^= contribution[j];
+    }
+    return Void{};
   } catch (const std::bad_alloc &) {
     return makeError(StatusCode::kNotEnoughMemory);
   }

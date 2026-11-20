@@ -61,6 +61,14 @@ class EcCodec {
                                                      uint16_t helper,
                                                      std::string_view slice,
                                                      const EcCodecFormat &format = {});
+  // XOR one helper's contributions into equally sized accumulators in target
+  // order. All destinations and all bridge outputs are checked before writing.
+  static Result<Void> accumulateContribution(std::span<const uint16_t> healthy,
+                                             std::span<const uint16_t> targets,
+                                             uint16_t helper,
+                                             std::string_view slice,
+                                             std::span<std::string> accumulators,
+                                             const EcCodecFormat &format = {});
 };
 
 }  // namespace hf3fs::storage

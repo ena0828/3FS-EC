@@ -87,21 +87,29 @@ TEST(TestEcCodec, HelperContributionsReconstructOrderedTargetsAndSlices) {
   auto encoded = EcCodec::encode(logical, 257);
   ASSERT_OK(encoded);
   const std::array<uint16_t, 10> healthy{11, 9, 8, 7, 6, 5, 4, 3, 2, 1};
+  const std::array<uint16_t, 10> helperOrder{4, 7, 9, 5, 11, 8, 1, 3, 6, 2};
   const std::array<uint16_t, 2> targets{10, 0};
-  for (auto [offset, length] : {std::pair<size_t, size_t>{0, 257}, {33, 77}, {256, 1}, {257, 0}}) {
-    std::array<std::string, 2> combined{std::string(length, '\0'), std::string(length, '\0')};
-    for (auto helper : healthy) {
-      auto slice = std::string_view((*encoded)[helper]).substr(offset, length);
-      auto contribution = EcCodec::contribute(healthy, targets, helper, slice);
-      ASSERT_OK(contribution);
-      ASSERT_EQ(contribution->size(), 2);
-      for (size_t target = 0; target != targets.size(); ++target) {
-        ASSERT_EQ((*contribution)[target].size(), length);
-        for (size_t byte = 0; byte != length; ++byte) combined[target][byte] ^= (*contribution)[target][byte];
+  for (size_t count : {1, 2}) {
+    auto selected = std::span(targets).first(count);
+    for (auto [offset, length] : {std::pair<size_t, size_t>{0, 257}, {33, 77}, {1, 63}, {1, 64}, {1, 65},
+                                  {256, 1}, {257, 0}}) {
+      std::array<std::string, 2> combined{std::string(length, '\0'), std::string(length, '\0')};
+      auto inPlace = combined;
+      for (auto helper : helperOrder) {
+        auto slice = std::string_view((*encoded)[helper]).substr(offset, length);
+        auto contribution = EcCodec::contribute(healthy, selected, helper, slice);
+        ASSERT_OK(contribution);
+        ASSERT_EQ(contribution->size(), count);
+        for (size_t target = 0; target != count; ++target) {
+          ASSERT_EQ((*contribution)[target].size(), length);
+          for (size_t byte = 0; byte != length; ++byte) combined[target][byte] ^= (*contribution)[target][byte];
+        }
+        ASSERT_OK(EcCodec::accumulateContribution(healthy, selected, helper, slice, std::span(inPlace).first(count)));
+        ASSERT_EQ(inPlace, combined);  // Every prefix, including the unused second slot for single-target repair.
       }
-    }
-    for (size_t target = 0; target != targets.size(); ++target) {
-      ASSERT_EQ(combined[target], (*encoded)[targets[target]].substr(offset, length));
+      for (size_t target = 0; target != count; ++target) {
+        ASSERT_EQ(inPlace[target], (*encoded)[targets[target]].substr(offset, length));
+      }
     }
   }
 }
@@ -184,6 +192,27 @@ TEST(TestEcCodec, ContributionValidatesPlanAndOneMiBInputBound) {
   ASSERT_EQ((*full)[0], std::string(EcCodec::kMaxShardBytes, (*byte)[0][0]));
   maximum.push_back('x');
   ASSERT_ERROR(EcCodec::contribute(healthy, oneTarget, 0, maximum), StatusCode::kInvalidArg);
+
+  // The second destination is invalid. Validation must precede even the first
+  // XOR. An error from the Rust plan or format must preserve both values too.
+  std::array<std::string, 2> outputs{"old", "keep"};
+  auto before = outputs;
+  ASSERT_ERROR(EcCodec::accumulateContribution(healthy, targets, 0, "new", outputs), StatusCode::kInvalidArg);
+  EXPECT_EQ(outputs, before);
+  ASSERT_ERROR(EcCodec::accumulateContribution(healthy, targets, 0, "new", std::span(outputs).first(1)),
+               StatusCode::kInvalidArg);
+  EXPECT_EQ(outputs, before);
+  outputs[1] = "ok!";
+  before = outputs;
+  ASSERT_ERROR(EcCodec::accumulateContribution(healthy, duplicateTargets, 0, "new", outputs), StatusCode::kInvalidArg);
+  EXPECT_EQ(outputs, before);
+  ASSERT_ERROR(EcCodec::accumulateContribution(healthy, targets, 10, "new", outputs), StatusCode::kInvalidArg);
+  EXPECT_EQ(outputs, before);
+  EcCodecFormat unknown;
+  ++unknown.matrixVersion;
+  ASSERT_ERROR(EcCodec::accumulateContribution(healthy, targets, 0, "new", outputs, unknown),
+               StatusCode::kInvalidArg);
+  EXPECT_EQ(outputs, before);
 }
 
 }  // namespace

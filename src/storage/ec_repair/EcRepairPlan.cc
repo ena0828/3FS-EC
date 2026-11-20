@@ -178,21 +178,13 @@ Result<EcRepairBlock> EcRepairBlockCore::advance(const EcRepairPlan &plan,
     const auto &source = plan.input().sources[position];
     RETURN_ON_ERROR(verifyEcIntegrityBlock(source.identity, source.integrity, incoming.blockIndex, localBlock));
     const auto &format = source.integrity;
-    CHECK_RESULT(
-        contributions,
-        EcCodec::contribute(
-            plan.healthy(),
-            plan.targets(),
-            source.identity.shard,
-            localBlock,
-            {format.codecId, format.matrixVersion, format.dataShards, format.parityShards, format.fieldPolynomial}));
-    if (contributions.size() != incoming.targetCount) return makeError(StatusCode::kFoundBug);
-    for (size_t target = 0; target != incoming.targetCount; ++target) {
-      if (contributions[target].size() != incoming.outputs[target].size()) return makeError(StatusCode::kFoundBug);
-      for (size_t byte = 0; byte != incoming.outputs[target].size(); ++byte) {
-        incoming.outputs[target][byte] ^= contributions[target][byte];
-      }
-    }
+    RETURN_ON_ERROR(EcCodec::accumulateContribution(
+        plan.healthy(),
+        plan.targets(),
+        source.identity.shard,
+        localBlock,
+        std::span(incoming.outputs).first(incoming.targetCount),
+        {format.codecId, format.matrixVersion, format.dataShards, format.parityShards, format.fieldPolynomial}));
     incoming.nextHelper = position + 1;
     incoming.contributorMask |= uint16_t{1} << position;
     if (incoming.nextHelper == 10) RETURN_ON_ERROR(validateComplete(plan, incoming));
