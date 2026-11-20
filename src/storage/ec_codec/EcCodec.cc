@@ -139,6 +139,37 @@ Result<EcCodec::Shards> EcCodec::recover(std::span<const EcCodecShardView> sourc
   }
 }
 
+Result<std::array<std::string, 10>> EcCodec::recoverMissingData(std::span<const EcCodecShardView> sources,
+                                                               uint64_t logicalLength,
+                                                               uint32_t shardBytes,
+                                                               const EcCodecFormat &format) {
+  try {
+    RETURN_ON_ERROR(validateShape(logicalLength, shardBytes));
+    RETURN_ON_ERROR(validateSources(sources, 10, shardBytes));
+    auto input = rawSources(sources);
+    auto result = chunk_engine::ec_codec_recover_missing_data(
+        rawFormat(format), {input.data(), sources.size()}, logicalLength, shardBytes);
+    RETURN_ON_ERROR(checkResult(result));
+    std::array<bool, 10> present{};
+    for (const auto &source : sources) {
+      if (source.index < present.size()) present[source.index] = true;
+    }
+    std::array<std::string, 10> output;
+    size_t row = 0;
+    for (size_t i = 0; i < present.size(); ++i) {
+      if (present[i]) continue;
+      if (row >= result.shards.size() || result.shards[row].index != i || result.shards[row].data.size() != shardBytes)
+        return makeError(StatusCode::kFoundBug, "EC missing data output has incorrect index or size");
+      const auto &data = result.shards[row++].data;
+      output[i].assign(reinterpret_cast<const char *>(data.data()), data.size());
+    }
+    if (row != result.shards.size()) return makeError(StatusCode::kFoundBug, "EC missing data returned extra rows");
+    return output;
+  } catch (const std::bad_alloc &) {
+    return makeError(StatusCode::kNotEnoughMemory);
+  }
+}
+
 Result<std::vector<std::string>> EcCodec::contribute(std::span<const uint16_t> healthy,
                                                      std::span<const uint16_t> targets,
                                                      uint16_t helper,

@@ -52,6 +52,12 @@ class EcCodec {
                                 uint64_t logicalLength,
                                 uint32_t shardBytes,
                                 const EcCodecFormat &format = {});
+  // Apply the same complete codeword checks, returning owned bytes only for
+  // missing data indices. Present data indices have an empty result slot.
+  static Result<std::array<std::string, 10>> recoverMissingData(std::span<const EcCodecShardView> sources,
+                                                               uint64_t logicalLength,
+                                                               uint32_t shardBytes,
+                                                               const EcCodecFormat &format = {});
   // XOR exactly one result from each healthy shard with the same ordered plan,
   // generation, offset and length. Outputs follow targets order. This function
   // does not detect duplicates/omissions across separate helper invocations.

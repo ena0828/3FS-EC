@@ -48,6 +48,7 @@ TEST(TestEcCodec, RecoversAllSixtySixTenSourceSetsInArbitraryOrder) {
   const auto logical = codecPattern(153);
   auto encoded = EcCodec::encode(logical, 17);
   ASSERT_OK(encoded);
+  const auto immutable = *encoded;
   for (uint16_t first = 0; first != 12; ++first) {
     for (uint16_t second = first + 1; second != 12; ++second) {
       SCOPED_TRACE(std::to_string(first) + "," + std::to_string(second));
@@ -59,6 +60,16 @@ TEST(TestEcCodec, RecoversAllSixtySixTenSourceSetsInArbitraryOrder) {
       auto repaired = EcCodec::recover(healthy, logical.size(), 17);
       ASSERT_OK(repaired);
       ASSERT_EQ(*repaired, *encoded);
+      auto data = EcCodec::recoverMissingData(healthy, logical.size(), 17);
+      ASSERT_OK(data);
+      for (size_t i = 0; i < data->size(); ++i) {
+        if (i == first || i == second) {
+          EXPECT_EQ((*data)[i], immutable[i]);
+        } else {
+          EXPECT_TRUE((*data)[i].empty());
+        }
+      }
+      EXPECT_EQ(*encoded, immutable);
     }
   }
 }
@@ -163,6 +174,7 @@ TEST(TestEcCodec, RejectsInvalidShapeSourcesAndUnsupportedFormats) {
     ASSERT_ERROR(EcCodec::encode({}, 1, format), StatusCode::kInvalidArg);
     ASSERT_ERROR(EcCodec::verify(views(*encoded), 31, 4, format), StatusCode::kInvalidArg);
     ASSERT_ERROR(EcCodec::recover(healthy, 31, 4, format), StatusCode::kInvalidArg);
+    ASSERT_ERROR(EcCodec::recoverMissingData(healthy, 31, 4, format), StatusCode::kInvalidArg);
   }
 }
 

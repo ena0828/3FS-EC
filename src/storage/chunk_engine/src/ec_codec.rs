@@ -279,16 +279,28 @@ fn output(shards: Vec<Vec<u8>>, indices: impl IntoIterator<Item = usize>) -> Vec
 
 fn verify_codeword(
     codec: &Codec,
-    shards: &[Vec<u8>],
+    indexed: [Option<&[u8]>; N],
     logical_length: u64,
     size: usize,
 ) -> BridgeResult<()> {
-    if shards.len() != N || shards.iter().any(|shard| shard.len() != size) {
+    // A missing view has length zero, which cannot equal the validated size.
+    let shards = indexed.map(Option::unwrap_or_default);
+    if shards.iter().any(|shard| shard.len() != size) {
         return Err((FOUND_BUG, "EC codec returned an inconsistent shape".into()));
     }
     verify_padding(&shards[..K], logical_length, size)?;
-    let expected = codec.encode(&shards[..K]).map_err(codec_error)?;
-    if expected[K..] != shards[K..] {
+    let expected = codec.encode_parity(&shards[..K]).map_err(codec_error)?;
+    if expected.len() != N - K {
+        return Err((
+            FOUND_BUG,
+            "EC codec returned an inconsistent parity count".into(),
+        ));
+    }
+    if expected
+        .iter()
+        .map(Vec::as_slice)
+        .ne(shards[K..].iter().copied())
+    {
         return Err((
             CORRUPT,
             "EC parity differs from the fixed encoding matrix".into(),
@@ -297,7 +309,7 @@ fn verify_codeword(
     Ok(())
 }
 
-fn verify_padding(shards: &[Vec<u8>], logical_length: u64, size: usize) -> BridgeResult<()> {
+fn verify_padding(shards: &[&[u8]], logical_length: u64, size: usize) -> BridgeResult<()> {
     for (index, shard) in shards.iter().enumerate() {
         let valid = logical_length
             .saturating_sub((index * size) as u64)
@@ -345,24 +357,43 @@ pub(crate) fn ec_codec_verify(
         let size = shape(logical_length, shard_bytes)?;
         let indexed = inputs(shards, N, size)?;
         let codec = codec(format)?;
-        // The existing Codec takes owned data shards. Parity inputs remain
-        // borrowed; no copy of those two potentially 1MiB inputs is needed.
-        let data = indexed[..K]
-            .iter()
-            .map(|shard| copy_bytes(shard.ok_or_else(|| invalid("missing EC shard"))?))
-            .collect::<BridgeResult<Vec<_>>>()?;
-        verify_padding(&data, logical_length, size)?;
-        let expected = codec.encode(&data).map_err(codec_error)?;
-        for index in K..N {
-            if Some(expected[index].as_slice()) != indexed[index] {
-                return Err((
-                    CORRUPT,
-                    "EC parity differs from the fixed encoding matrix".into(),
-                ));
-            }
-        }
+        verify_codeword(codec, indexed, logical_length, size)?;
         Ok(Vec::new())
     })
+}
+
+fn recover_erased_rows(
+    format: &EcCodecFormat,
+    shards: &[EcCodecInput<'_>],
+    logical_length: u64,
+    shard_bytes: u32,
+) -> BridgeResult<Vec<EcCodecShard>> {
+    let size = shape(logical_length, shard_bytes)?;
+    let mut indexed = inputs(shards, K, size)?;
+    let codec = codec(format)?;
+    let healthy: [usize; K] = std::array::from_fn(|i| usize::from(shards[i].index));
+    let targets: Vec<_> = indexed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, shard)| shard.is_none().then_some(i))
+        .collect();
+    let key = PlanKey::checked(format, &healthy, &targets)?;
+    let plan = plans().repair(codec, key)?;
+    let data: [&[u8]; K] = std::array::from_fn(|i| shards[i].data);
+    let repaired = plan.recover_borrowed(&data).map_err(codec_error)?;
+    if repaired.len() != targets.len() {
+        return Err((
+            FOUND_BUG,
+            "EC reconstruction returned an inconsistent count".into(),
+        ));
+    }
+    for (&target, row) in targets.iter().zip(&repaired) {
+        indexed[target] = Some(row);
+    }
+    // Even when only a data row will be returned, check the other erased row,
+    // both parity equations and all logical padding before exposing any bytes.
+    verify_codeword(codec, indexed, logical_length, size)?;
+    Ok(output(repaired, targets))
 }
 
 pub(crate) fn ec_codec_recover(
@@ -372,38 +403,31 @@ pub(crate) fn ec_codec_recover(
     shard_bytes: u32,
 ) -> EcCodecResult {
     boundary(|| {
-        let size = shape(logical_length, shard_bytes)?;
-        let indexed = inputs(shards, K, size)?;
-        let codec = codec(format)?;
-        let healthy: Vec<_> = shards.iter().map(|shard| shard.index as usize).collect();
-        let targets: Vec<_> = indexed
-            .iter()
-            .enumerate()
-            .filter_map(|(i, shard)| shard.is_none().then_some(i))
-            .collect();
-        let key = PlanKey::checked(format, &healthy, &targets)?;
-        let plan = plans().repair(codec, key)?;
-        let data = shards
-            .iter()
-            .map(|shard| copy_bytes(shard.data))
-            .collect::<BridgeResult<Vec<_>>>()?;
-        let recovered = plan.recover_slice(&data).map_err(codec_error)?;
-        let mut complete: Vec<Option<Vec<u8>>> = (0..N).map(|_| None).collect();
-        for (index, bytes) in healthy
-            .into_iter()
-            .zip(data)
-            .chain(targets.into_iter().zip(recovered))
-        {
-            complete[index] = Some(bytes);
+        let mut complete = recover_erased_rows(format, shards, logical_length, shard_bytes)?;
+        complete
+            .try_reserve_exact(K)
+            .map_err(|_| (NO_MEMORY, "cannot allocate EC codeword".into()))?;
+        for source in shards {
+            complete.push(EcCodecShard {
+                index: source.index,
+                data: copy_bytes(source.data)?,
+            });
         }
-        let complete = complete
-            .into_iter()
-            .map(|shard| {
-                shard.ok_or_else(|| (FOUND_BUG, "EC reconstruction omitted a shard".into()))
-            })
-            .collect::<BridgeResult<Vec<_>>>()?;
-        verify_codeword(codec, &complete, logical_length, size)?;
-        Ok(output(complete, 0..N))
+        complete.sort_unstable_by_key(|shard| shard.index);
+        Ok(complete)
+    })
+}
+
+pub(crate) fn ec_codec_recover_missing_data(
+    format: &EcCodecFormat,
+    shards: &[EcCodecInput<'_>],
+    logical_length: u64,
+    shard_bytes: u32,
+) -> EcCodecResult {
+    boundary(|| {
+        let mut recovered = recover_erased_rows(format, shards, logical_length, shard_bytes)?;
+        recovered.retain(|shard| usize::from(shard.index) < K);
+        Ok(recovered)
     })
 }
 
@@ -460,6 +484,7 @@ mod tests {
             ec_codec_encode(&bad, &[], 1),
             ec_codec_encode(&format(), &[], 0),
             ec_codec_recover(&format(), &[], 0, 1),
+            ec_codec_recover_missing_data(&format(), &[], 0, 1),
             ec_codec_contribute(&format(), &[0; 10], &[11], 0, &[1]),
         ] {
             assert_eq!(result.error_code, INVALID);
@@ -501,6 +526,7 @@ mod tests {
         for result in [
             ec_codec_verify(&format(), &sources, 0, 1),
             ec_codec_recover(&format(), &sources[..K], 0, 1),
+            ec_codec_recover_missing_data(&format(), &sources[..K], 0, 1),
         ] {
             assert_eq!(result.error_code, INVALID);
             assert!(result.shards.is_empty());
@@ -585,6 +611,12 @@ mod tests {
                 assert_eq!(shard.index as usize, index);
                 assert_eq!(shard.data, expected[index]);
             }
+            let missing =
+                ec_codec_recover_missing_data(&format(), &sources, logical.len() as u64, size as u32);
+            assert_eq!(missing.error_code, 0);
+            assert_eq!(missing.shards.len(), 1);
+            assert_eq!(missing.shards[0].index, 0);
+            assert_eq!(missing.shards[0].data, expected[0]);
             let mut sum = vec![vec![0u8; size]; 2];
             for &helper in &healthy {
                 let result = ec_codec_contribute(

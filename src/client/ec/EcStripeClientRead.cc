@@ -52,9 +52,14 @@ Result<EcReadBlockAssembly> assembleEcReadBlock(std::array<storage::EcCodecShard
     return EcReadBlockAssembly::Systematic;
   }
   // Stable source/byte pairs give all arrival permutations the same codec plan key.
-  auto recovered = storage::EcCodec::recover(sources, logicalBlockLength, length);
+  auto recovered = storage::EcCodec::recoverMissingData(sources, logicalBlockLength, length);
   RETURN_ON_ERROR(recovered);
-  for (size_t i = 0; i < sources.size(); ++i) copy(i, (*recovered)[i]);
+  for (const auto &source : sources) {
+    if (source.index < valid.size()) copy(source.index, source.data);
+  }
+  for (size_t i = 0; i < recovered->size(); ++i) {
+    if (!(*recovered)[i].empty()) copy(i, (*recovered)[i]);
+  }
   return EcReadBlockAssembly::Recovered;
 }
 
@@ -239,9 +244,8 @@ Result<EcStripeReadSession> EcStripeClientCore::startRead(EcStripePinIds pin,
                                                           std::optional<meta::AcquireEcReadV2Rsp> supplied) {
   RETURN_ON_ERROR(validControl(control));
   RETURN_ON_ERROR(validPin(pin));
-  // Peak per active block includes ten selected bytes plus Rust's twelve
-  // reconstructed/twelve verification bytes (34), rounded to 36 to include
-  // pending selector completions. Each earlier block can retain two late bytes.
+  // Preserve the established admission bound, including selector responses,
+  // codec scratch and pending completions. Each prior block can retain two late reads.
   const size_t bytes = size_t(storage::EcCodec::kMaxShardBytes) * 10 +
                        (2 * storage::kEcIntegrityMaxBlocks + 36 * limits.readBlocks) * storage::kEcIntegrityBlockBytes;
   try {

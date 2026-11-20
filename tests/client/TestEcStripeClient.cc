@@ -84,6 +84,23 @@ TEST(TestEcStripeClient, DirectBlockRejectsNonzeroPaddingAndMalformedQuorums) {
   ASSERT_ERROR(detail::assembleEcReadBlock(views, shardBytes, 0, shardBytes, out), StatusCode::kInvalidArg);
   views[9] = {9, views[9].data.substr(1)};
   ASSERT_ERROR(detail::assembleEcReadBlock(views, shardBytes, 0, shardBytes, out), StatusCode::kInvalidArg);
+
+  // Construct a valid full codeword with nonzero bytes beyond the claimed file
+  // length. That padding can lie in a borrowed data row or a recovered one.
+  std::string padded = original;
+  padded.resize(10 * shardBytes, '\0');
+  padded.back() = '!';
+  auto bad = storage::EcCodec::encode(padded, shardBytes);
+  ASSERT_OK(bad);
+  for (auto [first, second] : {std::pair{0, 10}, std::pair{9, 10}, std::pair{8, 9}}) {
+    size_t filled = 0;
+    for (uint16_t i = 0; i != 12; ++i) {
+      if (i != first && i != second) views[filled++] = {i, (*bad)[i]};
+    }
+    ASSERT_ERROR(storage::EcCodec::recover(views, original.size(), shardBytes), StatusCode::kDataCorruption);
+    ASSERT_ERROR(detail::assembleEcReadBlock(views, shardBytes, 0, shardBytes, out), StatusCode::kDataCorruption);
+    EXPECT_EQ(out, std::string(original.size(), '\x7f'));
+  }
 }
 
 std::shared_ptr<Core> manager(folly::CPUThreadPoolExecutor &pool, size_t bytes, size_t operations = 4) {

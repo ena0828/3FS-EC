@@ -63,9 +63,12 @@ fn invert(mut matrix: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
     Ok(out)
 }
 
-fn equal_lengths<'a>(mut shards: impl Iterator<Item = &'a Vec<u8>>) -> Result<usize> {
-    let length = shards.next().ok_or_else(|| error("no shards"))?.len();
-    if shards.any(|shard| shard.len() != length) {
+fn equal_lengths<'a, I: AsRef<[u8]> + 'a>(
+    mut shards: impl Iterator<Item = &'a I>,
+) -> Result<usize> {
+    let first = shards.next().ok_or_else(|| error("no shards"))?;
+    let length = first.as_ref().len();
+    if shards.any(|shard| shard.as_ref().len() != length) {
         return Err(error("shards must have equal lengths"));
     }
     Ok(length)
@@ -206,13 +209,23 @@ impl Codec {
 
     /// Returns all k+m shards, starting with the unchanged data shards.
     pub fn encode(&self, data: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        let parity = self.parity_from(data)?;
+        let mut encoded = data.to_vec();
+        encoded.extend(parity);
+        Ok(encoded)
+    }
+
+    /// Re-encode the parity rows without returning copies of the systematic rows.
+    pub fn encode_parity(&self, data: &[&[u8]]) -> Result<Vec<Vec<u8>>> {
+        self.parity_from(data)
+    }
+
+    fn parity_from<I: AsRef<[u8]>>(&self, data: &[I]) -> Result<Vec<Vec<u8>>> {
         if data.len() != self.k {
             return Err(error("encode requires exactly k data shards"));
         }
         let length = equal_lengths(data.iter())?;
-        let mut encoded = data.to_vec();
-        encoded.extend(self.parity.apply(data, length)?);
-        Ok(encoded)
+        self.parity.apply(data, length)
     }
 
     pub fn repair_plan(&self, healthy: &[usize], targets: &[usize]) -> Result<RepairPlan> {
@@ -336,6 +349,15 @@ impl RepairPlan {
     }
 
     pub fn recover_slice(&self, inputs: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        self.recover_from(inputs)
+    }
+
+    /// Borrow the source slices while computing the same prepared target rows.
+    pub fn recover_borrowed(&self, inputs: &[&[u8]]) -> Result<Vec<Vec<u8>>> {
+        self.recover_from(inputs)
+    }
+
+    fn recover_from<I: AsRef<[u8]>>(&self, inputs: &[I]) -> Result<Vec<Vec<u8>>> {
         if inputs.len() != self.healthy.len() {
             return Err(error("slice input count differs from repair plan"));
         }

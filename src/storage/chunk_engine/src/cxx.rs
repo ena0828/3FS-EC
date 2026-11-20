@@ -5,7 +5,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::ec_codec::{
-    ec_codec_backend, ec_codec_contribute, ec_codec_encode, ec_codec_recover, ec_codec_verify,
+    ec_codec_backend, ec_codec_contribute, ec_codec_encode, ec_codec_recover,
+    ec_codec_recover_missing_data, ec_codec_verify,
 };
 use crate::ec_scope_bridge::*;
 use crate::ec_stage_bridge::*;
@@ -670,6 +671,12 @@ pub mod ffi {
             shard_bytes: u32,
         ) -> EcCodecResult;
         fn ec_codec_recover(
+            format: &EcCodecFormat,
+            shards: &[EcCodecInput],
+            logical_length: u64,
+            shard_bytes: u32,
+        ) -> EcCodecResult;
+        fn ec_codec_recover_missing_data(
             format: &EcCodecFormat,
             shards: &[EcCodecInput],
             logical_length: u64,
