@@ -58,7 +58,7 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(archive_file, "");
   CONFIG_ITEM(output_file, "");
   CONFIG_ITEM(storage_transport, "tcp");
-  CONFIG_ITEM(read_quorum_first, true);
+  CONFIG_ITEM(read_quorum_first, false);
   CONFIG_OBJ(ib_devices, net::IBDevice::Config);
   CONFIG_ITEM(deadline_seconds, uint32_t{300});
   CONFIG_ITEM(worker_threads, uint32_t{2});
@@ -149,7 +149,7 @@ int execute(int argc, char **argv) {
         << "ec_read_spool_cli --cfg=FILE [--config.FIELD=VALUE] COMMAND\n"
            "Client Storage EC: --config.storage_transport=tcp|rdma (default tcp; no fallback).\n"
            "Select it per invocation, including resume; Meta-owned data configuration is independent.\n"
-           "Foreground EC reads: --config.read_quorum_first=true|false (default true; false starts eleven).\n"
+           "Foreground EC reads: --config.read_quorum_first=false starts eleven (default), true starts ten.\n"
            "Commands: create-state, inspect, cleanup, retire, resume-read\n"
            "Unmount first. Every command obtains the original private spool's exclusive flock.\n"
            "inspect is local-only and does not require a reachable cluster or token.\n"

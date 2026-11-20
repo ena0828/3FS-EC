@@ -12,7 +12,7 @@ struct EcStripeControl {
   std::chrono::steady_clock::time_point deadline;
   CancellationToken cancellation;
   EcStorageTransportPolicy transport = EcStorageTransportPolicy::TcpOnly;
-  bool readQuorumFirst = true;
+  bool readQuorumFirst = false;
 };
 
 // All IDs are supplied and persisted by the caller. Request UUIDs are separate

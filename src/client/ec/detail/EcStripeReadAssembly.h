@@ -9,7 +9,7 @@ namespace hf3fs::client::ec::detail {
 
 EcStripeReadOptions foregroundEcReadOptions(const std::array<std::optional<Status>, 12> &routeFailures,
                                             std::chrono::steady_clock::time_point deadline,
-                                            bool quorumFirst = true);
+                                            bool quorumFirst);
 
 enum class EcReadBlockAssembly { Systematic, Recovered };
 

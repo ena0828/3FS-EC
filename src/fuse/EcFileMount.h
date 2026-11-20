@@ -65,7 +65,7 @@ class EcFileMount final : public std::enable_shared_from_this<EcFileMount> {
                                                     std::chrono::seconds maximumTime,
                                                     storage::client::EcRequestControl::TransportPolicy transport =
                                                         storage::client::EcRequestControl::TransportPolicy::TcpOnly,
-                                                    bool readQuorumFirst = true);
+                                                    bool readQuorumFirst = false);
   ~EcFileMount();
   CoTryTask<Void> recoverState();
   CoTryTask<EcMountOpenResult> open(meta::Inode, flat::UserInfo, int flags);
@@ -166,7 +166,7 @@ class EcFileMount final : public std::enable_shared_from_this<EcFileMount> {
   EcFileMount(std::shared_ptr<EcFileMountState> s, Dependencies d, std::chrono::seconds t,
               storage::client::EcRequestControl::TransportPolicy transport =
                   storage::client::EcRequestControl::TransportPolicy::TcpOnly,
-              bool readQuorumFirst = true)
+              bool readQuorumFirst = false)
       : state_(std::move(s)),
         deps_(std::move(d)),
         time_(t),

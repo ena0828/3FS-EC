@@ -221,7 +221,7 @@ struct FuseClients {
   std::unique_ptr<folly::CPUThreadPoolExecutor> ecExecutor;
   std::filesystem::path ecArchiveDirectory;
   bool ecRetireCompleted = false;
-  bool ecReadQuorumFirst = true;
+  bool ecReadQuorumFirst = false;
   std::chrono::seconds ecOperationTime{300};
   storage::client::EcRequestControl::TransportPolicy ecStorageTransport =
       storage::client::EcRequestControl::TransportPolicy::TcpOnly;

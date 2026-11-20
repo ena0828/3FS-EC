@@ -74,7 +74,7 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(block_window, uint8_t{0});
   CONFIG_ITEM(repair_metrics, false);
   CONFIG_ITEM(storage_transport, "tcp");
-  CONFIG_ITEM(read_quorum_first, true);
+  CONFIG_ITEM(read_quorum_first, false);
   CONFIG_OBJ(ib_devices, net::IBDevice::Config);
   CONFIG_ITEM(deadline_seconds, uint32_t{300});
   CONFIG_ITEM(worker_threads, uint32_t{4});
@@ -470,7 +470,7 @@ int execute(int argc, char **argv) {
         << "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/new-run new-write|new-read|new-repair\n"
            "Client Storage EC: --config.storage_transport=tcp|rdma (default tcp; no fallback).\n"
            "Select it per invocation, including resume; Meta-owned data configuration is independent.\n"
-           "Foreground EC reads: --config.read_quorum_first=true|false (default true; false starts eleven).\n"
+           "Foreground EC reads: --config.read_quorum_first=false starts eleven (default), true starts ten.\n"
            "ec_stripe_cli --cfg=client.toml --config.run_dir=/absolute/new-run "
            "--config.source_run=/absolute/published-run --config.input_file=/absolute/restored-data "
            "new-recovery-write\n"

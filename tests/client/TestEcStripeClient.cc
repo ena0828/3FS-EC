@@ -23,7 +23,8 @@ TEST(TestEcStripeClient, ForegroundReadPreservesPinnedIndicesAndPrioritizesRouta
   failed[0].emplace(StatusCode::kInvalidArg);
   failed[4].emplace(StatusCode::kInvalidArg);
   failed[11].emplace(StatusCode::kInvalidArg);
-  const auto options = detail::foregroundEcReadOptions(failed, deadline);
+  EXPECT_FALSE(EcStripeControl{}.readQuorumFirst);
+  const auto options = detail::foregroundEcReadOptions(failed, deadline, true);
   EXPECT_EQ(options.order, (std::array<uint16_t, 12>{1, 2, 3, 5, 6, 7, 8, 9, 10, 0, 4, 11}));
   EXPECT_TRUE(options.quorumFirst);
   const auto eager = detail::foregroundEcReadOptions(failed, deadline, false);
