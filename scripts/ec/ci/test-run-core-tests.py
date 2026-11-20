@@ -219,6 +219,7 @@ class TestCoreAcceptanceContract(unittest.TestCase):
         self.assertEqual(RUNNER.parser().parse_args(base + ["--profile", "repair"]).profile, "repair")
         cases, test_filter, fuse = RUNNER.selection("repair")
         self.assertEqual(cases, (
+            "TestEcFileNativeRepair.UnreservedRepairRequiresAbortedParentReleasedSourceAndMissingExecution",
             "TestEcFileNativeRepair.ThreeStrategiesPublishFreshTwelveAndKeepSourceDebtExplicit",
             "TestEcFileNativeRepair.HealthyCopyPendingIntentResumesSameJournalAfterEngineReopen",
             "TestEcFileNativeRepair.HelperDirectCommittedIssuanceLostReplyAndFreshTwelvePublication",
