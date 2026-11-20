@@ -8,6 +8,11 @@ namespace hf3fs::fuse {
 TEST(TestEcFuseTransportConfig, ExplicitPolicyCannotChangeDuringAMount) {
   FuseConfig config;
   EXPECT_EQ(config.ec_storage_transport(), "tcp");
+  EXPECT_TRUE(config.ec_read_quorum_first());
+  ASSERT_OK(config.atomicallyUpdate(std::string_view{"ec_read_quorum_first = false"}, false));
+  EXPECT_FALSE(config.ec_read_quorum_first());
+  EXPECT_FALSE(config.atomicallyUpdate(std::string_view{"ec_read_quorum_first = true"}, true));
+  EXPECT_FALSE(config.ec_read_quorum_first());
   ASSERT_OK(config.atomicallyUpdate(std::string_view{"ec_storage_transport = 'rdma'"}, false));
   EXPECT_EQ(config.ec_storage_transport(), "rdma");
   for (const auto value : {"auto", "RDMA", "", "tcp,rdma"}) {

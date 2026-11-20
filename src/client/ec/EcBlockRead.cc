@@ -216,7 +216,8 @@ EcBlockRead::~EcBlockRead() = default;
 Result<EcBlockReadHandle> EcBlockRead::start(EcBlockReadInput input, EcStripeReadOptions options) {
   auto pinned = input.pinned;
   auto block = input.blockIndex;
-  auto started = impl_->kernel.start(std::move(input), {options.deadline, options.hedgeAfter, options.order});
+  auto started =
+      impl_->kernel.start(std::move(input), {options.deadline, options.hedgeAfter, options.order, options.quorumFirst});
   if (!started) return makeError(started.error());
   try {
     return EcBlockReadHandle(std::make_shared<detail::EcBlockReadState>(std::move(*started), std::move(pinned), block));

@@ -58,6 +58,7 @@ Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
                                const String &tokenFile,
                                FuseConfig &fuseConfig) {
   config = &fuseConfig;
+  ecReadQuorumFirst = fuseConfig.ec_read_quorum_first();
   fullyStopped = false;
   const auto &transport = fuseConfig.ec_storage_transport();
   if (transport != "tcp" && transport != "rdma")
@@ -235,7 +236,8 @@ Result<Void> FuseClients::init(const flat::AppInfo &appInfo,
                                        [this](const flat::UserInfo &u) { return userConfig.getConfig(u).readonly(); }},
                                       flat::Token(fuseToken),
                                       std::chrono::seconds(fuseConfig.ec_file().maximum_operation_seconds()),
-                                      ecStorageTransport);
+                                      ecStorageTransport,
+                                      ecReadQuorumFirst);
     RETURN_ON_ERROR(mounted);
     ecFiles = std::move(*mounted);
     // Store the owner before recovery: all failure/exception exits reach the
@@ -371,7 +373,8 @@ Result<Void> FuseClients::stop() noexcept {
 }
 
 client::ec::EcStripeControl FuseClients::ecControl() const {
-  return {std::chrono::steady_clock::now() + ecOperationTime, cancelIos.getToken(), ecStorageTransport};
+  return {std::chrono::steady_clock::now() + ecOperationTime, cancelIos.getToken(), ecStorageTransport,
+          ecReadQuorumFirst};
 }
 CoTask<void> FuseClients::retireDeliveredEcRead(client::ec::EcReadReceipt receipt, flat::UserInfo user, bool allT2) {
   if (!ecRetireCompleted || !allT2 || !ecDispatcher) co_return;

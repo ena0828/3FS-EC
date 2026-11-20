@@ -36,6 +36,9 @@ struct EcStripeReadOptions {
   std::chrono::steady_clock::time_point deadline;
   std::chrono::milliseconds hedgeAfter{10};
   std::array<uint16_t, 12> order{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+  // Start with exactly ten sources. Failed reads are replaced immediately;
+  // slow reads can use both remaining candidates before the deadline.
+  bool quorumFirst = false;
 };
 
 namespace detail {

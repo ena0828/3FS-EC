@@ -82,6 +82,7 @@ class Config : public ConfigBase<Config> {
   CONFIG_ITEM(repair_window_decimal, "");
   CONFIG_ITEM(repair_metrics, false);
   CONFIG_ITEM(storage_transport, "tcp");
+  CONFIG_ITEM(read_quorum_first, true);
   CONFIG_OBJ(ib_devices, net::IBDevice::Config);
   CONFIG_ITEM(deadline_seconds, uint32_t{300});
   CONFIG_ITEM(worker_threads, uint32_t{4});
@@ -129,7 +130,7 @@ Result<std::string> tokenFile(const std::string &path) {
 
 EcStripeControl control(const Config &c) {
   return {std::chrono::steady_clock::now() + std::chrono::seconds(c.deadline_seconds()),
-          {}, *parseEcStorageTransport(c.storage_transport())};
+          {}, *parseEcStorageTransport(c.storage_transport()), c.read_quorum_first()};
 }
 void printProgress(const EcFileRunJournal &j) {
   if (j.latest()) {
@@ -145,6 +146,7 @@ int execute(int argc, char **argv) {
     std::cout << "ec_file_cli --cfg=FILE [--config.FIELD=VALUE] COMMAND\n"
                  "Client Storage EC: --config.storage_transport=tcp|rdma (default tcp; no fallback).\n"
                  "Select it per invocation, including resume; Meta-owned data configuration is independent.\n"
+                 "Foreground EC reads: --config.read_quorum_first=true|false (default true; false starts eleven).\n"
                  "Commands: describe, new-range-read, new-append-at, resume, release, inspect\n"
                  "One command only. New commands require explicit inode_decimal/incarnation; read requires "
                  "offset_decimal/length_decimal.\n"

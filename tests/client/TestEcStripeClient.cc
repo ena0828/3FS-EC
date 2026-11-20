@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "client/ec/detail/EcStripeClientCore.h"
+#include "client/ec/detail/EcStripeReadAssembly.h"
 #include "client/storage/StorageClientInMem.h"
 #include "tests/FakeMgmtdClient.h"
 #include "tests/GtestHelpers.h"
@@ -15,6 +16,74 @@ namespace hf3fs::client::ec::test {
 namespace {
 using folly::coro::blockingWait;
 using Core = detail::EcStripeClientCore;
+
+TEST(TestEcStripeClient, ForegroundReadPreservesPinnedIndicesAndPrioritizesRoutableData) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  std::array<std::optional<Status>, 12> failed;
+  failed[0].emplace(StatusCode::kInvalidArg);
+  failed[4].emplace(StatusCode::kInvalidArg);
+  failed[11].emplace(StatusCode::kInvalidArg);
+  const auto options = detail::foregroundEcReadOptions(failed, deadline);
+  EXPECT_EQ(options.order, (std::array<uint16_t, 12>{1, 2, 3, 5, 6, 7, 8, 9, 10, 0, 4, 11}));
+  EXPECT_TRUE(options.quorumFirst);
+  const auto eager = detail::foregroundEcReadOptions(failed, deadline, false);
+  EXPECT_FALSE(eager.quorumFirst);
+  EXPECT_EQ(eager.order, options.order);
+  EXPECT_EQ(options.deadline, deadline);
+}
+
+TEST(TestEcStripeClient, ReadBlockAssemblyMatchesOriginalForEverySurvivorSetAndPartialTail) {
+  constexpr uint32_t shardBytes = 13;
+  std::string original;
+  for (size_t i = 0; i < 93; ++i) original.push_back(static_cast<char>(i * 29 + 11));
+  auto encoded = storage::EcCodec::encode(original, shardBytes);
+  ASSERT_OK(encoded);
+  for (uint16_t first = 0; first < 12; ++first) {
+    for (uint16_t second = first + 1; second < 12; ++second) {
+      SCOPED_TRACE(::testing::Message() << "erased " << first << ',' << second);
+      std::string actual(original.size(), '\x7f');
+      for (uint32_t offset = 0; offset < shardBytes; offset += 5) {
+        const uint32_t length = std::min(5u, shardBytes - offset);
+        std::array<storage::EcCodecShardView, 10> views;
+        size_t filled = 0;
+        for (uint16_t i = 0; i < 12; ++i) {
+          const uint16_t shard = 11 - i;  // A valid completion order independent of plan order.
+          if (shard == first || shard == second) continue;
+          views[filled++] = {shard, std::string_view((*encoded)[shard]).substr(offset, length)};
+        }
+        auto assembled = detail::assembleEcReadBlock(views, shardBytes, offset, length, actual);
+        ASSERT_OK(assembled);
+        EXPECT_EQ(*assembled, first == 10 ? detail::EcReadBlockAssembly::Systematic : detail::EcReadBlockAssembly::Recovered);
+      }
+      EXPECT_EQ(actual, original);
+    }
+  }
+}
+
+TEST(TestEcStripeClient, DirectBlockRejectsNonzeroPaddingAndMalformedQuorums) {
+  constexpr uint32_t shardBytes = 5;
+  const std::string original = "elevenbytes";
+  auto encoded = storage::EcCodec::encode(original, shardBytes);
+  ASSERT_OK(encoded);
+  std::array<storage::EcCodecShardView, 10> views;
+  for (uint16_t i = 0; i < 10; ++i) views[i] = {i, (*encoded)[i]};
+  std::string out(original.size(), '\x7f');
+  // The original length ends inside shard 2. Corrupt padding there and then
+  // in an entirely padded shard; the full logical SHA cannot see either.
+  for (auto location : {std::pair{2, 1}, std::pair{9, 4}}) {
+    (*encoded)[location.first][location.second] = '!';
+    ASSERT_ERROR(storage::EcCodec::recover(views, original.size(), shardBytes), StatusCode::kDataCorruption);
+    ASSERT_ERROR(detail::assembleEcReadBlock(views, shardBytes, 0, shardBytes, out), StatusCode::kDataCorruption);
+    EXPECT_EQ(out, std::string(original.size(), '\x7f'));
+    (*encoded)[location.first][location.second] = 0;
+  }
+  views[9].index = views[0].index;
+  ASSERT_ERROR(detail::assembleEcReadBlock(views, shardBytes, 0, shardBytes, out), StatusCode::kInvalidArg);
+  views[9].index = 12;
+  ASSERT_ERROR(detail::assembleEcReadBlock(views, shardBytes, 0, shardBytes, out), StatusCode::kInvalidArg);
+  views[9] = {9, views[9].data.substr(1)};
+  ASSERT_ERROR(detail::assembleEcReadBlock(views, shardBytes, 0, shardBytes, out), StatusCode::kInvalidArg);
+}
 
 std::shared_ptr<Core> manager(folly::CPUThreadPoolExecutor &pool, size_t bytes, size_t operations = 4) {
   EcStripeClient::Limits limits;

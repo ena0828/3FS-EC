@@ -80,7 +80,7 @@ Result<std::string> writeEvidence(const EcFilePwriteJournal &j, const EcPwriteOu
 
 }  // namespace
 EcStripeControl EcFileMount::control() const {
-  return {shutdownDeadline_.value_or(std::chrono::steady_clock::now() + time_), {}, transport_};
+  return {shutdownDeadline_.value_or(std::chrono::steady_clock::now() + time_), {}, transport_, readQuorumFirst_};
 }
 EcFileMount::~EcFileMount() {
   if (!stopped_) std::terminate();
@@ -89,12 +89,13 @@ Result<std::shared_ptr<EcFileMount>> EcFileMount::start(std::shared_ptr<EcFileMo
                                                         Dependencies d,
                                                         flat::Token token,
                                                         std::chrono::seconds time,
-                                                        storage::client::EcRequestControl::TransportPolicy transport) {
+                                                        storage::client::EcRequestControl::TransportPolicy transport,
+                                                        bool readQuorumFirst) {
   if (!s || !d.meta || !d.storage || !d.mgmtd || !d.rmw || d.meta->clientId().uuid != s->clientNamespace() ||
       time < std::chrono::seconds(1) || time > std::chrono::hours(1) ||
       !storage::client::isExplicitEcTransportPolicy(transport))
     return makeError(StatusCode::kInvalidArg);
-  auto self = std::shared_ptr<EcFileMount>(new EcFileMount(std::move(s), std::move(d), time, transport));
+  auto self = std::shared_ptr<EcFileMount>(new EcFileMount(std::move(s), std::move(d), time, transport, readQuorumFirst));
   self->token_ = std::move(token);
   self->thread_ = std::thread([self] { self->loop(); });
   self->stopped_ = false;

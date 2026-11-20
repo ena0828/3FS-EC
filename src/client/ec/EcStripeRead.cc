@@ -149,7 +149,8 @@ EcStripeRead::EcStripeRead(std::shared_ptr<EcReadTransport> transport,
 EcStripeRead::~EcStripeRead() = default;
 Result<EcStripeReadHandle> EcStripeRead::start(EcStripeReadInput input, EcStripeReadOptions options) {
   auto manifest = input.manifest;
-  auto started = impl_->kernel.start(std::move(input), {options.deadline, options.hedgeAfter, options.order});
+  auto started =
+      impl_->kernel.start(std::move(input), {options.deadline, options.hedgeAfter, options.order, options.quorumFirst});
   if (!started) return makeError(started.error());
   try {
     return EcStripeReadHandle(std::make_shared<detail::EcReadState>(std::move(*started), std::move(manifest)));

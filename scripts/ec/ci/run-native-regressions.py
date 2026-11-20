@@ -103,6 +103,16 @@ RPC_OBSERVER_CASES = (
 )
 CLIENT_MANDATORY |= set(RPC_FRAME_CASES) | set(RPC_OBSERVER_CASES)
 CLIENT_MANDATORY |= {
+    "TestEcBlockRead.QuorumFirstReadsTenHealthySourcesAndReplacesCorruption",
+    "TestEcBlockRead.QuorumFirstHedgesTwoStalledSourcesAndJoinsThem",
+    "TestEcStripeClient.ForegroundReadPreservesPinnedIndicesAndPrioritizesRoutableData",
+    "TestEcStripeClient.ReadBlockAssemblyMatchesOriginalForEverySurvivorSetAndPartialTail",
+    "TestEcStripeClient.DirectBlockRejectsNonzeroPaddingAndMalformedQuorums",
+    "TestEcRepairPipeline.ShortStripesShareWindowAndUsePlanSourceOrder",
+    "TestEcRepairPipeline.BatchedReadExceptionJoinsBothActorsAndPreservesSourceErrorOrder",
+    "TestEcRepairPipeline.BatchedReadCancellationJoinsSubmittedReadsWithoutRefill",
+}
+CLIENT_MANDATORY |= {
     "TestEcRepairPipeline." + name for name in (
         "DirectDeliveryUsesWindowAndSealsWithoutClientAppend",
         "DirectDeliveryRequiresExplicitSupportedHelperBeforeBegin",

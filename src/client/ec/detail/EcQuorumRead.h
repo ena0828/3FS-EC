@@ -54,6 +54,7 @@ struct EcQuorumOptions {
   std::chrono::steady_clock::time_point deadline;
   std::chrono::milliseconds hedgeAfter{10};
   std::array<uint16_t, 12> order{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+  bool quorumFirst = false;
 };
 struct EcQuorumLimits {
   size_t maxOperations;
@@ -290,7 +291,10 @@ class EcQuorumRead {
     }
   }
   CoTask<void> select(std::shared_ptr<State> state) {
-    size_t launched = 0, inflight = 0, wanted = 11, accepted = 0, rejected = 0;
+    const auto &options = state->options;
+    const auto interval =
+        std::min(options.hedgeAfter, std::chrono::duration_cast<std::chrono::milliseconds>(limits_.maxOperationTime));
+    size_t launched = 0, inflight = 0, wanted = options.quorumFirst ? 10 : 11, accepted = 0, rejected = 0;
     std::array<typename Selection::Shard, 10> selected;
     auto progress = Clock::now();
     while (true) {
@@ -303,6 +307,10 @@ class EcQuorumRead {
         publish(state, makeError(StorageClientCode::kTimeout));
         co_return;
       }
+      // Leave the final interval for the spare reads to return. An already
+      // short deadline admits both up front, as waiting would consume it.
+      if (options.quorumFirst && now >= options.deadline - interval)
+        wanted = inflight + (12 - launched);
       while (inflight < wanted && launched < 12) {
         launch(state, state->options.order[launched++]);
         ++inflight;
@@ -312,7 +320,8 @@ class EcQuorumRead {
         co_return;
       }
       const bool canHedge = launched < 12 && inflight < 12;
-      const auto hedgeAt = progress + state->options.hedgeAfter;
+      auto hedgeAt = progress + interval;
+      if (options.quorumFirst) hedgeAt = std::min(hedgeAt, options.deadline - interval);
       if (canHedge && now >= hedgeAt) {
         wanted = inflight + 1;
         progress = now;
@@ -336,7 +345,9 @@ class EcQuorumRead {
       if (state->stop.isCancellationRequested() || Clock::now() >= state->options.deadline) continue;
       selected[accepted++] = {*index, std::move(*response)};
       --wanted;
-      progress = Clock::now();
+      // In quorum-first mode a stream of fast replies must not postpone a
+      // spare for a different stalled shard. The timer advances on hedges.
+      if (!options.quorumFirst) progress = Clock::now();
       if (accepted == 10) {
         Selection output;
         output.shards = std::move(selected);

@@ -38,6 +38,7 @@ struct FuseConfig : public ConfigBase<FuseConfig> {
   CONFIG_ITEM(enable_writeback_cache, false);
   // Fixed at mount initialization; Metadata and scope-control routing are independent.
   CONFIG_ITEM(ec_storage_transport, "tcp", [](const auto &value) { return value == "tcp" || value == "rdma"; });
+  CONFIG_ITEM(ec_read_quorum_first, true);
   CONFIG_SECT(ec_read, {
     CONFIG_ITEM(enable, false);
     CONFIG_ITEM(state_directory, "");

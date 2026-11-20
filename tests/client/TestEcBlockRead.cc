@@ -23,6 +23,7 @@ class BlockTransport final : public EcBlockReadTransport {
   enum class Corruption { None, Bytes, Instance, Operation, Block, Length, Root };
   std::atomic<uint16_t> blocked{1u << 10};
   Corruption corruptFirst = Corruption::None;
+  size_t releaseAfterStarts = 11;
   std::atomic<size_t> started{0}, active{0};
   static std::string bytes(uint16_t shard, size_t length) { return std::string(length, char('a' + shard)); }
   CoTryTask<storage::EcReadBlockResultV2> read(storage::EcReadBlockV2Req wire, EcReadControl control) override {
@@ -31,7 +32,7 @@ class BlockTransport final : public EcBlockReadTransport {
     ++started;
     const auto &request = wire.request;
     const auto shard = request.identity.shard;
-    while (started.load() < 11 || (blocked.load() & (1u << shard))) {
+    while (started.load() < releaseAfterStarts || (blocked.load() & (1u << shard))) {
       if (Clock::now() >= control.deadline) co_return makeError(StorageClientCode::kTimeout);
       co_await folly::coro::sleep(1ms);
     }
@@ -148,6 +149,56 @@ bool waitStarted(const BlockTransport &transport, size_t count) {
   const auto limit = Clock::now() + 1s;
   while (transport.started.load() < count && Clock::now() < limit) std::this_thread::sleep_for(1ms);
   return transport.started.load() >= count;
+}
+
+TEST(TestEcBlockRead, QuorumFirstReadsTenHealthySourcesAndReplacesCorruption) {
+  folly::CPUThreadPoolExecutor executor(2);
+  for (bool corrupt : {false, true}) {
+    auto transport = std::make_shared<BlockTransport>();
+    transport->releaseAfterStarts = 10;
+    transport->blocked = 0;
+    if (corrupt) transport->corruptFirst = BlockTransport::Corruption::Bytes;
+    EcBlockRead reader(transport, executor, {});
+    SCOPE_EXIT { blockingWait(reader.close()); };
+    auto policy = options(10s);
+    policy.quorumFirst = true;
+    policy.hedgeAfter = 3s;
+    auto started = reader.start(input(), policy);
+    ASSERT_TRUE(started);
+    auto selected = blockingWait(started->takeReady());
+    ASSERT_TRUE(selected);
+    EXPECT_EQ(selected->attempted, corrupt ? 11u : 10u);
+    EXPECT_EQ(selected->rejected, corrupt ? 1u : 0u);
+    blockingWait(started->waitLocalCleanup());
+    EXPECT_EQ(transport->started.load(), selected->attempted);
+  }
+}
+
+TEST(TestEcBlockRead, QuorumFirstHedgesTwoStalledSourcesAndJoinsThem) {
+  folly::CPUThreadPoolExecutor executor(2);
+  for (bool shortDeadline : {false, true}) {
+    auto transport = std::make_shared<BlockTransport>();
+    transport->releaseAfterStarts = shortDeadline ? 12 : 10;
+    transport->blocked = (1u << 0) | (1u << 1);
+    EcBlockRead reader(transport, executor, {});
+    SCOPE_EXIT {
+      transport->blocked = 0;
+      blockingWait(reader.close());
+    };
+    auto policy = options(2s);
+    policy.quorumFirst = true;
+    policy.hedgeAfter = shortDeadline ? 3s : 25ms;
+    auto started = reader.start(input(), policy);
+    ASSERT_TRUE(started);
+    auto selected = blockingWait(started->takeReady());
+    ASSERT_TRUE(selected);
+    EXPECT_EQ(selected->attempted, 12u);
+    EXPECT_EQ(selected->rejected, 0u);
+    EXPECT_EQ(reader.snapshot().activeRequests, 2u);
+    transport->blocked = 0;
+    blockingWait(started->waitLocalCleanup());
+    EXPECT_EQ(reader.snapshot().activeRequests, 0u);
+  }
 }
 
 TEST(TestEcBlockRead, OutputAndLateCleanupOwnSeparateContinuousCharges) {

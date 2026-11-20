@@ -64,7 +64,8 @@ class EcFileMount final : public std::enable_shared_from_this<EcFileMount> {
                                                     flat::Token recoveryToken,
                                                     std::chrono::seconds maximumTime,
                                                     storage::client::EcRequestControl::TransportPolicy transport =
-                                                        storage::client::EcRequestControl::TransportPolicy::TcpOnly);
+                                                        storage::client::EcRequestControl::TransportPolicy::TcpOnly,
+                                                    bool readQuorumFirst = true);
   ~EcFileMount();
   CoTryTask<Void> recoverState();
   CoTryTask<EcMountOpenResult> open(meta::Inode, flat::UserInfo, int flags);
@@ -164,11 +165,13 @@ class EcFileMount final : public std::enable_shared_from_this<EcFileMount> {
   }
   EcFileMount(std::shared_ptr<EcFileMountState> s, Dependencies d, std::chrono::seconds t,
               storage::client::EcRequestControl::TransportPolicy transport =
-                  storage::client::EcRequestControl::TransportPolicy::TcpOnly)
+                  storage::client::EcRequestControl::TransportPolicy::TcpOnly,
+              bool readQuorumFirst = true)
       : state_(std::move(s)),
         deps_(std::move(d)),
         time_(t),
         transport_(transport),
+        readQuorumFirst_(readQuorumFirst),
         executor_(std::make_unique<folly::CPUThreadPoolExecutor>(2)) {}
   client::ec::EcStripeControl control() const;
   bool readonly(const flat::UserInfo &u) const { return deps_.readonly && deps_.readonly(u); }
@@ -190,6 +193,7 @@ class EcFileMount final : public std::enable_shared_from_this<EcFileMount> {
   Dependencies deps_;
   std::chrono::seconds time_;
   const storage::client::EcRequestControl::TransportPolicy transport_;
+  const bool readQuorumFirst_;
   // Written/read only by the owned worker after accepted jobs have completed.
   std::optional<std::chrono::steady_clock::time_point> shutdownDeadline_;
   std::unique_ptr<folly::CPUThreadPoolExecutor> executor_;
