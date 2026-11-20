@@ -1,5 +1,6 @@
 #include "EcRepairPipeline.h"
 
+#include <algorithm>
 #include <folly/experimental/coro/Baton.h>
 #include <folly/experimental/coro/Collect.h>
 #include <mutex>
@@ -114,6 +115,14 @@ CoTryTask<void> appendBlock(std::shared_ptr<Window> state, EcRepairBlock block) 
   co_return Void{};
 }
 
+// Check admission when the lazy task actually starts. The owning block keeps
+// the window alive until every child in the batch has returned.
+CoTryTask<std::string> readBatchSource(Window &state, uint8_t source, uint32_t block) {
+  if (state.stopped()) co_return makeError(StorageClientCode::kRequestCanceled, "EC repair stopped before source read");
+  CO_RETURN_ON_ERROR(active(state.control));
+  co_return co_await state.transport->read(state.plan, source, block, state.control);
+}
+
 CoTryTask<void> oneBlock(std::shared_ptr<Window> state, uint32_t blockIndex) {
   if (state->stopped()) co_return Void{};
   CO_RETURN_ON_ERROR(active(state->control));
@@ -135,21 +144,45 @@ CoTryTask<void> oneBlock(std::shared_ptr<Window> state, uint32_t blockIndex) {
     if (block->blockIndex != blockIndex)
       co_return makeError(StatusCode::kDataCorruption, "helper returned another block");
   } else {
-    // One block actor retains only one source block and its target accumulator.
-    // Different actors overlap read, contribution calculation and ordered write.
-    for (uint8_t source = 0; source != 10; ++source) {
+    // When all block slots can be occupied, keep the original single-source
+    // fast path. A shorter stripe shares unused slots across its fixed actors.
+    // Their quotas sum to the window, bounding both reads and retained source
+    // payloads to W blocks; a completed batch drops its payloads before refill.
+    const uint32_t blocks = state->plan->blockCount();
+    const uint32_t window = state->plan->input().maxBlocksInFlight;
+    const uint8_t quota = blocks < window ? window / blocks + (blockIndex < window % blocks) : 1;
+    const auto consume = [&](uint8_t source, Result<std::string> &bytes) -> Result<Void> {
+      RETURN_ON_ERROR(bytes);
+      EcRepairObservation::Scope compute(state->observation, EcRepairPoint::ClientBlockAdvance);
+      block = EcRepairBlockCore::advance(*state->plan, source, std::move(*block), *bytes);
+      if (block) compute.success();
+      RETURN_ON_ERROR(block);
+      return Void{};
+    };
+    const auto sources = state->plan->input().sources.size();
+    for (uint8_t first = 0; first < sources; first += quota) {
       if (state->stopped()) co_return Void{};
       CO_RETURN_ON_ERROR(active(state->control));
-      auto bytes = co_await state->transport->read(state->plan, source, blockIndex, state->control);
-      CO_RETURN_ON_ERROR(bytes);
-      {
-        // Includes integrity/plan validation and contribution accumulation;
-        // this local wall span is not a pure GF arithmetic CPU measurement.
-        EcRepairObservation::Scope compute(state->observation, EcRepairPoint::ClientBlockAdvance);
-        block = EcRepairBlockCore::advance(*state->plan, source, std::move(*block), *bytes);
-        if (block) compute.success();
+      const auto count = std::min<size_t>(quota, sources - first);
+      if (count == 1) {
+        auto bytes = co_await state->transport->read(state->plan, first, blockIndex, state->control);
+        CO_RETURN_ON_ERROR(consume(first, bytes));
+        continue;
       }
-      CO_RETURN_ON_ERROR(block);
+      std::vector<CoTryTask<std::string>> reads;
+      reads.reserve(count);
+      for (size_t offset = 0; offset != count; ++offset)
+        reads.push_back(readBatchSource(*state, first + offset, blockIndex));
+      // Read errors and exceptions occupy their original source slots. Join
+      // the entire batch before propagating either or advancing the packet.
+      auto results = co_await folly::coro::collectAllTryRange(std::move(reads));
+      for (size_t offset = 0; offset != count; ++offset) {
+        if (offset != 0) {
+          if (state->stopped()) co_return Void{};
+          CO_RETURN_ON_ERROR(active(state->control));
+        }
+        CO_RETURN_ON_ERROR(consume(first + offset, results[offset].value()));
+      }
     }
   }
   CO_RETURN_ON_ERROR(active(state->control));

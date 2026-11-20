@@ -61,6 +61,7 @@ class TestTransport final : public EcRepairTransport {
   std::atomic<bool> failAppend{false};
   bool allowHelper = true;
   bool readFailureBeforeUnknownAppend = false;
+  std::function<CoTryTask<void>(uint8_t, uint32_t)> beforeRead;
   folly::coro::Baton appendWaiting, readFailureReturning;
   std::mutex mutex;
   std::array<std::string, 2> written;
@@ -76,6 +77,10 @@ class TestTransport final : public EcRepairTransport {
     ++active;
     SCOPE_EXIT { --active; };
     ++reads;
+    if (beforeRead) {
+      auto admitted = co_await beforeRead(source, block);
+      CO_RETURN_ON_ERROR(admitted);
+    }
     if (holdReadAcrossAppendException && block == 1 && source == 0) {
       secondReadEntered.post();
       co_await releaseSecondRead;
@@ -197,6 +202,179 @@ bool waitFor(const std::function<bool()> &predicate) {
   const auto until = Clock::now() + 2s;
   while (!predicate() && Clock::now() < until) std::this_thread::sleep_for(1ms);
   return predicate();
+}
+
+// Hold individual sources in the first batch. All reads, including later
+// batches, participate in the high-water counter.
+struct BatchReadGate {
+  explicit BatchReadGate(std::array<uint8_t, 4> firstBatch) : quota(firstBatch) {}
+
+  std::array<uint8_t, 4> quota;
+  std::array<std::array<folly::coro::Baton, 4>, 4> release;
+  std::array<std::atomic<unsigned>, 4> entered{}, returned{};
+  std::atomic<unsigned> inFlight{0}, peak{0};
+
+  CoTask<void> wait(uint8_t source, uint32_t block) {
+    auto count = ++inFlight;
+    auto prior = peak.load();
+    while (prior < count && !peak.compare_exchange_weak(prior, count)) {}
+    SCOPE_EXIT { --inFlight; };
+    if (source < quota.at(block)) {
+      entered[block].fetch_or(1u << source);
+      co_await release[block][source];
+      returned[block].fetch_or(1u << source);
+    }
+    co_return;
+  }
+  bool full() const {
+    for (size_t block = 0; block < quota.size(); ++block) {
+      if (entered[block] != (1u << quota[block]) - 1) return false;
+    }
+    return true;
+  }
+  void releaseAll() {
+    for (auto &block : release)
+      for (auto &source : block) source.post();
+  }
+};
+
+TEST(TestEcRepairPipeline, ShortStripesShareWindowAndUsePlanSourceOrder) {
+  // Each released continuation completes before the executor can resume the
+  // next one. The held read tasks themselves overlap on this single thread.
+  folly::CPUThreadPoolExecutor executor(1);
+  struct Case {
+    uint32_t bytes;
+    uint8_t window;
+    std::array<uint8_t, 4> quota;
+  };
+  for (const Case &c : {Case{31, 1, {1}}, Case{31, 2, {2}}, Case{31, 4, {4}},
+                        Case{kEcIntegrityBlockBytes + 31, 3, {2, 1}},
+                        Case{kEcIntegrityBlockBytes + 31, 4, {2, 2}},
+                        Case{2 * kEcIntegrityBlockBytes + 31, 4, {2, 1, 1}}}) {
+    SCOPED_TRACE(::testing::Message() << "bytes=" << c.bytes << " window=" << int(c.window));
+    auto data = repair_test::makeData(c.bytes, {0, 11}, c.window);
+    auto plan = EcRepairPlan::create(data.input);
+    ASSERT_OK(plan);
+    BatchReadGate gate{c.quota};
+    auto transport = std::make_shared<TestTransport>(data);
+    transport->beforeRead = [&](uint8_t source, uint32_t block) -> CoTryTask<void> {
+      co_await gate.wait(source, block);
+      co_return Void{};
+    };
+    std::optional<Result<EcRepairSealed>> result;
+    std::atomic<bool> done{false};
+    std::thread runner([&] {
+      result = folly::coro::blockingWait(EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline,
+                                                              control(), executor));
+      done = true;
+    });
+    SCOPE_EXIT { gate.releaseAll(); runner.join(); };
+    ASSERT_TRUE(waitFor([&] { return gate.full(); }));
+    EXPECT_EQ(gate.inFlight.load(), c.window);
+    EXPECT_EQ(transport->reads.load(), c.window);
+    EXPECT_EQ(transport->appends.load(), 0);
+    // Later source slots return before earlier ones. The fixture assigns
+    // shards in descending order and computes expected bytes independently.
+    for (size_t block = 0; block < c.quota.size(); ++block) {
+      for (int source = c.quota[block] - 1; source >= 0; --source) {
+        gate.release[block][source].post();
+        ASSERT_TRUE(waitFor([&] { return (gate.returned[block].load() & (1u << source)) != 0; }));
+      }
+    }
+    ASSERT_TRUE(waitFor([&] { return done.load(); }));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_OK(*result);
+    EXPECT_EQ(gate.inFlight.load(), 0);
+    EXPECT_EQ(gate.peak.load(), c.window);
+    EXPECT_EQ(transport->reads.load(), 10u * (*plan)->blockCount());
+    EXPECT_EQ(transport->written[0], data.shards[0]);
+    EXPECT_EQ(transport->written[1], data.shards[11]);
+  }
+}
+
+TEST(TestEcRepairPipeline, BatchedReadExceptionJoinsBothActorsAndPreservesSourceErrorOrder) {
+  // One executor thread makes release of the other actor run after the first
+  // actor's error has unwound. Batons still let all four reads enter.
+  folly::CPUThreadPoolExecutor executor(1);
+  auto data = repair_test::makeData(kEcIntegrityBlockBytes + 7, {0}, 4);
+  auto plan = EcRepairPlan::create(data.input);
+  ASSERT_OK(plan);
+  for (bool earlierSourceFails : {false, true}) {
+    BatchReadGate gate{{2, 2}};
+    auto transport = std::make_shared<TestTransport>(data);
+    transport->beforeRead = [&](uint8_t source, uint32_t block) -> CoTryTask<void> {
+      co_await gate.wait(source, block);
+      if (block == 0 && source == 1) throw std::bad_alloc();
+      if (block == 0 && source == 0 && earlierSourceFails)
+        co_return makeError(StatusCode::kDataCorruption, "earlier source failed");
+      co_return Void{};
+    };
+    EcRepairObservation observation;
+    std::optional<Result<EcRepairSealed>> result;
+    std::atomic<bool> done{false};
+    std::thread runner([&] {
+      result = folly::coro::blockingWait(EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline,
+                                                              control(), executor, &observation));
+      done = true;
+    });
+    SCOPE_EXIT { gate.releaseAll(); runner.join(); };
+    ASSERT_TRUE(waitFor([&] { return gate.full(); }));
+    gate.release[0][1].post();
+    ASSERT_TRUE(waitFor([&] { return transport->active.load() == 3; }));
+    EXPECT_EQ(observation.snapshot().at(EcRepairPoint::BlockActor).finished, 0);
+    gate.release[0][0].post();
+    ASSERT_TRUE(waitFor([&] { return observation.snapshot().at(EcRepairPoint::BlockActor).finished == 1; }));
+    EXPECT_FALSE(done);
+    EXPECT_EQ(gate.inFlight.load(), 2);
+    gate.releaseAll();
+    ASSERT_TRUE(waitFor([&] { return done.load(); }));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_ERROR(*result, earlierSourceFails ? StatusCode::kDataCorruption : StatusCode::kNotEnoughMemory);
+    EXPECT_EQ(transport->active.load(), 0);
+    EXPECT_EQ(transport->reads.load(), 4);
+    EXPECT_EQ(transport->appends.load(), 0);
+    EXPECT_EQ(transport->seals.load(), 0);
+  }
+}
+
+TEST(TestEcRepairPipeline, BatchedReadCancellationJoinsSubmittedReadsWithoutRefill) {
+  folly::CPUThreadPoolExecutor executor(2);
+  auto data = repair_test::makeData(31, {0}, 4);
+  auto plan = EcRepairPlan::create(data.input);
+  ASSERT_OK(plan);
+  BatchReadGate gate{{4}};
+  auto transport = std::make_shared<TestTransport>(data);
+  transport->beforeRead = [&](uint8_t source, uint32_t block) -> CoTryTask<void> {
+    co_await gate.wait(source, block);
+    // This result returns after cancellation. The serial policy checks the
+    // control before moving on from source zero to this later source.
+    if (source == 2) co_return makeError(StatusCode::kDataCorruption, "late source failure");
+    co_return Void{};
+  };
+  CancellationSource cancel;
+  auto options = control();
+  options.cancellation = cancel.getToken();
+  std::optional<Result<EcRepairSealed>> result;
+  std::atomic<bool> done{false};
+  std::thread runner([&] {
+    result = folly::coro::blockingWait(EcRepairPipeline::run(*plan, transport, EcRepairMode::ClientPipeline,
+                                                            options, executor));
+    done = true;
+  });
+  SCOPE_EXIT { gate.releaseAll(); runner.join(); };
+  ASSERT_TRUE(waitFor([&] { return gate.full(); }));
+  cancel.requestCancellation();
+  for (unsigned source = 0; source < 3; ++source) gate.release[0][source].post();
+  ASSERT_TRUE(waitFor([&] { return transport->active.load() == 1; }));
+  EXPECT_FALSE(done);
+  gate.releaseAll();
+  ASSERT_TRUE(waitFor([&] { return done.load(); }));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_ERROR(*result, StorageClientCode::kRequestCanceled);
+  EXPECT_EQ(transport->reads.load(), 4);
+  EXPECT_EQ(transport->active.load(), 0);
+  EXPECT_EQ(transport->appends.load(), 0);
+  EXPECT_EQ(transport->seals.load(), 0);
 }
 
 void mutationExceptionCase(TestTransport::FaultAt point) {
